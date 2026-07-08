@@ -1,0 +1,236 @@
+from pathlib import Path
+
+import pytest
+
+from quickjoiner.config import SourceConfig
+from quickjoiner.connectors.azure_devops import pull_request_document, work_item_document
+from quickjoiner.connectors.base import Mode
+from quickjoiner.connectors.github import issue_document as gh_issue_document
+from quickjoiner.connectors.github import pr_document, runs_document
+from quickjoiner.connectors.jira import _adf_to_text, issue_document as jira_issue_document
+from quickjoiner.connectors.registry import CONNECTOR_TYPES, _load_builtin_connectors, create_connector
+from quickjoiner.connectors.util import resolve_secret
+
+
+def test_registry_knows_all_phase2_types(tmp_path):
+    _load_builtin_connectors()
+    for type_ in ("files", "git", "github", "jira", "confluence", "azure_devops"):
+        assert type_ in CONNECTOR_TYPES, f"missing connector type {type_}"
+    connector = create_connector(
+        SourceConfig(name="x", type="github", options={"repo": "o/r"}), tmp_path
+    )
+    assert connector.source_id == "github:x"
+    assert Mode.LIVE in connector.modes
+
+
+def test_unknown_connector_type_raises(tmp_path):
+    with pytest.raises(ValueError, match="Unknown connector type"):
+        create_connector(SourceConfig(name="x", type="nope"), tmp_path)
+
+
+def test_resolve_secret_precedence(monkeypatch):
+    monkeypatch.setenv("MY_TOKEN", "from-env-indirect")
+    monkeypatch.setenv("FALLBACK_TOKEN", "from-fallback")
+    assert resolve_secret({"token": "literal"}, "token", "FALLBACK_TOKEN") == "literal"
+    assert resolve_secret({"token": "env:MY_TOKEN"}, "token", "FALLBACK_TOKEN") == "from-env-indirect"
+    assert resolve_secret({}, "token", "FALLBACK_TOKEN") == "from-fallback"
+    assert resolve_secret({}, "token") is None
+
+
+def test_github_pr_document():
+    pr = {
+        "number": 42,
+        "title": "Add rate limiting",
+        "state": "open",
+        "html_url": "https://github.com/o/r/pull/42",
+        "user": {"login": "alice"},
+        "labels": [{"name": "backend"}],
+        "head": {"ref": "feat/rl"},
+        "base": {"ref": "main"},
+        "updated_at": "2026-07-01T10:00:00Z",
+        "body": "Adds a token bucket.",
+    }
+    doc = pr_document("o/r", pr)
+    assert doc.kind == "ticket"
+    assert "Add rate limiting" in doc.text and "alice" in doc.text and "token bucket" in doc.text
+    assert doc.uri.endswith("/pull/42")
+
+
+def test_github_issue_and_runs_documents():
+    issue = {
+        "number": 7, "title": "Flaky test", "state": "open",
+        "html_url": "https://github.com/o/r/issues/7",
+        "user": {"login": "bob"}, "labels": [], "updated_at": "2026-07-02T00:00:00Z",
+        "body": None,
+    }
+    doc = gh_issue_document("o/r", issue)
+    assert "Flaky test" in doc.title and "(no description)" in doc.text
+
+    runs = [{"name": "CI", "head_branch": "main", "status": "completed",
+             "conclusion": "failure", "run_number": 9, "updated_at": "2026-07-03T00:00:00Z"}]
+    rdoc = runs_document("o/r", runs)
+    assert rdoc.kind == "pipeline" and "failure" in rdoc.text
+
+
+def test_jira_issue_document_with_adf_description():
+    issue = {
+        "key": "PAY-123",
+        "fields": {
+            "summary": "Migrate ledger to Postgres 16",
+            "status": {"name": "In Progress"},
+            "assignee": {"displayName": "Priya"},
+            "issuetype": {"name": "Story"},
+            "labels": ["db"],
+            "updated": "2026-07-01T08:00:00.000+0000",
+            "priority": {"name": "High"},
+            "parent": {"key": "PAY-100"},
+            "description": {
+                "type": "doc",
+                "content": [
+                    {"type": "paragraph", "content": [{"type": "text", "text": "Upgrade path notes."}]}
+                ],
+            },
+        },
+    }
+    doc = jira_issue_document("https://acme.atlassian.net", issue)
+    assert doc.uri == "https://acme.atlassian.net/browse/PAY-123"
+    assert "In Progress" in doc.text and "Priya" in doc.text
+    assert "Upgrade path notes." in doc.text
+    assert "PAY-100" in doc.text
+
+
+def test_adf_flattening_nested_lists():
+    adf = {
+        "type": "doc",
+        "content": [
+            {"type": "bulletList", "content": [
+                {"type": "listItem", "content": [
+                    {"type": "paragraph", "content": [{"type": "text", "text": "item one"}]}
+                ]},
+            ]},
+        ],
+    }
+    assert "item one" in _adf_to_text(adf)
+
+
+def test_azure_devops_documents():
+    item = {
+        "id": 1001,
+        "fields": {
+            "System.WorkItemType": "Bug",
+            "System.Title": "Nightly settlement job times out",
+            "System.State": "Active",
+            "System.AssignedTo": {"displayName": "Chen"},
+            "System.AreaPath": "Payments\\Settlement",
+            "System.IterationPath": "Sprint 42",
+            "System.Tags": "prod",
+            "System.ChangedDate": "2026-07-04T00:00:00Z",
+            "System.Description": "<div>Job exceeds <b>30m</b> budget.</div>",
+        },
+    }
+    doc = work_item_document("https://dev.azure.com/acme", item)
+    assert doc.kind == "ticket"
+    assert "Nightly settlement job times out" in doc.title
+    assert "Chen" in doc.text and "30m" in doc.text and "<div>" not in doc.text
+
+    pr = {
+        "pullRequestId": 55, "title": "Fix retry loop", "status": "active",
+        "createdBy": {"displayName": "Dana"},
+        "sourceRefName": "refs/heads/fix", "targetRefName": "refs/heads/main",
+        "repository": {"name": "settlement"},
+        "creationDate": "2026-07-04T00:00:00Z",
+        "description": "Bounded retries.",
+    }
+    prdoc = pull_request_document("https://dev.azure.com/acme", "Payments", pr)
+    assert "settlement" in prdoc.text and "Dana" in prdoc.text
+    assert prdoc.uri.endswith("/pullrequest/55")
+
+
+def test_confluence_page_document():
+    from quickjoiner.connectors.confluence import page_document
+
+    page = {
+        "id": "98765",
+        "title": "Incident response runbook",
+        "body": {"storage": {"value": "<h1>Sev1</h1><p>Page the on-call via PagerDuty.</p>"}},
+        "version": {"when": "2026-06-30T00:00:00Z"},
+        "_links": {"webui": "/spaces/ENG/pages/98765"},
+    }
+    doc = page_document("https://acme.atlassian.net/wiki", page)
+    assert doc.title == "Incident response runbook"
+    assert "PagerDuty" in doc.text and "<p>" not in doc.text
+    assert doc.uri == "https://acme.atlassian.net/wiki/spaces/ENG/pages/98765"
+
+
+def test_confluence_live_and_push_modes(tmp_path):
+    connector = create_connector(
+        SourceConfig(
+            name="wiki",
+            type="confluence",
+            options={"base_url": "https://acme.atlassian.net", "spaces": ["ENG"]},
+        ),
+        tmp_path,
+    )
+    assert Mode.PUSH in connector.modes and Mode.LIVE in connector.modes
+    assert [t.spec.name for t in connector.tools()] == ["confluence_search_wiki"]
+    assert "ENG" in connector.tools()[0].spec.description  # space scoping surfaced to the agent
+
+    # A webhook payload that carries the full storage body converts without HTTP.
+    payload = {
+        "page": {
+            "id": "1",
+            "title": "Deploy guide",
+            "body": {"storage": {"value": "<p>Use Octopus on Fridays.</p>"}},
+            "version": {"when": "2026-07-07T00:00:00Z"},
+            "_links": {"webui": "/spaces/ENG/pages/1"},
+        }
+    }
+    docs = list(connector.handle_event(payload))
+    assert len(docs) == 1 and "Octopus" in docs[0].text
+    assert docs[0].uri.endswith("/spaces/ENG/pages/1")
+
+    assert list(connector.handle_event({})) == []  # unrecognized payloads are ignored
+
+
+def test_azure_devops_live_tools(tmp_path):
+    connector = create_connector(
+        SourceConfig(
+            name="ado",
+            type="azure_devops",
+            options={"organization": "acme", "project": "Payments"},
+        ),
+        tmp_path,
+    )
+    names = [t.spec.name for t in connector.tools()]
+    assert names == ["ado_query_work_items_ado", "ado_search_code_ado", "ado_get_file_ado"]
+
+
+def test_github_webhook_event_to_document(tmp_path):
+    connector = create_connector(
+        SourceConfig(name="x", type="github", options={"repo": "o/r"}), tmp_path
+    )
+    payload = {
+        "repository": {"full_name": "o/r"},
+        "pull_request": {
+            "number": 5, "title": "hook pr", "state": "open",
+            "html_url": "https://github.com/o/r/pull/5",
+            "user": {"login": "eve"}, "labels": [],
+            "head": {"ref": "b"}, "base": {"ref": "main"},
+            "updated_at": "2026-07-05T00:00:00Z", "body": "",
+        },
+    }
+    docs = list(connector.handle_event(payload))
+    assert len(docs) == 1 and "hook pr" in docs[0].title
+
+
+def test_files_connector_shared_reader(tmp_path):
+    from quickjoiner.connectors.files import read_file_document
+
+    f = tmp_path / "readme.md"
+    f.write_text("# Hello", encoding="utf-8")
+    doc = read_file_document(f, tmp_path)
+    assert doc is not None and doc.title == "readme.md" and doc.kind == "doc"
+
+    binary = tmp_path / "img.png"
+    binary.write_bytes(b"\x89PNG")
+    assert read_file_document(binary, tmp_path) is None

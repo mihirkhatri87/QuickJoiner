@@ -1,0 +1,591 @@
+"""qj — the QuickJoiner CLI."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Optional
+
+import typer
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.table import Table
+
+from quickjoiner.config import Config, SourceConfig, load_config, save_config, workspace_dir
+
+app = typer.Typer(
+    name="qj",
+    help="QuickJoiner: onboarding intelligence that learns your new org and answers only from what it learned.",
+    no_args_is_help=True,
+)
+console = Console()
+
+WORKSPACE_OPT = typer.Option(None, "--workspace", "-w", help="Workspace directory (default: QJ_WORKSPACE or ~/.quickjoiner/default)")
+PROVIDER_OPT = typer.Option(None, "--provider", "-p", help="Override LLM provider: anthropic | ollama")
+MODEL_OPT = typer.Option(None, "--model", "-m", help="Override LLM model id")
+
+
+def _workspace(workspace: Optional[Path]) -> Path:
+    return workspace or workspace_dir()
+
+
+def _context(workspace: Optional[Path]):
+    from quickjoiner.app import build_context
+
+    ws = _workspace(workspace)
+    if not ws.exists():
+        console.print(f"[red]Workspace {ws} does not exist. Run [bold]qj init[/bold] first.[/red]")
+        raise typer.Exit(1)
+    return build_context(ws)
+
+
+def _stream_renderer():
+    """Console renderer for agent events: dim thinking, live answer tokens, tool notes."""
+    state = {"mode": None, "streamed": False}
+
+    def on_event(etype: str, detail: str) -> None:
+        if etype == "tool_call":
+            if state["mode"] is not None:
+                console.print()
+            console.print(f"[dim]· using {detail}[/dim]")
+            state["mode"] = None
+        elif etype == "thinking":
+            if state["mode"] != "thinking":
+                if state["mode"] is not None:
+                    console.print()
+                console.print("[dim italic]thinking…[/dim italic]")
+                state["mode"] = "thinking"
+            console.print(detail, end="", style="dim italic", markup=False, highlight=False)
+        elif etype == "delta":
+            if state["mode"] == "thinking":
+                console.print("\n")
+            state["mode"] = "text"
+            state["streamed"] = True
+            console.print(detail, end="", markup=False, highlight=False)
+
+    return on_event, state
+
+
+def _export_answer(ctx, markdown_text: str, fmt: str, out: Optional[Path], title: str) -> None:
+    from datetime import datetime, timezone
+
+    from quickjoiner.export import export_markdown
+
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M%S")
+    path = out or ctx.workspace / "exports" / f"answer-{stamp}.{fmt}"
+    try:
+        written = export_markdown(markdown_text, fmt, path, title=title)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    console.print(f"[green]Exported ({fmt}):[/green] {written}")
+
+
+@app.command()
+def init(
+    org: str = typer.Argument("default", help="Organization/workspace name"),
+    provider: str = typer.Option("anthropic", help="LLM provider: anthropic | ollama"),
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """Create a workspace for an organization."""
+    ws = workspace or workspace_dir(org)
+    config = load_config(ws) if (ws / "config.yaml").exists() else Config(org=org)
+    config.org = org
+    config.llm.provider = provider
+    save_config(ws, config)
+    from quickjoiner.memory.catalog import Catalog
+
+    Catalog(ws).close()
+    console.print(f"[green]Workspace created:[/green] {ws}")
+    console.print(f"LLM provider: [bold]{provider}[/bold] (model: {config.llm.resolved_model()})")
+    if provider == "anthropic":
+        console.print("Set [bold]ANTHROPIC_API_KEY[/bold] in your environment or in a .env file.")
+    else:
+        console.print(f"Make sure Ollama is running at {config.llm.base_url}.")
+    console.print("Next: [bold]qj learn <path-or-url>[/bold], then [bold]qj ask \"...\"[/bold]")
+    if workspace is None and org != "default":
+        console.print(f"Tip: set QJ_WORKSPACE={ws} to make this workspace the default.")
+
+
+@app.command()
+def status(workspace: Optional[Path] = WORKSPACE_OPT):
+    """Show workspace, config, and learned-memory statistics."""
+    ctx = _context(workspace)
+    stats = ctx.catalog.stats()
+    console.print(f"Workspace: [bold]{ctx.workspace}[/bold]  (org: {ctx.config.org})")
+    console.print(
+        f"LLM: {ctx.config.llm.provider} / {ctx.config.llm.resolved_model()}   "
+        f"Embeddings: {ctx.config.embedding.provider} / {ctx.config.embedding.resolved_model()}"
+    )
+    console.print(
+        f"Learned: {stats['documents']} documents, {stats['chunks']} chunks, {stats['sources']} sources"
+    )
+    sources = ctx.catalog.list_sources()
+    if sources:
+        table = Table(title="Sources")
+        table.add_column("id")
+        table.add_column("type")
+        table.add_column("documents", justify="right")
+        for s in sources:
+            table.add_row(s["id"], s["type"], str(s["doc_count"]))
+        console.print(table)
+
+
+@app.command()
+def learn(
+    target: str = typer.Argument(..., help="A file, folder, URL, or a free-text fact in quotes"),
+    name: Optional[str] = typer.Option(None, help="Source name (defaults to the target)"),
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """Ingest a file/folder/URL into memory, or store free text as a taught note."""
+    ctx = _context(workspace)
+    is_url = target.startswith(("http://", "https://"))
+    is_path = Path(target).exists()
+
+    if is_url or is_path:
+        from quickjoiner.connectors.files import FilesConnector
+
+        source_name = name or (target if is_url else Path(target).name)
+        options = {"url": target} if is_url else {"path": str(Path(target).resolve())}
+        connector = FilesConnector(name=source_name, options=options, workspace=ctx.workspace)
+        ctx.catalog.upsert_source(connector.source_id, source_name, connector.type_name, options)
+        with console.status(f"Learning from {target} ..."):
+            stats = ctx.pipeline.ingest(connector.sync({}), connector.source_id)
+        console.print(f"[green]Done:[/green] {stats.summary()}")
+        for err in stats.errors[:5]:
+            console.print(f"[yellow]warn:[/yellow] {err}")
+    else:
+        from quickjoiner.agent.tools import build_builtin_tools
+
+        tools = {
+            t.spec.name: t
+            for t in build_builtin_tools(ctx.store, ctx.catalog, ctx.pipeline, ctx.config.retrieval)
+        }
+        result = tools["remember"].run(fact=target, topic=name)
+        console.print(f"[green]{result}[/green]")
+
+
+@app.command()
+def ask(
+    question: str = typer.Argument(..., help="Your question about the organization"),
+    provider: Optional[str] = PROVIDER_OPT,
+    model: Optional[str] = MODEL_OPT,
+    format: Optional[str] = typer.Option(None, "--format", "-f", help="Export the answer: md | html | csv | pptx"),
+    out: Optional[Path] = typer.Option(None, "--out", help="Export file path (default: <workspace>/exports/)"),
+    no_stream: bool = typer.Option(False, "--no-stream", help="Wait and render the answer as markdown instead of streaming"),
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """Ask one question, answered only from learned knowledge (with citations)."""
+    ctx = _context(workspace)
+    agent = ctx.build_agent(provider, model)
+    if no_stream:
+        with console.status("Thinking..."):
+            answer, _ = agent.ask(question)
+        console.print(Markdown(answer))
+    else:
+        on_event, state = _stream_renderer()
+        answer, _ = agent.ask(question, on_event=on_event)
+        if state["streamed"]:
+            console.print()
+        else:  # provider didn't stream; render normally
+            console.print(Markdown(answer))
+    if format:
+        _export_answer(ctx, answer, format, out, title=question[:60])
+
+
+@app.command()
+def chat(
+    provider: Optional[str] = PROVIDER_OPT,
+    model: Optional[str] = MODEL_OPT,
+    project: Optional[str] = typer.Option(None, "--project", help="Project name/id to chat within (scopes memory + framing)"),
+    session: Optional[str] = typer.Option(None, "--session", help="Session id to continue"),
+    resume: bool = typer.Option(False, "--resume", help="Continue the most recent session (of --project if given)"),
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """Interactive chat. Sessions persist; history is compressed when it grows long."""
+    from quickjoiner.sessions import SessionManager
+
+    ctx = _context(workspace)
+    manager = SessionManager(ctx)
+    if resume and not session:
+        project_row = manager.resolve_project(project)
+        rows = ctx.catalog.list_sessions(project_row["id"] if project_row else None)
+        session = rows[0]["id"] if rows else None
+    sess = manager.open_session(session, project)
+    history = manager.history(sess)
+
+    llm = ctx.config.llm
+    where = f" · project: {project}" if sess.get("project_id") else ""
+    console.print(
+        f"[bold]QuickJoiner chat[/bold] ({provider or llm.provider}){where} · "
+        f"session {sess['id'][:8]}{' (resumed, ' + str(len(history)) + ' msgs)' if history else ''}. "
+        "Type 'exit' to quit.\n"
+    )
+    agent = ctx.build_agent(provider, model, extra_system=manager.system_context(sess))
+    while True:
+        try:
+            question = console.input("[bold cyan]you>[/bold cyan] ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if not question:
+            continue
+        if question.lower() in {"exit", "quit", "q"}:
+            break
+        on_event, state = _stream_renderer()
+        answer, history = agent.ask(question, history, on_event=on_event)
+        if state["streamed"]:
+            console.print()
+        else:
+            console.print(Markdown(answer))
+        console.print()
+        manager.record_turn(sess["id"], history)
+        if manager.maybe_compress(sess["id"]):
+            sess = ctx.catalog.get_session(sess["id"])
+            history = manager.history(sess)
+            agent = ctx.build_agent(provider, model, extra_system=manager.system_context(sess))
+            console.print("[dim]· compressed older turns into the session summary[/dim]\n")
+    console.print(f"[dim]session saved: {sess['id']} (qj chat --session {sess['id'][:8]}… to continue)[/dim]")
+
+
+projects_app = typer.Typer(help="Projects: purposeful groups of conversations with shared memory framing.")
+app.add_typer(projects_app, name="projects")
+
+
+@projects_app.command("create")
+def projects_create(
+    name: str = typer.Argument(..., help="Project name"),
+    description: str = typer.Option("", "--description", "-d", help="What this project is about (injected into chats)"),
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """Create (or update) a project."""
+    from quickjoiner.sessions import SessionManager
+
+    ctx = _context(workspace)
+    row = SessionManager(ctx).create_project(name, description)
+    console.print(f"[green]Project ready:[/green] {row['id']} — chat in it with: qj chat --project {row['id']}")
+
+
+@projects_app.command("list")
+def projects_list(workspace: Optional[Path] = WORKSPACE_OPT):
+    """List projects and their session counts."""
+    ctx = _context(workspace)
+    rows = ctx.catalog.list_projects()
+    if not rows:
+        console.print("No projects yet. Create one: qj projects create <name> -d \"...\"")
+        return
+    for p in rows:
+        console.print(f"- [bold]{p['id']}[/bold]: {p['name']} ({p['session_count']} sessions) {p['description']}")
+
+
+sessions_app = typer.Typer(help="Persistent chat sessions: list, inspect, distill into memory.")
+app.add_typer(sessions_app, name="sessions")
+
+
+@sessions_app.command("list")
+def sessions_list(
+    project: Optional[str] = typer.Option(None, "--project", help="Filter by project"),
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """List sessions, most recent first."""
+    from quickjoiner.sessions import SessionManager
+
+    ctx = _context(workspace)
+    project_row = SessionManager(ctx).resolve_project(project)
+    rows = ctx.catalog.list_sessions(project_row["id"] if project_row else None)
+    if not rows:
+        console.print("No sessions yet.")
+        return
+    for s in rows:
+        proj = f" [{s['project_id']}]" if s["project_id"] else ""
+        console.print(
+            f"- {s['id'][:8]}…{proj} {s['title'] or '(untitled)'} "
+            f"(~{s['est_tokens']} tok, updated {s['updated_at'][:16]})"
+        )
+
+
+@sessions_app.command("distill")
+def sessions_distill(
+    session_id: str = typer.Argument(..., help="Session id (full or unique prefix)"),
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """Extract a summary + durable facts from a session into the vector memory."""
+    from quickjoiner.sessions import SessionManager
+
+    ctx = _context(workspace)
+    matches = [s for s in ctx.catalog.list_sessions() if s["id"].startswith(session_id)]
+    if len(matches) != 1:
+        console.print(f"[red]{'No' if not matches else 'Ambiguous'} session {session_id!r}[/red]")
+        raise typer.Exit(1)
+    try:
+        facts = SessionManager(ctx).distill(matches[0]["id"], provider=ctx.build_provider())
+    except Exception as exc:
+        console.print(f"[red]Distill failed: {exc}[/red]")
+        raise typer.Exit(1)
+    console.print(f"[green]Distilled into memory[/green] ({facts} durable facts extracted).")
+
+
+@app.command()
+def connect(
+    type: str = typer.Argument(..., help="Connector type: files | git | github | gitlab | jira | confluence | azure_devops | octopus | grafana | datadog | dynatrace | elastic | web_scrape"),
+    name: str = typer.Option(..., "--name", "-n", help="Unique source name"),
+    option: list[str] = typer.Option([], "--option", "-o", help="Connector option key=value (repeatable). Secrets can use env indirection: token=env:GITHUB_TOKEN"),
+    skip_test: bool = typer.Option(False, help="Save without testing the connection"),
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """Register a source in the workspace config (then run: qj sync)."""
+    from quickjoiner.connectors.registry import create_connector
+
+    ctx = _context(workspace)
+    options: dict = {}
+    for entry in option:
+        if "=" not in entry:
+            console.print(f"[red]Bad --option {entry!r}; expected key=value[/red]")
+            raise typer.Exit(1)
+        key, _, value = entry.partition("=")
+        if "," in value:
+            options[key] = [v.strip() for v in value.split(",")]
+        else:
+            options[key] = value
+
+    source = SourceConfig(name=name, type=type, options=options)
+    connector = create_connector(source, ctx.workspace)
+
+    if not skip_test:
+        result = connector.test()
+        color = "green" if result.ok else "red"
+        console.print(f"[{color}]Connection test: {result.message}[/{color}]")
+        if not result.ok:
+            console.print("Fix the options or re-run with --skip-test to save anyway.")
+            raise typer.Exit(1)
+
+    ctx.config.sources = [s for s in ctx.config.sources if s.name != name] + [source]
+    save_config(ctx.workspace, ctx.config)
+    ctx.catalog.upsert_source(connector.source_id, name, type, options)
+    console.print(f"[green]Source '{name}' ({type}) saved.[/green] Run [bold]qj sync {name}[/bold] to learn from it.")
+
+
+@app.command()
+def sync(
+    name: Optional[str] = typer.Argument(None, help="Source name to sync (default: all configured sources)"),
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """Pull from configured sources, ingest changes into memory (incremental)."""
+    from datetime import datetime, timezone
+
+    from quickjoiner.connectors.registry import create_connector
+
+    ctx = _context(workspace)
+    targets = [s for s in ctx.config.sources if name is None or s.name == name]
+    if not targets:
+        console.print(f"[red]No configured source named {name!r}. See: qj sources[/red]" if name else "[yellow]No sources configured. Use qj connect first.[/yellow]")
+        raise typer.Exit(1)
+
+    for source in targets:
+        connector = create_connector(source, ctx.workspace)
+        ctx.catalog.upsert_source(connector.source_id, source.name, source.type, source.options)
+        state = ctx.catalog.get_sync_state(connector.source_id)
+        started = datetime.now(timezone.utc).isoformat()
+        console.print(f"Syncing [bold]{source.name}[/bold] ({source.type}) ...")
+        try:
+            with console.status("Pulling and ingesting..."):
+                stats = ctx.pipeline.ingest(connector.sync(state), connector.source_id)
+        except Exception as exc:
+            console.print(f"[red]Sync failed for {source.name}: {exc}[/red]")
+            continue
+        ctx.catalog.set_sync_state(connector.source_id, "since", started)
+        console.print(f"[green]{source.name}:[/green] {stats.summary()}")
+        for err in stats.errors[:5]:
+            console.print(f"[yellow]warn:[/yellow] {err}")
+
+
+@app.command("test")
+def test_source(
+    name: str = typer.Argument(..., help="Configured source name"),
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """Test connectivity/credentials for a configured source."""
+    from quickjoiner.connectors.registry import create_connector
+
+    ctx = _context(workspace)
+    source = next((s for s in ctx.config.sources if s.name == name), None)
+    if source is None:
+        console.print(f"[red]No configured source named {name!r}[/red]")
+        raise typer.Exit(1)
+    result = create_connector(source, ctx.workspace).test()
+    color = "green" if result.ok else "red"
+    console.print(f"[{color}]{result.message}[/{color}]")
+    raise typer.Exit(0 if result.ok else 1)
+
+
+@app.command()
+def sources(workspace: Optional[Path] = WORKSPACE_OPT):
+    """List connected sources."""
+    ctx = _context(workspace)
+    for s in ctx.catalog.list_sources():
+        console.print(f"- {s['id']} (type={s['type']}, documents={s['doc_count']})")
+
+
+@app.command()
+def brief(
+    type: str = typer.Argument(..., help="Brief type: architecture | week1 | roadmap | quick-wins"),
+    provider: Optional[str] = PROVIDER_OPT,
+    model: Optional[str] = MODEL_OPT,
+    format: Optional[str] = typer.Option(None, "--format", "-f", help="Also export as: html | csv | pptx (markdown is always saved)"),
+    out: Optional[Path] = typer.Option(None, "--out", help="Export file path (default: <workspace>/exports/)"),
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """Generate an onboarding brief from learned knowledge (cited; gaps listed)."""
+    from quickjoiner.agent.briefs import generate_brief
+
+    ctx = _context(workspace)
+    try:
+        with console.status(f"Writing the {type} brief from learned knowledge..."):
+            markdown, path = generate_brief(
+                ctx, type, provider_override=provider, model_override=model
+            )
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    except Exception as exc:  # provider/setup failures (e.g. missing API key)
+        console.print(f"[red]Brief generation failed: {exc}[/red]")
+        raise typer.Exit(1)
+    console.print(Markdown(markdown))
+    if path:
+        console.print(f"\n[green]Saved:[/green] {path} (also ingested into memory)")
+    if format and path:
+        _export_answer(ctx, markdown, format, out, title=f"{type} brief")
+
+
+@app.command("eval")
+def eval_cmd(
+    evalset: Path = typer.Argument(..., help="Path to a YAML eval set (create one with --init)"),
+    init: bool = typer.Option(False, "--init", help="Write a starter eval set to the given path and exit"),
+    agent: bool = typer.Option(False, "--agent", help="Also run the end-to-end agent layer (needs an LLM)"),
+    provider: Optional[str] = PROVIDER_OPT,
+    model: Optional[str] = MODEL_OPT,
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """Evaluate grounding quality: retrieval metrics always; agent behavior with --agent."""
+    from quickjoiner.evals.harness import TEMPLATE, run_eval
+
+    if init:
+        if evalset.exists():
+            console.print(f"[red]{evalset} already exists; not overwriting.[/red]")
+            raise typer.Exit(1)
+        evalset.parent.mkdir(parents=True, exist_ok=True)
+        evalset.write_text(TEMPLATE, encoding="utf-8")
+        console.print(f"[green]Starter eval set written:[/green] {evalset} — edit it, then run: qj eval {evalset}")
+        return
+
+    ctx = _context(workspace)
+    try:
+        with console.status("Running evals..."):
+            report = run_eval(
+                ctx, evalset, agent_layer=agent,
+                provider_override=provider, model_override=model,
+            )
+    except (ValueError, FileNotFoundError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    except Exception as exc:  # provider/setup failures on the agent layer
+        console.print(f"[red]Eval failed: {exc}[/red]")
+        raise typer.Exit(1)
+
+    table = Table(title=f"Retrieval layer — {report['name']}")
+    table.add_column("case")
+    table.add_column("hit rank", justify="right")
+    table.add_column("top score", justify="right")
+    table.add_column("grounded", justify="center")
+    for c in report["retrieval"]["cases"]:
+        if c["refusal_correct"] is not None:
+            grounded = "[green]refused ok[/green]" if c["refusal_correct"] else "[red]leaked[/red]"
+            table.add_row(c["case_id"], "-", f"{c['top_score']:.3f}", grounded)
+        else:
+            rank = str(c["hit_rank"]) if c["hit_rank"] else "[red]miss[/red]"
+            grounded = "[green]yes[/green]" if c["cleared_threshold"] else "[red]no[/red]"
+            table.add_row(c["case_id"], rank, f"{c['top_score']:.3f}", grounded)
+    console.print(table)
+    console.print(f"Summary: {report['retrieval']['summary']}")
+
+    if agent and "agent" in report:
+        atable = Table(title="Agent layer")
+        atable.add_column("case")
+        atable.add_column("refusal ok", justify="center")
+        atable.add_column("cited", justify="center")
+        atable.add_column("missing keywords")
+        for c in report["agent"]["cases"]:
+            atable.add_row(
+                c["case_id"],
+                "[green]yes[/green]" if c["refusal_correct"] else "[red]no[/red]",
+                {True: "[green]yes[/green]", False: "[red]no[/red]", None: "-"}[c["cited"]],
+                ", ".join(c["keywords_missing"]) or "-",
+            )
+        console.print(atable)
+        console.print(f"Summary: {report['agent']['summary']}")
+    console.print(f"[green]Report saved:[/green] {report['report_path']}")
+
+
+browser_app = typer.Typer(help="Persistent browser profile for user-credential fallback (SSO/MFA logins).")
+app.add_typer(browser_app, name="browser")
+
+
+@browser_app.command("login")
+def browser_login(
+    url: str = typer.Argument(..., help="Login page to open (e.g. your SSO portal or the tool's URL)"),
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """Open a real Chromium window; sign in, then close it. The session persists."""
+    from quickjoiner.connectors.browser.session import login
+
+    ws = _workspace(workspace)
+    console.print(f"Opening browser for [bold]{url}[/bold] — sign in, then close the window.")
+    try:
+        login(ws, url)
+    except RuntimeError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    console.print("[green]Browser session saved.[/green] Scrape connectors with use_browser=true can now use it.")
+
+
+@browser_app.command("status")
+def browser_status(workspace: Optional[Path] = WORKSPACE_OPT):
+    """Show whether a saved browser session exists for this workspace."""
+    from quickjoiner.connectors.browser.session import has_profile, profile_dir
+
+    ws = _workspace(workspace)
+    if has_profile(ws):
+        console.print(f"[green]Browser profile exists:[/green] {profile_dir(ws)}")
+    else:
+        console.print("[yellow]No browser profile yet.[/yellow] Run: qj browser login <url>")
+
+
+@app.command()
+def serve(
+    host: str = typer.Option("127.0.0.1", help="Bind address"),
+    port: int = typer.Option(8787, help="Port"),
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """Start the web UI + API (chat, sources dashboard, webhook receivers, scheduled syncs)."""
+    import uvicorn
+
+    from quickjoiner.api.app import create_app
+    from quickjoiner.app import build_context
+    from quickjoiner.scheduler import start_scheduler
+
+    ws = _workspace(workspace)
+    if not ws.exists():
+        console.print(f"[red]Workspace {ws} does not exist. Run [bold]qj init[/bold] first.[/red]")
+        raise typer.Exit(1)
+
+    scheduler = start_scheduler(build_context(ws))
+    if scheduler:
+        console.print(f"[green]Scheduler started[/green] ({len(scheduler.get_jobs())} periodic sync jobs)")
+    console.print(f"QuickJoiner UI: [bold]http://{host}:{port}[/bold]  (webhooks: POST /hooks/<source>)")
+    try:
+        uvicorn.run(create_app(ws), host=host, port=port, log_level="warning")
+    finally:
+        if scheduler:
+            scheduler.shutdown(wait=False)
+
+
+if __name__ == "__main__":
+    app()

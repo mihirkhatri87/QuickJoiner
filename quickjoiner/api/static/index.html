@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QuickJoiner</title>
+<style>
+  :root {
+    --paper: #EDF0EA; --panel: #F6F8F3; --ink: #1C2620; --muted: #5F6B62;
+    --line: #CDD5CB; --laurel: #20714F; --laurel-soft: #20714F22; --stamp: #9A6B22;
+    --user-tint: #E3E9E1;
+    --mono: "Cascadia Mono", Consolas, ui-monospace, monospace;
+    --serif: Georgia, "Times New Roman", serif;
+    --sans: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --paper:#121814; --panel:#1A2119; --ink:#E4EAE2; --muted:#93A096;
+            --line:#2C362D; --laurel:#63C695; --laurel-soft:#63C69526; --stamp:#D3A057;
+            --user-tint:#20291F; }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { margin:0; background:var(--paper); color:var(--ink); font-family:var(--sans);
+         display:flex; flex-direction:column; font-size:15px; }
+
+  /* header: system voice */
+  header { display:flex; align-items:baseline; gap:14px; padding:14px 22px 12px;
+           border-bottom:1px solid var(--line); }
+  .wordmark { font-family:var(--mono); font-size:15px; letter-spacing:.22em;
+              text-transform:uppercase; font-weight:600; }
+  .wordmark::before { content:""; display:inline-block; width:9px; height:9px;
+              background:var(--laurel); margin-right:10px; transform:translateY(-1px); }
+  .meta { font-family:var(--mono); font-size:11.5px; color:var(--muted); letter-spacing:.04em; }
+
+  main { flex:1; display:flex; min-height:0; }
+
+  /* sidebar: the logbook's index */
+  #sidebar { width:280px; border-right:1px solid var(--line); padding:18px;
+             overflow-y:auto; flex-shrink:0; }
+  .side-section { margin-bottom:24px; }
+  .eyebrow { font-family:var(--mono); font-size:10.5px; letter-spacing:.18em;
+             text-transform:uppercase; color:var(--muted); margin:0 0 12px; }
+  select, .mini-input { width:100%; background:var(--panel); color:var(--ink);
+             border:1px solid var(--line); border-radius:3px; padding:7px 9px;
+             font-family:var(--mono); font-size:12px; }
+  .mini-form { display:flex; gap:6px; margin-top:8px; }
+  .mini-form .mini-input { flex:1; }
+  .side-btn { font-family:var(--mono); font-size:10px; letter-spacing:.08em;
+             text-transform:uppercase; background:none; border:1px solid var(--line);
+             color:var(--muted); border-radius:2px; padding:4px 9px; cursor:pointer; }
+  .side-btn:hover, .side-btn.primary { border-color:var(--laurel); color:var(--laurel); }
+  .side-btn:disabled { opacity:.4; cursor:default; }
+  .conv { border-left:2px solid transparent; padding:6px 9px; margin:0 0 4px;
+          cursor:pointer; border-radius:0 3px 3px 0; }
+  .conv:hover { background:var(--panel); }
+  .conv.active { border-left-color:var(--laurel); background:var(--panel); }
+  .conv .t { font-size:12.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .conv .m { font-family:var(--mono); font-size:10px; color:var(--muted); margin-top:2px; }
+  .conv .m .proj { color:var(--stamp); }
+  .side-actions { display:flex; gap:6px; margin-top:10px; }
+  .source { background:var(--panel); border:1px solid var(--line); border-radius:3px;
+            padding:10px 12px; margin-bottom:10px; }
+  .source .name { font-weight:600; font-size:13.5px; }
+  .source .info { font-family:var(--mono); font-size:11px; color:var(--muted); margin-top:3px; }
+  .source button { float:right; font-family:var(--mono); font-size:10px; letter-spacing:.08em;
+            text-transform:uppercase; background:none; border:1px solid var(--laurel);
+            color:var(--laurel); border-radius:2px; padding:3px 8px; cursor:pointer; }
+  .source button:hover { background:var(--laurel-soft); }
+  .sidebar-hint { font-size:12.5px; color:var(--muted); line-height:1.5; }
+  .sidebar-hint code { font-family:var(--mono); font-size:11px; }
+
+  /* the ledger */
+  #chatcol { flex:1; display:flex; flex-direction:column; min-width:0; }
+  #chat { flex:1; overflow-y:auto; padding:26px 30px 10px; }
+  .entry { display:flex; gap:16px; margin-bottom:26px; max-width:880px; }
+  .gutter { width:96px; flex-shrink:0; text-align:right; font-family:var(--mono);
+            padding-top:2px; }
+  .gutter .who { display:block; font-size:11px; letter-spacing:.14em; text-transform:uppercase;
+            color:var(--ink); font-weight:600; }
+  .entry.qj .gutter .who { color:var(--laurel); }
+  .gutter .ts { display:block; font-size:10.5px; color:var(--muted); margin-top:2px; }
+  .stamps { margin-top:8px; display:flex; flex-direction:column; gap:4px; align-items:flex-end; }
+  .stamp { font-size:9.5px; letter-spacing:.06em; color:var(--stamp);
+           border:1px solid currentColor; border-radius:2px; padding:1.5px 5px;
+           max-width:96px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+
+  .body { min-width:0; flex:1; }
+  .entry.user .body { background:var(--user-tint); border-radius:3px;
+                      padding:10px 14px; white-space:pre-wrap; line-height:1.5; }
+  /* grounding rail: pulses while streaming, solidifies when grounded */
+  .entry.qj .body { border-left:2px solid var(--laurel); padding:2px 0 2px 16px; }
+  .entry.qj.streaming .body { border-image: linear-gradient(var(--laurel), transparent 60%) 1;
+                              border-left:2px solid; animation: breathe 1.6s ease-in-out infinite; }
+  @keyframes breathe { 50% { opacity:.75; } }
+  @media (prefers-reduced-motion: reduce) {
+    .entry.qj.streaming .body { animation:none; border-image:none; }
+  }
+  .answer { font-family:var(--serif); font-size:15.5px; line-height:1.62;
+            white-space:pre-wrap; overflow-wrap:break-word; }
+  .entry.sys .body { font-family:var(--mono); font-size:11.5px; color:var(--muted);
+                     padding-top:4px; white-space:pre-wrap; }
+  .entry.error .body { color:#A34632; font-family:var(--mono); font-size:12.5px; padding-top:3px;
+                       border-left-color:#A34632; }
+  @media (prefers-color-scheme: dark) {
+    .entry.error .body { color:#E08A72; border-left-color:#E08A72; }
+  }
+
+  details.think { margin:0 0 10px; }
+  details.think summary { font-family:var(--mono); font-size:10.5px; letter-spacing:.14em;
+            text-transform:uppercase; color:var(--muted); cursor:pointer; list-style:none; }
+  details.think summary::before { content:"▸ "; }
+  details.think[open] summary::before { content:"▾ "; }
+  /* compressed conversation memory */
+  details.memo { background:var(--laurel-soft); border-radius:3px; padding:8px 12px;
+                 margin:0 0 22px; max-width:880px; }
+  details.memo summary { font-family:var(--mono); font-size:10.5px; letter-spacing:.14em;
+                 text-transform:uppercase; color:var(--laurel); cursor:pointer; list-style:none; }
+  details.memo summary::before { content:"▸ "; }
+  details.memo[open] summary::before { content:"▾ "; }
+  details.memo pre { font-family:var(--mono); font-size:11.5px; color:var(--muted);
+                 white-space:pre-wrap; margin:8px 0 2px; }
+  details.think pre { font-family:var(--mono); font-size:11.5px; color:var(--muted);
+            white-space:pre-wrap; margin:6px 0 0; max-height:130px; overflow-y:auto;
+            border-left:1px solid var(--line); padding-left:10px; }
+
+  .cite { font-family:var(--mono); font-size:10.5px; color:var(--laurel);
+          background:var(--laurel-soft); border-radius:2px; padding:1px 6px;
+          white-space:nowrap; max-width:300px; overflow:hidden; text-overflow:ellipsis;
+          display:inline-block; vertical-align:baseline; text-decoration:none; }
+  .cite .n { font-weight:700; margin-right:5px; }
+  a.cite:hover { outline:1px solid var(--laurel); }
+
+  /* ask bar */
+  form { display:flex; gap:10px; padding:16px 30px 20px; border-top:1px solid var(--line);
+         align-items:center; }
+  .prompt-mark { font-family:var(--mono); color:var(--laurel); font-weight:700; }
+  input[type=text] { flex:1; background:var(--panel); color:var(--ink);
+         border:1px solid var(--line); border-radius:3px; padding:11px 14px;
+         font-size:14.5px; font-family:var(--sans); }
+  input[type=text]::placeholder { color:var(--muted); }
+  button.send { font-family:var(--mono); letter-spacing:.14em; text-transform:uppercase;
+         font-size:11.5px; background:var(--laurel); color:var(--paper); border:none;
+         border-radius:3px; padding:11px 20px; cursor:pointer; }
+  button.send:disabled { opacity:.45; }
+  :focus-visible { outline:2px solid var(--laurel); outline-offset:2px; }
+
+  @media (max-width: 860px) {
+    main { flex-direction:column; }
+    #sidebar { width:auto; border-right:none; border-bottom:1px solid var(--line);
+               max-height:38vh; padding:12px 16px; }
+    .side-section { margin-bottom:14px; }
+    #chat { padding:18px 14px 8px; }
+    .entry { gap:10px; }
+    .gutter { width:64px; }
+    form { padding:12px 14px 16px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <span class="wordmark">QuickJoiner</span>
+  <span class="meta" id="meta">loading…</span>
+</header>
+<main>
+  <aside id="sidebar">
+    <div class="side-section">
+      <h2 class="eyebrow">Project</h2>
+      <select id="project" aria-label="Active project">
+        <option value="">No project</option>
+      </select>
+      <form class="mini-form" id="project-form">
+        <input class="mini-input" id="project-name" placeholder="New project name" autocomplete="off">
+        <button class="side-btn" type="submit">Add</button>
+      </form>
+    </div>
+    <div class="side-section">
+      <h2 class="eyebrow">Conversations</h2>
+      <div id="convs"></div>
+      <div class="side-actions">
+        <button class="side-btn primary" id="new-conv" type="button">New conversation</button>
+        <button class="side-btn" id="distill" type="button" disabled
+                title="Extract a summary and durable facts from this conversation into memory">Save to memory</button>
+      </div>
+    </div>
+    <div class="side-section">
+      <h2 class="eyebrow">Connected systems</h2>
+      <div id="sources"></div>
+    </div>
+  </aside>
+  <section id="chatcol">
+    <div id="chat"></div>
+    <form id="form">
+      <span class="prompt-mark">▸</span>
+      <input type="text" id="input" placeholder="Ask about this organization — answers cite what was learned" autocomplete="off">
+      <button class="send" id="send" type="submit">Ask</button>
+    </form>
+  </section>
+</main>
+<script>
+const chat = document.getElementById("chat");
+const form = document.getElementById("form");
+const input = document.getElementById("input");
+const send = document.getElementById("send");
+const projectSel = document.getElementById("project");
+const convsEl = document.getElementById("convs");
+const distillBtn = document.getElementById("distill");
+let sessionId = null;
+let currentProject = "";
+
+const now = () => new Date().toTimeString().slice(0, 5);
+const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+function entry(role, who) {
+  const div = document.createElement("div");
+  div.className = "entry " + role;
+  div.innerHTML = `<div class="gutter"><span class="who">${who}</span>` +
+    `<span class="ts">${now()}</span><div class="stamps"></div></div><div class="body"></div>`;
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+  return { root: div, body: div.querySelector(".body"), stamps: div.querySelector(".stamps") };
+}
+
+function sysNote(text) {
+  const e = entry("sys", "sys");
+  e.body.textContent = text;
+}
+
+/* Citations arrive inline as [title or uri]; render them as numbered chips. */
+function renderAnswer(el, text) {
+  let n = 0;
+  const html = esc(text).replace(/\[([^\[\]\n]{2,200}?)\]/g, (_, ref) => {
+    n += 1;
+    const label = `<span class="n">${n}</span>${ref}`;
+    return /^https?:\/\//.test(ref)
+      ? `<a class="cite" href="${ref}" target="_blank" rel="noopener" title="${ref}">${label}</a>`
+      : `<span class="cite" title="${ref}">${label}</span>`;
+  });
+  el.innerHTML = html;
+}
+
+async function loadMeta() {
+  try {
+    const s = await (await fetch("/api/status")).json();
+    document.getElementById("meta").textContent =
+      `${s.org} · ${s.llm.provider}/${s.llm.model} · ${s.stats.documents} docs · ${s.stats.chunks} chunks learned`;
+  } catch { document.getElementById("meta").textContent = "status unavailable"; }
+}
+
+async function loadSources() {
+  const el = document.getElementById("sources");
+  try {
+    const sources = await (await fetch("/api/sources")).json();
+    el.innerHTML = "";
+    if (!sources.length) {
+      el.innerHTML = '<div class="sidebar-hint">Nothing learned yet. Connect a system with ' +
+        '<code>qj connect</code> or teach a fact with <code>qj learn</code>.</div>';
+      return;
+    }
+    for (const s of sources) {
+      const div = document.createElement("div");
+      div.className = "source";
+      div.innerHTML = `${s.configured ? '<button data-name="' + s.name + '">sync</button>' : ""}
+        <div class="name">${esc(s.name)}</div>
+        <div class="info">${esc(s.type)} · ${s.documents} docs</div>`;
+      el.appendChild(div);
+    }
+    el.querySelectorAll("button").forEach(b => b.onclick = async () => {
+      b.textContent = "…";
+      try {
+        const r = await (await fetch("/api/sync/" + encodeURIComponent(b.dataset.name), {method:"POST"})).json();
+        sysNote(`sync ${b.dataset.name}: ${r.result}`);
+      } catch (e) { sysNote("sync failed: " + e); }
+      b.textContent = "sync";
+      loadSources(); loadMeta();
+    });
+  } catch { el.textContent = "unavailable"; }
+}
+
+function greet() {
+  const e = entry("qj", "qj");
+  e.body.innerHTML = '<div class="answer">Ask me anything about this organization. ' +
+    'I answer only from what I have learned, and every claim cites its source. ' +
+    'If I have not learned something yet, I will say so and point at what to connect.</div>';
+}
+
+function memoBlock(summary) {
+  const memo = document.createElement("details");
+  memo.className = "memo";
+  memo.innerHTML = "<summary>Older turns condensed into memory</summary><pre></pre>";
+  memo.querySelector("pre").textContent = summary;
+  chat.insertBefore(memo, chat.firstChild);
+}
+
+async function loadProjects(selectId) {
+  try {
+    const projects = await (await fetch("/api/projects")).json();
+    projectSel.innerHTML = '<option value="">No project</option>';
+    for (const p of projects) {
+      const opt = document.createElement("option");
+      opt.value = p.id;
+      opt.textContent = `${p.name} (${p.session_count})`;
+      projectSel.appendChild(opt);
+    }
+    projectSel.value = selectId !== undefined ? selectId : currentProject;
+  } catch { /* sidebar stays usable without projects */ }
+}
+
+async function loadConvs() {
+  try {
+    const url = "/api/sessions" + (currentProject ? "?project=" + encodeURIComponent(currentProject) : "");
+    const rows = (await (await fetch(url)).json()).filter(s => s.title || s.est_tokens > 0);
+    convsEl.innerHTML = "";
+    if (!rows.length) {
+      convsEl.innerHTML = '<div class="sidebar-hint">No conversations yet — ask something below.</div>';
+      return;
+    }
+    for (const s of rows.slice(0, 20)) {
+      const div = document.createElement("div");
+      div.className = "conv" + (s.id === sessionId ? " active" : "");
+      const proj = s.project_id && !currentProject ? `<span class="proj">${esc(s.project_id)}</span> · ` : "";
+      div.innerHTML = `<div class="t">${esc(s.title || "(untitled)")}</div>
+        <div class="m">${proj}${s.updated_at.slice(0, 16).replace("T", " ")} · ~${s.est_tokens} tok</div>`;
+      div.onclick = () => openSession(s.id);
+      convsEl.appendChild(div);
+    }
+  } catch { convsEl.textContent = "unavailable"; }
+}
+
+async function openSession(id) {
+  try {
+    const s = await (await fetch("/api/sessions/" + encodeURIComponent(id))).json();
+    sessionId = s.id;
+    distillBtn.disabled = false;
+    if ((s.project_id || "") !== currentProject) {
+      currentProject = s.project_id || "";
+      projectSel.value = currentProject;
+    }
+    chat.innerHTML = "";
+    if (s.summary) memoBlock(s.summary);
+    for (const m of s.messages) {
+      if (m.role === "tool" || !m.content) continue;  // tool internals aren't replayed
+      const e = entry(m.role === "user" ? "user" : "qj", m.role === "user" ? "you" : "qj");
+      e.root.querySelector(".ts").textContent = "";   // original times aren't stored per turn
+      if (m.role === "user") e.body.textContent = m.content;
+      else {
+        const div = document.createElement("div");
+        div.className = "answer";
+        e.body.appendChild(div);
+        renderAnswer(div, m.content);
+      }
+    }
+    loadConvs();
+    input.focus();
+  } catch (e) { sysNote("could not open conversation: " + e); }
+}
+
+function newConversation() {
+  sessionId = null;
+  distillBtn.disabled = true;
+  chat.innerHTML = "";
+  greet();
+  loadConvs();
+  input.focus();
+}
+
+document.getElementById("new-conv").onclick = newConversation;
+
+projectSel.onchange = () => {
+  currentProject = projectSel.value;
+  newConversation();
+};
+
+document.getElementById("project-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const name = document.getElementById("project-name").value.trim();
+  if (!name) return;
+  try {
+    const p = await (await fetch("/api/projects", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({name}),
+    })).json();
+    document.getElementById("project-name").value = "";
+    currentProject = p.id;
+    await loadProjects(p.id);
+    newConversation();
+  } catch (e) { sysNote("could not create project: " + e); }
+});
+
+distillBtn.onclick = async () => {
+  if (!sessionId) return;
+  distillBtn.disabled = true;
+  try {
+    const resp = await fetch("/api/sessions/" + encodeURIComponent(sessionId) + "/distill", {method: "POST"});
+    const data = await resp.json();
+    if (resp.ok) {
+      sysNote(`saved to memory: ${data.facts_learned} durable fact(s) extracted`);
+      loadSources(); loadMeta();
+    } else {
+      sysNote("could not save to memory: " + (data.detail || resp.status));
+    }
+  } catch (e) { sysNote("could not save to memory: " + e); }
+  distillBtn.disabled = false;
+};
+
+form.addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const message = input.value.trim();
+  if (!message) return;
+  const q = entry("user", "you");
+  q.body.textContent = message;
+  input.value = "";
+  send.disabled = true;
+
+  const a = entry("qj", "qj");
+  a.root.classList.add("streaming");
+  let think = null, answerEl = null, answerText = "";
+  const ensureAnswer = () => {
+    if (!answerEl) { answerEl = document.createElement("div"); answerEl.className = "answer"; a.body.appendChild(answerEl); }
+    return answerEl;
+  };
+  try {
+    const resp = await fetch("/api/chat", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({message, session_id: sessionId, project: currentProject || null}),
+    });
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, {stream: true});
+      const events = buffer.split("\n\n");
+      buffer = events.pop();
+      for (const evt of events) {
+        if (!evt.startsWith("data: ")) continue;
+        const payload = JSON.parse(evt.slice(6));
+        if (payload.type === "thinking") {
+          if (!think) {
+            think = document.createElement("details");
+            think.className = "think"; think.open = true;
+            think.innerHTML = "<summary>thinking</summary><pre></pre>";
+            a.body.insertBefore(think, a.body.firstChild);
+          }
+          const pre = think.querySelector("pre");
+          pre.textContent += payload.data;
+          pre.scrollTop = pre.scrollHeight;
+        } else if (payload.type === "delta") {
+          answerText += payload.data;
+          ensureAnswer().textContent = answerText;
+          chat.scrollTop = chat.scrollHeight;
+        } else if (payload.type === "tool_call") {
+          const s = document.createElement("span");
+          s.className = "stamp"; s.title = payload.data; s.textContent = payload.data;
+          a.stamps.appendChild(s);
+        } else if (payload.type === "answer") {
+          sessionId = payload.session_id;
+          renderAnswer(ensureAnswer(), payload.data);
+        } else if (payload.type === "error") {
+          a.root.classList.add("error");
+          a.body.textContent = "Could not answer: " + payload.data;
+        }
+      }
+    }
+  } catch (err) {
+    a.root.classList.add("error");
+    a.body.textContent = "Request failed: " + err;
+  } finally {
+    a.root.classList.remove("streaming");
+    if (think) think.open = false;
+    if (!a.body.textContent.trim()) a.body.innerHTML = '<div class="answer">(no answer)</div>';
+    send.disabled = false;
+    distillBtn.disabled = !sessionId;
+    loadConvs();
+    input.focus();
+  }
+});
+
+/* ?demo=1 renders a sample grounded exchange (design/QA aid; no backend calls). */
+function demo() {
+  memoBlock("Earlier turns covered the deploy cadence (Fridays via Octopus " +
+    "[https://wiki.acme.test/deploys]) and the rollback path through #deploy-help. " +
+    "The user is preparing for their first release week.");
+  const q = entry("user", "you");
+  q.body.textContent = "Has PAY-123 been implemented and deployed to production?";
+  const a = entry("qj", "qj");
+  for (const t of ["jira_search_pay", "gitlab_search_code_app", "octopus_deployment_status_prod"]) {
+    const s = document.createElement("span");
+    s.className = "stamp"; s.title = t; s.textContent = t;
+    a.stamps.appendChild(s);
+  }
+  const think = document.createElement("details");
+  think.className = "think";
+  think.innerHTML = "<summary>thinking</summary><pre>The ticket mentions a retry budget; " +
+    "I should check MRs referencing PAY-123, then confirm the release version on the dashboard.</pre>";
+  a.body.appendChild(think);
+  const ans = document.createElement("div");
+  ans.className = "answer";
+  a.body.appendChild(ans);
+  renderAnswer(ans, "Yes — implemented and live in production.\n\n" +
+    "PAY-123 (add retry budget to payment calls) was closed last Tuesday " +
+    "[https://acme.atlassian.net/browse/PAY-123]. The change landed via MR !42 " +
+    "[https://gitlab.com/acme/app/-/merge_requests/42] and shipped in release 2.4.1, " +
+    "which the Octopus dashboard shows as the current Production deployment " +
+    "[https://octopus.acme.com/app#/dashboard].");
+}
+
+loadMeta(); loadSources(); loadProjects(); loadConvs(); greet();
+if (location.search.includes("demo=1")) demo();
+</script>
+</body>
+</html>

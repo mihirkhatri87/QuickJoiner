@@ -1,0 +1,25 @@
+# QuickJoiner workspace configuration (lives in <workspace>/config.yaml)
+org: acme
+
+llm:
+  provider: anthropic        # anthropic | ollama (switchable per command with qj --provider)
+  model: null                # null -> provider default (anthropic: claude-opus-4-8, ollama: llama3.1)
+  base_url: http://localhost:11434   # used by ollama
+  max_tokens: 8192
+
+embedding:
+  provider: fastembed        # fastembed (local ONNX, default) | ollama
+  model: null                # null -> BAAI/bge-small-en-v1.5 (fastembed) / nomic-embed-text (ollama)
+
+retrieval:
+  top_k: 8
+  min_score: 0.55            # below this, the agent answers "I haven't learned that yet"
+                             # (tuned for bge-small; retune if you change embedding models)
+
+# Connected sources (Phase 2+ adds git/github/jira/confluence/azure_devops/... types)
+sources: []
+#  - name: platform-docs
+#    type: files
+#    options:
+#      path: C:/work/docs
+#    sync_interval_minutes: 60
