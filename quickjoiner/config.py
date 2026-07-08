@@ -64,6 +64,10 @@ class SourceConfig(BaseModel):
     type: str
     options: dict = Field(default_factory=dict)
     sync_interval_minutes: int | None = None
+    # Ownership (used when workspace auth is enabled). owner=None -> commons
+    # (pre-auth sources); shared=True -> visible to everyone even when owned.
+    owner: str | None = None
+    shared: bool = True
 
 
 class Config(BaseModel):

@@ -38,6 +38,16 @@ def _context(workspace: Optional[Path]):
     return build_context(ws)
 
 
+def _session_user(ctx) -> Optional[str]:
+    """The CLI's signed-in user, from <workspace>/.session (None = signed out)."""
+    from quickjoiner.auth import SESSION_FILE, Auth
+
+    token_file = ctx.workspace / SESSION_FILE
+    if not token_file.exists():
+        return None
+    return Auth(ctx.catalog).resolve(token_file.read_text(encoding="utf-8").strip())
+
+
 def _stream_renderer():
     """Console renderer for agent events: dim thinking, live answer tokens, tool notes."""
     state = {"mode": None, "streamed": False}
@@ -176,7 +186,7 @@ def ask(
 ):
     """Ask one question, answered only from learned knowledge (with citations)."""
     ctx = _context(workspace)
-    agent = ctx.build_agent(provider, model)
+    agent = ctx.build_agent(provider, model, sources=ctx.visible_sources(_session_user(ctx)))
     if no_stream:
         with console.status("Thinking..."):
             answer, _ = agent.ask(question)
@@ -220,7 +230,9 @@ def chat(
         f"session {sess['id'][:8]}{' (resumed, ' + str(len(history)) + ' msgs)' if history else ''}. "
         "Type 'exit' to quit.\n"
     )
-    agent = ctx.build_agent(provider, model, extra_system=manager.system_context(sess))
+    my_sources = ctx.visible_sources(_session_user(ctx))
+    agent = ctx.build_agent(provider, model, extra_system=manager.system_context(sess),
+                            sources=my_sources)
     while True:
         try:
             question = console.input("[bold cyan]you>[/bold cyan] ").strip()
@@ -241,7 +253,8 @@ def chat(
         if manager.maybe_compress(sess["id"]):
             sess = ctx.catalog.get_session(sess["id"])
             history = manager.history(sess)
-            agent = ctx.build_agent(provider, model, extra_system=manager.system_context(sess))
+            agent = ctx.build_agent(provider, model, extra_system=manager.system_context(sess),
+                                    sources=my_sources)
             console.print("[dim]· compressed older turns into the session summary[/dim]\n")
     console.print(f"[dim]session saved: {sess['id']} (qj chat --session {sess['id'][:8]}… to continue)[/dim]")
 
@@ -329,9 +342,11 @@ def connect(
     name: str = typer.Option(..., "--name", "-n", help="Unique source name"),
     option: list[str] = typer.Option([], "--option", "-o", help="Connector option key=value (repeatable). Secrets can use env indirection: token=env:GITHUB_TOKEN"),
     skip_test: bool = typer.Option(False, help="Save without testing the connection"),
+    share: Optional[bool] = typer.Option(None, "--share/--private", help="Share with everyone, or keep it yours only (signed in: private by default)"),
     workspace: Optional[Path] = WORKSPACE_OPT,
 ):
     """Register a source in the workspace config (then run: qj sync)."""
+    from quickjoiner.auth import Auth, can_manage
     from quickjoiner.connectors.registry import create_connector
 
     ctx = _context(workspace)
@@ -346,7 +361,19 @@ def connect(
         else:
             options[key] = value
 
-    source = SourceConfig(name=name, type=type, options=options)
+    auth_enabled = Auth(ctx.catalog).enabled
+    user = _session_user(ctx)
+    if auth_enabled and user is None:
+        console.print("[red]Auth is on for this workspace — sign in first: qj login <name>[/red]")
+        raise typer.Exit(1)
+    existing = next((s for s in ctx.config.sources if s.name == name), None)
+    if existing is not None and not can_manage(existing, user, auth_enabled):
+        console.print(f"[red]The name {name!r} belongs to {existing.owner}. Pick another name.[/red]")
+        raise typer.Exit(1)
+
+    # Signed in: yours (private) unless --share. Open mode: commons.
+    shared = share if share is not None else not (auth_enabled and user)
+    source = SourceConfig(name=name, type=type, options=options, owner=user, shared=shared)
     connector = create_connector(source, ctx.workspace)
 
     if not skip_test:
@@ -360,7 +387,8 @@ def connect(
     ctx.config.sources = [s for s in ctx.config.sources if s.name != name] + [source]
     save_config(ctx.workspace, ctx.config)
     ctx.catalog.upsert_source(connector.source_id, name, type, options)
-    console.print(f"[green]Source '{name}' ({type}) saved.[/green] Run [bold]qj sync {name}[/bold] to learn from it.")
+    scope = "shared with everyone" if source.shared else f"private to {user}" if user else "shared"
+    console.print(f"[green]Source '{name}' ({type}) saved — {scope}.[/green] Run [bold]qj sync {name}[/bold] to learn from it.")
 
 
 @app.command()
@@ -374,7 +402,8 @@ def sync(
     from quickjoiner.connectors.registry import create_connector
 
     ctx = _context(workspace)
-    targets = [s for s in ctx.config.sources if name is None or s.name == name]
+    visible_now = ctx.visible_sources(_session_user(ctx))
+    targets = [s for s in visible_now if name is None or s.name == name]
     if not targets:
         console.print(f"[red]No configured source named {name!r}. See: qj sources[/red]" if name else "[yellow]No sources configured. Use qj connect first.[/yellow]")
         raise typer.Exit(1)
@@ -406,7 +435,7 @@ def test_source(
     from quickjoiner.connectors.registry import create_connector
 
     ctx = _context(workspace)
-    source = next((s for s in ctx.config.sources if s.name == name), None)
+    source = next((s for s in ctx.visible_sources(_session_user(ctx)) if s.name == name), None)
     if source is None:
         console.print(f"[red]No configured source named {name!r}[/red]")
         raise typer.Exit(1)
@@ -418,10 +447,104 @@ def test_source(
 
 @app.command()
 def sources(workspace: Optional[Path] = WORKSPACE_OPT):
-    """List connected sources."""
+    """List connected sources you can see (yours, shared, and commons)."""
     ctx = _context(workspace)
+    user = _session_user(ctx)
+    mine = {s.name: s for s in ctx.visible_sources(user)}
+    all_configured = {s.name for s in ctx.config.sources}
     for s in ctx.catalog.list_sources():
-        console.print(f"- {s['id']} (type={s['type']}, documents={s['doc_count']})")
+        cfg = mine.get(s["name"])
+        if cfg is None and s["name"] in all_configured:
+            continue  # configured but not visible to this user
+        badge = ""
+        if cfg is not None and cfg.owner:
+            badge = f", owner={cfg.owner}" + ("" if cfg.shared else ", private")
+        console.print(f"- {s['id']} (type={s['type']}, documents={s['doc_count']}{badge})")
+
+
+users_app = typer.Typer(help="Workspace users. Creating the first user turns authentication on.")
+app.add_typer(users_app, name="users")
+
+
+@users_app.command("add")
+def users_add(
+    username: str = typer.Argument(..., help="New username"),
+    password: Optional[str] = typer.Option(None, "--password", help="Password (omit to be prompted)"),
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """Create a user. The first user enables auth for this workspace."""
+    from quickjoiner.auth import Auth
+
+    ctx = _context(workspace)
+    auth = Auth(ctx.catalog)
+    if auth.enabled and _session_user(ctx) is None:
+        console.print("[red]Sign in first: qj login <your-username>[/red]")
+        raise typer.Exit(1)
+    pw = password or typer.prompt("Password", hide_input=True, confirmation_prompt=True)
+    try:
+        auth.create_user(username, pw)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    console.print(f"[green]User '{username}' created.[/green] Sign in with [bold]qj login {username}[/bold].")
+
+
+@users_app.command("list")
+def users_list(workspace: Optional[Path] = WORKSPACE_OPT):
+    """List workspace users."""
+    ctx = _context(workspace)
+    rows = ctx.catalog.list_users()
+    if not rows:
+        console.print("No users yet — open mode. Create one with [bold]qj users add <name>[/bold].")
+        return
+    for u in rows:
+        console.print(f"- {u['username']} (since {u['created_at'][:10]})")
+
+
+@app.command()
+def login(
+    username: str = typer.Argument(..., help="Your username"),
+    password: Optional[str] = typer.Option(None, "--password", help="Password (omit to be prompted)"),
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """Sign in; private connectors you own become usable in this workspace."""
+    from quickjoiner.auth import SESSION_FILE, Auth
+
+    ctx = _context(workspace)
+    pw = password or typer.prompt("Password", hide_input=True)
+    try:
+        token = Auth(ctx.catalog).login(username, pw)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    (ctx.workspace / SESSION_FILE).write_text(token, encoding="utf-8")
+    console.print(f"[green]Signed in as {username}.[/green]")
+
+
+@app.command()
+def logout(workspace: Optional[Path] = WORKSPACE_OPT):
+    """Sign out of this workspace."""
+    from quickjoiner.auth import SESSION_FILE, Auth
+
+    ctx = _context(workspace)
+    token_file = ctx.workspace / SESSION_FILE
+    if token_file.exists():
+        Auth(ctx.catalog).logout(token_file.read_text(encoding="utf-8").strip())
+        token_file.unlink()
+    console.print("Signed out.")
+
+
+@app.command()
+def whoami(workspace: Optional[Path] = WORKSPACE_OPT):
+    """Show who is signed in, and whether auth is enabled."""
+    from quickjoiner.auth import Auth
+
+    ctx = _context(workspace)
+    if not Auth(ctx.catalog).enabled:
+        console.print("Open mode — no users yet, everything is shared. [dim](qj users add <name> to enable auth)[/dim]")
+        return
+    user = _session_user(ctx)
+    console.print(f"Signed in as [bold]{user}[/bold]." if user else "Not signed in. Use [bold]qj login <name>[/bold].")
 
 
 @app.command()

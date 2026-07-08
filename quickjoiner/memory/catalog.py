@@ -50,6 +50,16 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_project ON chat_sessions(project_id);
+CREATE TABLE IF NOT EXISTS users (
+    username TEXT PRIMARY KEY,
+    password_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS auth_tokens (
+    token_hash TEXT PRIMARY KEY,
+    username TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -205,6 +215,59 @@ class Catalog:
         with self._lock:
             rows = self._conn.execute(query, params).fetchall()
         return [dict(r) for r in rows]
+
+    # -- users & auth tokens --------------------------------------------------
+    def create_user(self, username: str, password_hash: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
+                (username, password_hash, _now()),
+            )
+            self._conn.commit()
+
+    def get_user(self, username: str) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM users WHERE username = ?", (username,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_users(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT username, created_at FROM users ORDER BY username"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def count_users(self) -> int:
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()
+        return row["n"]
+
+    def save_token(self, token_hash: str, username: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO auth_tokens (token_hash, username, created_at) VALUES (?, ?, ?)",
+                (token_hash, username, _now()),
+            )
+            self._conn.commit()
+
+    def get_token_user(self, token_hash: str) -> str | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT username FROM auth_tokens WHERE token_hash = ?", (token_hash,)
+            ).fetchone()
+        return row["username"] if row else None
+
+    def delete_token(self, token_hash: str) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM auth_tokens WHERE token_hash = ?", (token_hash,))
+            self._conn.commit()
+
+    def delete_source(self, source_id: str) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM sources WHERE id = ?", (source_id,))
+            self._conn.commit()
 
     # -- sync state ---------------------------------------------------------
     def get_sync_state(self, source_id: str) -> dict[str, str]:

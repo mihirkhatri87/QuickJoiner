@@ -11,11 +11,14 @@ with citations — or says "I haven't learned that yet."
   - Run: `.venv\Scripts\python.exe`, `.venv\Scripts\qj.exe`
   - Tests: `.venv\Scripts\python.exe -m pytest -q`
   - Install deps after editing pyproject.toml:
-    `%USERPROFILE%\.local\bin\uv.exe pip install -e ".[dev]" --python .venv\Scripts\python.exe`
-- No `ANTHROPIC_API_KEY` / Ollama on this machine so far — live LLM calls can't be exercised;
-  the agent loop is covered by scripted-provider tests (`tests/test_agent_loop.py`,
-  `tests/test_streaming.py`). Playwright is NOT installed (browser extra + `playwright install
-  chromium` needed before `qj browser login` works).
+    `%USERPROFILE%\.local\bin\uv.exe pip install -e ".[dev,browser]" --python .venv\Scripts\python.exe`
+- Ollama 0.31.1 installed (CLI at `%LOCALAPPDATA%\Programs\Ollama\ollama.exe`, not on PATH in
+  fresh shells), signed into ollama.com free tier. Models: `gemma4:cloud` (proxies gemma4:31b,
+  tools+vision, 256K ctx) and local `qwen3:4b`. Live workspace: `~/.quickjoiner/default`
+  (provider ollama, model gemma4:cloud). First live run 2026-07-07 validated grounded+cited
+  answers AND "I haven't learned that yet" refusal. Still no `ANTHROPIC_API_KEY`; scripted-provider
+  tests remain the coverage for the Anthropic path. Playwright IS installed (playwright 1.61.0 +
+  Chromium 149, verified headless launch 2026-07-07) — `qj browser login` works.
 
 ## Commands
 
@@ -23,8 +26,12 @@ with citations — or says "I haven't learned that yet."
 qj init <org> [--provider anthropic|ollama]   # create workspace (~/.quickjoiner/<org>)
 qj learn <path|url|"free text fact">          # ad-hoc ingestion / taught notes
 qj connect <type> --name N -o key=value ...   # register a source (types: files git github gitlab
-                                              #   jira confluence azure_devops octopus grafana
-                                              #   datadog dynatrace elastic web_scrape)
+    [--share | --private]                     #   jira confluence azure_devops octopus grafana
+                                              #   datadog dynatrace elastic web_scrape).
+                                              #   --private (signed-in default) keeps it to you;
+                                              #   --share exposes it to everyone.
+qj users add|list / qj login / qj logout / qj whoami  # auth: first `users add` turns auth ON;
+                                              #   token in <workspace>/.session. Open mode until then.
 qj sync [name] / qj test <name>               # incremental pull / credential check
 qj ask "..." [--provider ollama] [-f html|csv|pptx|md] [--no-stream]  # grounded Q&A (streams by default)
 qj chat [--project P] [--session ID|--resume]  # persistent sessions; auto-compresses history
@@ -62,13 +69,37 @@ Override location with `--workspace` or `QJ_WORKSPACE`.
   `tests/test_phase4_connectors.py`). `logsearch/` (grafana/datadog/dynatrace/elastic) ingests
   inventory only — logs are queried live via tools, never vectorized. `browser/` holds the
   Playwright persistent-profile session (`session.py`, optional dep `.[browser]`) and the
-  `web_scrape` connector (`scraper.py`, injectable `_fetch_http` for tests).
+  `web_scrape` connector (`scraper.py`). The scraper is a **polite, resilient browser-like
+  client**: realistic Chrome headers (`browser_headers`), per-host rate limiting, retry+backoff,
+  robots.txt respect (default on), and **auto-fallback to the real headless browser** when a plain
+  fetch is refused (`Blocked` on 403/444/429/5xx CDN codes → `_should_fall_back` probes the start
+  URL, then re-crawls via Playwright). The bare-`python-httpx`-UA default was the usual cause of
+  nginx 444 / WAF 403; realistic headers alone clear most (verified live vs opentext.com). No
+  CAPTCHA-solving, IP rotation, or TLS-forgery — a site that still refuses a real browser is
+  respected. Injectable seams for offline tests: `_fetch_http` and `_transport` (httpx MockTransport).
+  Browser hardening lives in `browser/session.py` (`DESKTOP_UA`, `_CONTEXT_OPTS`, `_STEALTH_JS`
+  masking `navigator.webdriver`) — applied to both `qj browser login` and headless fetch.
+- `quickjoiner/connectors/specs.py` — `FORM_SPECS` per-type field catalog (label/required/secret/
+  env/list) + `connector_catalog()` (adds supported `modes`) driving the web-UI connector forms
+  and capability stamps. **Keep field keys in sync with what each connector reads from `options`.**
 - `quickjoiner/agent/` — grounded system prompt (`prompts.py`), built-in tools
   (search_memory/remember/list_sources in `tools.py`), tool-call loop (`agent.py`, max 10 rounds),
   onboarding briefs (`briefs.py`: seed queries → retrieved chunks → one-shot LLM call → saved to
   `<workspace>/briefs/` and re-ingested; refuses without hits and without building a provider).
-- `quickjoiner/api/` — FastAPI (`app.py`: SSE `/api/chat`, sources, sync, search, briefs) +
-  `hooks.py` (HMAC-verified `POST /hooks/{source}` push ingestion). UI: `api/static/index.html`.
+- `quickjoiner/auth.py` — opt-in local auth. `Auth` over the catalog: PBKDF2 password hashing,
+  bearer tokens (sha256-hashed at rest in `auth_tokens`), `users` table. **Open mode until the
+  first user exists** (no login, everything shared = pre-auth behavior). Sharing model on
+  `SourceConfig` (`owner`, `shared`): ownerless = commons; owned = owner-only unless `shared`.
+  `visible()` / `can_manage()` are the gate. Ingested *knowledge* stays one communal memory;
+  sharing governs who sees/manages a **connector's config + credentials** and gets its live tools.
+- `quickjoiner/api/` — FastAPI (`app.py`: SSE `/api/chat`, sources, sync, search, briefs;
+  `/api/auth/*` status/users/login/logout; `/api/connectors` CRUD + `/test` + `/types`) +
+  `hooks.py` (HMAC-verified `POST /hooks/{source}` push ingestion). Bearer token via
+  `Authorization` header → `_user()`; secret option values masked (`MASKED`) in responses, and a
+  PATCH sending the mask back keeps the stored secret. Live connector tools in chat are scoped to
+  `ctx.visible_sources(user)`. UI: `api/static/index.html` — the chat "logbook" plus a top-right
+  **Settings drawer** (account sign-in/out + connector registry plates with capability stamps,
+  test/sync/share/remove, and a dynamic per-type add-connector form built from `/api/connectors/types`).
 - `quickjoiner/export.py` — markdown → md/html/csv/pptx (`--format` on `qj ask` / `qj brief`);
   SSE chat events: `thinking` / `delta` / `tool_call` / `answer` / `error` / `done`.
 - `quickjoiner/sessions.py` — `SessionManager`: persistent sessions + projects (catalog tables
@@ -127,8 +158,9 @@ Post-phase additions (2026-07-07, all tested — suite: **89 passed**):
    no knowledge fine-tune (breaks freshness/citations/refusal); if quality gaps appear, try
    reranker/hybrid search first, then embedding fine-tune (highest ROI), and optionally a
    behavior-tune of a small Ollama model for tool-calling discipline.
-2. First live LLM run (needs API key or Ollama): validate chained flow end-to-end; add the
-   "Jira ticket implemented+deployed?" scenario as an eval case.
+2. ~~First live LLM run~~ DONE 2026-07-07 via Ollama gemma4:cloud (grounded+cited answer and
+   refusal both verified live). Remaining: the multi-hop "Jira ticket implemented+deployed?"
+   scenario needs real connectors — add it as an eval case once an org is connected.
 
-Known gaps: live LLM path untested (no API key), Playwright untested (not installed),
+Known gaps: Anthropic live path untested (no API key; Ollama path verified live),
 connectors untested against real external services (converters covered by unit tests only).

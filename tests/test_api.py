@@ -1,4 +1,4 @@
-"""Phase 3 verification: FastAPI endpoints, SSE chat, webhook receivers, scheduler."""
+﻿"""Phase 3 verification: FastAPI endpoints, SSE chat, webhook receivers, scheduler."""
 
 from __future__ import annotations
 
@@ -124,7 +124,7 @@ def test_sync_unknown_source_is_404(client):
 # -- SSE chat ----------------------------------------------------------------
 
 def test_chat_streams_tool_calls_and_answer(client, monkeypatch):
-    def fake_build_agent(self, provider_override=None, model_override=None, extra_system=None):
+    def fake_build_agent(self, provider_override=None, model_override=None, extra_system=None, sources=None):
         from quickjoiner.agent.agent import OnboardingAgent
 
         provider = ScriptedProvider(
@@ -151,7 +151,7 @@ def test_chat_streams_tool_calls_and_answer(client, monkeypatch):
 def test_chat_reuses_session_history(client, monkeypatch):
     providers: list[ScriptedProvider] = []
 
-    def fake_build_agent(self, provider_override=None, model_override=None, extra_system=None):
+    def fake_build_agent(self, provider_override=None, model_override=None, extra_system=None, sources=None):
         from quickjoiner.agent.agent import OnboardingAgent
 
         provider = ScriptedProvider([ChatResult(text=f"answer {len(providers)}")])
@@ -178,7 +178,7 @@ def test_chat_provider_failure_becomes_error_event(client, monkeypatch):
 
 
 def test_chat_session_persists_across_app_restarts(api_workspace, monkeypatch):
-    def fake_build_agent(self, provider_override=None, model_override=None, extra_system=None):
+    def fake_build_agent(self, provider_override=None, model_override=None, extra_system=None, sources=None):
         from quickjoiner.agent.agent import OnboardingAgent
 
         return OnboardingAgent(ScriptedProvider([ChatResult(text="persisted answer")]), [], system="sys")
@@ -203,7 +203,7 @@ def test_projects_and_sessions_endpoints(client, monkeypatch):
     ).json()
     assert project["id"] == "payments-ramp-up"
 
-    def fake_build_agent(self, provider_override=None, model_override=None, extra_system=None):
+    def fake_build_agent(self, provider_override=None, model_override=None, extra_system=None, sources=None):
         from quickjoiner.agent.agent import OnboardingAgent
 
         fake_build_agent.last_system = extra_system

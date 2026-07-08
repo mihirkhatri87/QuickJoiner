@@ -11,3 +11,21 @@ build/
 .claude/settings.local.json
 *.db
 lancedb/
+
+# Local workspace state — never commit. If someone runs qj with the repo as its
+# workspace (or QJ_WORKSPACE points inside it), these appear here:
+#   browser_profile/  Playwright/Chromium profile: live SSO cookies, tokens, and
+#                     saved logins after `qj browser login`, plus machine-specific
+#                     caches. Nothing in a browser profile belongs in a shared repo
+#                     — the session files are credentials, the rest is disposable
+#                     cache. Each user runs `qj browser login` on their own machine.
+#   .session          the CLI's bearer token (a live credential)
+#   /config.yaml      a real workspace config may hold literal secrets
+#                     (config.example.yaml is the tracked template)
+browser_profile/
+.session
+/config.yaml
+briefs/
+exports/
+repos/
+evals/

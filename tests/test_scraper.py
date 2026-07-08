@@ -1,14 +1,27 @@
 """Web scraper connector: extraction, link scoping, and crawl behavior (no network)."""
 
+import httpx
+import pytest
+
 from quickjoiner.config import SourceConfig
 from quickjoiner.connectors.base import Mode
 from quickjoiner.connectors.browser.scraper import (
+    Blocked,
     WebScrapeConnector,
+    browser_headers,
     default_prefixes,
     extract_links,
     page_document,
 )
 from quickjoiner.connectors.registry import create_connector
+
+
+def _connector(tmp_path, **options):
+    options.setdefault("start_urls", "https://site.test/")
+    options.setdefault("rate_limit_seconds", 0)  # no sleeps in tests
+    return create_connector(
+        SourceConfig(name="s", type="web_scrape", options=options), tmp_path
+    )
 
 PAGE = """
 <html><head><title>Runbook index</title></head>
@@ -119,6 +132,81 @@ def test_crawl_survives_dead_links(tmp_path, monkeypatch):
     monkeypatch.setattr(connector, "_fetch_http", fetch)
     docs = list(connector.sync({}))
     assert len(docs) == 1  # the dead link is skipped, crawl continues
+
+
+def _mock_connector(tmp_path, handler, **options):
+    """A connector whose HTTP client is backed by an in-memory transport."""
+    c = _connector(tmp_path, **options)
+    c._transport = httpx.MockTransport(handler)
+    return c
+
+
+def test_fetch_sends_browser_headers(tmp_path):
+    seen = {}
+
+    def handler(request):
+        seen.update(request.headers)
+        return httpx.Response(200, text="<html><body>ok</body></html>",
+                              headers={"content-type": "text/html"})
+
+    c = _mock_connector(tmp_path, handler)
+    c._fetch_http("https://site.test/page")
+    assert "python-httpx" not in seen["user-agent"]
+    assert "Chrome" in seen["user-agent"]
+    assert seen["accept-language"].startswith("en-US")
+
+
+def test_fetch_raises_blocked_on_444(tmp_path):
+    c = _mock_connector(tmp_path, lambda req: httpx.Response(444), max_retries=0)
+    with pytest.raises(Blocked) as exc:
+        c._fetch_http("https://site.test/blocked")
+    assert exc.value.status == 444
+
+
+def test_fetch_retries_then_succeeds(tmp_path):
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return httpx.Response(503)
+        return httpx.Response(200, text="<html><body>recovered content here</body></html>",
+                              headers={"content-type": "text/html"})
+
+    c = _mock_connector(tmp_path, handler, max_retries=3)
+    c._backoff = staticmethod(lambda attempt: 0)  # no real waiting
+    assert "recovered" in c._fetch_http("https://site.test/flaky")
+    assert calls["n"] == 3
+
+
+def test_robots_disallow_skips_url(tmp_path):
+    robots = "User-agent: *\nDisallow: /private/\n"
+    pages = {
+        "https://site.test/robots.txt": robots,
+        "https://site.test/": '<html><body><main><p>public landing page with enough text to keep '
+                              'it above the thin-page threshold for indexing.</p>'
+                              '<a href="/private/secret.html">secret</a>'
+                              '<a href="/ok.html">ok</a></main></body></html>',
+        "https://site.test/ok.html": '<html><head><title>OK</title></head><body><main><p>'
+                                     'an allowed page with plenty of readable content to index, '
+                                     'well past the thin-page threshold so it is kept as a doc.'
+                                     '</p></main></body></html>',
+    }
+
+    def fetch(url):
+        return pages.get(url, "")
+
+    c = _connector(tmp_path, start_urls="https://site.test/", respect_robots="true", max_pages=10)
+    c._fetch_http = fetch  # exercised by both robots.txt load and page fetches
+    titles = [d.uri for d in c._crawl(["https://site.test/"], set(),
+                                      ["https://site.test/"], 10, fetch)]
+    assert "https://site.test/ok.html" in titles
+    assert "https://site.test/private/secret.html" not in titles
+
+
+def test_browser_headers_shape():
+    h = browser_headers("UA/1.0")
+    assert h["User-Agent"] == "UA/1.0" and "Sec-Fetch-Mode" in h
 
 
 def test_browser_mode_requires_profile(tmp_path):

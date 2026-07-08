@@ -12,6 +12,33 @@ from pathlib import Path
 
 PROFILE_DIRNAME = "browser_profile"
 
+# A current desktop-Chrome UA. Headless Chromium otherwise advertises
+# "HeadlessChrome/…", which basic bot filters reject outright — the single most
+# common reason a real browser still gets blocked. Keep the major version roughly
+# in step with the installed Chromium.
+DESKTOP_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+)
+
+# Realistic desktop context. Applied to both the login window and headless fetch
+# so the session the user signs in with matches the one that scrapes.
+_CONTEXT_OPTS = dict(
+    user_agent=DESKTOP_UA,
+    viewport={"width": 1280, "height": 800},
+    locale="en-US",
+    timezone_id="America/New_York",
+)
+
+# Undo the handful of automation tells that headless Chromium leaves in the DOM.
+# This is standard hardening so legitimate automation isn't misclassified — it is
+# not a CAPTCHA/anti-abuse bypass, and it will not get you past a determined WAF.
+_STEALTH_JS = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+window.chrome = window.chrome || { runtime: {} };
+"""
+
 INSTALL_HINT = (
     "Playwright is not installed. Install the browser extra first:\n"
     '  uv pip install -e ".[browser]"  (or: pip install quickjoiner[browser])\n'
@@ -41,7 +68,10 @@ def login(workspace: Path, url: str) -> None:
     profile = profile_dir(workspace)
     profile.mkdir(parents=True, exist_ok=True)
     with sync_playwright() as p:
-        context = p.chromium.launch_persistent_context(str(profile), headless=False)
+        context = p.chromium.launch_persistent_context(
+            str(profile), headless=False, **_CONTEXT_OPTS
+        )
+        context.add_init_script(_STEALTH_JS)
         page = context.pages[0] if context.pages else context.new_page()
         page.goto(url)
         try:
@@ -61,7 +91,10 @@ def browser_session(workspace: Path, headless: bool = True):
     profile = profile_dir(workspace)
     profile.mkdir(parents=True, exist_ok=True)
     with sync_playwright() as p:
-        context = p.chromium.launch_persistent_context(str(profile), headless=headless)
+        context = p.chromium.launch_persistent_context(
+            str(profile), headless=headless, **_CONTEXT_OPTS
+        )
+        context.add_init_script(_STEALTH_JS)
         try:
             yield context
         finally:

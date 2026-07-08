@@ -39,24 +39,36 @@ class AppContext:
         provider_override: str | None = None,
         model_override: str | None = None,
         extra_system: str | None = None,
+        sources: list | None = None,
     ) -> OnboardingAgent:
         provider = self.build_provider(provider_override, model_override)
         tools = build_builtin_tools(self.store, self.catalog, self.pipeline, self.config.retrieval)
-        tools.extend(self.connector_tools())
+        tools.extend(self.connector_tools(sources))
         system = SYSTEM_PROMPT + (f"\n\n{extra_system}" if extra_system else "")
         return OnboardingAgent(provider, tools, system)
 
-    def connector_tools(self):
-        """Live read-from-source tools contributed by configured connectors."""
+    def connector_tools(self, sources: list | None = None):
+        """Live read-from-source tools contributed by configured connectors.
+
+        `sources=None` means all configured sources; pass a filtered list to
+        scope the agent's live tools to what a given user may see.
+        """
         from quickjoiner.connectors.registry import create_connector
 
         tools = []
-        for source in self.config.sources:
+        for source in self.config.sources if sources is None else sources:
             try:
                 tools.extend(create_connector(source, self.workspace).tools())
             except Exception:
                 continue  # a misconfigured source shouldn't break the agent
         return tools
+
+    def visible_sources(self, user: str | None):
+        """Sources `user` may see: everything in open mode, else own + shared."""
+        from quickjoiner.auth import Auth, visible
+
+        enabled = Auth(self.catalog).enabled
+        return [s for s in self.config.sources if visible(s, user, enabled)]
 
 
 def build_context(workspace: Path) -> AppContext:

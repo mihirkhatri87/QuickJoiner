@@ -5,509 +5,1015 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>QuickJoiner</title>
 <style>
+  /* ============================================================
+     QuickJoiner — "knowledge console"
+     Dark-first. Teal = the live agent. Gold = the provenance seal
+     (citations + grounded answers). Violet = the honest "not learned"
+     state. Slate surfaces layer to give the tool depth and weight.
+     ============================================================ */
   :root {
-    --paper: #EDF0EA; --panel: #F6F8F3; --ink: #1C2620; --muted: #5F6B62;
-    --line: #CDD5CB; --laurel: #20714F; --laurel-soft: #20714F22; --stamp: #9A6B22;
-    --user-tint: #E3E9E1;
-    --mono: "Cascadia Mono", Consolas, ui-monospace, monospace;
-    --serif: Georgia, "Times New Roman", serif;
-    --sans: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+    --bg:#0C1115; --surface:#121A1F; --raised:#18222A; --raised-2:#1F2B33;
+    --border:#25333B; --border-soft:#1E2A31; --hair:#2C3B44;
+    --text:#E9EFEC; --muted:#93A39E; --faint:#61716D;
+    --accent:#37C6B4; --accent-hi:#5FDccb; --accent-ink:#05130F; --accent-soft:#37C6B41C;
+    --gold:#DDAB55; --gold-hi:#EDC079; --gold-soft:#DDAB5518; --gold-line:#DDAB5540;
+    --unknown:#A18DE6; --unknown-soft:#A18DE618;
+    --danger:#E6715E; --danger-soft:#E6715E18;
+    --shadow:0 18px 46px -20px rgba(0,0,0,.66);
+    --shadow-sm:0 8px 22px -14px rgba(0,0,0,.6);
+    --mono:"Cascadia Code","Cascadia Mono",ui-monospace,"SF Mono",Consolas,monospace;
+    --sans:"Segoe UI Variable Text","Segoe UI",system-ui,-apple-system,sans-serif;
+    --display:"Segoe UI Variable Display","Segoe UI",system-ui,sans-serif;
+    --r:12px; --r-sm:8px; --r-xs:5px;
   }
-  @media (prefers-color-scheme: dark) {
-    :root { --paper:#121814; --panel:#1A2119; --ink:#E4EAE2; --muted:#93A096;
-            --line:#2C362D; --laurel:#63C695; --laurel-soft:#63C69526; --stamp:#D3A057;
-            --user-tint:#20291F; }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg:#EEF2F1; --surface:#FBFCFB; --raised:#FFFFFF; --raised-2:#F4F7F6;
+      --border:#DCE4E2; --border-soft:#E5EBEA; --hair:#D2DCDA;
+      --text:#16211D; --muted:#5C6C68; --faint:#8A9995;
+      --accent:#0E9C8B; --accent-hi:#0BB39F; --accent-ink:#FFFFFF; --accent-soft:#0E9C8B14;
+      --gold:#B27C1F; --gold-hi:#9C6C15; --gold-soft:#B27C1F14; --gold-line:#B27C1F3A;
+      --unknown:#6A52C0; --unknown-soft:#6A52C012;
+      --danger:#C4462F; --danger-soft:#C4462F12;
+      --shadow:0 18px 40px -22px rgba(31,45,42,.28);
+      --shadow-sm:0 8px 20px -14px rgba(31,45,42,.24);
+    }
   }
-  * { box-sizing: border-box; }
-  html, body { height: 100%; }
-  body { margin:0; background:var(--paper); color:var(--ink); font-family:var(--sans);
-         display:flex; flex-direction:column; font-size:15px; }
-
-  /* header: system voice */
-  header { display:flex; align-items:baseline; gap:14px; padding:14px 22px 12px;
-           border-bottom:1px solid var(--line); }
-  .wordmark { font-family:var(--mono); font-size:15px; letter-spacing:.22em;
-              text-transform:uppercase; font-weight:600; }
-  .wordmark::before { content:""; display:inline-block; width:9px; height:9px;
-              background:var(--laurel); margin-right:10px; transform:translateY(-1px); }
-  .meta { font-family:var(--mono); font-size:11.5px; color:var(--muted); letter-spacing:.04em; }
-
-  main { flex:1; display:flex; min-height:0; }
-
-  /* sidebar: the logbook's index */
-  #sidebar { width:280px; border-right:1px solid var(--line); padding:18px;
-             overflow-y:auto; flex-shrink:0; }
-  .side-section { margin-bottom:24px; }
-  .eyebrow { font-family:var(--mono); font-size:10.5px; letter-spacing:.18em;
-             text-transform:uppercase; color:var(--muted); margin:0 0 12px; }
-  select, .mini-input { width:100%; background:var(--panel); color:var(--ink);
-             border:1px solid var(--line); border-radius:3px; padding:7px 9px;
-             font-family:var(--mono); font-size:12px; }
-  .mini-form { display:flex; gap:6px; margin-top:8px; }
-  .mini-form .mini-input { flex:1; }
-  .side-btn { font-family:var(--mono); font-size:10px; letter-spacing:.08em;
-             text-transform:uppercase; background:none; border:1px solid var(--line);
-             color:var(--muted); border-radius:2px; padding:4px 9px; cursor:pointer; }
-  .side-btn:hover, .side-btn.primary { border-color:var(--laurel); color:var(--laurel); }
-  .side-btn:disabled { opacity:.4; cursor:default; }
-  .conv { border-left:2px solid transparent; padding:6px 9px; margin:0 0 4px;
-          cursor:pointer; border-radius:0 3px 3px 0; }
-  .conv:hover { background:var(--panel); }
-  .conv.active { border-left-color:var(--laurel); background:var(--panel); }
-  .conv .t { font-size:12.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .conv .m { font-family:var(--mono); font-size:10px; color:var(--muted); margin-top:2px; }
-  .conv .m .proj { color:var(--stamp); }
-  .side-actions { display:flex; gap:6px; margin-top:10px; }
-  .source { background:var(--panel); border:1px solid var(--line); border-radius:3px;
-            padding:10px 12px; margin-bottom:10px; }
-  .source .name { font-weight:600; font-size:13.5px; }
-  .source .info { font-family:var(--mono); font-size:11px; color:var(--muted); margin-top:3px; }
-  .source button { float:right; font-family:var(--mono); font-size:10px; letter-spacing:.08em;
-            text-transform:uppercase; background:none; border:1px solid var(--laurel);
-            color:var(--laurel); border-radius:2px; padding:3px 8px; cursor:pointer; }
-  .source button:hover { background:var(--laurel-soft); }
-  .sidebar-hint { font-size:12.5px; color:var(--muted); line-height:1.5; }
-  .sidebar-hint code { font-family:var(--mono); font-size:11px; }
-
-  /* the ledger */
-  #chatcol { flex:1; display:flex; flex-direction:column; min-width:0; }
-  #chat { flex:1; overflow-y:auto; padding:26px 30px 10px; }
-  .entry { display:flex; gap:16px; margin-bottom:26px; max-width:880px; }
-  .gutter { width:96px; flex-shrink:0; text-align:right; font-family:var(--mono);
-            padding-top:2px; }
-  .gutter .who { display:block; font-size:11px; letter-spacing:.14em; text-transform:uppercase;
-            color:var(--ink); font-weight:600; }
-  .entry.qj .gutter .who { color:var(--laurel); }
-  .gutter .ts { display:block; font-size:10.5px; color:var(--muted); margin-top:2px; }
-  .stamps { margin-top:8px; display:flex; flex-direction:column; gap:4px; align-items:flex-end; }
-  .stamp { font-size:9.5px; letter-spacing:.06em; color:var(--stamp);
-           border:1px solid currentColor; border-radius:2px; padding:1.5px 5px;
-           max-width:96px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-
-  .body { min-width:0; flex:1; }
-  .entry.user .body { background:var(--user-tint); border-radius:3px;
-                      padding:10px 14px; white-space:pre-wrap; line-height:1.5; }
-  /* grounding rail: pulses while streaming, solidifies when grounded */
-  .entry.qj .body { border-left:2px solid var(--laurel); padding:2px 0 2px 16px; }
-  .entry.qj.streaming .body { border-image: linear-gradient(var(--laurel), transparent 60%) 1;
-                              border-left:2px solid; animation: breathe 1.6s ease-in-out infinite; }
-  @keyframes breathe { 50% { opacity:.75; } }
-  @media (prefers-reduced-motion: reduce) {
-    .entry.qj.streaming .body { animation:none; border-image:none; }
+  :root[data-theme="dark"] {
+    --bg:#0C1115; --surface:#121A1F; --raised:#18222A; --raised-2:#1F2B33;
+    --border:#25333B; --border-soft:#1E2A31; --hair:#2C3B44;
+    --text:#E9EFEC; --muted:#93A39E; --faint:#61716D;
+    --accent:#37C6B4; --accent-hi:#5FDccb; --accent-ink:#05130F; --accent-soft:#37C6B41C;
+    --gold:#DDAB55; --gold-hi:#EDC079; --gold-soft:#DDAB5518; --gold-line:#DDAB5540;
+    --unknown:#A18DE6; --unknown-soft:#A18DE618;
+    --danger:#E6715E; --danger-soft:#E6715E18;
+    --shadow:0 18px 46px -20px rgba(0,0,0,.66); --shadow-sm:0 8px 22px -14px rgba(0,0,0,.6);
   }
-  .answer { font-family:var(--serif); font-size:15.5px; line-height:1.62;
-            white-space:pre-wrap; overflow-wrap:break-word; }
-  .entry.sys .body { font-family:var(--mono); font-size:11.5px; color:var(--muted);
-                     padding-top:4px; white-space:pre-wrap; }
-  .entry.error .body { color:#A34632; font-family:var(--mono); font-size:12.5px; padding-top:3px;
-                       border-left-color:#A34632; }
-  @media (prefers-color-scheme: dark) {
-    .entry.error .body { color:#E08A72; border-left-color:#E08A72; }
+  :root[data-theme="light"] {
+    --bg:#EEF2F1; --surface:#FBFCFB; --raised:#FFFFFF; --raised-2:#F4F7F6;
+    --border:#DCE4E2; --border-soft:#E5EBEA; --hair:#D2DCDA;
+    --text:#16211D; --muted:#5C6C68; --faint:#8A9995;
+    --accent:#0E9C8B; --accent-hi:#0BB39F; --accent-ink:#FFFFFF; --accent-soft:#0E9C8B14;
+    --gold:#B27C1F; --gold-hi:#9C6C15; --gold-soft:#B27C1F14; --gold-line:#B27C1F3A;
+    --unknown:#6A52C0; --unknown-soft:#6A52C012;
+    --danger:#C4462F; --danger-soft:#C4462F12;
+    --shadow:0 18px 40px -22px rgba(31,45,42,.28); --shadow-sm:0 8px 20px -14px rgba(31,45,42,.24);
   }
 
-  details.think { margin:0 0 10px; }
-  details.think summary { font-family:var(--mono); font-size:10.5px; letter-spacing:.14em;
-            text-transform:uppercase; color:var(--muted); cursor:pointer; list-style:none; }
-  details.think summary::before { content:"▸ "; }
-  details.think[open] summary::before { content:"▾ "; }
-  /* compressed conversation memory */
-  details.memo { background:var(--laurel-soft); border-radius:3px; padding:8px 12px;
-                 margin:0 0 22px; max-width:880px; }
-  details.memo summary { font-family:var(--mono); font-size:10.5px; letter-spacing:.14em;
-                 text-transform:uppercase; color:var(--laurel); cursor:pointer; list-style:none; }
-  details.memo summary::before { content:"▸ "; }
-  details.memo[open] summary::before { content:"▾ "; }
-  details.memo pre { font-family:var(--mono); font-size:11.5px; color:var(--muted);
-                 white-space:pre-wrap; margin:8px 0 2px; }
-  details.think pre { font-family:var(--mono); font-size:11.5px; color:var(--muted);
-            white-space:pre-wrap; margin:6px 0 0; max-height:130px; overflow-y:auto;
-            border-left:1px solid var(--line); padding-left:10px; }
+  * { box-sizing:border-box; }
+  html, body { height:100%; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:var(--sans);
+         font-size:15px; -webkit-font-smoothing:antialiased; display:flex; flex-direction:column;
+         min-height:100%; }
+  ::selection { background:var(--accent-soft); }
+  :focus-visible { outline:2px solid var(--accent); outline-offset:2px; border-radius:3px; }
+  button { font-family:inherit; }
+  svg { display:block; }
+  .ico { width:16px; height:16px; stroke:currentColor; stroke-width:1.8; fill:none;
+         stroke-linecap:round; stroke-linejoin:round; }
 
-  .cite { font-family:var(--mono); font-size:10.5px; color:var(--laurel);
-          background:var(--laurel-soft); border-radius:2px; padding:1px 6px;
-          white-space:nowrap; max-width:300px; overflow:hidden; text-overflow:ellipsis;
-          display:inline-block; vertical-align:baseline; text-decoration:none; }
-  .cite .n { font-weight:700; margin-right:5px; }
-  a.cite:hover { outline:1px solid var(--laurel); }
+  /* ---- top bar ------------------------------------------------ */
+  .topbar { display:flex; align-items:center; gap:16px; height:56px; padding:0 20px;
+            border-bottom:1px solid var(--border); background:var(--surface);
+            position:sticky; top:0; z-index:6; }
+  .brand { display:flex; align-items:center; gap:11px; font-family:var(--mono); font-weight:600;
+           letter-spacing:.2em; text-transform:uppercase; font-size:13.5px; }
+  .brand-dot { width:11px; height:11px; border-radius:50%; background:var(--accent);
+               box-shadow:0 0 0 4px var(--accent-soft); position:relative; }
+  .brand-dot::after { content:""; position:absolute; inset:3px; border-radius:50%;
+               background:var(--bg); opacity:.35; }
+  .org-tag { font-family:var(--mono); font-size:11.5px; color:var(--muted); letter-spacing:.06em;
+             padding:3px 9px; border:1px solid var(--border); border-radius:100px; }
+  .model-tag { font-family:var(--mono); font-size:11px; color:var(--accent); letter-spacing:.02em;
+               display:inline-flex; align-items:center; gap:6px; }
+  .model-tag::before { content:""; width:6px; height:6px; border-radius:50%; background:var(--accent); }
+  .top-actions { margin-left:auto; display:flex; align-items:center; gap:8px; }
+  .icon-btn { display:inline-flex; align-items:center; justify-content:center; width:36px; height:36px;
+              border-radius:var(--r-sm); border:1px solid var(--border); background:var(--raised);
+              color:var(--muted); cursor:pointer; transition:.15s; }
+  .icon-btn:hover { color:var(--text); border-color:var(--hair); background:var(--raised-2); }
 
-  /* ask bar */
-  form { display:flex; gap:10px; padding:16px 30px 20px; border-top:1px solid var(--line);
-         align-items:center; }
-  .prompt-mark { font-family:var(--mono); color:var(--laurel); font-weight:700; }
-  input[type=text] { flex:1; background:var(--panel); color:var(--ink);
-         border:1px solid var(--line); border-radius:3px; padding:11px 14px;
-         font-size:14.5px; font-family:var(--sans); }
-  input[type=text]::placeholder { color:var(--muted); }
-  button.send { font-family:var(--mono); letter-spacing:.14em; text-transform:uppercase;
-         font-size:11.5px; background:var(--laurel); color:var(--paper); border:none;
-         border-radius:3px; padding:11px 20px; cursor:pointer; }
-  button.send:disabled { opacity:.45; }
-  :focus-visible { outline:2px solid var(--laurel); outline-offset:2px; }
+  /* ---- app grid ---------------------------------------------- */
+  .app { flex:1; display:grid; grid-template-columns:296px 1fr; min-height:0; }
 
-  @media (max-width: 860px) {
-    main { flex-direction:column; }
-    #sidebar { width:auto; border-right:none; border-bottom:1px solid var(--line);
-               max-height:38vh; padding:12px 16px; }
-    .side-section { margin-bottom:14px; }
-    #chat { padding:18px 14px 8px; }
-    .entry { gap:10px; }
-    .gutter { width:64px; }
-    form { padding:12px 14px 16px; }
+  /* ---- left rail --------------------------------------------- */
+  .rail { border-right:1px solid var(--border); background:var(--surface);
+          overflow-y:auto; padding:18px 16px 26px; display:flex; flex-direction:column; gap:22px; }
+  .memory { background:var(--raised); border:1px solid var(--border-soft); border-radius:var(--r);
+            padding:14px 15px; }
+  .memory .m-label { font-family:var(--mono); font-size:9.5px; letter-spacing:.18em;
+            text-transform:uppercase; color:var(--faint); }
+  .memory .m-nums { display:flex; align-items:baseline; gap:5px; margin-top:8px; flex-wrap:wrap; }
+  .memory .m-big { font-family:var(--mono); font-size:26px; font-weight:600; color:var(--text);
+            letter-spacing:-.01em; line-height:1; font-variant-numeric:tabular-nums; }
+  .memory .m-unit { font-size:12px; color:var(--muted); }
+  .memory .m-sub { margin-top:9px; font-size:12px; color:var(--muted); display:flex; gap:6px;
+            align-items:center; }
+  .memory .m-sub .sourcecount { color:var(--gold); font-family:var(--mono);
+            font-variant-numeric:tabular-nums; }
+
+  .rail-sec { display:flex; flex-direction:column; gap:10px; }
+  .eyebrow { font-family:var(--mono); font-size:10px; letter-spacing:.2em; text-transform:uppercase;
+             color:var(--faint); display:flex; align-items:center; gap:8px; }
+  .eyebrow .link { margin-left:auto; color:var(--accent); cursor:pointer; text-transform:none;
+             letter-spacing:.02em; font-size:11px; background:none; border:none; padding:0;
+             display:inline-flex; align-items:center; gap:4px; }
+  .eyebrow .link:hover { color:var(--accent-hi); }
+
+  .select-wrap { position:relative; }
+  .select-wrap select { width:100%; appearance:none; background:var(--raised); color:var(--text);
+             border:1px solid var(--border); border-radius:var(--r-sm); padding:9px 32px 9px 12px;
+             font-family:var(--sans); font-size:13px; cursor:pointer; }
+  .select-wrap::after { content:""; position:absolute; right:13px; top:50%; width:7px; height:7px;
+             border-right:1.6px solid var(--muted); border-bottom:1.6px solid var(--muted);
+             transform:translateY(-70%) rotate(45deg); pointer-events:none; }
+  .mini-form { display:flex; gap:6px; }
+  .mini-input { flex:1; background:var(--raised); color:var(--text); border:1px solid var(--border);
+             border-radius:var(--r-sm); padding:8px 11px; font-size:12.5px; font-family:var(--sans); }
+  .mini-input::placeholder { color:var(--faint); }
+
+  .chip-btn { font-size:12px; background:var(--raised); border:1px solid var(--border);
+             color:var(--muted); border-radius:var(--r-sm); padding:8px 12px; cursor:pointer;
+             transition:.15s; display:inline-flex; align-items:center; gap:7px; justify-content:center; }
+  .chip-btn:hover { border-color:var(--accent); color:var(--accent); }
+  .chip-btn.primary { background:var(--accent); border-color:var(--accent); color:var(--accent-ink);
+             font-weight:600; }
+  .chip-btn.primary:hover { background:var(--accent-hi); border-color:var(--accent-hi); }
+  .chip-btn.full { width:100%; }
+  .chip-btn:disabled { opacity:.45; cursor:default; }
+  .row { display:flex; gap:7px; }
+
+  .chat-item { border:1px solid transparent; border-left:2px solid transparent; padding:8px 10px;
+             border-radius:var(--r-xs); cursor:pointer; transition:.12s; }
+  .chat-item:hover { background:var(--raised); }
+  .chat-item.active { background:var(--raised); border-left-color:var(--accent); }
+  .chat-item .ci-t { font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .chat-item .ci-m { font-family:var(--mono); font-size:10px; color:var(--faint); margin-top:3px;
+             font-variant-numeric:tabular-nums; }
+  .chat-item .ci-m .proj { color:var(--gold); }
+
+  .sys-item { display:flex; align-items:center; gap:9px; padding:7px 4px; border-radius:var(--r-xs); }
+  .sys-item:hover { background:var(--raised); }
+  .sys-dot { width:7px; height:7px; border-radius:50%; background:var(--gold);
+             box-shadow:0 0 0 3px var(--gold-soft); flex-shrink:0; }
+  .sys-item .s-name { font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .sys-item .s-meta { margin-left:auto; font-family:var(--mono); font-size:10.5px; color:var(--faint);
+             flex-shrink:0; font-variant-numeric:tabular-nums; }
+  .hint { font-size:12.5px; color:var(--muted); line-height:1.55; }
+  .hint code { font-family:var(--mono); font-size:11px; color:var(--text);
+             background:var(--raised); padding:1px 5px; border-radius:4px; }
+
+  /* ---- canvas ------------------------------------------------- */
+  .canvas { display:flex; flex-direction:column; min-width:0; position:relative; }
+  .thread { flex:1; overflow-y:auto; padding:30px 30px 14px; scroll-behavior:smooth; }
+  .thread-inner { max-width:820px; margin:0 auto; display:flex; flex-direction:column; gap:26px; }
+
+  .msg { display:flex; gap:15px; }
+  .avatar { width:30px; height:30px; border-radius:9px; flex-shrink:0; display:flex;
+            align-items:center; justify-content:center; font-family:var(--mono); font-size:10px;
+            font-weight:700; letter-spacing:.02em; }
+  .msg.user .avatar { background:var(--raised-2); color:var(--muted); border:1px solid var(--border); }
+  .msg.agent .avatar { background:var(--accent-soft); color:var(--accent);
+            border:1px solid color-mix(in srgb, var(--accent) 40%, transparent); }
+  .msg-body { min-width:0; flex:1; padding-top:3px; }
+  .msg .who { font-family:var(--mono); font-size:10.5px; letter-spacing:.14em; text-transform:uppercase;
+            color:var(--faint); margin-bottom:7px; display:flex; align-items:center; gap:9px; }
+  .msg.agent .who { color:var(--accent); }
+  .msg .ts { color:var(--faint); font-size:10px; letter-spacing:.06em; }
+  .user-text { background:var(--raised); border:1px solid var(--border-soft); border-radius:var(--r);
+            padding:11px 15px; white-space:pre-wrap; line-height:1.5; font-size:14.5px; }
+
+  /* grounded-answer treatment: the gold seal is the signature */
+  .answer { font-size:15px; line-height:1.68; white-space:pre-wrap; overflow-wrap:break-word;
+            padding-left:16px; border-left:2px solid var(--gold-line); }
+  .answer.streaming { border-left-color:var(--accent);
+            animation:pulse 1.5s ease-in-out infinite; }
+  @keyframes pulse { 50% { border-left-color:color-mix(in srgb,var(--accent) 35%,transparent); } }
+  .answer.refused { border-left-color:var(--unknown); color:var(--text); }
+  .grounded-tag { display:inline-flex; align-items:center; gap:6px; font-family:var(--mono);
+            font-size:9.5px; letter-spacing:.14em; text-transform:uppercase; color:var(--gold);
+            border:1px solid var(--gold-line); background:var(--gold-soft); padding:2px 8px;
+            border-radius:100px; }
+  .refused-tag { color:var(--unknown); border-color:color-mix(in srgb,var(--unknown) 34%,transparent);
+            background:var(--unknown-soft); }
+
+  /* inline citations = provenance chips */
+  .cite { display:inline-flex; align-items:center; gap:6px; font-family:var(--mono); font-size:11px;
+            color:var(--gold); background:var(--gold-soft); border:1px solid var(--gold-line);
+            border-radius:100px; padding:1px 9px 1px 3px; max-width:340px; vertical-align:baseline;
+            text-decoration:none; transition:.14s; }
+  a.cite:hover { background:color-mix(in srgb,var(--gold) 20%,transparent); color:var(--gold-hi); }
+  .cite .cn { display:inline-flex; align-items:center; justify-content:center; width:16px; height:16px;
+            border-radius:50%; background:var(--gold); color:var(--bg); font-weight:700; font-size:9.5px;
+            flex-shrink:0; }
+  .cite .ct { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+
+  /* thinking + tool activity */
+  details.think { margin:0 0 12px; border:1px solid var(--border-soft); border-radius:var(--r-sm);
+            background:var(--surface); overflow:hidden; }
+  details.think summary { font-family:var(--mono); font-size:10px; letter-spacing:.16em;
+            text-transform:uppercase; color:var(--muted); cursor:pointer; list-style:none;
+            padding:8px 12px; display:flex; align-items:center; gap:8px; }
+  details.think summary::-webkit-details-marker { display:none; }
+  details.think summary::before { content:""; width:6px; height:6px; border-right:1.5px solid currentColor;
+            border-bottom:1.5px solid currentColor; transform:rotate(-45deg); transition:.15s; }
+  details.think[open] summary::before { transform:rotate(45deg); }
+  details.think pre { font-family:var(--mono); font-size:11.5px; color:var(--muted); line-height:1.5;
+            white-space:pre-wrap; margin:0; padding:0 12px 11px; max-height:150px; overflow-y:auto; }
+  .tools { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:11px; }
+  .toolchip { font-family:var(--mono); font-size:10px; letter-spacing:.02em; color:var(--muted);
+            background:var(--surface); border:1px solid var(--border); border-radius:100px;
+            padding:3px 10px 3px 8px; display:inline-flex; align-items:center; gap:6px;
+            max-width:280px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .toolchip::before { content:""; width:5px; height:5px; border-radius:50%; background:var(--accent);
+            flex-shrink:0; }
+
+  details.memo { background:var(--accent-soft); border:1px solid color-mix(in srgb,var(--accent) 22%,transparent);
+            border-radius:var(--r-sm); padding:9px 13px; }
+  details.memo summary { font-family:var(--mono); font-size:10px; letter-spacing:.14em;
+            text-transform:uppercase; color:var(--accent); cursor:pointer; list-style:none; }
+  details.memo summary::-webkit-details-marker { display:none; }
+  details.memo pre { font-family:var(--mono); font-size:11.5px; color:var(--muted); white-space:pre-wrap;
+            margin:9px 0 2px; line-height:1.55; }
+  .msg.error .answer { border-left-color:var(--danger); color:var(--danger); font-family:var(--mono);
+            font-size:13px; }
+
+  /* ---- onboarding / empty states ----------------------------- */
+  .empty { max-width:600px; margin:6vh auto 0; text-align:left; }
+  .empty .badge { display:inline-flex; align-items:center; gap:8px; font-family:var(--mono);
+            font-size:10px; letter-spacing:.16em; text-transform:uppercase; color:var(--accent);
+            border:1px solid color-mix(in srgb,var(--accent) 30%,transparent); background:var(--accent-soft);
+            padding:4px 11px; border-radius:100px; }
+  .empty h1 { font-family:var(--display); font-size:30px; line-height:1.18; font-weight:600;
+            letter-spacing:-.015em; margin:18px 0 12px; }
+  .empty h1 .gold { color:var(--gold); }
+  .empty p { color:var(--muted); font-size:15px; line-height:1.62; margin:0 0 22px; max-width:520px; }
+  .empty .cta-row { display:flex; gap:10px; flex-wrap:wrap; }
+  .cta { display:inline-flex; align-items:center; gap:9px; background:var(--accent);
+            color:var(--accent-ink); border:none; border-radius:var(--r-sm); padding:11px 18px;
+            font-size:14px; font-weight:600; cursor:pointer; transition:.15s; }
+  .cta:hover { background:var(--accent-hi); }
+  .cta.ghost { background:transparent; color:var(--text); border:1px solid var(--border); }
+  .cta.ghost:hover { border-color:var(--hair); background:var(--raised); }
+  .promises { margin-top:30px; display:grid; gap:14px; }
+  .promise { display:flex; gap:12px; align-items:flex-start; }
+  .promise .p-ic { width:30px; height:30px; border-radius:8px; display:flex; align-items:center;
+            justify-content:center; flex-shrink:0; }
+  .promise.g .p-ic { background:var(--gold-soft); color:var(--gold);
+            border:1px solid var(--gold-line); }
+  .promise.u .p-ic { background:var(--unknown-soft); color:var(--unknown);
+            border:1px solid color-mix(in srgb,var(--unknown) 32%,transparent); }
+  .promise.t .p-ic { background:var(--accent-soft); color:var(--accent);
+            border:1px solid color-mix(in srgb,var(--accent) 32%,transparent); }
+  .promise .p-t { font-size:13.5px; font-weight:600; }
+  .promise .p-d { font-size:12.5px; color:var(--muted); line-height:1.5; margin-top:2px; }
+
+  .starters { display:flex; flex-wrap:wrap; gap:8px; margin-top:20px; }
+  .starter { font-size:13px; color:var(--muted); background:var(--raised); border:1px solid var(--border);
+            border-radius:100px; padding:8px 14px; cursor:pointer; transition:.14s; }
+  .starter:hover { border-color:var(--accent); color:var(--text); }
+
+  /* ---- composer ---------------------------------------------- */
+  .composer-wrap { padding:14px 30px 22px; }
+  .composer { max-width:820px; margin:0 auto; display:flex; align-items:flex-end; gap:10px;
+            background:var(--raised); border:1px solid var(--border); border-radius:var(--r);
+            padding:10px 10px 10px 16px; box-shadow:var(--shadow-sm); transition:border-color .15s; }
+  .composer:focus-within { border-color:color-mix(in srgb,var(--accent) 55%,transparent); }
+  .composer textarea { flex:1; background:none; border:none; resize:none; color:var(--text);
+            font-family:var(--sans); font-size:15px; line-height:1.5; max-height:180px; padding:6px 0;
+            outline:none; }
+  .composer textarea::placeholder { color:var(--faint); }
+  .send { width:40px; height:40px; flex-shrink:0; border:none; border-radius:var(--r-sm);
+            background:var(--accent); color:var(--accent-ink); cursor:pointer; display:flex;
+            align-items:center; justify-content:center; transition:.15s; }
+  .send:hover { background:var(--accent-hi); }
+  .send:disabled { opacity:.4; cursor:default; }
+  .send .ico { width:18px; height:18px; stroke-width:2; }
+  .composer-note { max-width:820px; margin:9px auto 0; font-size:11px; color:var(--faint);
+            text-align:center; letter-spacing:.01em; }
+  .composer-note b { color:var(--gold); font-weight:600; }
+
+  /* ---- settings drawer --------------------------------------- */
+  #backdrop { position:fixed; inset:0; background:rgba(6,10,12,.55); opacity:0; pointer-events:none;
+            transition:opacity .2s; z-index:8; backdrop-filter:blur(2px); }
+  #backdrop.open { opacity:1; pointer-events:auto; }
+  #drawer { position:fixed; top:0; right:0; bottom:0; width:min(468px,100vw); background:var(--surface);
+            border-left:1px solid var(--border); z-index:9; transform:translateX(103%);
+            transition:transform .24s cubic-bezier(.22,.85,.28,1); display:flex; flex-direction:column;
+            box-shadow:var(--shadow); }
+  #drawer.open { transform:none; }
+  @media (prefers-reduced-motion:reduce) { #drawer,#backdrop,.thread { transition:none; scroll-behavior:auto; } }
+  .drawer-head { display:flex; align-items:center; gap:11px; padding:16px 20px;
+            border-bottom:1px solid var(--border); }
+  .drawer-head .dh-ic { width:30px; height:30px; border-radius:8px; background:var(--accent-soft);
+            color:var(--accent); display:flex; align-items:center; justify-content:center;
+            border:1px solid color-mix(in srgb,var(--accent) 32%,transparent); }
+  .drawer-head .t { font-family:var(--mono); font-size:12px; letter-spacing:.18em; text-transform:uppercase;
+            font-weight:600; }
+  .drawer-head .x { margin-left:auto; }
+  .drawer-body { flex:1; overflow-y:auto; padding:20px; display:flex; flex-direction:column; gap:24px; }
+  .drawer-status { font-family:var(--mono); font-size:11.5px; min-height:15px; padding:0; }
+  .drawer-status.ok { color:var(--accent); }
+  .drawer-status.err { color:var(--danger); }
+  .sec-title { font-family:var(--mono); font-size:10px; letter-spacing:.2em; text-transform:uppercase;
+            color:var(--faint); margin-bottom:12px; }
+
+  .acct-card { background:var(--raised); border:1px solid var(--border-soft); border-radius:var(--r);
+            padding:15px; }
+  .acct-line { display:flex; align-items:center; gap:11px; }
+  .acct-avatar { width:36px; height:36px; border-radius:10px; background:var(--accent-soft);
+            color:var(--accent); display:flex; align-items:center; justify-content:center;
+            font-family:var(--mono); font-weight:700; font-size:14px; text-transform:uppercase;
+            border:1px solid color-mix(in srgb,var(--accent) 32%,transparent); }
+  .acct-line .a-name { font-size:14px; font-weight:600; }
+  .acct-line .a-sub { font-size:12px; color:var(--muted); margin-top:1px; }
+  .acct-line .chip-btn { margin-left:auto; }
+
+  .field { margin-bottom:11px; }
+  .field label { display:block; font-family:var(--mono); font-size:10px; letter-spacing:.1em;
+            text-transform:uppercase; color:var(--muted); margin-bottom:5px; }
+  .field input { width:100%; background:var(--raised); color:var(--text); border:1px solid var(--border);
+            border-radius:var(--r-sm); padding:9px 11px; font-family:var(--mono); font-size:12.5px; }
+  .field input::placeholder { color:var(--faint); }
+  .field .fhint { font-size:11px; color:var(--faint); margin-top:4px; line-height:1.5; }
+  .check { display:flex; gap:9px; align-items:flex-start; font-size:12.5px; color:var(--muted);
+            margin:14px 0; line-height:1.45; }
+  .check input { accent-color:var(--accent); margin-top:2px; width:15px; height:15px; }
+  .btn-row { display:flex; gap:8px; flex-wrap:wrap; margin-top:6px; }
+  .btn-row .chip-btn.danger { border-color:color-mix(in srgb,var(--danger) 50%,transparent);
+            color:var(--danger); }
+  .btn-row .chip-btn.danger:hover { background:var(--danger-soft); }
+  details.disc summary { font-family:var(--mono); font-size:10.5px; letter-spacing:.1em;
+            text-transform:uppercase; color:var(--muted); cursor:pointer; margin-top:12px;
+            list-style:none; display:inline-flex; align-items:center; gap:7px; }
+  details.disc summary::-webkit-details-marker { display:none; }
+  details.disc summary::before { content:"+"; font-size:13px; }
+  details.disc[open] summary::before { content:"–"; }
+  details.disc[open] summary { margin-bottom:12px; }
+
+  /* connector plates */
+  .plate { background:var(--raised); border:1px solid var(--border-soft); border-radius:var(--r);
+            padding:15px; margin-bottom:12px; }
+  .plate-top { display:flex; align-items:center; gap:11px; }
+  .plate-ic { width:34px; height:34px; border-radius:9px; background:var(--raised-2);
+            border:1px solid var(--border); display:flex; align-items:center; justify-content:center;
+            color:var(--muted); flex-shrink:0; }
+  .plate-top .pn { font-size:14.5px; font-weight:600; }
+  .plate-top .pt { font-family:var(--mono); font-size:10px; color:var(--faint); letter-spacing:.06em;
+            text-transform:uppercase; margin-top:2px; }
+  .sharechip { margin-left:auto; font-family:var(--mono); font-size:9px; letter-spacing:.12em;
+            text-transform:uppercase; border-radius:100px; padding:3px 9px; flex-shrink:0; }
+  .sharechip.commons { border:1px solid var(--accent); color:var(--accent); background:var(--accent-soft); }
+  .sharechip.mine { border:1px solid var(--gold-line); color:var(--gold); background:var(--gold-soft); }
+  .plate-reg { font-family:var(--mono); font-size:10.5px; color:var(--faint); margin-top:10px;
+            display:flex; flex-wrap:wrap; gap:5px 10px; font-variant-numeric:tabular-nums; }
+  .modes { display:flex; gap:5px; margin-top:11px; flex-wrap:wrap; }
+  .modechip { font-family:var(--mono); font-size:8.5px; letter-spacing:.1em; text-transform:uppercase;
+            border:1px solid var(--border); border-radius:100px; padding:2px 8px; color:var(--faint); }
+  .modechip.on { border-color:color-mix(in srgb,var(--accent) 45%,transparent); color:var(--accent);
+            background:var(--accent-soft); }
+  .plate-actions { display:flex; gap:7px; margin-top:13px; flex-wrap:wrap; }
+  .plate-msg { font-family:var(--mono); font-size:10.5px; margin-top:9px; color:var(--muted);
+            white-space:pre-wrap; line-height:1.45; }
+  .plate-msg.ok { color:var(--accent); } .plate-msg.err { color:var(--danger); }
+
+  .typegrid { display:grid; grid-template-columns:1fr 1fr; gap:9px; }
+  .typecard { background:var(--raised); border:1px solid var(--border-soft); border-radius:var(--r-sm);
+            padding:12px 13px; cursor:pointer; text-align:left; color:var(--text); transition:.14s; }
+  .typecard:hover { border-color:var(--accent); background:var(--raised-2); }
+  .typecard .tl { font-weight:600; font-size:13px; }
+  .typecard .tb { font-size:11px; color:var(--muted); margin-top:4px; line-height:1.45; }
+  .crumb { font-family:var(--mono); font-size:10px; letter-spacing:.1em; text-transform:uppercase;
+            color:var(--muted); background:none; border:none; cursor:pointer; padding:0; margin-bottom:14px;
+            display:inline-flex; align-items:center; gap:7px; }
+  .crumb:hover { color:var(--accent); }
+
+  /* ---- responsive -------------------------------------------- */
+  @media (max-width:900px) {
+    .app { grid-template-columns:1fr; }
+    .rail { position:fixed; top:56px; bottom:0; left:0; width:296px; z-index:7;
+            transform:translateX(-102%); transition:transform .2s; }
+    .rail.open { transform:none; box-shadow:var(--shadow); }
+    .rail-toggle { display:inline-flex !important; }
+    .thread { padding:20px 16px 10px; }
+    .composer-wrap { padding:12px 16px 18px; }
+    .empty h1 { font-size:25px; }
   }
+  .rail-toggle { display:none; }
+  @media (min-width:901px) { .rail-scrim { display:none; } }
+  .rail-scrim { position:fixed; inset:56px 0 0 0; background:rgba(6,10,12,.5); z-index:6; opacity:0;
+            pointer-events:none; transition:.2s; }
+  .rail-scrim.open { opacity:1; pointer-events:auto; }
 </style>
 </head>
 <body>
-<header>
-  <span class="wordmark">QuickJoiner</span>
-  <span class="meta" id="meta">loading…</span>
-</header>
-<main>
-  <aside id="sidebar">
-    <div class="side-section">
-      <h2 class="eyebrow">Project</h2>
-      <select id="project" aria-label="Active project">
-        <option value="">No project</option>
-      </select>
+<div class="topbar">
+  <button class="icon-btn rail-toggle" id="rail-toggle" aria-label="Menu">
+    <svg class="ico" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+  </button>
+  <span class="brand"><span class="brand-dot"></span>QuickJoiner</span>
+  <span class="org-tag" id="org-tag">—</span>
+  <span class="model-tag" id="model-tag"></span>
+  <div class="top-actions">
+    <button class="icon-btn" id="theme-btn" aria-label="Toggle theme" title="Toggle light/dark">
+      <svg class="ico" id="theme-ico" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8Z"/></svg>
+    </button>
+    <button class="icon-btn" id="gear" aria-haspopup="dialog" aria-label="Settings" title="Settings">
+      <svg class="ico" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/></svg>
+    </button>
+  </div>
+</div>
+
+<div class="app">
+  <div class="rail-scrim" id="rail-scrim"></div>
+  <aside class="rail" id="rail">
+    <div class="memory">
+      <div class="m-label">Learned memory</div>
+      <div class="m-nums"><span class="m-big" id="mem-docs">0</span><span class="m-unit">docs</span>
+        <span class="m-big" id="mem-chunks" style="margin-left:12px">0</span><span class="m-unit">chunks</span></div>
+      <div class="m-sub">from <span class="sourcecount" id="mem-sources">0</span>&nbsp;connected system(s)</div>
+    </div>
+
+    <div class="rail-sec">
+      <div class="eyebrow">Project</div>
+      <div class="select-wrap">
+        <select id="project" aria-label="Active project"><option value="">All memory · no project</option></select>
+      </div>
       <form class="mini-form" id="project-form">
-        <input class="mini-input" id="project-name" placeholder="New project name" autocomplete="off">
-        <button class="side-btn" type="submit">Add</button>
+        <input class="mini-input" id="project-name" placeholder="New project" autocomplete="off">
+        <button class="chip-btn" type="submit">Add</button>
       </form>
     </div>
-    <div class="side-section">
-      <h2 class="eyebrow">Conversations</h2>
+
+    <div class="rail-sec">
+      <div class="eyebrow">Conversations</div>
       <div id="convs"></div>
-      <div class="side-actions">
-        <button class="side-btn primary" id="new-conv" type="button">New conversation</button>
-        <button class="side-btn" id="distill" type="button" disabled
-                title="Extract a summary and durable facts from this conversation into memory">Save to memory</button>
+      <div class="row">
+        <button class="chip-btn primary full" id="new-conv" type="button">
+          <svg class="ico" viewBox="0 0 24 24" style="width:14px;height:14px"><path d="M12 5v14M5 12h14"/></svg>New</button>
+        <button class="chip-btn" id="distill" type="button" disabled
+          title="Extract a summary and durable facts from this conversation into memory">Save</button>
       </div>
     </div>
-    <div class="side-section">
-      <h2 class="eyebrow">Connected systems</h2>
+
+    <div class="rail-sec">
+      <div class="eyebrow">Connected systems
+        <button class="link" id="rail-manage" type="button">Manage
+          <svg class="ico" viewBox="0 0 24 24" style="width:12px;height:12px"><path d="M9 6l6 6-6 6"/></svg></button>
+      </div>
       <div id="sources"></div>
     </div>
   </aside>
-  <section id="chatcol">
-    <div id="chat"></div>
-    <form id="form">
-      <span class="prompt-mark">▸</span>
-      <input type="text" id="input" placeholder="Ask about this organization — answers cite what was learned" autocomplete="off">
-      <button class="send" id="send" type="submit">Ask</button>
-    </form>
+
+  <section class="canvas">
+    <div class="thread"><div class="thread-inner" id="thread"></div></div>
+    <div class="composer-wrap">
+      <form class="composer" id="composer">
+        <textarea id="input" rows="1" placeholder="Ask about this organization…" autocomplete="off"></textarea>
+        <button class="send" id="send" type="submit" aria-label="Ask">
+          <svg class="ico" viewBox="0 0 24 24"><path d="M7 11l5-5 5 5M12 6v13"/></svg>
+        </button>
+      </form>
+      <div class="composer-note">Answers are grounded in learned memory and <b>cite their sources</b> — or say what hasn't been learned yet.</div>
+    </div>
   </section>
-</main>
+</div>
+
+<div id="backdrop"></div>
+<aside id="drawer" role="dialog" aria-modal="true" aria-label="Settings">
+  <div class="drawer-head">
+    <span class="dh-ic"><svg class="ico" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/></svg></span>
+    <span class="t">Settings</span>
+    <button class="icon-btn x" id="drawer-close" aria-label="Close settings">
+      <svg class="ico" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+  </div>
+  <div class="drawer-body">
+    <div class="drawer-status" id="drawer-status" aria-live="polite"></div>
+    <div><div class="sec-title">Account</div><div id="account"></div></div>
+    <div><div class="sec-title">Connectors</div><div id="connectors"></div></div>
+  </div>
+</aside>
+
 <script>
-const chat = document.getElementById("chat");
-const form = document.getElementById("form");
-const input = document.getElementById("input");
-const send = document.getElementById("send");
-const projectSel = document.getElementById("project");
-const convsEl = document.getElementById("convs");
-const distillBtn = document.getElementById("distill");
-let sessionId = null;
-let currentProject = "";
+/* ============ helpers ============ */
+const $ = (id) => document.getElementById(id);
+const thread = $("thread");
+const composer = $("composer");
+const input = $("input");
+const send = $("send");
+const projectSel = $("project");
+const convsEl = $("convs");
+const distillBtn = $("distill");
+let sessionId = null, currentProject = "", knowledge = {documents:0, sources:0};
 
-const now = () => new Date().toTimeString().slice(0, 5);
-const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+const now = () => new Date().toTimeString().slice(0,5);
+const esc = (s) => s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+const el = (tag, cls, html) => { const n=document.createElement(tag); if(cls)n.className=cls;
+  if(html!=null)n.innerHTML=html; return n; };
 
-function entry(role, who) {
-  const div = document.createElement("div");
-  div.className = "entry " + role;
-  div.innerHTML = `<div class="gutter"><span class="who">${who}</span>` +
-    `<span class="ts">${now()}</span><div class="stamps"></div></div><div class="body"></div>`;
-  chat.appendChild(div);
-  chat.scrollTop = chat.scrollHeight;
-  return { root: div, body: div.querySelector(".body"), stamps: div.querySelector(".stamps") };
+/* auth: bearer token in localStorage; absent = anonymous / open mode */
+const TOKEN_KEY="qj_token", USER_KEY="qj_user";
+const authHeaders = () => { const t=localStorage.getItem(TOKEN_KEY); return t?{"Authorization":"Bearer "+t}:{}; };
+const apiFetch = (path, opts={}) => fetch(path,{...opts, headers:{...(opts.headers||{}),...authHeaders()}});
+
+/* ============ theme ============ */
+function applyTheme(mode){
+  const root=document.documentElement;
+  if(mode==="dark"||mode==="light") root.setAttribute("data-theme",mode);
+  else root.removeAttribute("data-theme");
+  const dark = mode==="dark" || (mode!=="light" && matchMedia("(prefers-color-scheme:dark)").matches);
+  $("theme-ico").innerHTML = dark
+    ? '<circle cx="12" cy="12" r="4.2"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5 19 19M19 5l-1.5 1.5M6.5 17.5 5 19"/>'
+    : '<path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8Z"/>';
 }
-
-function sysNote(text) {
-  const e = entry("sys", "sys");
-  e.body.textContent = text;
-}
-
-/* Citations arrive inline as [title or uri]; render them as numbered chips. */
-function renderAnswer(el, text) {
-  let n = 0;
-  const html = esc(text).replace(/\[([^\[\]\n]{2,200}?)\]/g, (_, ref) => {
-    n += 1;
-    const label = `<span class="n">${n}</span>${ref}`;
-    return /^https?:\/\//.test(ref)
-      ? `<a class="cite" href="${ref}" target="_blank" rel="noopener" title="${ref}">${label}</a>`
-      : `<span class="cite" title="${ref}">${label}</span>`;
-  });
-  el.innerHTML = html;
-}
-
-async function loadMeta() {
-  try {
-    const s = await (await fetch("/api/status")).json();
-    document.getElementById("meta").textContent =
-      `${s.org} · ${s.llm.provider}/${s.llm.model} · ${s.stats.documents} docs · ${s.stats.chunks} chunks learned`;
-  } catch { document.getElementById("meta").textContent = "status unavailable"; }
-}
-
-async function loadSources() {
-  const el = document.getElementById("sources");
-  try {
-    const sources = await (await fetch("/api/sources")).json();
-    el.innerHTML = "";
-    if (!sources.length) {
-      el.innerHTML = '<div class="sidebar-hint">Nothing learned yet. Connect a system with ' +
-        '<code>qj connect</code> or teach a fact with <code>qj learn</code>.</div>';
-      return;
-    }
-    for (const s of sources) {
-      const div = document.createElement("div");
-      div.className = "source";
-      div.innerHTML = `${s.configured ? '<button data-name="' + s.name + '">sync</button>' : ""}
-        <div class="name">${esc(s.name)}</div>
-        <div class="info">${esc(s.type)} · ${s.documents} docs</div>`;
-      el.appendChild(div);
-    }
-    el.querySelectorAll("button").forEach(b => b.onclick = async () => {
-      b.textContent = "…";
-      try {
-        const r = await (await fetch("/api/sync/" + encodeURIComponent(b.dataset.name), {method:"POST"})).json();
-        sysNote(`sync ${b.dataset.name}: ${r.result}`);
-      } catch (e) { sysNote("sync failed: " + e); }
-      b.textContent = "sync";
-      loadSources(); loadMeta();
-    });
-  } catch { el.textContent = "unavailable"; }
-}
-
-function greet() {
-  const e = entry("qj", "qj");
-  e.body.innerHTML = '<div class="answer">Ask me anything about this organization. ' +
-    'I answer only from what I have learned, and every claim cites its source. ' +
-    'If I have not learned something yet, I will say so and point at what to connect.</div>';
-}
-
-function memoBlock(summary) {
-  const memo = document.createElement("details");
-  memo.className = "memo";
-  memo.innerHTML = "<summary>Older turns condensed into memory</summary><pre></pre>";
-  memo.querySelector("pre").textContent = summary;
-  chat.insertBefore(memo, chat.firstChild);
-}
-
-async function loadProjects(selectId) {
-  try {
-    const projects = await (await fetch("/api/projects")).json();
-    projectSel.innerHTML = '<option value="">No project</option>';
-    for (const p of projects) {
-      const opt = document.createElement("option");
-      opt.value = p.id;
-      opt.textContent = `${p.name} (${p.session_count})`;
-      projectSel.appendChild(opt);
-    }
-    projectSel.value = selectId !== undefined ? selectId : currentProject;
-  } catch { /* sidebar stays usable without projects */ }
-}
-
-async function loadConvs() {
-  try {
-    const url = "/api/sessions" + (currentProject ? "?project=" + encodeURIComponent(currentProject) : "");
-    const rows = (await (await fetch(url)).json()).filter(s => s.title || s.est_tokens > 0);
-    convsEl.innerHTML = "";
-    if (!rows.length) {
-      convsEl.innerHTML = '<div class="sidebar-hint">No conversations yet — ask something below.</div>';
-      return;
-    }
-    for (const s of rows.slice(0, 20)) {
-      const div = document.createElement("div");
-      div.className = "conv" + (s.id === sessionId ? " active" : "");
-      const proj = s.project_id && !currentProject ? `<span class="proj">${esc(s.project_id)}</span> · ` : "";
-      div.innerHTML = `<div class="t">${esc(s.title || "(untitled)")}</div>
-        <div class="m">${proj}${s.updated_at.slice(0, 16).replace("T", " ")} · ~${s.est_tokens} tok</div>`;
-      div.onclick = () => openSession(s.id);
-      convsEl.appendChild(div);
-    }
-  } catch { convsEl.textContent = "unavailable"; }
-}
-
-async function openSession(id) {
-  try {
-    const s = await (await fetch("/api/sessions/" + encodeURIComponent(id))).json();
-    sessionId = s.id;
-    distillBtn.disabled = false;
-    if ((s.project_id || "") !== currentProject) {
-      currentProject = s.project_id || "";
-      projectSel.value = currentProject;
-    }
-    chat.innerHTML = "";
-    if (s.summary) memoBlock(s.summary);
-    for (const m of s.messages) {
-      if (m.role === "tool" || !m.content) continue;  // tool internals aren't replayed
-      const e = entry(m.role === "user" ? "user" : "qj", m.role === "user" ? "you" : "qj");
-      e.root.querySelector(".ts").textContent = "";   // original times aren't stored per turn
-      if (m.role === "user") e.body.textContent = m.content;
-      else {
-        const div = document.createElement("div");
-        div.className = "answer";
-        e.body.appendChild(div);
-        renderAnswer(div, m.content);
-      }
-    }
-    loadConvs();
-    input.focus();
-  } catch (e) { sysNote("could not open conversation: " + e); }
-}
-
-function newConversation() {
-  sessionId = null;
-  distillBtn.disabled = true;
-  chat.innerHTML = "";
-  greet();
-  loadConvs();
-  input.focus();
-}
-
-document.getElementById("new-conv").onclick = newConversation;
-
-projectSel.onchange = () => {
-  currentProject = projectSel.value;
-  newConversation();
+let themeMode = localStorage.getItem("qj_theme") || "system";
+applyTheme(themeMode);
+$("theme-btn").onclick = () => {
+  const attr = document.documentElement.getAttribute("data-theme");
+  const effectiveDark = attr ? attr==="dark" : matchMedia("(prefers-color-scheme:dark)").matches;
+  themeMode = effectiveDark ? "light" : "dark";  // always flip what's on screen
+  localStorage.setItem("qj_theme", themeMode); applyTheme(themeMode);
 };
 
-document.getElementById("project-form").addEventListener("submit", async (ev) => {
-  ev.preventDefault();
-  const name = document.getElementById("project-name").value.trim();
-  if (!name) return;
-  try {
-    const p = await (await fetch("/api/projects", {
-      method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({name}),
-    })).json();
-    document.getElementById("project-name").value = "";
-    currentProject = p.id;
-    await loadProjects(p.id);
-    newConversation();
-  } catch (e) { sysNote("could not create project: " + e); }
+/* ============ mobile rail ============ */
+const rail=$("rail"), railScrim=$("rail-scrim");
+const closeRail=()=>{rail.classList.remove("open");railScrim.classList.remove("open");};
+$("rail-toggle").onclick=()=>{rail.classList.toggle("open");railScrim.classList.toggle("open");};
+railScrim.onclick=closeRail;
+
+/* ============ message rendering ============ */
+function addMsg(role, who){
+  const m = el("div","msg "+role);
+  const av = role==="user" ? "you" : (role==="agent"?"QJ":"·");
+  m.innerHTML = `<div class="avatar">${av}</div><div class="msg-body">
+    <div class="who"><span>${who}</span><span class="ts">${now()}</span></div></div>`;
+  thread.appendChild(m);
+  scrollDown();
+  return { root:m, body:m.querySelector(".msg-body") };
+}
+function scrollDown(){ const t=thread.parentElement; t.scrollTop=t.scrollHeight; }
+function sysNote(text){
+  const m = addMsg("agent","system");
+  m.body.appendChild(el("div","answer",esc(text)));
+}
+
+const REFUSAL = /haven'?t learned|not (yet )?learned|don'?t (yet )?have|no.*(learned|in memory)/i;
+function renderAnswer(container, text){
+  const refused = REFUSAL.test(text.slice(0,140));
+  const ans = el("div","answer"+(refused?" refused":""));
+  const tag = el("div", "grounded-tag"+(refused?" refused-tag":""));
+  let n=0;
+  const html = esc(text).replace(/\[([^\[\]\n]{2,200}?)\]/g,(_,ref)=>{
+    n++; const isUrl=/^https?:\/\//.test(ref);
+    const inner=`<span class="cn">${n}</span><span class="ct">${ref}</span>`;
+    return isUrl
+      ? `<a class="cite" href="${ref}" target="_blank" rel="noopener" title="${ref}">${inner}</a>`
+      : `<span class="cite" title="${ref}">${inner}</span>`;
+  });
+  ans.innerHTML = html;
+  tag.innerHTML = refused
+    ? '<svg class="ico" viewBox="0 0 24 24" style="width:12px;height:12px"><path d="M12 8v4M12 16h.01"/><circle cx="12" cy="12" r="9"/></svg>Not learned yet'
+    : (n?`<svg class="ico" viewBox="0 0 24 24" style="width:12px;height:12px"><path d="M20 6 9 17l-5-5"/></svg>Grounded · ${n} source${n>1?"s":""}`
+        :'<svg class="ico" viewBox="0 0 24 24" style="width:12px;height:12px"><path d="M20 6 9 17l-5-5"/></svg>Grounded');
+  const wrap = el("div");
+  if(refused || n){ ans.style.marginTop="8px"; wrap.appendChild(tag); }
+  wrap.appendChild(ans);
+  container.appendChild(wrap);
+}
+
+/* ============ status / memory ============ */
+async function loadMeta(){
+  try{
+    const s = await (await apiFetch("/api/status")).json();
+    $("org-tag").textContent = s.org;
+    $("model-tag").textContent = `${s.llm.provider} · ${s.llm.model}`;
+    $("mem-docs").textContent = s.stats.documents;
+    $("mem-chunks").textContent = s.stats.chunks;
+    $("mem-sources").textContent = s.stats.sources;
+    knowledge = {documents:s.stats.documents, sources:s.stats.sources};
+    if(!sessionId && !thread.children.length) welcome();
+  }catch{ $("org-tag").textContent="offline"; }
+}
+
+/* ============ sources (rail glance) ============ */
+async function loadSources(){
+  const box=$("sources");
+  try{
+    const sources = await (await apiFetch("/api/sources")).json();
+    box.innerHTML="";
+    const configured = sources.filter(s=>s.configured);
+    if(!configured.length){
+      box.appendChild(el("div","hint","Nothing connected yet. Open <b>Manage</b> to add a system, "
+        +"or teach a fact with <code>qj learn</code>."));
+      return;
+    }
+    for(const s of configured){
+      const row=el("div","sys-item");
+      row.innerHTML=`<span class="sys-dot"></span><span class="s-name">${esc(s.name)}</span>
+        <span class="s-meta">${s.documents}</span>`;
+      row.title = `${s.type} · ${s.documents} docs`;
+      box.appendChild(row);
+    }
+  }catch{ box.textContent="unavailable"; }
+}
+
+/* ============ projects ============ */
+async function loadProjects(selectId){
+  try{
+    const projects = await (await apiFetch("/api/projects")).json();
+    projectSel.innerHTML='<option value="">All memory · no project</option>';
+    for(const p of projects){
+      const o=el("option"); o.value=p.id; o.textContent=`${p.name} (${p.session_count})`;
+      projectSel.appendChild(o);
+    }
+    projectSel.value = selectId!==undefined ? selectId : currentProject;
+  }catch{}
+}
+projectSel.onchange=()=>{ currentProject=projectSel.value; newConversation(); };
+$("project-form").addEventListener("submit", async (e)=>{
+  e.preventDefault();
+  const name=$("project-name").value.trim(); if(!name)return;
+  try{
+    const p = await (await apiFetch("/api/projects",{method:"POST",
+      headers:{"Content-Type":"application/json"},body:JSON.stringify({name})})).json();
+    $("project-name").value=""; currentProject=p.id; await loadProjects(p.id); newConversation();
+  }catch(e){ sysNote("could not create project: "+e); }
 });
 
-distillBtn.onclick = async () => {
-  if (!sessionId) return;
-  distillBtn.disabled = true;
-  try {
-    const resp = await fetch("/api/sessions/" + encodeURIComponent(sessionId) + "/distill", {method: "POST"});
-    const data = await resp.json();
-    if (resp.ok) {
-      sysNote(`saved to memory: ${data.facts_learned} durable fact(s) extracted`);
-      loadSources(); loadMeta();
-    } else {
-      sysNote("could not save to memory: " + (data.detail || resp.status));
+/* ============ conversations ============ */
+async function loadConvs(){
+  try{
+    const url="/api/sessions"+(currentProject?"?project="+encodeURIComponent(currentProject):"");
+    const rows=(await (await apiFetch(url)).json()).filter(s=>s.title||s.est_tokens>0);
+    convsEl.innerHTML="";
+    if(!rows.length){ convsEl.appendChild(el("div","hint","No conversations yet — ask something below."));
+      return; }
+    for(const s of rows.slice(0,24)){
+      const item=el("div","chat-item"+(s.id===sessionId?" active":""));
+      const proj = s.project_id&&!currentProject ? `<span class="proj">${esc(s.project_id)}</span> · ` : "";
+      item.innerHTML=`<div class="ci-t">${esc(s.title||"(untitled)")}</div>
+        <div class="ci-m">${proj}${s.updated_at.slice(0,16).replace("T"," ")} · ~${s.est_tokens} tok</div>`;
+      item.onclick=()=>{ openSession(s.id); closeRail(); };
+      convsEl.appendChild(item);
     }
-  } catch (e) { sysNote("could not save to memory: " + e); }
-  distillBtn.disabled = false;
+  }catch{ convsEl.textContent="unavailable"; }
+}
+async function openSession(id){
+  try{
+    const s=await (await apiFetch("/api/sessions/"+encodeURIComponent(id))).json();
+    sessionId=s.id; distillBtn.disabled=false;
+    if((s.project_id||"")!==currentProject){ currentProject=s.project_id||""; projectSel.value=currentProject; }
+    thread.innerHTML="";
+    if(s.summary) memoBlock(s.summary);
+    for(const m of s.messages){
+      if(m.role==="tool"||!m.content) continue;
+      const e=addMsg(m.role==="user"?"user":"agent", m.role==="user"?"you":"QJ");
+      e.body.querySelector(".ts").textContent="";
+      if(m.role==="user") e.body.appendChild(el("div","user-text",esc(m.content)));
+      else renderAnswer(e.body, m.content);
+    }
+    loadConvs(); input.focus();
+  }catch(e){ sysNote("could not open conversation: "+e); }
+}
+function memoBlock(summary){
+  const d=el("details","memo","<summary>Older turns condensed into memory</summary><pre></pre>");
+  d.querySelector("pre").textContent=summary;
+  thread.insertBefore(d, thread.firstChild);
+}
+function newConversation(){
+  sessionId=null; distillBtn.disabled=true; thread.innerHTML=""; welcome(); loadConvs(); input.focus();
+}
+$("new-conv").onclick=newConversation;
+
+distillBtn.onclick=async ()=>{
+  if(!sessionId)return; distillBtn.disabled=true;
+  try{
+    const resp=await apiFetch("/api/sessions/"+encodeURIComponent(sessionId)+"/distill",{method:"POST"});
+    const data=await resp.json();
+    if(resp.ok){ sysNote(`Saved to memory: ${data.facts_learned} durable fact(s) extracted.`);
+      loadSources(); loadMeta(); }
+    else sysNote("could not save to memory: "+(data.detail||resp.status));
+  }catch(e){ sysNote("could not save to memory: "+e); }
+  distillBtn.disabled=false;
 };
 
-form.addEventListener("submit", async (ev) => {
-  ev.preventDefault();
-  const message = input.value.trim();
-  if (!message) return;
-  const q = entry("user", "you");
-  q.body.textContent = message;
-  input.value = "";
-  send.disabled = true;
+/* ============ welcome / empty state ============ */
+const STARTERS = ["How do we deploy and roll back?","What should I focus on in week one?",
+  "Who owns the payments service?","Where are the runbooks?"];
+function welcome(){
+  const wrap=el("div","empty");
+  if(knowledge.sources===0 && knowledge.documents===0){
+    wrap.innerHTML=`
+      <span class="badge"><svg class="ico" viewBox="0 0 24 24" style="width:12px;height:12px"><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/><circle cx="12" cy="12" r="4"/></svg>Nothing learned yet</span>
+      <h1>Connect your org, and I'll answer with <span class="gold">receipts</span>.</h1>
+      <p>QuickJoiner learns from the systems your team actually uses — code, tickets, wikis,
+         CI/CD and logs — then answers your onboarding questions grounded only in what it learned.
+         Connect a system to begin.</p>
+      <div class="cta-row">
+        <button class="cta" id="empty-connect"><svg class="ico" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>Connect a system</button>
+      </div>
+      <div class="promises">
+        <div class="promise g"><span class="p-ic"><svg class="ico" viewBox="0 0 24 24" style="width:16px;height:16px"><path d="M20 6 9 17l-5-5"/></svg></span>
+          <div><div class="p-t">Every claim is cited</div><div class="p-d">Answers link back to the exact source they came from.</div></div></div>
+        <div class="promise u"><span class="p-ic"><svg class="ico" viewBox="0 0 24 24" style="width:16px;height:16px"><circle cx="12" cy="12" r="9"/><path d="M12 8v4M12 16h.01"/></svg></span>
+          <div><div class="p-t">It says when it doesn't know</div><div class="p-d">No invented answers — just "haven't learned that yet," and what to connect.</div></div></div>
+        <div class="promise t"><span class="p-ic"><svg class="ico" viewBox="0 0 24 24" style="width:16px;height:16px"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8Z"/></svg></span>
+          <div><div class="p-t">Ask across every system at once</div><div class="p-d">One question spans code, tickets, wikis and deploys.</div></div></div>
+      </div>`;
+    thread.appendChild(wrap);
+    $("empty-connect").onclick=()=>openDrawer(true);
+  } else {
+    wrap.innerHTML=`
+      <span class="badge"><svg class="ico" viewBox="0 0 24 24" style="width:12px;height:12px"><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/><circle cx="12" cy="12" r="4"/></svg>${knowledge.documents} docs · ${knowledge.sources} systems learned</span>
+      <h1>What would you like to know?</h1>
+      <p>Ask anything about this organization. I answer only from what I've learned, and every
+         claim cites its source.</p>
+      <div class="starters" id="starters"></div>`;
+    thread.appendChild(wrap);
+    const sb=wrap.querySelector("#starters");
+    for(const q of STARTERS){ const b=el("button","starter",esc(q));
+      b.onclick=()=>{ input.value=q; input.focus(); autoGrow(); }; sb.appendChild(b); }
+  }
+}
 
-  const a = entry("qj", "qj");
-  a.root.classList.add("streaming");
-  let think = null, answerEl = null, answerText = "";
-  const ensureAnswer = () => {
-    if (!answerEl) { answerEl = document.createElement("div"); answerEl.className = "answer"; a.body.appendChild(answerEl); }
-    return answerEl;
-  };
-  try {
-    const resp = await fetch("/api/chat", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({message, session_id: sessionId, project: currentProject || null}),
-    });
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    while (true) {
-      const {done, value} = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, {stream: true});
-      const events = buffer.split("\n\n");
-      buffer = events.pop();
-      for (const evt of events) {
-        if (!evt.startsWith("data: ")) continue;
-        const payload = JSON.parse(evt.slice(6));
-        if (payload.type === "thinking") {
-          if (!think) {
-            think = document.createElement("details");
-            think.className = "think"; think.open = true;
-            think.innerHTML = "<summary>thinking</summary><pre></pre>";
-            a.body.insertBefore(think, a.body.firstChild);
-          }
-          const pre = think.querySelector("pre");
-          pre.textContent += payload.data;
-          pre.scrollTop = pre.scrollHeight;
-        } else if (payload.type === "delta") {
-          answerText += payload.data;
-          ensureAnswer().textContent = answerText;
-          chat.scrollTop = chat.scrollHeight;
-        } else if (payload.type === "tool_call") {
-          const s = document.createElement("span");
-          s.className = "stamp"; s.title = payload.data; s.textContent = payload.data;
-          a.stamps.appendChild(s);
-        } else if (payload.type === "answer") {
-          sessionId = payload.session_id;
-          renderAnswer(ensureAnswer(), payload.data);
-        } else if (payload.type === "error") {
+/* ============ composer ============ */
+function autoGrow(){ input.style.height="auto"; input.style.height=Math.min(input.scrollHeight,180)+"px"; }
+input.addEventListener("input", autoGrow);
+input.addEventListener("keydown",(e)=>{
+  if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); composer.requestSubmit(); }
+});
+
+composer.addEventListener("submit", async (e)=>{
+  e.preventDefault();
+  const message=input.value.trim(); if(!message)return;
+  const first = thread.querySelector(".empty"); if(first) thread.innerHTML="";
+  const q=addMsg("user","you"); q.body.appendChild(el("div","user-text",esc(message)));
+  input.value=""; autoGrow(); send.disabled=true;
+
+  const a=addMsg("agent","QJ");
+  let think=null, answerText="", answerEl=null, tools=null;
+  const streamAns=()=>{ if(!answerEl){ answerEl=el("div","answer streaming"); a.body.appendChild(answerEl);} return answerEl; };
+  try{
+    const resp=await fetch("/api/chat",{method:"POST",
+      headers:{"Content-Type":"application/json",...authHeaders()},
+      body:JSON.stringify({message, session_id:sessionId, project:currentProject||null})});
+    const reader=resp.body.getReader(); const dec=new TextDecoder(); let buf="";
+    while(true){
+      const {done,value}=await reader.read(); if(done)break;
+      buf+=dec.decode(value,{stream:true});
+      const parts=buf.split("\n\n"); buf=parts.pop();
+      for(const evt of parts){
+        if(!evt.startsWith("data: "))continue;
+        const p=JSON.parse(evt.slice(6));
+        if(p.type==="thinking"){
+          if(!think){ think=el("details","think","<summary>Reasoning</summary><pre></pre>"); think.open=true;
+            a.body.insertBefore(think,a.body.firstChild); }
+          const pre=think.querySelector("pre"); pre.textContent+=p.data; pre.scrollTop=pre.scrollHeight;
+        } else if(p.type==="tool_call"){
+          if(!tools){ tools=el("div","tools"); a.body.insertBefore(tools, think?think.nextSibling:a.body.firstChild); }
+          const c=el("span","toolchip"); c.title=p.data; c.textContent=p.data; tools.appendChild(c);
+        } else if(p.type==="delta"){
+          answerText+=p.data; streamAns().textContent=answerText; scrollDown();
+        } else if(p.type==="answer"){
+          sessionId=p.session_id;
+          if(answerEl){ answerEl.remove(); answerEl=null; }
+          renderAnswer(a.body, p.data);
+        } else if(p.type==="error"){
           a.root.classList.add("error");
-          a.body.textContent = "Could not answer: " + payload.data;
+          if(answerEl){answerEl.remove();answerEl=null;}
+          a.body.appendChild(el("div","answer","Could not answer: "+esc(p.data)));
         }
       }
     }
-  } catch (err) {
-    a.root.classList.add("error");
-    a.body.textContent = "Request failed: " + err;
-  } finally {
-    a.root.classList.remove("streaming");
-    if (think) think.open = false;
-    if (!a.body.textContent.trim()) a.body.innerHTML = '<div class="answer">(no answer)</div>';
-    send.disabled = false;
-    distillBtn.disabled = !sessionId;
-    loadConvs();
-    input.focus();
+  }catch(err){
+    a.root.classList.add("error"); a.body.appendChild(el("div","answer","Request failed: "+esc(String(err))));
+  }finally{
+    if(answerEl) answerEl.classList.remove("streaming");
+    if(think) think.open=false;
+    send.disabled=false; distillBtn.disabled=!sessionId; loadConvs(); loadMeta(); input.focus();
   }
 });
 
-/* ?demo=1 renders a sample grounded exchange (design/QA aid; no backend calls). */
-function demo() {
-  memoBlock("Earlier turns covered the deploy cadence (Fridays via Octopus " +
-    "[https://wiki.acme.test/deploys]) and the rollback path through #deploy-help. " +
-    "The user is preparing for their first release week.");
-  const q = entry("user", "you");
-  q.body.textContent = "Has PAY-123 been implemented and deployed to production?";
-  const a = entry("qj", "qj");
-  for (const t of ["jira_search_pay", "gitlab_search_code_app", "octopus_deployment_status_prod"]) {
-    const s = document.createElement("span");
-    s.className = "stamp"; s.title = t; s.textContent = t;
-    a.stamps.appendChild(s);
-  }
-  const think = document.createElement("details");
-  think.className = "think";
-  think.innerHTML = "<summary>thinking</summary><pre>The ticket mentions a retry budget; " +
-    "I should check MRs referencing PAY-123, then confirm the release version on the dashboard.</pre>";
-  a.body.appendChild(think);
-  const ans = document.createElement("div");
-  ans.className = "answer";
-  a.body.appendChild(ans);
-  renderAnswer(ans, "Yes — implemented and live in production.\n\n" +
-    "PAY-123 (add retry budget to payment calls) was closed last Tuesday " +
-    "[https://acme.atlassian.net/browse/PAY-123]. The change landed via MR !42 " +
-    "[https://gitlab.com/acme/app/-/merge_requests/42] and shipped in release 2.4.1, " +
-    "which the Octopus dashboard shows as the current Production deployment " +
-    "[https://octopus.acme.com/app#/dashboard].");
+/* ============ settings drawer ============ */
+const drawer=$("drawer"), backdrop=$("backdrop");
+const accountEl=$("account"), connectorsEl=$("connectors"), drawerStatus=$("drawer-status");
+const ALL_MODES=["pull","hooks","live","browser","scrape"];
+let authState={enabled:false,user:null}, typesCache=null;
+const MASK="•••";
+
+function dStatus(msg,cls){ drawerStatus.textContent=msg||""; drawerStatus.className="drawer-status"+(cls?" "+cls:""); }
+function openDrawer(toConnectors){
+  drawer.classList.add("open"); backdrop.classList.add("open"); dStatus("");
+  refreshDrawer(toConnectors); $("drawer-close").focus();
+}
+function closeDrawer(){ drawer.classList.remove("open"); backdrop.classList.remove("open"); $("gear").focus(); }
+$("gear").onclick=()=>openDrawer(false);
+$("rail-manage").onclick=()=>{ closeRail(); openDrawer(true); };
+$("drawer-close").onclick=closeDrawer; backdrop.onclick=closeDrawer;
+document.addEventListener("keydown",(e)=>{ if(e.key==="Escape"&&drawer.classList.contains("open"))closeDrawer(); });
+
+async function refreshDrawer(toConnectors){
+  try{ authState=await (await apiFetch("/api/auth/status")).json(); }catch{ authState={enabled:false,user:null}; }
+  renderAccount(); renderConnectors();
 }
 
-loadMeta(); loadSources(); loadProjects(); loadConvs(); greet();
-if (location.search.includes("demo=1")) demo();
+function credForm(pfx, label, onSubmit){
+  const f=el("form",null,`
+    <div class="field"><label for="${pfx}-u">Username</label><input type="text" id="${pfx}-u" autocomplete="username"></div>
+    <div class="field"><label for="${pfx}-p">Password</label><input type="password" id="${pfx}-p" autocomplete="current-password"></div>
+    <div class="btn-row"><button class="chip-btn primary" type="submit">${label}</button></div>`);
+  f.addEventListener("submit",(e)=>{ e.preventDefault();
+    onSubmit(f.querySelector(`#${pfx}-u`).value.trim(), f.querySelector(`#${pfx}-p`).value); });
+  return f;
+}
+async function doLogin(u,p){
+  const resp=await fetch("/api/auth/login",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({username:u,password:p})});
+  const d=await resp.json();
+  if(!resp.ok){ dStatus(d.detail||"Sign-in failed","err"); return false; }
+  localStorage.setItem(TOKEN_KEY,d.token); localStorage.setItem(USER_KEY,d.username);
+  dStatus("Signed in as "+d.username,"ok"); return true;
+}
+async function createUser(u,p,thenLogin){
+  const resp=await apiFetch("/api/auth/users",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({username:u,password:p})});
+  const d=await resp.json();
+  if(!resp.ok){ dStatus(d.detail||"Could not create user","err"); return; }
+  if(thenLogin) await doLogin(u,p); else dStatus(`User ${u} created`,"ok");
+  refreshDrawer(); loadSources();
+}
+function renderAccount(){
+  accountEl.innerHTML="";
+  if(!authState.enabled){
+    accountEl.appendChild(el("div","hint","Open workspace — no sign-in, and every connector is shared. "
+      +"Create the first user to turn on sign-in and private connectors."));
+    const d=el("details","disc","<summary>Turn on sign-in</summary>");
+    d.appendChild(credForm("boot","Create user & sign in",(u,p)=>createUser(u,p,true)));
+    accountEl.appendChild(d); return;
+  }
+  if(!authState.user){
+    const card=el("div","acct-card"); card.appendChild(credForm("login","Sign in",async(u,p)=>{
+      if(await doLogin(u,p)){ refreshDrawer(); loadSources(); } }));
+    accountEl.appendChild(card); return;
+  }
+  const card=el("div","acct-card");
+  card.innerHTML=`<div class="acct-line"><span class="acct-avatar">${esc(authState.user[0]||"?")}</span>
+    <div><div class="a-name">${esc(authState.user)}</div><div class="a-sub">Signed in</div></div></div>`;
+  const out=el("button","chip-btn","Sign out"); out.type="button";
+  out.onclick=async()=>{ await apiFetch("/api/auth/logout",{method:"POST"});
+    localStorage.removeItem(TOKEN_KEY); localStorage.removeItem(USER_KEY);
+    dStatus("Signed out","ok"); refreshDrawer(); loadSources(); };
+  card.querySelector(".acct-line").appendChild(out);
+  accountEl.appendChild(card);
+  const d=el("details","disc","<summary>Add a user</summary>");
+  d.appendChild(credForm("newu","Create user",(u,p)=>createUser(u,p,false)));
+  accountEl.appendChild(d);
+}
+
+async function getTypes(){ if(!typesCache) typesCache=await (await fetch("/api/connectors/types")).json(); return typesCache; }
+function plateMsg(plate,msg,cls){ const e=plate.querySelector(".plate-msg"); e.textContent=msg;
+  e.className="plate-msg"+(cls?" "+cls:""); }
+function actionBtn(label,handler,cls){ const b=el("button","chip-btn"+(cls?" "+cls:""),label); b.type="button";
+  b.onclick=()=>handler(b); return b; }
+
+async function renderConnectors(){
+  connectorsEl.innerHTML="";
+  let rows=[];
+  try{ rows=await (await apiFetch("/api/connectors")).json(); }catch{ connectorsEl.textContent="unavailable"; return; }
+  const types=await getTypes(); const byType=Object.fromEntries(types.map(t=>[t.type,t]));
+  if(!rows.length){
+    connectorsEl.appendChild(el("div","hint","No connectors yet. Connect the systems this org lives in — "
+      +"code, tickets, wikis, deploys — and QuickJoiner learns from them."));
+  }
+  for(const c of rows){
+    const plate=el("div","plate");
+    const label=(byType[c.type]||{}).label||c.type;
+    const shareCls = (c.shared||!c.owner)?"commons":"mine";
+    const shareTxt = (c.shared||!c.owner)?"shared":"only you";
+    const reg=[ c.owner?`by ${c.owner}`:"commons", `${c.documents} docs`,
+      c.last_sync?`synced ${c.last_sync.slice(0,16).replace("T"," ")}`:"never synced" ];
+    plate.innerHTML=`
+      <div class="plate-top">
+        <span class="plate-ic"><svg class="ico" viewBox="0 0 24 24"><path d="M9 2v6M15 2v6M6 8h12v3a6 6 0 0 1-12 0V8ZM12 17v5"/></svg></span>
+        <div><div class="pn">${esc(c.name)}</div><div class="pt">${esc(label)}</div></div>
+        <span class="sharechip ${shareCls}">${shareTxt}</span>
+      </div>
+      <div class="plate-reg">${reg.map(r=>`<span>${esc(r)}</span>`).join("")}</div>
+      <div class="modes">${ALL_MODES.map(m=>`<span class="modechip${(c.modes||[]).includes(m)?" on":""}">${m}</span>`).join("")}</div>
+      <div class="plate-actions"></div><div class="plate-msg"></div>`;
+    const actions=plate.querySelector(".plate-actions");
+    actions.appendChild(actionBtn("Test",async(b)=>{ b.disabled=true; plateMsg(plate,"testing…");
+      try{ const r=await (await apiFetch(`/api/connectors/${encodeURIComponent(c.name)}/test`,{method:"POST"})).json();
+        plateMsg(plate, r.message||(r.ok?"Reachable":"Failed"), r.ok?"ok":"err"); }
+      catch(e){ plateMsg(plate,"Test failed: "+e,"err"); } b.disabled=false; }));
+    actions.appendChild(actionBtn("Sync now",async(b)=>{ b.disabled=true; plateMsg(plate,"syncing…");
+      try{ const resp=await apiFetch(`/api/sync/${encodeURIComponent(c.name)}`,{method:"POST"}); const r=await resp.json();
+        plateMsg(plate, resp.ok?r.result:(r.detail||"Sync failed"), resp.ok?"ok":"err"); loadSources(); loadMeta(); }
+      catch(e){ plateMsg(plate,"Sync failed: "+e,"err"); } b.disabled=false; }));
+    if(c.can_manage && authState.enabled && c.owner){
+      actions.appendChild(actionBtn(c.shared?"Make private":"Share",async()=>{
+        const resp=await apiFetch(`/api/connectors/${encodeURIComponent(c.name)}`,{method:"PATCH",
+          headers:{"Content-Type":"application/json"},body:JSON.stringify({shared:!c.shared})});
+        if(resp.ok) renderConnectors(); else plateMsg(plate,(await resp.json()).detail||"Could not change sharing","err");
+      }));
+    }
+    if(c.can_manage){
+      actions.appendChild(actionBtn("Remove",async(b)=>{
+        if(b.dataset.armed!=="1"){ b.dataset.armed="1"; b.textContent="Confirm?"; b.classList.add("danger");
+          plateMsg(plate,"Removes the configuration; what was already learned stays in memory.");
+          setTimeout(()=>{ b.dataset.armed=""; b.textContent="Remove"; b.classList.remove("danger"); },4000); return; }
+        const resp=await apiFetch(`/api/connectors/${encodeURIComponent(c.name)}`,{method:"DELETE"});
+        if(resp.ok){ renderConnectors(); loadSources(); loadMeta(); } else plateMsg(plate,(await resp.json()).detail||"Could not remove","err");
+      },"danger"));
+    }
+    connectorsEl.appendChild(plate);
+  }
+  if(authState.enabled && !authState.user){
+    connectorsEl.appendChild(el("div","hint","Sign in above to add or manage connectors."));
+    return;
+  }
+  const add=el("button","chip-btn primary full",
+    '<svg class="ico" viewBox="0 0 24 24" style="width:14px;height:14px"><path d="M12 5v14M5 12h14"/></svg>Connect a system');
+  add.type="button"; add.onclick=renderTypePicker;
+  connectorsEl.appendChild(add);
+}
+
+async function renderTypePicker(){
+  const types=await getTypes(); connectorsEl.innerHTML="";
+  const crumb=el("button","crumb",'<svg class="ico" viewBox="0 0 24 24" style="width:12px;height:12px"><path d="M15 6l-6 6 6 6"/></svg>All connectors');
+  crumb.type="button"; crumb.onclick=renderConnectors; connectorsEl.appendChild(crumb);
+  const grid=el("div","typegrid");
+  for(const t of types){
+    const card=el("button","typecard",`<div class="tl">${esc(t.label)}</div><div class="tb">${esc(t.blurb)}</div>`);
+    card.type="button"; card.onclick=()=>renderConnectorForm(t); grid.appendChild(card);
+  }
+  connectorsEl.appendChild(grid);
+}
+function renderConnectorForm(t){
+  connectorsEl.innerHTML="";
+  const crumb=el("button","crumb",'<svg class="ico" viewBox="0 0 24 24" style="width:12px;height:12px"><path d="M15 6l-6 6 6 6"/></svg>Pick another system');
+  crumb.type="button"; crumb.onclick=renderTypePicker; connectorsEl.appendChild(crumb);
+  const form=el("form");
+  let html=`<div class="field"><label for="cf-name">Name *</label>
+    <input type="text" id="cf-name" placeholder="e.g. ${esc(t.type)}-main" autocomplete="off">
+    <div class="fhint">How this connector appears everywhere — pick something recognizable.</div></div>`;
+  for(const f of t.fields){
+    const type=f.secret?"password":"text";
+    const hints=[]; if(f.help)hints.push(esc(f.help));
+    if(f.secret&&f.env)hints.push(`Safer: keep it out of config with env:${f.env}`);
+    if(f.list)hints.push("Several values? Separate with commas.");
+    html+=`<div class="field"><label for="cf-${f.key}">${esc(f.label)}${f.required?" *":""}</label>
+      <input type="${type}" id="cf-${f.key}" placeholder="${esc(f.placeholder)}" autocomplete="off">
+      ${hints.length?`<div class="fhint">${hints.join(" — ")}</div>`:""}</div>`;
+  }
+  const canShare=authState.enabled&&authState.user;
+  form.innerHTML=html+(canShare?`<div class="check"><input type="checkbox" id="cf-share">
+    <label for="cf-share">Share with everyone — others can see, sync, and ask through this connector</label></div>`:"")
+    +`<div class="btn-row"><button class="chip-btn primary" type="submit">Test &amp; save</button>
+      <button class="chip-btn" type="button" id="cf-skip">Save without testing</button></div>
+      <div class="plate-msg" id="cf-msg"></div>`;
+  const submit=async(skip)=>{
+    const name=form.querySelector("#cf-name").value.trim();
+    const msg=form.querySelector("#cf-msg");
+    const fail=(t)=>{ msg.textContent=t; msg.className="plate-msg err"; };
+    if(!name) return fail("Give this connector a name.");
+    const options={};
+    for(const f of t.fields){ let v=form.querySelector(`#cf-${f.key}`).value.trim();
+      if(!v){ if(f.required) return fail(`${f.label} is required.`); continue; }
+      options[f.key]= f.list&&v.includes(",") ? v.split(",").map(s=>s.trim()) : v; }
+    msg.textContent=skip?"saving…":"testing connection…"; msg.className="plate-msg";
+    const resp=await apiFetch("/api/connectors",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({name,type:t.type,options,skip_test:skip,
+        shared:canShare?form.querySelector("#cf-share").checked:true})});
+    const d=await resp.json();
+    if(!resp.ok) return fail(d.detail||"Could not save");
+    dStatus(`Connected ${name}. Sync it to start learning.`,"ok"); renderConnectors(); loadSources(); loadMeta();
+  };
+  form.addEventListener("submit",(e)=>{ e.preventDefault(); submit(false); });
+  form.querySelector("#cf-skip").onclick=()=>submit(true);
+  connectorsEl.appendChild(form); form.querySelector("#cf-name").focus();
+}
+
+/* ============ demo (design/QA aid; ?demo=1) ============ */
+function demo(){
+  thread.innerHTML="";
+  memoBlock("Earlier turns covered the deploy cadence (Fridays via Octopus "
+    +"[https://wiki.acme.test/deploys]) and the rollback path through #deploy-help.");
+  const q=addMsg("user","you"); q.body.appendChild(el("div","user-text","Has PAY-123 been implemented and deployed to production?"));
+  const a=addMsg("agent","QJ");
+  const tools=el("div","tools");
+  for(const t of ["jira_search_pay","gitlab_search_code_app","octopus_deployment_status_prod"]){
+    const c=el("span","toolchip"); c.textContent=t; tools.appendChild(c); }
+  a.body.appendChild(tools);
+  renderAnswer(a.body, "Yes — implemented and live in production.\n\nPAY-123 (add retry budget to payment "
+    +"calls) was closed last Tuesday [https://acme.atlassian.net/browse/PAY-123]. The change landed via "
+    +"MR !42 [https://gitlab.com/acme/app/-/merge_requests/42] and shipped in release 2.4.1, which the "
+    +"Octopus dashboard shows as the current Production deployment [https://octopus.acme.com/app#/dashboard].");
+}
+
+/* ============ boot ============ */
+loadMeta(); loadSources(); loadProjects(); loadConvs();
+if(location.search.includes("demo=1")) demo();
 </script>
 </body>
 </html>
