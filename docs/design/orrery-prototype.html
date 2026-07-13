@@ -1,0 +1,603 @@
+<title>QuickJoiner · The Orrery — concept prototype</title>
+<style>
+  /* ======================================================================
+     THE ORRERY — QuickJoiner concept prototype (design fiction, ~2028)
+     A committed single-world design: a dark cartographic instrument.
+     Metaphor: what the org KNOWS is luminous territory; what it DOESN'T
+     know is visible darkness. Questions are probes. Evidence is thread.
+     Palette honors the shipped product tokens: teal=knowledge/agent,
+     gold=provenance/evidence, violet=unknown/refusal.
+     ====================================================================== */
+  :root{
+    --ground:#060b10;
+    --ground-2:#0a141b;
+    --ink:#e9f3f4;
+    --muted:#7e95a0;
+    --faint:#41565f;
+    --line:#16242c;
+    --teal:#35e0c6;
+    --teal-dim:#1d8b7c;
+    --gold:#d9a441;
+    --gold-dim:#8a6a2e;
+    --violet:#8f7cf6;
+    --violet-dim:#5b4fa8;
+    --panel:rgba(10,20,27,.78);
+    --panel-line:rgba(53,224,198,.14);
+    --display:"Avenir Next","Futura","Century Gothic","Segoe UI",sans-serif;
+    --mono:"Cascadia Code","JetBrains Mono","SF Mono",Consolas,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{
+    background:var(--ground);
+    color:var(--ink);
+    font-family:var(--mono);
+    overflow:hidden;
+  }
+  #stage{position:fixed;inset:0}
+  #field{position:absolute;inset:0;display:block;cursor:crosshair}
+
+  /* ---------- HUD chrome ------------------------------------------------ */
+  .hud{
+    position:absolute;
+    background:var(--panel);
+    border:1px solid var(--panel-line);
+    backdrop-filter:blur(14px);
+    border-radius:4px;
+  }
+  .stamp{
+    font-size:9px;letter-spacing:.22em;text-transform:uppercase;color:var(--faint);
+  }
+
+  /* brand block, top-left */
+  .brand{left:20px;top:18px;padding:14px 18px 12px;border-left:2px solid var(--teal)}
+  .brand h1{
+    font-family:var(--display);
+    font-size:15px;font-weight:600;letter-spacing:.42em;text-transform:uppercase;
+  }
+  .brand h1 span{color:var(--teal)}
+  .brand .stamp{margin-top:6px}
+
+  /* integrity + coverage instruments, top-right */
+  .instruments{right:20px;top:18px;display:flex;gap:0;padding:0}
+  .instruments div{padding:12px 18px 11px;border-left:1px solid var(--line)}
+  .instruments div:first-child{border-left:0}
+  .instruments b{
+    display:block;font-size:19px;font-weight:500;color:var(--ink);
+    font-variant-numeric:tabular-nums;letter-spacing:.02em;
+  }
+  .instruments b.gold{color:var(--gold)}
+  .instruments b.violet{color:var(--violet)}
+  .instruments .stamp{margin-top:3px}
+
+  /* ramp ribbon — the 90-day orbit, top-center */
+  .ramp{
+    left:50%;top:18px;transform:translateX(-50%);
+    padding:11px 20px 13px;min-width:420px;
+  }
+  .ramp .row{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px}
+  .ramp .row b{font-size:11px;letter-spacing:.14em;color:var(--teal);font-weight:500}
+  .track{position:relative;height:22px}
+  .track .line{position:absolute;left:0;right:0;top:10px;height:1px;background:var(--line)}
+  .track .fill{position:absolute;left:0;top:10px;height:1px;width:31%;background:var(--teal)}
+  .track .tick{
+    position:absolute;top:6px;width:1px;height:9px;background:var(--faint);
+  }
+  .track .milestone{
+    position:absolute;top:7px;width:7px;height:7px;border-radius:50%;
+    background:var(--ground);border:1px solid var(--gold);transform:translateX(-50%);
+  }
+  .track .milestone.done{background:var(--gold);border-color:var(--gold)}
+  .track .you{
+    position:absolute;left:31%;top:3px;width:15px;height:15px;border-radius:50%;
+    border:1px solid var(--teal);transform:translateX(-50%);
+    box-shadow:0 0 12px rgba(53,224,198,.45);
+  }
+  .track .you::after{
+    content:"";position:absolute;inset:4px;border-radius:50%;background:var(--teal);
+  }
+  .track .lab{position:absolute;top:24px;transform:translateX(-50%);font-size:8.5px;
+    letter-spacing:.14em;color:var(--faint);text-transform:uppercase;white-space:nowrap}
+
+  /* legend, bottom-left */
+  .legend{left:20px;bottom:20px;padding:12px 16px;display:flex;flex-direction:column;gap:7px}
+  .legend span{display:flex;align-items:center;gap:9px;font-size:9.5px;
+    letter-spacing:.18em;text-transform:uppercase;color:var(--muted)}
+  .legend i{width:8px;height:8px;border-radius:50%;flex:none}
+  .legend .dark i{background:transparent;border:1px dashed var(--violet)}
+
+  /* ---------- the intent line ------------------------------------------ */
+  #intent{
+    position:absolute;left:50%;bottom:26px;transform:translateX(-50%);
+    width:min(680px,86vw);
+  }
+  #intent form{
+    display:flex;align-items:center;gap:12px;
+    background:var(--panel);border:1px solid var(--panel-line);
+    backdrop-filter:blur(16px);border-radius:4px;padding:14px 18px;
+    transition:border-color .3s, box-shadow .3s;
+  }
+  #intent form:focus-within{
+    border-color:rgba(53,224,198,.5);
+    box-shadow:0 0 0 1px rgba(53,224,198,.25), 0 18px 60px -20px rgba(0,0,0,.9);
+  }
+  #intent .sigil{color:var(--teal);font-size:13px;flex:none;animation:sigil 2.6s ease-in-out infinite}
+  @keyframes sigil{0%,100%{opacity:1}50%{opacity:.35}}
+  #q{
+    flex:1;background:transparent;border:0;outline:none;color:var(--ink);
+    font-family:var(--mono);font-size:13.5px;letter-spacing:.02em;
+  }
+  #q::placeholder{color:var(--faint)}
+  #intent button{
+    background:transparent;border:1px solid var(--panel-line);color:var(--teal);
+    font-family:var(--mono);font-size:9.5px;letter-spacing:.2em;text-transform:uppercase;
+    padding:7px 13px;border-radius:3px;cursor:pointer;
+  }
+  #intent button:hover,#intent button:focus-visible{border-color:var(--teal);outline:none}
+  .probes{display:flex;gap:8px;justify-content:center;margin-top:10px;flex-wrap:wrap}
+  .probes button{
+    background:rgba(10,20,27,.6);border:1px solid var(--line);color:var(--muted);
+    font-family:var(--mono);font-size:10px;letter-spacing:.06em;
+    padding:6px 12px;border-radius:99px;cursor:pointer;backdrop-filter:blur(8px);
+  }
+  .probes button:hover,.probes button:focus-visible{color:var(--ink);border-color:var(--teal-dim);outline:none}
+  .probes button.dark-probe:hover{border-color:var(--violet-dim);color:var(--violet)}
+
+  /* ---------- the dossier ------------------------------------------------ */
+  #dossier{
+    position:absolute;right:20px;top:96px;bottom:110px;width:min(390px,90vw);
+    background:var(--panel);border:1px solid var(--panel-line);backdrop-filter:blur(18px);
+    border-radius:4px;padding:0;overflow:hidden;display:none;flex-direction:column;
+    transform:translateX(24px);opacity:0;
+    transition:transform .45s cubic-bezier(.2,.9,.25,1),opacity .45s;
+  }
+  #dossier.show{display:flex}
+  #dossier.in{transform:translateX(0);opacity:1}
+  #dossier header{
+    padding:15px 18px 13px;border-bottom:1px solid var(--line);
+    display:flex;align-items:flex-start;gap:10px;
+  }
+  #dossier header .dot{width:8px;height:8px;border-radius:50%;background:var(--gold);
+    margin-top:4px;flex:none;box-shadow:0 0 10px rgba(217,164,65,.5)}
+  #dossier.refused header .dot{background:var(--violet);box-shadow:0 0 10px rgba(143,124,246,.5)}
+  #dossier header h2{font-family:var(--display);font-size:13px;font-weight:600;
+    letter-spacing:.08em;line-height:1.45;flex:1}
+  #dossier header button{background:none;border:0;color:var(--faint);cursor:pointer;
+    font-family:var(--mono);font-size:14px;padding:0 2px}
+  #dossier header button:hover,#dossier header button:focus-visible{color:var(--ink);outline:none}
+  .verdict{
+    margin:14px 18px 0;display:inline-flex;align-self:flex-start;
+    font-size:9px;letter-spacing:.22em;text-transform:uppercase;
+    padding:5px 10px;border-radius:2px;
+  }
+  .verdict.grounded{color:var(--gold);border:1px solid var(--gold-dim);background:rgba(217,164,65,.07)}
+  .verdict.refused{color:var(--violet);border:1px solid var(--violet-dim);background:rgba(143,124,246,.08)}
+  #claims{padding:12px 18px 18px;overflow-y:auto;display:flex;flex-direction:column;gap:10px}
+  #claims::-webkit-scrollbar{width:4px}
+  #claims::-webkit-scrollbar-thumb{background:var(--line)}
+  .claim{
+    border:1px solid var(--line);border-radius:3px;padding:11px 13px;
+    font-size:12px;line-height:1.65;color:var(--ink);cursor:default;
+    transition:border-color .25s,background .25s;
+  }
+  .claim:hover{border-color:var(--teal-dim);background:rgba(53,224,198,.04)}
+  .claim .ev{
+    display:flex;flex-wrap:wrap;gap:6px;margin-top:9px;
+  }
+  .claim .ev i{
+    font-style:normal;font-size:9px;letter-spacing:.08em;color:var(--gold);
+    border:1px solid rgba(217,164,65,.3);background:rgba(217,164,65,.06);
+    padding:2.5px 7px;border-radius:2px;
+  }
+  .remedy{border-color:var(--violet-dim)!important}
+  .remedy .fixes{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+  .remedy .fixes button{
+    background:rgba(143,124,246,.1);border:1px solid var(--violet-dim);color:var(--violet);
+    font-family:var(--mono);font-size:9.5px;letter-spacing:.14em;text-transform:uppercase;
+    padding:6px 11px;border-radius:2px;cursor:pointer;
+  }
+  .remedy .fixes button:hover,.remedy .fixes button:focus-visible{
+    background:rgba(143,124,246,.2);outline:none}
+  .trail{padding:0 18px 14px}
+  .trail .stamp{color:var(--faint)}
+
+  /* concept stamp bottom-right */
+  .concept{right:20px;bottom:20px;padding:9px 13px;text-align:right}
+
+  @media (max-width:760px){
+    .ramp,.instruments{display:none}
+    #dossier{top:70px}
+  }
+  @media (prefers-reduced-motion:reduce){
+    *{animation:none!important;transition:none!important}
+  }
+</style>
+
+<div id="stage">
+  <canvas id="field" aria-label="Knowledge territory map: luminous regions are learned, dark regions are not yet learned"></canvas>
+
+  <header class="hud brand">
+    <h1>Quick<span>Joiner</span> · Orrery</h1>
+    <div class="stamp">Knowledge territory · payments-platform org</div>
+  </header>
+
+  <div class="hud instruments" role="status">
+    <div><b id="i-entities">312</b><span class="stamp">entities</span></div>
+    <div><b class="gold">100%</b><span class="stamp">claims cited</span></div>
+    <div><b id="i-cov">64%</b><span class="stamp">territory lit</span></div>
+    <div><b class="violet" id="i-gaps">7</b><span class="stamp">dark zones</span></div>
+  </div>
+
+  <div class="hud ramp" aria-label="Ramp trajectory, day 28 of 90">
+    <div class="row"><b>RAMP TRAJECTORY</b><span class="stamp">day 28 / 90</span></div>
+    <div class="track">
+      <div class="line"></div><div class="fill"></div>
+      <div class="tick" style="left:0"></div>
+      <div class="tick" style="left:33.3%"></div>
+      <div class="tick" style="left:66.6%"></div>
+      <div class="tick" style="right:0"></div>
+      <div class="milestone done" style="left:9%" title="Environment running · day 8"></div>
+      <div class="milestone done" style="left:22%" title="First PR merged · day 19"></div>
+      <div class="milestone" style="left:52%" title="On-call ready"></div>
+      <div class="milestone" style="left:88%" title="Leading an epic"></div>
+      <div class="you" title="You · day 28"></div>
+      <div class="lab" style="left:9%">env</div>
+      <div class="lab" style="left:22%">first pr</div>
+      <div class="lab" style="left:52%">on-call</div>
+      <div class="lab" style="left:88%">lead</div>
+    </div>
+  </div>
+
+  <div class="hud legend" aria-hidden="true">
+    <span><i style="background:var(--teal)"></i>repo / service</span>
+    <span><i style="background:var(--gold)"></i>package · evidence</span>
+    <span><i style="background:var(--violet)"></i>ticket · person</span>
+    <span class="dark"><i></i>uncharted — not learned</span>
+  </div>
+
+  <aside id="dossier" aria-live="polite">
+    <header>
+      <span class="dot"></span>
+      <h2 id="d-title"></h2>
+      <button id="d-close" aria-label="Close dossier">✕</button>
+    </header>
+    <span class="verdict grounded" id="d-verdict">grounded · 3 sources</span>
+    <div id="claims"></div>
+    <div class="trail"><span class="stamp" id="d-trail"></span></div>
+  </aside>
+
+  <div id="intent">
+    <form id="intent-form">
+      <span class="sigil" aria-hidden="true">◉</span>
+      <input id="q" type="text" autocomplete="off" spellcheck="false"
+        placeholder="ask the territory — every answer proves itself, or admits the dark"
+        aria-label="Ask a question about the organization" />
+      <button type="submit">probe</button>
+    </form>
+    <div class="probes">
+      <button type="button" data-q="how does checkout relate to nautical models?">checkout ↔ nautical models</button>
+      <button type="button" data-q="who owns the payments gateway?">who owns the gateway?</button>
+      <button type="button" class="dark-probe" data-q="where is the disaster recovery runbook?">DR runbook — dark zone</button>
+    </div>
+  </div>
+
+  <div class="hud concept">
+    <div class="stamp">concept prototype · orrery / w10</div>
+    <div class="stamp">quickjoiner design fiction — 2028</div>
+  </div>
+</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById("field");
+  const ctx = canvas.getContext("2d");
+  const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  let W = 0, H = 0, DPR = 1;
+
+  const TEAL = "#35e0c6", GOLD = "#d9a441", VIOLET = "#8f7cf6";
+
+  /* -- territory ---------------------------------------------------------- */
+  // clusters: [cx, cy, spread, count, palette weights (teal,gold,violet)]
+  const CLUSTERS = [
+    { x:.30, y:.44, s:.085, n:34, w:[.5,.3,.2], label:"payments core" },
+    { x:.47, y:.66, s:.065, n:22, w:[.4,.45,.15], label:"nautical libs" },
+    { x:.62, y:.36, s:.075, n:26, w:[.55,.2,.25], label:"checkout" },
+    { x:.18, y:.70, s:.055, n:16, w:[.35,.25,.4], label:"tickets & people" },
+    { x:.74, y:.62, s:.05,  n:14, w:[.5,.35,.15], label:"deploy" },
+  ];
+  // dark zones: territory the org has NOT learned
+  const FOG = [
+    { x:.86, y:.24, r:.13, label:"DISASTER RECOVERY" },
+    { x:.12, y:.24, r:.10, label:"LEGACY BILLING" },
+  ];
+
+  let nodes = [], edges = [];
+  function rand(a, b){ return a + Math.random() * (b - a); }
+  function pick(w){ const r = Math.random(); return r < w[0] ? TEAL : r < w[0]+w[1] ? GOLD : VIOLET; }
+
+  function build(){
+    nodes = []; edges = [];
+    CLUSTERS.forEach((c, ci) => {
+      const start = nodes.length;
+      for (let i = 0; i < c.n; i++){
+        const a = Math.random() * Math.PI * 2, d = Math.sqrt(Math.random()) * c.s;
+        nodes.push({
+          hx: c.x + Math.cos(a) * d, hy: c.y + Math.sin(a) * d * .8,
+          r: rand(1.4, 3.4), color: pick(c.w), ph: Math.random() * Math.PI * 2,
+          sp: rand(.3, 1), cluster: ci,
+        });
+      }
+      for (let i = 0; i < c.n * 1.15; i++){
+        const a = start + (Math.random() * c.n | 0), b = start + (Math.random() * c.n | 0);
+        if (a !== b) edges.push([a, b, .05]);
+      }
+    });
+    // arteries between clusters
+    [[0,1],[0,2],[1,2],[0,3],[2,4],[1,4]].forEach(([a, b]) => {
+      const na = CLUSTERS[a], nb = CLUSTERS[b];
+      const pa = a * 0 + nodes.findIndex(n => n.cluster === a);
+      const pb = nodes.findIndex(n => n.cluster === b);
+      if (pa >= 0 && pb >= 0) edges.push([pa, pb, .12]);
+    });
+  }
+
+  function resize(){
+    DPR = Math.min(devicePixelRatio || 1, 2);
+    W = innerWidth; H = innerHeight;
+    canvas.width = W * DPR; canvas.height = H * DPR;
+    canvas.style.width = W + "px"; canvas.style.height = H + "px";
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+  addEventListener("resize", resize);
+
+  /* -- probe / thread state ------------------------------------------------ */
+  // phase: idle | fly | link | flare ; t: 0..1
+  const probe = { phase:"idle", t:0, from:null, to:null, targets:[], color:TEAL };
+  let highlight = new Set();
+
+  function px(n){ return { x: n.hx * W + Math.sin(time * .0004 * n.sp + n.ph) * 6,
+                           y: n.hy * H + Math.cos(time * .0005 * n.sp + n.ph) * 6 }; }
+
+  let time = 0;
+  function draw(now){
+    time = now;
+    ctx.clearRect(0, 0, W, H);
+
+    // faint survey grid
+    ctx.strokeStyle = "rgba(53,224,198,.045)"; ctx.lineWidth = 1;
+    const step = 90;
+    ctx.beginPath();
+    for (let x = (W/2) % step; x < W; x += step){ ctx.moveTo(x, 0); ctx.lineTo(x, H); }
+    for (let y = (H/2) % step; y < H; y += step){ ctx.moveTo(0, y); ctx.lineTo(W, y); }
+    ctx.stroke();
+
+    // dark zones — the fog of the unknown
+    FOG.forEach(f => {
+      const fx = f.x * W, fy = f.y * H, fr = f.r * Math.min(W, H) * 1.6;
+      const g = ctx.createRadialGradient(fx, fy, fr * .15, fx, fy, fr);
+      g.addColorStop(0, "rgba(2,4,7,.92)");
+      g.addColorStop(.7, "rgba(4,7,11,.55)");
+      g.addColorStop(1, "rgba(4,7,11,0)");
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(fx, fy, fr, 0, 7); ctx.fill();
+      // dashed frontier
+      ctx.strokeStyle = "rgba(143,124,246,.28)";
+      ctx.setLineDash([3, 7]); ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.arc(fx, fy, fr * .62, 0, 7); ctx.stroke();
+      ctx.setLineDash([]);
+      // pulsing unknowns
+      const pulse = reduced ? .5 : (Math.sin(time * .002 + fx) + 1) / 2;
+      ctx.fillStyle = `rgba(143,124,246,${.25 + pulse * .4})`;
+      ctx.font = "11px monospace"; ctx.textAlign = "center";
+      ctx.fillText("?", fx - fr * .2, fy - 8);
+      ctx.fillText("?", fx + fr * .18, fy + fr * .2);
+      ctx.fillStyle = "rgba(143,124,246,.55)";
+      ctx.font = "8.5px monospace";
+      ctx.fillText("◇ UNCHARTED — " + f.label, fx, fy + fr * .62 + 16);
+    });
+
+    // edges
+    edges.forEach(([a, b, alpha]) => {
+      const pa = px(nodes[a]), pb = px(nodes[b]);
+      const hot = highlight.has(a) || highlight.has(b);
+      ctx.strokeStyle = hot ? "rgba(53,224,198,.5)" : `rgba(120,160,170,${alpha})`;
+      ctx.lineWidth = hot ? 1.2 : .6;
+      ctx.beginPath(); ctx.moveTo(pa.x, pa.y); ctx.lineTo(pb.x, pb.y); ctx.stroke();
+    });
+
+    // nodes
+    nodes.forEach((n, i) => {
+      const p = px(n);
+      const hot = highlight.has(i);
+      ctx.beginPath(); ctx.arc(p.x, p.y, hot ? n.r + 1.6 : n.r, 0, 7);
+      ctx.fillStyle = n.color; ctx.globalAlpha = hot ? 1 : .8; ctx.fill();
+      if (hot){
+        ctx.globalAlpha = .35;
+        ctx.beginPath(); ctx.arc(p.x, p.y, n.r + 7, 0, 7);
+        ctx.strokeStyle = n.color; ctx.lineWidth = 1; ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+    });
+
+    // probe flight + threads
+    if (probe.phase !== "idle"){
+      probe.t = Math.min(1, probe.t + (reduced ? 1 : .016));
+      const e = 1 - Math.pow(1 - probe.t, 3);
+      if (probe.phase === "fly"){
+        const x = probe.from.x + (probe.to.x - probe.from.x) * e;
+        const y = probe.from.y + (probe.to.y - probe.from.y) * e;
+        ctx.strokeStyle = "rgba(53,224,198,.35)"; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(probe.from.x, probe.from.y); ctx.lineTo(x, y); ctx.stroke();
+        ctx.beginPath(); ctx.arc(x, y, 4, 0, 7);
+        ctx.fillStyle = probe.color; ctx.fill();
+        ctx.beginPath(); ctx.arc(x, y, 10 + Math.sin(time * .02) * 3, 0, 7);
+        ctx.strokeStyle = probe.color; ctx.globalAlpha = .5; ctx.stroke(); ctx.globalAlpha = 1;
+        if (probe.t >= 1){ probe.phase = probe.next; probe.t = 0; }
+      } else if (probe.phase === "link"){
+        probe.targets.forEach((ti, k) => {
+          const p = px(nodes[ti]);
+          const seg = Math.max(0, Math.min(1, e * probe.targets.length - k));
+          if (seg <= 0) return;
+          const x = probe.to.x + (p.x - probe.to.x) * seg;
+          const y = probe.to.y + (p.y - probe.to.y) * seg;
+          ctx.strokeStyle = "rgba(217,164,65,.7)"; ctx.lineWidth = 1.3;
+          ctx.setLineDash([5, 4]);
+          ctx.beginPath(); ctx.moveTo(probe.to.x, probe.to.y); ctx.lineTo(x, y); ctx.stroke();
+          ctx.setLineDash([]);
+        });
+        ctx.beginPath(); ctx.arc(probe.to.x, probe.to.y, 5, 0, 7);
+        ctx.fillStyle = GOLD; ctx.fill();
+        if (probe.t >= 1) probe.phase = "hold";
+      } else if (probe.phase === "flare"){
+        for (let k = 0; k < 3; k++){
+          const rr = (probe.t * 90 + k * 26) % 110;
+          ctx.strokeStyle = `rgba(143,124,246,${Math.max(0, .7 - rr / 110)})`;
+          ctx.lineWidth = 1.4;
+          ctx.beginPath(); ctx.arc(probe.to.x, probe.to.y, rr, 0, 7); ctx.stroke();
+        }
+        if (probe.t >= 1) probe.phase = "hold";
+      } else if (probe.phase === "hold"){
+        if (probe.targets.length){
+          probe.targets.forEach(ti => {
+            const p = px(nodes[ti]);
+            ctx.strokeStyle = "rgba(217,164,65,.45)"; ctx.lineWidth = 1;
+            ctx.setLineDash([5, 4]);
+            ctx.beginPath(); ctx.moveTo(probe.to.x, probe.to.y); ctx.lineTo(p.x, p.y); ctx.stroke();
+            ctx.setLineDash([]);
+          });
+          ctx.beginPath(); ctx.arc(probe.to.x, probe.to.y, 5, 0, 7);
+          ctx.fillStyle = GOLD; ctx.fill();
+        }
+      }
+    }
+
+    if (!reduced) requestAnimationFrame(draw);
+  }
+
+  /* -- dossier content ------------------------------------------------------ */
+  const DOSSIERS = {
+    grounded: {
+      title: "checkout ↔ nautical models — proven chain, 2 hops",
+      verdict: "grounded · 3 sources · 2 hops",
+      trail: "probe #147 · retrieval 121 ms · graph_path 2 ms · every claim cited",
+      cluster: 2,
+      claims: [
+        { text: "checkout-svc depends on AppRiver.Nautical.Models 3.2.0 via src/Api/Api.csproj.",
+          ev: ["checkout-svc: dependencies & packages"] },
+        { text: "AppRiver.Nautical.Models is provided by the nautical-models repo (NuGet package id, Models.csproj).",
+          ev: ["nautical-models: dependencies & packages"] },
+        { text: "Team convention: the package is spoken of as “nautical models” — resolved by the org alias table.",
+          ev: ["Conversation: naming conventions"] },
+      ],
+    },
+    owner: {
+      title: "who owns the payments gateway?",
+      verdict: "grounded · 3 sources",
+      trail: "probe #148 · people graph · consent: org policy §4 · every claim cited",
+      cluster: 0,
+      claims: [
+        { text: "The payments guild owns payments-gateway (stated by your onboarding buddy, distilled 2028-03-02).",
+          ev: ["Conversation: week-1 sync"] },
+        { text: "Meena K. authored 61% of commits in the last two quarters and is CODEOWNER for /gateway/**.",
+          ev: ["payments-gateway: commit history", "CODEOWNERS"] },
+        { text: "Escalation path: #payments-oncall, then the guild lead — per the runbook.",
+          ev: ["Gateway runbook v7"] },
+      ],
+    },
+    refused: {
+      title: "where is the disaster recovery runbook?",
+      verdict: "not learned — refusing to guess",
+      trail: "probe #149 · best evidence score 0.31 < calibrated gate 0.55 · refusal logged to gap backlog",
+      refusal: true,
+      claims: [
+        { text: "Nothing in learned territory answers this. This probe entered the DISASTER RECOVERY dark zone — 12 teammates have hit it this month.",
+          ev: [], remedy: true,
+          fixes: ["connect confluence /dr space", "ask Meena — likely owner", "teach me the answer"] },
+      ],
+    },
+  };
+
+  const dossier = document.getElementById("dossier");
+  const dTitle = document.getElementById("d-title");
+  const dVerdict = document.getElementById("d-verdict");
+  const dClaims = document.getElementById("claims");
+  const dTrail = document.getElementById("d-trail");
+
+  function showDossier(d){
+    dTitle.textContent = d.title;
+    dVerdict.textContent = d.verdict;
+    dVerdict.className = "verdict " + (d.refusal ? "refused" : "grounded");
+    dossier.classList.toggle("refused", !!d.refusal);
+    dTrail.textContent = d.trail;
+    dClaims.innerHTML = "";
+    d.claims.forEach((c, i) => {
+      const el = document.createElement("div");
+      el.className = "claim" + (c.remedy ? " remedy" : "");
+      el.innerHTML = c.text +
+        (c.ev.length ? `<span class="ev">${c.ev.map(e => `<i>${e}</i>`).join("")}</span>` : "") +
+        (c.fixes ? `<span class="fixes">${c.fixes.map(f => `<button type="button">${f}</button>`).join("")}</span>` : "");
+      if (!d.refusal){
+        el.addEventListener("mouseenter", () => { highlight = new Set(probe.targets.slice(i, i + 2)); paint(); });
+        el.addEventListener("mouseleave", () => { highlight = new Set(probe.targets); paint(); });
+      }
+      dClaims.appendChild(el);
+    });
+    dossier.classList.add("show");
+    requestAnimationFrame(() => dossier.classList.add("in"));
+  }
+  document.getElementById("d-close").addEventListener("click", () => {
+    dossier.classList.remove("in");
+    setTimeout(() => dossier.classList.remove("show"), 300);
+    probe.phase = "idle"; highlight = new Set(); paint();
+  });
+
+  /* -- launching probes ------------------------------------------------------ */
+  function launch(kind){
+    const d = DOSSIERS[kind];
+    dossier.classList.remove("in"); dossier.classList.remove("show");
+    highlight = new Set();
+    const bar = document.getElementById("intent-form").getBoundingClientRect();
+    probe.from = { x: bar.left + bar.width / 2, y: bar.top };
+    probe.t = 0; probe.phase = "fly";
+    if (d.refusal){
+      probe.color = VIOLET;
+      probe.to = { x: FOG[0].x * W, y: FOG[0].y * H };
+      probe.next = "flare"; probe.targets = [];
+    } else {
+      probe.color = TEAL;
+      const c = CLUSTERS[d.cluster];
+      probe.to = { x: c.x * W, y: c.y * H };
+      const members = nodes.map((n, i) => n.cluster === d.cluster ? i : -1).filter(i => i >= 0);
+      probe.targets = [members[2], members[7], members[12]].filter(i => i != null);
+      probe.next = "link";
+    }
+    const wait = reduced ? 60 : 1500;
+    setTimeout(() => { highlight = new Set(probe.targets); showDossier(d); paint(); }, wait);
+  }
+
+  function route(q){
+    const s = q.toLowerCase();
+    if (s.includes("runbook") || s.includes("disaster") || s.includes("dr ")) return "refused";
+    if (s.includes("own") || s.includes("who")) return "owner";
+    if (s.includes("nautical") || s.includes("checkout") || s.includes("relate")) return "grounded";
+    // unscripted input in this prototype: honesty demo by default
+    return "refused";
+  }
+
+  document.getElementById("intent-form").addEventListener("submit", e => {
+    e.preventDefault();
+    const q = document.getElementById("q").value.trim();
+    if (q) launch(route(q));
+  });
+  document.querySelectorAll(".probes button").forEach(b =>
+    b.addEventListener("click", () => {
+      document.getElementById("q").value = b.dataset.q;
+      launch(route(b.dataset.q));
+    }));
+
+  function paint(){ if (reduced) draw(performance.now()); }
+
+  resize(); build();
+  if (reduced){ draw(0); } else requestAnimationFrame(draw);
+})();
+</script>

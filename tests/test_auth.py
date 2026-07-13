@@ -172,10 +172,76 @@ def test_secret_masking_and_masked_update_keeps_secret(tmp_path, monkeypatch):
         "options": {"token": MASKED, "base_url": "https://ghe2.acme.com/api/v3"},
     })
     assert resp.status_code == 200
-    saved = yaml.safe_load((tmp_path / "ws" / "config.yaml").read_text(encoding="utf-8"))
-    gh = next(s for s in saved["sources"] if s["name"] == "gh")
-    assert gh["options"]["token"] == "ghp_realsecret"
-    assert gh["options"]["base_url"] == "https://ghe2.acme.com/api/v3"
+    # Config now lives in SQLite — read the raw stored source back from the catalog.
+    catalog = Catalog(tmp_path / "ws")
+    gh = next(s for s in catalog.list_source_configs() if s.name == "gh")
+    catalog.close()
+    assert gh.options["token"] == "ghp_realsecret"
+    assert gh.options["base_url"] == "https://ghe2.acme.com/api/v3"
+
+
+def test_connector_sync_interval(tmp_path, monkeypatch):
+    client = _client(tmp_path, monkeypatch)
+    docs = str(tmp_path / "docs")
+    row = client.post("/api/connectors", json={
+        "name": "handbook", "type": "files", "options": {"path": docs},
+        "sync_interval_minutes": 30,
+    }).json()
+    assert row["sync_interval_minutes"] == 30
+
+    # Change it.
+    r = client.patch("/api/connectors/handbook", json={"sync_interval_minutes": 60})
+    assert r.status_code == 200 and r.json()["sync_interval_minutes"] == 60
+
+    # Clear it (back to manual) — None over JSON is ambiguous, so use the explicit flag.
+    r = client.patch("/api/connectors/handbook", json={"clear_sync_interval": True})
+    assert r.status_code == 200 and r.json()["sync_interval_minutes"] is None
+
+    # Persisted to SQLite.
+    catalog = Catalog(tmp_path / "ws")
+    src = next(s for s in catalog.list_source_configs() if s.name == "handbook")
+    catalog.close()
+    assert src.sync_interval_minutes is None
+
+
+def test_settings_get_patch_and_persist(tmp_path, monkeypatch):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "config.yaml").write_text(yaml.safe_dump({"org": "acme", "sources": []}), encoding="utf-8")
+    monkeypatch.setattr(app_module, "create_embedder", lambda cfg: FakeEmbedder())
+    client = TestClient(create_app(ws))
+
+    s = client.get("/api/settings").json()
+    assert s["retrieval"]["min_score"] == 0.55 and s["llm"]["provider"] == "anthropic"
+    assert s["embedding_reindex_required"] is True
+
+    # Open mode: no sign-in required to tune.
+    resp = client.patch("/api/settings", json={
+        "llm": {"provider": "ollama", "model": "gemma4:cloud", "max_tokens": 4096},
+        "retrieval": {"min_score": 0.7, "top_k": 12},
+        "chat": {"learn_from_conversations": False},
+    })
+    assert resp.status_code == 200
+    got = resp.json()
+    assert got["llm"]["model"] == "gemma4:cloud" and got["retrieval"]["min_score"] == 0.7
+
+    # Invalid value -> 400, not a crash.
+    assert client.patch("/api/settings", json={"retrieval": {"min_score": "high"}}).status_code == 400
+
+    # Persisted to SQLite: a fresh app on the same workspace sees the change.
+    client2 = TestClient(create_app(ws))
+    s2 = client2.get("/api/settings").json()
+    assert s2["llm"]["provider"] == "ollama" and s2["retrieval"]["top_k"] == 12
+    assert s2["chat"]["learn_from_conversations"] is False
+
+
+def test_settings_patch_requires_signin_when_auth_enabled(tmp_path, monkeypatch):
+    client = _client(tmp_path, monkeypatch)
+    client.post("/api/auth/users", json={"username": "meena", "password": "pw44"})  # auth on
+    assert client.patch("/api/settings", json={"retrieval": {"top_k": 5}}).status_code == 401
+    tok = client.post("/api/auth/login", json={"username": "meena", "password": "pw44"}).json()["token"]
+    assert client.patch("/api/settings", json={"retrieval": {"top_k": 5}},
+                        headers=_bearer(tok)).status_code == 200
 
 
 def test_connector_types_catalog(tmp_path, monkeypatch):

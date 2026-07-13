@@ -15,6 +15,8 @@ Options:
     start_urls:          one URL or a list — crawl roots (required)
     allow_prefixes:      URL prefixes the crawler may follow (default: each start URL's folder)
     max_pages:           crawl budget (default 30)
+    max_depth:           link-hop limit from a start URL (start page = depth 0; links on it
+                         = depth 1, ...). Unset = unlimited (budget still applies).
     use_browser:         true -> always fetch via the persistent browser profile
     fallback_to_browser: true (default) -> if plain HTTP is blocked, retry the crawl
                          via a real headless browser (needs the browser extra)
@@ -137,6 +139,13 @@ class WebScrapeConnector(Connector):
     def _max_pages(self) -> int:
         return int(self.options.get("max_pages", DEFAULT_MAX_PAGES))
 
+    def _max_depth(self) -> int | None:
+        raw = self.options.get("max_depth")
+        try:
+            return int(raw) if raw not in (None, "") else None
+        except (TypeError, ValueError):
+            return None
+
     def _use_browser(self) -> bool:
         return _truthy(self.options.get("use_browser", ""), False)
 
@@ -218,7 +227,8 @@ class WebScrapeConnector(Connector):
             if self._use_browser() or self._should_fall_back(starts):
                 yield from self._crawl_via_browser(starts, prefixes, budget)
             else:
-                yield from self._crawl(list(starts), set(), prefixes, budget, self._fetch_http)
+                yield from self._crawl(list(starts), set(), prefixes, budget, self._fetch_http,
+                                       self._max_depth())
         finally:
             client = getattr(self, "_client", None)
             if client is not None:
@@ -249,7 +259,7 @@ class WebScrapeConnector(Connector):
 
         with browser_session(self.workspace) as context:
             yield from self._crawl(list(starts), set(), prefixes, budget,
-                                   lambda url: fetch_html(context, url))
+                                   lambda url: fetch_html(context, url), self._max_depth())
 
     def _fetch_http(self, url: str) -> str:
         """Fetch one page politely: rate-limited, retried on transient failures,
@@ -309,10 +319,12 @@ class WebScrapeConnector(Connector):
         rules.parse(text.splitlines())
         return rules
 
-    def _crawl(self, queue, visited, prefixes, budget,
-               fetch: Callable[[str], str]) -> Iterator[Document]:
+    def _crawl(self, starts, visited, prefixes, budget,
+               fetch: Callable[[str], str], max_depth: int | None = None) -> Iterator[Document]:
+        queue: list[tuple[str, int]] = [(url, 0) for url in starts]
+        enqueued = set(url for url in starts)
         while queue and len(visited) < budget:
-            url = queue.pop(0)
+            url, depth = queue.pop(0)
             if url in visited:
                 continue
             visited.add(url)
@@ -327,6 +339,9 @@ class WebScrapeConnector(Connector):
             doc = page_document(url, html)
             if doc:
                 yield doc
+            if max_depth is not None and depth >= max_depth:
+                continue  # deep enough — don't follow this page's links
             for link in extract_links(url, html, prefixes):
-                if link not in visited and link not in queue:
-                    queue.append(link)
+                if link not in enqueued:
+                    enqueued.add(link)
+                    queue.append((link, depth + 1))

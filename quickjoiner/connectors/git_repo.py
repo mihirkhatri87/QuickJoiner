@@ -9,7 +9,8 @@ from typing import Iterator
 from urllib.parse import urlparse, urlunparse
 
 from quickjoiner.connectors.base import ConnectionStatus, Connector, Document, Mode
-from quickjoiner.connectors.files import SKIP_DIRS, read_file_document
+from quickjoiner.connectors.deps import SKIP_DIRS, dependency_document
+from quickjoiner.connectors.files import read_file_document
 from quickjoiner.connectors.registry import register
 from quickjoiner.connectors.util import resolve_secret
 
@@ -77,6 +78,10 @@ class GitRepoConnector(Connector):
                 doc.uri = f"{repo_url}::{rel}"
                 doc.title = f"{self.name}/{rel}"
                 yield doc
+
+        dep_doc = dependency_document(clone_dir, self.name, repo_url)
+        if dep_doc:
+            yield dep_doc
 
         history = self._git(
             "log", f"-n{HISTORY_COMMITS}", "--date=iso",

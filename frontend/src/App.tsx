@@ -1,0 +1,341 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { api, streamChat } from "./api";
+import type { GapsResponse, ProjectRow, SessionRow, SourceRow, Status } from "./types";
+import { buildCommands, startConnectFlow, type CommandCtx, type Flow } from "./commands";
+import { ArtifactModal, type Artifact } from "./components/ArtifactModal";
+import { Chat, type Msg } from "./components/Chat";
+import { Composer } from "./components/Composer";
+import { EmptyState } from "./components/EmptyState";
+import { GapsPanel } from "./components/GapsPanel";
+import { GraphView } from "./components/GraphView";
+import { Rail } from "./components/Rail";
+import { SettingsDrawer } from "./components/SettingsDrawer";
+import { TopBar } from "./components/TopBar";
+
+const uid = () => (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()));
+const now = () => new Date().toTimeString().slice(0, 5);
+
+export default function App() {
+  const [status, setStatus] = useState<Status | null>(null);
+  const [projects, setProjects] = useState<ProjectRow[]>([]);
+  const [sessions, setSessions] = useState<SessionRow[]>([]);
+  const [sources, setSources] = useState<SourceRow[]>([]);
+  const [currentProject, setCurrentProject] = useState("");
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [messages, setMessages] = useState<Msg[]>([]);
+  const [memo, setMemo] = useState<string | null>(null);
+  const [input, setInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [drawer, setDrawer] = useState(false);
+  const [view, setView] = useState<"chat" | "graph">("chat");
+  const [artifact, setArtifact] = useState<Artifact | null>(null);
+  const [learnState, setLearnState] = useState<"idle" | "busy" | "done">("idle");
+  const [gaps, setGaps] = useState<GapsResponse>({ open_count: 0, clusters: [] });
+  const [gapsOpen, setGapsOpen] = useState(false);
+  const flowRef = useRef<Flow | null>(null); // active conversational flow (wizard, follow-up questions)
+  const [rail, setRail] = useState(false); // mobile off-canvas overlay
+  const [collapsed, setCollapsed] = useState(() => localStorage.getItem("qj_rail") === "collapsed");
+
+  // One toggle serves both worlds: overlay below md, collapse at md+.
+  const toggleRail = useCallback(() => {
+    if (window.matchMedia("(min-width: 768px)").matches) {
+      setCollapsed((v) => {
+        localStorage.setItem("qj_rail", v ? "open" : "collapsed");
+        return !v;
+      });
+    } else {
+      setRail((v) => !v);
+    }
+  }, []);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "b") {
+        e.preventDefault();
+        toggleRail();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [toggleRail]);
+
+  const loadStatus = useCallback(() => {
+    api.status().then(setStatus).catch(() => setStatus(null));
+  }, []);
+  const loadSources = useCallback(() => {
+    api.sources().then(setSources).catch(() => setSources([]));
+  }, []);
+  const loadProjects = useCallback(() => {
+    api.projects().then(setProjects).catch(() => setProjects([]));
+  }, []);
+  const loadSessions = useCallback(
+    (project = currentProject) => {
+      api.sessions(project || undefined).then(setSessions).catch(() => setSessions([]));
+    },
+    [currentProject],
+  );
+  const loadGaps = useCallback(() => {
+    api.gaps().then(setGaps).catch(() => setGaps({ open_count: 0, clusters: [] }));
+  }, []);
+
+  useEffect(() => {
+    loadStatus();
+    loadSources();
+    loadProjects();
+    loadSessions("");
+    loadGaps();
+  }, [loadStatus, loadSources, loadProjects, loadSessions, loadGaps]);
+
+  const newConversation = () => {
+    setMessages([]);
+    setMemo(null);
+    setSessionId(null);
+    setRail(false);
+  };
+
+  const openSession = async (id: string) => {
+    try {
+      const s = await api.session(id);
+      setSessionId(s.id);
+      setCurrentProject(s.project_id || "");
+      setMemo(s.summary || null);
+      const msgs: Msg[] = [];
+      for (const m of s.messages) {
+        if (m.role === "tool" || !m.content) continue;
+        msgs.push(
+          m.role === "user"
+            ? { id: uid(), role: "user", text: m.content }
+            : { id: uid(), role: "agent", answer: m.content },
+        );
+      }
+      setMessages(msgs);
+      setRail(false);
+    } catch (e) {
+      setMessages((m) => [...m, { id: uid(), role: "error", text: "Could not open conversation: " + e }]);
+    }
+  };
+
+  const say = (text: string) => setMessages((m) => [...m, { id: uid(), role: "agent", text }]);
+  const sayError = (text: string) => setMessages((m) => [...m, { id: uid(), role: "error", text }]);
+  const pushUser = (text: string) => setMessages((m) => [...m, { id: uid(), role: "user", text, ts: now() }]);
+
+  // Pipeline stages 1-2 (flows + command registry) live in commands.ts;
+  // App provides the capabilities and keeps only the agentic-chat stage.
+  const ctx: CommandCtx = {
+    pushUser,
+    say,
+    sayError,
+    addAgentPlaceholder: () => {
+      const id = uid();
+      setMessages((m) => [...m, { id, role: "agent", streaming: true, ts: now() }]);
+      return id;
+    },
+    patchMessage: (id, fn) => setMessages((list) => list.map((x) => (x.id === id ? fn(x) : x))),
+    setBusy,
+    refresh: () => {
+      loadSources();
+      loadStatus();
+      loadGaps();
+    },
+    setFlow: (f) => {
+      flowRef.current = f;
+    },
+    openArtifact: (a) => {
+      setArtifact(a);
+      setLearnState("idle");
+    },
+  };
+  const commands = buildCommands(ctx);
+
+  const send = async () => {
+    const text = input.trim();
+    if (!text || busy) return;
+    setInput("");
+
+    // Stage 1: an active conversational flow gets first claim on the input.
+    const flow = flowRef.current;
+    if (flow && (await flow.handle(text))) return;
+
+    // Stage 2: deterministic slash commands from the registry.
+    for (const cmd of commands) {
+      const m = text.match(cmd.match);
+      if (m) {
+        await cmd.run(m, text);
+        return;
+      }
+    }
+
+    // Stage 3: the agentic path — /api/chat tool-call loop.
+    const agentId = uid();
+    setMessages((m) => [
+      ...m,
+      { id: uid(), role: "user", text, ts: now() },
+      { id: agentId, role: "agent", streaming: true, ts: now() },
+    ]);
+    setBusy(true);
+    const patch = (fn: (m: Msg) => Msg) =>
+      setMessages((list) => list.map((x) => (x.id === agentId ? fn(x) : x)));
+    try {
+      await streamChat({ message: text, session_id: sessionId, project: currentProject || null }, (e) => {
+        if (e.type === "thinking") patch((m) => ({ ...m, thinking: (m.thinking || "") + e.data }));
+        else if (e.type === "tool_call") patch((m) => ({ ...m, tools: [...(m.tools || []), e.data] }));
+        else if (e.type === "delta") patch((m) => ({ ...m, streamText: (m.streamText || "") + e.data }));
+        else if (e.type === "answer") {
+          setSessionId(e.session_id);
+          patch((m) => ({ ...m, answer: e.data, streaming: false, streamText: undefined }));
+        } else if (e.type === "error")
+          patch((m) => ({ ...m, role: "error", text: "Could not answer: " + e.data, streaming: false }));
+      });
+    } catch (err) {
+      patch((m) => ({ ...m, role: "error", text: "Request failed: " + String(err), streaming: false }));
+    } finally {
+      setBusy(false);
+      patch((m) => ({ ...m, streaming: false }));
+      loadSessions();
+      loadStatus();
+    }
+  };
+
+  const distill = async () => {
+    if (!sessionId) return;
+    try {
+      const r = await api.distill(sessionId);
+      setMessages((m) => [
+        ...m,
+        { id: uid(), role: "agent", answer: `Saved to memory: ${r.facts_learned} durable fact(s) extracted.` },
+      ]);
+      loadSources();
+      loadStatus();
+    } catch (e) {
+      setMessages((m) => [...m, { id: uid(), role: "error", text: "Could not save to memory: " + e }]);
+    }
+  };
+
+  const learnArtifact = async () => {
+    if (!artifact || learnState !== "idle") return;
+    setLearnState("busy");
+    try {
+      await api.learn(artifact.markdown, artifact.title);
+      setLearnState("done");
+      say(`Learned **${artifact.title}** into memory — ask about it any time.`);
+      loadSources();
+      loadStatus();
+    } catch (e) {
+      setLearnState("idle");
+      sayError("Could not learn the report: " + String(e));
+    }
+  };
+
+  const learned = (status?.stats.documents ?? 0) > 0 || sources.some((s) => s.configured);
+
+  return (
+    <div className="flex h-full flex-col">
+      <TopBar status={status} collapsed={collapsed} view={view} onMenu={toggleRail}
+              onSettings={() => setDrawer(true)} onView={setView} />
+      <div className="flex min-h-0 flex-1">
+        <Rail
+          open={rail}
+          collapsed={collapsed}
+          onClose={() => setRail(false)}
+          status={status}
+          projects={projects}
+          currentProject={currentProject}
+          onProject={(id) => {
+            setCurrentProject(id);
+            newConversation();
+            loadSessions(id);
+          }}
+          onNewProject={async (name) => {
+            try {
+              const p = await api.createProject(name);
+              setCurrentProject(p.id);
+              await loadProjects();
+              newConversation();
+              loadSessions(p.id);
+            } catch {
+              /* ignore */
+            }
+          }}
+          sessions={sessions}
+          activeSession={sessionId}
+          onOpenSession={openSession}
+          onNewConversation={newConversation}
+          onDistill={distill}
+          canDistill={!!sessionId}
+          sources={sources}
+          onManage={() => {
+            setRail(false);
+            setDrawer(true);
+          }}
+          gapCount={gaps.open_count}
+          onOpenGaps={() => setGapsOpen(true)}
+        />
+        <section className="relative flex min-w-0 flex-1 flex-col">
+          {view === "graph" ? (
+            <GraphView />
+          ) : (
+            <>
+              {messages.length === 0 ? (
+                <div className="scroll-thin flex-1 overflow-y-auto px-5 py-8 md:px-10">
+                  <EmptyState
+                    learned={learned}
+                    docs={status?.stats.documents ?? 0}
+                    sources={status?.stats.sources ?? 0}
+                    onConnect={() => setDrawer(true)}
+                    onStarter={(q) => setInput(q)}
+                  />
+                </div>
+              ) : (
+                <Chat
+                  messages={messages}
+                  memo={memo}
+                  onOpenArtifact={(a) => {
+                    setArtifact(a);
+                    setLearnState("idle");
+                  }}
+                />
+              )}
+              <Composer value={input} onChange={setInput} onSend={send} disabled={busy} />
+            </>
+          )}
+        </section>
+      </div>
+      <SettingsDrawer
+        open={drawer}
+        onClose={() => setDrawer(false)}
+        onChanged={() => {
+          loadStatus();
+          loadSources();
+        }}
+      />
+      <ArtifactModal
+        artifact={artifact}
+        learnState={learnState}
+        onLearn={learnArtifact}
+        onClose={() => setArtifact(null)}
+      />
+      <GapsPanel
+        open={gapsOpen}
+        data={gaps}
+        onClose={() => setGapsOpen(false)}
+        onConnect={(type) => {
+          setGapsOpen(false);
+          setView("chat");
+          void startConnectFlow(ctx, type);
+        }}
+        onTeach={() => {
+          setGapsOpen(false);
+          setView("chat");
+          setInput("/learn ");
+        }}
+        onDismiss={async (cluster) => {
+          try {
+            await api.resolveGaps(cluster.gap_ids, "dismissed");
+          } finally {
+            loadGaps();
+          }
+        }}
+      />
+    </div>
+  );
+}

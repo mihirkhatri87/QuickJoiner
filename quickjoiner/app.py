@@ -8,20 +8,20 @@ from pathlib import Path
 from quickjoiner.agent.agent import OnboardingAgent
 from quickjoiner.agent.prompts import SYSTEM_PROMPT
 from quickjoiner.agent.tools import build_builtin_tools
-from quickjoiner.config import Config, load_config
+from quickjoiner.config import Config, load_env
 from quickjoiner.ingest.pipeline import IngestPipeline
 from quickjoiner.llm import create_provider
-from quickjoiner.memory.catalog import Catalog
+from quickjoiner.memory.base import CatalogBackend, StoreBackend
 from quickjoiner.memory.embedder import create_embedder
-from quickjoiner.memory.store import KnowledgeStore
+from quickjoiner.memory.factory import create_catalog, create_store
 
 
 @dataclass
 class AppContext:
     workspace: Path
     config: Config
-    catalog: Catalog
-    store: KnowledgeStore
+    catalog: CatalogBackend
+    store: StoreBackend
     pipeline: IngestPipeline
 
     def build_provider(self, provider_override: str | None = None, model_override: str | None = None):
@@ -41,8 +41,13 @@ class AppContext:
         extra_system: str | None = None,
         sources: list | None = None,
     ) -> OnboardingAgent:
+        from quickjoiner.agent.ops import build_ops_tools
+
         provider = self.build_provider(provider_override, model_override)
-        tools = build_builtin_tools(self.store, self.catalog, self.pipeline, self.config.retrieval)
+        tools = build_builtin_tools(
+            self.store, self.catalog, self.pipeline, self.config.retrieval, self.config.gaps
+        )
+        tools.extend(build_ops_tools(self))
         tools.extend(self.connector_tools(sources))
         system = SYSTEM_PROMPT + (f"\n\n{extra_system}" if extra_system else "")
         return OnboardingAgent(provider, tools, system)
@@ -72,10 +77,11 @@ class AppContext:
 
 
 def build_context(workspace: Path) -> AppContext:
-    config = load_config(workspace)
-    catalog = Catalog(workspace)
+    load_env(workspace)
+    catalog = create_catalog(workspace)
+    config = catalog.load_config()
     embedder = create_embedder(config.embedding)
-    store = KnowledgeStore(workspace, embedder)
+    store = create_store(workspace, embedder, config.retrieval)
     pipeline = IngestPipeline(store, catalog)
     return AppContext(
         workspace=workspace, config=config, catalog=catalog, store=store, pipeline=pipeline

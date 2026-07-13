@@ -351,6 +351,24 @@
   details.disc[open] summary::before { content:"–"; }
   details.disc[open] summary { margin-bottom:12px; }
 
+  /* workspace settings form */
+  .settings-form .subhead { font-family:var(--mono); font-size:10px; letter-spacing:.14em;
+            text-transform:uppercase; color:var(--accent); margin:18px 0 11px;
+            padding-bottom:6px; border-bottom:1px solid var(--border-soft); }
+  .settings-form .subhead:first-child { margin-top:0; }
+  .settings-form .two { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .settings-form select.fld { width:100%; background:var(--raised); color:var(--text);
+            border:1px solid var(--border); border-radius:var(--r-sm); padding:9px 11px;
+            font-family:var(--mono); font-size:12.5px; appearance:none; cursor:pointer; }
+  .warn { font-size:11px; color:var(--gold); background:var(--gold-soft);
+            border:1px solid var(--gold-line); border-radius:var(--r-sm); padding:9px 11px;
+            margin:10px 0; line-height:1.5; }
+  .warn b { color:var(--gold-hi); }
+  .settings-form .save-bar { display:flex; align-items:center; gap:10px; margin-top:16px;
+            padding-top:14px; border-top:1px solid var(--border-soft); }
+  .settings-form .save-msg { font-family:var(--mono); font-size:11px; }
+  .settings-form .save-msg.ok { color:var(--accent); } .settings-form .save-msg.err { color:var(--danger); }
+
   /* connector plates */
   .plate { background:var(--raised); border:1px solid var(--border-soft); border-radius:var(--r);
             padding:15px; margin-bottom:12px; }
@@ -372,7 +390,11 @@
             border:1px solid var(--border); border-radius:100px; padding:2px 8px; color:var(--faint); }
   .modechip.on { border-color:color-mix(in srgb,var(--accent) 45%,transparent); color:var(--accent);
             background:var(--accent-soft); }
-  .plate-actions { display:flex; gap:7px; margin-top:13px; flex-wrap:wrap; }
+  .plate-actions { display:flex; gap:7px; margin-top:13px; flex-wrap:wrap; align-items:center; }
+  .sched { font-family:var(--mono); font-size:11px; background:var(--raised); color:var(--muted);
+            border:1px solid var(--border); border-radius:var(--r-sm); padding:7px 9px; cursor:pointer;
+            appearance:none; }
+  .sched:hover { border-color:var(--accent); color:var(--accent); }
   .plate-msg { font-family:var(--mono); font-size:10.5px; margin-top:9px; color:var(--muted);
             white-space:pre-wrap; line-height:1.45; }
   .plate-msg.ok { color:var(--accent); } .plate-msg.err { color:var(--danger); }
@@ -490,6 +512,7 @@
   <div class="drawer-body">
     <div class="drawer-status" id="drawer-status" aria-live="polite"></div>
     <div><div class="sec-title">Account</div><div id="account"></div></div>
+    <div><div class="sec-title">Workspace</div><div id="settings"></div></div>
     <div><div class="sec-title">Connectors</div><div id="connectors"></div></div>
   </div>
 </aside>
@@ -801,6 +824,13 @@ const ALL_MODES=["pull","hooks","live","browser","scrape"];
 let authState={enabled:false,user:null}, typesCache=null;
 const MASK="•••";
 
+const SYNC_OPTS=[["","Manual only"],["15","Every 15 min"],["30","Every 30 min"],
+  ["60","Hourly"],["360","Every 6 hours"],["1440","Daily"]];
+const syncOptionsHtml=(cur)=>SYNC_OPTS.map(([v,l])=>
+  `<option value="${v}" ${String(cur||"")===v?"selected":""}>${l}</option>`).join("");
+function schedLabel(min){ if(!min)return "manual sync";
+  if(min%1440===0)return `every ${min/1440}d`; if(min%60===0)return `every ${min/60}h`; return `every ${min}m`; }
+
 function dStatus(msg,cls){ drawerStatus.textContent=msg||""; drawerStatus.className="drawer-status"+(cls?" "+cls:""); }
 function openDrawer(toConnectors){
   drawer.classList.add("open"); backdrop.classList.add("open"); dStatus("");
@@ -814,7 +844,81 @@ document.addEventListener("keydown",(e)=>{ if(e.key==="Escape"&&drawer.classList
 
 async function refreshDrawer(toConnectors){
   try{ authState=await (await apiFetch("/api/auth/status")).json(); }catch{ authState={enabled:false,user:null}; }
-  renderAccount(); renderConnectors();
+  renderAccount(); renderSettings(); renderConnectors();
+}
+
+/* -- workspace settings ------------------------------------------------ */
+async function renderSettings(){
+  const box=$("settings"); box.innerHTML="";
+  let s;
+  try{ s=await (await apiFetch("/api/settings")).json(); }catch{ box.textContent="unavailable"; return; }
+  const locked = authState.enabled && !authState.user;
+  const f=el("form","settings-form");
+  const num=(id,label,val,hint)=>`<div class="field"><label for="st-${id}">${label}</label>
+    <input type="text" id="st-${id}" value="${val}" inputmode="decimal">${hint?`<div class="fhint">${hint}</div>`:""}</div>`;
+  const bool=(id,label,val)=>`<div class="check"><input type="checkbox" id="st-${id}" ${val?"checked":""}>
+    <label for="st-${id}">${label}</label></div>`;
+  const provOpts=(v)=>["anthropic","ollama"].map(p=>`<option value="${p}" ${p===v?"selected":""}>${p}</option>`).join("");
+  const embOpts=(v)=>["fastembed","ollama"].map(p=>`<option value="${p}" ${p===v?"selected":""}>${p}</option>`).join("");
+  f.innerHTML=`
+    <div class="subhead">Language model</div>
+    <div class="field"><label for="st-provider">Provider</label>
+      <select class="fld" id="st-provider">${provOpts(s.llm.provider)}</select></div>
+    <div class="field"><label for="st-model">Model</label>
+      <input type="text" id="st-model" value="${esc(s.llm.model||"")}" placeholder="default for provider" autocomplete="off"></div>
+    <div class="field"><label for="st-base_url">Ollama base URL</label>
+      <input type="text" id="st-base_url" value="${esc(s.llm.base_url||"")}" autocomplete="off"></div>
+    <div class="two">${num("max_tokens","Max tokens",s.llm.max_tokens)}${num("thinking_budget","Thinking budget",s.llm.thinking_budget)}</div>
+    ${bool("thinking","Extended thinking (uses more tokens / quota)",s.llm.thinking)}
+
+    <div class="subhead">Retrieval</div>
+    <div class="two">${num("top_k","Top-K chunks",s.retrieval.top_k)}${num("min_score","Grounding threshold",s.retrieval.min_score,"0–1; higher = stricter grounding")}</div>
+
+    <div class="subhead">Conversations</div>
+    <div class="two">${num("compress_after_est_tokens","Compress after (tokens)",s.chat.compress_after_est_tokens)}${num("keep_recent_messages","Keep recent msgs",s.chat.keep_recent_messages)}</div>
+    ${num("tool_result_max_chars","Tool-result cap (chars)",s.chat.tool_result_max_chars)}
+    ${bool("learn_from_conversations","Distill durable facts from chats into memory",s.chat.learn_from_conversations)}
+
+    <details class="disc"><summary>Embedding (advanced)</summary>
+      <div class="warn"><b>Changing embeddings needs a re-index.</b> Existing vectors are in the current
+        model's space — after changing this, restart the server and re-sync every source, or search breaks.</div>
+      <div class="field"><label for="st-eprovider">Provider</label>
+        <select class="fld" id="st-eprovider">${embOpts(s.embedding.provider)}</select></div>
+      <div class="field"><label for="st-emodel">Model</label>
+        <input type="text" id="st-emodel" value="${esc(s.embedding.model||"")}" placeholder="default for provider" autocomplete="off"></div>
+    </details>
+
+    <div class="save-bar">
+      <button class="chip-btn primary" type="submit">Save settings</button>
+      <span class="save-msg" id="st-msg"></span>
+    </div>`;
+  if(locked){
+    box.appendChild(el("div","hint","Sign in above to change workspace settings."));
+    f.querySelectorAll("input,select,button").forEach(e=>e.disabled=true);
+  }
+  const msg=()=>f.querySelector("#st-msg");
+  const val=(id)=>f.querySelector(`#st-${id}`).value.trim();
+  const numv=(id)=>{ const n=Number(val(id)); return Number.isFinite(n)?n:undefined; };
+  f.addEventListener("submit", async (e)=>{
+    e.preventDefault();
+    const body={
+      llm:{ provider:f.querySelector("#st-provider").value, model:val("model")||null,
+            base_url:val("base_url"), max_tokens:numv("max_tokens"),
+            thinking:f.querySelector("#st-thinking").checked, thinking_budget:numv("thinking_budget") },
+      retrieval:{ top_k:numv("top_k"), min_score:numv("min_score") },
+      chat:{ compress_after_est_tokens:numv("compress_after_est_tokens"),
+             keep_recent_messages:numv("keep_recent_messages"),
+             tool_result_max_chars:numv("tool_result_max_chars"),
+             learn_from_conversations:f.querySelector("#st-learn_from_conversations").checked },
+      embedding:{ provider:f.querySelector("#st-eprovider").value, model:val("emodel")||null },
+    };
+    msg().textContent="saving…"; msg().className="save-msg";
+    const resp=await apiFetch("/api/settings",{method:"PATCH",
+      headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    if(resp.ok){ msg().textContent="Saved"; msg().className="save-msg ok"; loadMeta(); }
+    else { const d=await resp.json(); msg().textContent=(d.detail||"Invalid").slice(0,80); msg().className="save-msg err"; }
+  });
+  box.appendChild(f);
 }
 
 function credForm(pfx, label, onSubmit){
@@ -891,7 +995,8 @@ async function renderConnectors(){
     const shareCls = (c.shared||!c.owner)?"commons":"mine";
     const shareTxt = (c.shared||!c.owner)?"shared":"only you";
     const reg=[ c.owner?`by ${c.owner}`:"commons", `${c.documents} docs`,
-      c.last_sync?`synced ${c.last_sync.slice(0,16).replace("T"," ")}`:"never synced" ];
+      c.last_sync?`synced ${c.last_sync.slice(0,16).replace("T"," ")}`:"never synced",
+      schedLabel(c.sync_interval_minutes) ];
     plate.innerHTML=`
       <div class="plate-top">
         <span class="plate-ic"><svg class="ico" viewBox="0 0 24 24"><path d="M9 2v6M15 2v6M6 8h12v3a6 6 0 0 1-12 0V8ZM12 17v5"/></svg></span>
@@ -918,6 +1023,18 @@ async function renderConnectors(){
       }));
     }
     if(c.can_manage){
+      const sched=el("select","sched");
+      sched.title="Automatic sync schedule";
+      sched.innerHTML=syncOptionsHtml(c.sync_interval_minutes);
+      sched.onchange=async()=>{
+        const v=sched.value;
+        const body=v===""?{clear_sync_interval:true}:{sync_interval_minutes:Number(v)};
+        const resp=await apiFetch(`/api/connectors/${encodeURIComponent(c.name)}`,{method:"PATCH",
+          headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+        if(resp.ok){ plateMsg(plate, v===""?"Set to manual sync":`Scheduled: ${schedLabel(Number(v))} (takes effect on server restart)`,"ok"); renderConnectors(); }
+        else plateMsg(plate,(await resp.json()).detail||"Could not set schedule","err");
+      };
+      actions.appendChild(sched);
       actions.appendChild(actionBtn("Remove",async(b)=>{
         if(b.dataset.armed!=="1"){ b.dataset.armed="1"; b.textContent="Confirm?"; b.classList.add("danger");
           plateMsg(plate,"Removes the configuration; what was already learned stays in memory.");
@@ -967,6 +1084,9 @@ function renderConnectorForm(t){
       ${hints.length?`<div class="fhint">${hints.join(" — ")}</div>`:""}</div>`;
   }
   const canShare=authState.enabled&&authState.user;
+  html+=`<div class="field"><label for="cf-sync">Sync automatically</label>
+    <select class="fld" id="cf-sync">${syncOptionsHtml("")}</select>
+    <div class="fhint">Keep memory fresh on a schedule (needs the server running).</div></div>`;
   form.innerHTML=html+(canShare?`<div class="check"><input type="checkbox" id="cf-share">
     <label for="cf-share">Share with everyone — others can see, sync, and ask through this connector</label></div>`:"")
     +`<div class="btn-row"><button class="chip-btn primary" type="submit">Test &amp; save</button>
@@ -982,8 +1102,10 @@ function renderConnectorForm(t){
       if(!v){ if(f.required) return fail(`${f.label} is required.`); continue; }
       options[f.key]= f.list&&v.includes(",") ? v.split(",").map(s=>s.trim()) : v; }
     msg.textContent=skip?"saving…":"testing connection…"; msg.className="plate-msg";
+    const syncVal=form.querySelector("#cf-sync").value;
     const resp=await apiFetch("/api/connectors",{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({name,type:t.type,options,skip_test:skip,
+        sync_interval_minutes:syncVal?Number(syncVal):null,
         shared:canShare?form.querySelector("#cf-share").checked:true})});
     const d=await resp.json();
     if(!resp.ok) return fail(d.detail||"Could not save");

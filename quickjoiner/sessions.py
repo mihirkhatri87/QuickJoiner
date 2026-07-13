@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
+from dataclasses import dataclass
 from typing import Any
 
 from quickjoiner.connectors.base import Document
@@ -37,8 +38,52 @@ identifiers, and citations like [uri] verbatim>
 FACTS:
 - <one durable organization fact per line, worth remembering beyond this conversation>
 
-If there are no durable facts, leave the FACTS section empty. Output nothing else.\
+RELATIONSHIPS:
+- <type>: <name> | <relation> | <type>: <name>
+
+RELATIONSHIPS lines record concrete links between two NAMED things that this
+conversation established (e.g. "team: payments guild | owns | repo: proj-a").
+Allowed types: repo, package, project, service, environment, ticket, person, team.
+Allowed relations: depends_on, provides, references, part_of, deploys, owns, works_on.
+Use names exactly as the conversation gave them. Never invent relationships.
+
+If a section has nothing, leave it empty. Output nothing else.\
 """
+
+# Distill-time triples (knowledge graph Phase C). LLM output is never trusted
+# into the graph without shape validation against these vocabularies.
+TRIPLE_TYPES = {"repo", "package", "project", "service", "environment", "ticket",
+                "person", "team"}
+TRIPLE_RELS = {"depends_on", "provides", "references", "part_of", "deploys",
+               "owns", "works_on"}
+_TRIPLE_LINE = re.compile(
+    r"^([a-z_]+)\s*:\s*(.{1,80}?)\s*\|\s*([a-z_]+)\s*\|\s*([a-z_]+)\s*:\s*(.{1,80}?)$"
+)
+_MAX_TRIPLES = 20
+
+
+@dataclass(frozen=True)
+class Triple:
+    src_type: str
+    src_name: str
+    rel: str
+    dst_type: str
+    dst_name: str
+
+
+def parse_triples(lines: list[str]) -> list[Triple]:
+    """Validate proposed relationship lines; anything off-vocabulary is dropped."""
+    out: list[Triple] = []
+    for line in lines:
+        m = _TRIPLE_LINE.match(line.strip())
+        if not m:
+            continue
+        src_type, src_name, rel, dst_type, dst_name = m.groups()
+        if src_type in TRIPLE_TYPES and dst_type in TRIPLE_TYPES and rel in TRIPLE_RELS:
+            out.append(Triple(src_type, src_name, rel, dst_type, dst_name))
+            if len(out) >= _MAX_TRIPLES:
+                break
+    return out
 
 
 def estimate_tokens(messages: list[Message], summary: str = "") -> int:
@@ -87,18 +132,25 @@ def split_for_compression(messages: list[Message], keep_recent: int) -> tuple[li
     return messages[:cut], messages[cut:]
 
 
-def parse_compression(text: str) -> tuple[str, list[str]]:
-    summary, facts = text.strip(), []
-    match = re.search(r"^FACTS:\s*$", text, flags=re.MULTILINE)
-    if match:
-        summary = text[: match.start()]
-        facts = [
-            line.strip()[2:].strip()
-            for line in text[match.end():].splitlines()
-            if line.strip().startswith("- ")
-        ]
-    summary = re.sub(r"^SUMMARY:\s*", "", summary.strip(), flags=re.IGNORECASE).strip()
-    return summary, [f for f in facts if f]
+_SECTION = re.compile(r"^(SUMMARY|FACTS|RELATIONSHIPS):\s*$", flags=re.MULTILINE)
+
+
+def _bullets(block: str) -> list[str]:
+    return [line.strip()[2:].strip() for line in block.splitlines()
+            if line.strip().startswith("- ") and line.strip()[2:].strip()]
+
+
+def parse_compression(text: str) -> tuple[str, list[str], list[Triple]]:
+    matches = list(_SECTION.finditer(text))
+    if not matches:
+        return text.strip(), [], []
+    sections: dict[str, str] = {}
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        sections[m.group(1)] = text[m.end():end]
+    head = text[: matches[0].start()].strip()  # prose before any header counts as summary
+    summary = sections.get("SUMMARY", "").strip() or head
+    return summary, _bullets(sections.get("FACTS", "")), parse_triples(_bullets(sections.get("RELATIONSHIPS", "")))
 
 
 def fallback_digest(messages: list[Message]) -> str:
@@ -197,7 +249,7 @@ class SessionManager:
         if not old:
             return False
 
-        summary_add, facts = self._summarize(old, provider)
+        summary_add, facts, triples = self._summarize(old, provider)
         summary = (session.get("summary", "") + "\n\n" + summary_add).strip()
         self.ctx.catalog.save_session(
             session_id,
@@ -207,8 +259,8 @@ class SessionManager:
             messages_to_json(recent),
             estimate_tokens(recent, summary),
         )
-        if facts and cfg.learn_from_conversations:
-            self._ingest_memory(session, summary_add, facts)
+        if (facts or triples) and cfg.learn_from_conversations:
+            self._ingest_memory(session, summary_add, facts, triples)
         return True
 
     def distill(self, session_id: str, provider) -> int:
@@ -219,11 +271,11 @@ class SessionManager:
         messages = self.history(session)
         if not messages:
             return 0
-        summary, facts = self._summarize(messages, provider)
-        self._ingest_memory(session, summary, facts)
+        summary, facts, triples = self._summarize(messages, provider)
+        self._ingest_memory(session, summary, facts, triples)
         return len(facts)
 
-    def _summarize(self, messages: list[Message], provider) -> tuple[str, list[str]]:
+    def _summarize(self, messages: list[Message], provider) -> tuple[str, list[str], list[Triple]]:
         transcript = "\n".join(
             f"{m['role']}: {str(m.get('content', ''))[:1000]}"
             for m in messages
@@ -233,7 +285,7 @@ class SessionManager:
             try:
                 provider = self.ctx.build_provider()
             except Exception:
-                return fallback_digest(messages), []
+                return fallback_digest(messages), [], []  # keyless: no triples, deterministic graph only
         try:
             result = provider.chat(
                 [{"role": "user", "content": f"Compress these conversation turns:\n\n{transcript}"}],
@@ -241,21 +293,49 @@ class SessionManager:
             )
             return parse_compression(result.text)
         except Exception:
-            return fallback_digest(messages), []
+            return fallback_digest(messages), [], []
 
-    def _ingest_memory(self, session: dict, summary: str, facts: list[str]) -> None:
+    def _ingest_memory(self, session: dict, summary: str, facts: list[str],
+                       triples: list[Triple] = ()) -> None:
         project = session.get("project_id") or "default"
+        label = session.get("title") or session["id"][:8]
         text = f"Conversation memory ({session.get('title') or session['id']}):\n{summary}"
         if facts:
             text += "\n\nDurable facts learned:\n" + "\n".join(f"- {f}" for f in facts)
+        if triples:
+            text += "\n\nRelationships noted:\n" + "\n".join(
+                f"- {t.src_name} ({t.src_type}) {t.rel} {t.dst_name} ({t.dst_type})"
+                for t in triples
+            )
+        # Triples ride the document as graph metadata — the pipeline persists them
+        # with this conversation doc as the evidence for every edge (Phase C).
+        metadata: dict = {}
+        if triples:
+            from quickjoiner.connectors.deps import aliases, entity_id
+
+            entities: dict[str, tuple[str, str, str]] = {}
+            alias_rows: set[tuple[str, str]] = set()
+            edges: list[tuple[str, str, str, str]] = []
+            for t in triples:
+                src_id = entity_id(t.src_type, t.src_name)
+                dst_id = entity_id(t.dst_type, t.dst_name)
+                entities.setdefault(src_id, (src_id, t.src_name, t.src_type))
+                entities.setdefault(dst_id, (dst_id, t.dst_name, t.dst_type))
+                for name, eid in ((t.src_name, src_id), (t.dst_name, dst_id)):
+                    for form in aliases(name, drop_prefix="." in name):
+                        alias_rows.add((form, eid))
+                edges.append((src_id, t.rel, dst_id, f"said in conversation: {label[:60]}"))
+            metadata = {"graph": {"entities": sorted(entities.values()),
+                                  "aliases": sorted(alias_rows), "edges": edges}}
         self.ctx.catalog.upsert_source("conversations:learned", "Conversation memory", "conversations", {})
         self.ctx.pipeline.ingest(
             [
                 Document(
                     uri=f"conversation://{project}/{session['id']}",
-                    title=f"Conversation: {session.get('title') or session['id'][:8]}",
+                    title=f"Conversation: {label}",
                     text=text,
                     kind="note",
+                    metadata=metadata,
                 )
             ],
             "conversations:learned",

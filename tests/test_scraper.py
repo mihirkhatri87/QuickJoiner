@@ -114,6 +114,35 @@ def test_crawl_respects_max_pages(tmp_path, monkeypatch):
     assert len(docs) == 1  # budget stops the crawl after the first page
 
 
+def _chain_page(n: int, total: int) -> str:
+    link = f'<a href="/p{n + 1}.html">next</a>' if n + 1 < total else ""
+    return (
+        f"<html><head><title>P{n}</title></head><body><main><p>"
+        f"page {n} carries a comfortably long paragraph of readable body content so the "
+        f"extractor keeps it well above the eighty-character thin-page threshold."
+        f"</p>{link}</main></body></html>"
+    )
+
+
+def test_crawl_respects_max_depth(tmp_path, monkeypatch):
+    connector = create_connector(
+        SourceConfig(
+            name="chain",
+            type="web_scrape",
+            options={"start_urls": "https://site.test/p0.html",
+                     "allow_prefixes": "https://site.test/",
+                     "max_depth": 2, "max_pages": 50, "respect_robots": "false"},
+        ),
+        tmp_path,
+    )
+    monkeypatch.setattr(
+        connector, "_fetch_http",
+        lambda url: _chain_page(int(url.rsplit("p", 1)[1].split(".")[0]), 6),
+    )
+    docs = list(connector.sync({}))
+    assert [d.title for d in docs] == ["P0", "P1", "P2"]  # start=0, two hops, stop
+
+
 def test_crawl_survives_dead_links(tmp_path, monkeypatch):
     connector = create_connector(
         SourceConfig(

@@ -78,6 +78,100 @@ def sse_events(text: str) -> list[dict]:
     return [json.loads(line[len("data: "):]) for line in text.splitlines() if line.startswith("data: ")]
 
 
+def test_learn_endpoint_teaches_fact(client):
+    r = client.post("/api/learn", json={"fact": "The payments guild owns nautical.",
+                                        "topic": "nautical ownership"})
+    assert r.status_code == 200
+    assert "Remembered" in r.json()["result"]
+    hits = client.get("/api/search", params={"q": "payments guild owns nautical"}).json()
+    assert any(h["uri"].startswith("note://") for h in hits)  # taught note is live memory
+
+
+def test_learn_endpoint_rejects_empty_fact(client):
+    assert client.post("/api/learn", json={"fact": "   "}).status_code == 400
+
+
+def test_scrape_endpoint_streams_report(client, monkeypatch):
+    from quickjoiner.connectors.base import Document
+    from quickjoiner.connectors.browser.scraper import WebScrapeConnector
+
+    def fake_sync(self, state):
+        assert self.options["max_depth"] == 2  # the request's depth reaches the crawler
+        yield Document(uri="https://ex.test/", title="Home", text="welcome " * 30, kind="doc")
+        yield Document(uri="https://ex.test/docs/", title="Docs", text="docs " * 30, kind="doc")
+
+    monkeypatch.setattr(WebScrapeConnector, "sync", fake_sync)
+    resp = client.post("/api/scrape", json={"url": "https://ex.test/", "depth": 2})
+    assert resp.status_code == 200
+    events = sse_events(resp.text)
+    types = [e["type"] for e in events]
+    assert types[0] == "status" and types[-1] == "done"
+    answer = next(e for e in events if e["type"] == "answer")
+    assert answer["pages"] == 2
+    assert "## Site structure" in answer["data"] and "```mermaid" in answer["data"]
+    assert answer["path"].endswith(".md")  # report persisted under <workspace>/scrapes/
+
+
+def test_scrape_endpoint_rejects_non_http_url(client):
+    assert client.post("/api/scrape", json={"url": "ftp://nope"}).status_code == 400
+
+
+def test_graph_endpoint_resolves_and_snapshots(client):
+    # Teaching a fact that mentions a ticket key populates the graph via the
+    # pipeline's ticket extractor — the endpoint then resolves it by name.
+    client.post("/api/learn", json={"fact": "PAY-42 tracks the nautical checkout rewrite."})
+    r = client.get("/api/graph", params={"entity": "PAY-42"})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["entity"]["type"] == "ticket"
+    ref = next(e for e in data["edges"] if e["rel"] == "references")
+    assert ref["evidence"]["title"]  # edges stay citable
+    assert client.get("/api/graph").json()["edges"]  # unfiltered snapshot
+    assert client.get("/api/graph", params={"entity": "warp-drive"}).status_code == 404
+
+
+def test_graph_path_endpoint(client):
+    client.post("/api/learn", json={"fact": "OPS-9 tracks the gateway migration."})
+    r = client.get("/api/graph/path", params={"a": "OPS-9", "b": "user-taught"})
+    assert r.status_code == 200
+    path = r.json()["path"]
+    assert len(path) == 1 and path[0]["rel"] == "references"
+    assert client.get("/api/graph/path", params={"a": "OPS-9", "b": "nope"}).status_code == 404
+
+
+def test_gaps_endpoints_list_and_resolve(client, api_workspace):
+    # Seed refusals directly on the shared catalog file, then read them via the API.
+    from quickjoiner.memory.catalog import Catalog
+
+    cat = Catalog(api_workspace)
+    cat.log_gap("how do we deploy with octopus", 0.3,
+                [{"source_id": "files:handbook", "title": "Deploys", "score": 0.3}])
+    cat.log_gap("how do we deploy with octopus", 0.3, [])
+    cat.close()
+
+    data = client.get("/api/gaps").json()
+    assert data["open_count"] == 2
+    assert len(data["clusters"]) == 1
+    cluster = data["clusters"][0]
+    assert cluster["count"] == 2 and "octopus" in cluster["suggested_connectors"]
+
+    rr = client.post("/api/gaps/resolve",
+                     json={"gap_ids": cluster["gap_ids"], "resolution": "connected:octopus"})
+    assert rr.status_code == 200 and rr.json()["resolved"] == 2
+    assert client.get("/api/gaps").json()["open_count"] == 0
+
+
+def test_gaps_privacy_mode_hides_query(client, api_workspace):
+    from quickjoiner.memory.catalog import Catalog
+
+    cat = Catalog(api_workspace)
+    cat.log_gap("confidential question about payroll numbers", 0.1, [], store_query=False)
+    cat.close()
+    data = client.get("/api/gaps").json()
+    assert data["open_count"] == 1
+    assert "payroll" not in json.dumps(data)  # query text never leaves in hash-only mode
+
+
 def github_sig(body: bytes, secret: str = SECRET) -> str:
     return "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
 

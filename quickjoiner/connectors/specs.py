@@ -144,6 +144,9 @@ FORM_SPECS: dict[str, dict] = {
             _f("allow_prefixes", "Only follow links under", list_=True,
                placeholder="https://docs.acme.internal/"),
             _f("max_pages", "Page limit", placeholder="50"),
+            _f("max_depth", "Link depth limit", placeholder="4",
+               help="How many link hops to follow from a start URL (start page = 0). "
+                    "Empty = unlimited; the page limit still applies."),
             _f("use_browser", "Always use signed-in browser session", placeholder="true",
                help="Needs qj browser login first; renders JS and reuses your SSO session."),
             _f("fallback_to_browser", "Fall back to a browser if blocked", placeholder="true",

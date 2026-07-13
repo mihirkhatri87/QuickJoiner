@@ -46,7 +46,24 @@ class RetrievalConfig(BaseModel):
     # Below this cosine-similarity score hits are dropped; if nothing clears it the agent
     # must say "not learned yet". Tuned for BAAI/bge-small-en-v1.5 (relevant ~0.64+,
     # unrelated ~0.55 and below) — retune if you switch embedding models.
+    # NOTE: this gate stays cosine-based even in hybrid mode — hybrid changes which
+    # candidates surface and their order, never the grounded-vs-refuse decision.
     min_score: float = 0.55
+    # Hybrid retrieval: dense (vector) + sparse (BM25 full-text) legs fused with
+    # reciprocal rank fusion. The sparse leg rescues exact-token matches (error
+    # codes, ticket IDs, service names) that sit outside the dense top-k.
+    hybrid: bool = True
+    rrf_k: int = 60  # RRF constant: score = sum(1 / (rrf_k + rank)); 60 is the literature default
+    candidate_multiplier: int = 4  # each leg fetches top_k * this before fusion
+    # LanceDB builds an approximate (IVF) vector index once the chunk count crosses
+    # this threshold; below it brute-force search is exact and fast enough.
+    ann_min_rows: int = 4000
+    # Optional second-stage ranking with a cross-encoder over the fused candidates.
+    # "none" (default) keeps RRF order; "fastembed" downloads a small ONNX
+    # cross-encoder on first use (needs network once, then cached).
+    reranker: str = "none"  # none | fastembed
+    reranker_model: str | None = None  # None -> Xenova/ms-marco-MiniLM-L-6-v2
+    rerank_candidates: int = 24  # how many fused candidates the reranker scores
 
 
 class ChatConfig(BaseModel):
@@ -57,6 +74,17 @@ class ChatConfig(BaseModel):
     keep_recent_messages: int = 12
     tool_result_max_chars: int = 2000  # persisted tool outputs are truncated to this
     learn_from_conversations: bool = True  # distill durable facts into memory on compression
+
+
+class GapsConfig(BaseModel):
+    # Knowledge-debt backlog: every refusal (search_memory NO_RESULTS) is logged and
+    # clustered into remediable gaps. Turn off to stop logging entirely.
+    enabled: bool = True
+    # Privacy: when False, the raw query text is NOT stored (hash-only mode) — clustering
+    # then falls back to exact normalized-query equality. Use in shared/cloud workspaces.
+    store_queries: bool = True
+    # Cosine similarity above which two refusal queries share a cluster.
+    cluster_threshold: float = 0.8
 
 
 class SourceConfig(BaseModel):
@@ -76,6 +104,7 @@ class Config(BaseModel):
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
     retrieval: RetrievalConfig = Field(default_factory=RetrievalConfig)
     chat: ChatConfig = Field(default_factory=ChatConfig)
+    gaps: GapsConfig = Field(default_factory=GapsConfig)
     sources: list[SourceConfig] = Field(default_factory=list)
 
 
@@ -91,19 +120,12 @@ def config_path(workspace: Path) -> Path:
     return workspace / "config.yaml"
 
 
-def load_config(workspace: Path) -> Config:
+def load_env(workspace: Path) -> None:
+    """Load environment variables from <workspace>/.env and a cwd .env.
+
+    Workspace configuration itself now lives in SQLite (see Catalog.load_config /
+    save_config); this only hydrates env vars used for connector secret indirection
+    (token=env:VAR) and provider keys (ANTHROPIC_API_KEY).
+    """
     load_dotenv(workspace / ".env")
-    load_dotenv()  # also pick up a cwd .env
-    path = config_path(workspace)
-    if not path.exists():
-        return Config()
-    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    return Config.model_validate(data)
-
-
-def save_config(workspace: Path, config: Config) -> None:
-    workspace.mkdir(parents=True, exist_ok=True)
-    config_path(workspace).write_text(
-        yaml.safe_dump(config.model_dump(mode="json"), sort_keys=False),
-        encoding="utf-8",
-    )
+    load_dotenv()

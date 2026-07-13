@@ -1,0 +1,28 @@
+services:
+  quickjoiner:
+    build:
+      context: .
+      # Uncomment to bundle the Playwright browser (web_scrape fallback):
+      # args:
+      #   WITH_BROWSER: "1"
+    image: quickjoiner:latest
+    container_name: quickjoiner
+    ports:
+      - "8787:8787"
+    volumes:
+      # Persists config (SQLite), vectors (LanceDB), repo clones, and the
+      # embedding-model cache across restarts.
+      - qj-data:/data
+    environment:
+      # First-boot defaults only — after that, tune everything from the UI ⚙ Settings.
+      QJ_PROVIDER: ollama
+      # For the Anthropic provider, supply a key (uncomment and set in your shell/.env):
+      # ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+    extra_hosts:
+      # Lets the container reach an Ollama running on the host at
+      # http://host.docker.internal:11434 (set that as the Ollama base URL in Settings).
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+volumes:
+  qj-data:

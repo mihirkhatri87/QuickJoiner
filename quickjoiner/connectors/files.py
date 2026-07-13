@@ -9,6 +9,7 @@ from typing import Iterator
 import httpx
 
 from quickjoiner.connectors.base import ConnectionStatus, Connector, Document, Mode
+from quickjoiner.connectors.deps import SKIP_DIRS, dependency_document  # noqa: F401 — SKIP_DIRS re-exported
 from quickjoiner.connectors.registry import register
 
 TEXT_EXTENSIONS = {
@@ -16,6 +17,9 @@ TEXT_EXTENSIONS = {
     ".rb", ".php", ".rs", ".c", ".h", ".cpp", ".hpp", ".sql", ".sh", ".ps1", ".psm1",
     ".yaml", ".yml", ".json", ".toml", ".ini", ".cfg", ".xml", ".html", ".css",
     ".tf", ".dockerfile", ".gradle", ".properties", ".csv",
+    # dependency manifests — the raw evidence of cross-repo links (see deps.py)
+    ".csproj", ".vbproj", ".fsproj", ".sln", ".props", ".targets", ".nuspec",
+    ".config", ".mod", ".kts",
 }
 CODE_EXTENSIONS = {
     ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".cs", ".go", ".rb", ".php", ".rs",
@@ -24,9 +28,9 @@ CODE_EXTENSIONS = {
 NAMED_TEXT_FILES = {
     "readme", "license", "notice", "changelog", "contributing", "authors", "owners",
     "codeowners", "dockerfile", "makefile", "jenkinsfile", "vagrantfile", "gemfile",
-    "rakefile", "procfile", ".gitignore", ".gitattributes", ".editorconfig", ".env.example",
+    "rakefile", "procfile", "pipfile", ".gitignore", ".gitattributes", ".editorconfig",
+    ".env.example",
 }
-SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", ".idea", ".vs"}
 MAX_FILE_BYTES = 2_000_000
 
 
@@ -100,6 +104,9 @@ class FilesConnector(Connector):
             doc = self._read_file(path, root)
             if doc:
                 yield doc
+        dep_doc = dependency_document(root, self.name, root.as_uri())
+        if dep_doc:
+            yield dep_doc
 
     def _read_file(self, path: Path, root: Path) -> Document | None:
         return read_file_document(path, root)

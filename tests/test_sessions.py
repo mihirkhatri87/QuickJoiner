@@ -81,14 +81,36 @@ def test_split_for_compression_respects_tool_groups():
 
 
 def test_parse_compression_and_fallback():
-    summary, facts = parse_compression(
+    summary, facts, triples = parse_compression(
         "SUMMARY:\nDiscussed deploy cadence.\n\nFACTS:\n- Deploys happen Fridays\n- Rollbacks via #deploy-help\n"
     )
     assert summary == "Discussed deploy cadence."
     assert facts == ["Deploys happen Fridays", "Rollbacks via #deploy-help"]
+    assert triples == []
 
-    summary, facts = parse_compression("just prose, no sections")
-    assert summary == "just prose, no sections" and facts == []
+    summary, facts, triples = parse_compression("just prose, no sections")
+    assert summary == "just prose, no sections" and facts == [] and triples == []
+
+
+def test_parse_compression_relationships_section():
+    from quickjoiner.sessions import Triple, parse_triples
+
+    summary, facts, triples = parse_compression(
+        "SUMMARY:\nOwnership chat.\n\nFACTS:\n- The payments guild owns proj-a\n\n"
+        "RELATIONSHIPS:\n"
+        "- team: payments guild | owns | repo: proj-a\n"
+        "- person: Meena | works_on | service: checkout\n"
+        "- alien: zork | eats | repo: proj-a\n"
+        "- team: sre | conquers | repo: proj-a\n"
+        "- free text that is not a triple\n"
+    )
+    assert summary == "Ownership chat."
+    assert facts == ["The payments guild owns proj-a"]  # FACTS bullets don't leak into triples
+    assert triples == [
+        Triple("team", "payments guild", "owns", "repo", "proj-a"),
+        Triple("person", "Meena", "works_on", "service", "checkout"),
+    ]  # off-vocabulary type/relation lines and prose are dropped, never invented
+    assert parse_triples(["The payments guild owns proj-a"]) == []
 
     digest = fallback_digest(_turns(2))
     assert "user: question 0" in digest and "assistant: answer 1" in digest
@@ -178,3 +200,32 @@ def test_distill_ingests_full_session(manager, ctx):
 
     with pytest.raises(ValueError, match="No session"):
         manager.distill("nope", provider)
+
+
+def test_distill_persists_relationship_triples(manager, ctx):
+    """Phase C: relationships the LLM extracts land in the knowledge graph with
+    the conversation document as evidence, alias-resolvable like everything else."""
+    sess = manager.open_session(project=None)
+    manager.record_turn(sess["id"], _turns(2))
+    provider = ScriptedProvider([ChatResult(text=(
+        "SUMMARY:\nOwnership and deps discussed.\n\n"
+        "FACTS:\n- The payments guild owns proj-a\n\n"
+        "RELATIONSHIPS:\n"
+        "- team: payments guild | owns | repo: proj-a\n"
+        "- repo: proj-a | depends_on | package: AppRiver.Nautical.Models\n"
+    ))])
+    manager.distill(sess["id"], provider)
+
+    guild = ctx.catalog.resolve_entity("payments guild")
+    assert guild and guild["type"] == "team"
+    rows = ctx.catalog.graph_neighbors("repo:proj-a")
+    rels = {(r["src"], r["rel"]) for r in rows}
+    assert ("team:payments guild", "owns") in rels
+    assert ("repo:proj-a", "depends_on") in rels
+    for r in rows:
+        assert r["evidence_uri"].startswith("conversation://")  # cited to the conversation
+    # dotted package name gets the org spoken-form alias
+    assert ctx.catalog.resolve_entity("nautical models")["id"] == "package:appriver.nautical.models"
+    # the relationships are also searchable text in the conversation doc
+    hits = ctx.store.search("payments guild owns proj-a", top_k=5, min_score=0.0)
+    assert any(h.uri.startswith("conversation://") for h in hits)

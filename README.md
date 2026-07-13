@@ -6,7 +6,7 @@ platforms), **constantly learns** from them into a local vector memory, and answ
 **only from what it has learned** — every answer cited, and "I haven't learned that yet"
 when memory has nothing relevant.
 
-- **Local-first**: LanceDB (embedded vectors) + SQLite (catalog) + local embeddings (fastembed). Org data stays on your machine.
+- **Local-first**: LanceDB (embedded vectors) + SQLite (catalog **+ all config and connectors**) + local embeddings (fastembed). Org data stays on your machine, and there's no config file to hand-edit — tune everything from the UI.
 - **Switchable LLM backend**: Anthropic Claude API or Ollama (fully local inference), with token streaming and optional extended thinking.
 - **Multi-mode connectors**: pull APIs, push webhooks, live "read from source" agent tools, authenticated browser sessions with your own credentials, and scraping as a last resort.
 - **Connectors**: files/URLs, git repos, GitHub, GitLab, Jira, Confluence, Azure DevOps, Octopus Deploy, Grafana, Datadog, Dynatrace, Elasticsearch, and a generic web scraper.
@@ -59,9 +59,32 @@ qj serve                    # http://127.0.0.1:8787 — streaming chat (with thi
                             # sources dashboard, POST /hooks/<source> webhook receivers
 ```
 
-Add `sync_interval_minutes: 30` to a source in config.yaml for continuous scheduled learning.
+The web UI is a React app (`frontend/` — Vite + TypeScript + Tailwind): streaming chat with a
+provenance ledger (every grounded answer lists its numbered sources in the margin), projects and
+resumable conversations, and a **⚙ Settings** drawer that manages everything without touching a
+file: sign-in and per-user connector sharing, adding/testing/syncing connectors, and tuning
+**workspace settings** (LLM provider/model, retrieval threshold, chat compression, embeddings).
+All of it — config and connectors — is stored in the workspace's SQLite `catalog.db`, not a YAML
+file. To develop the UI: `cd frontend && npm install && npm run dev` (proxies to `qj serve` on
+:8787); `npm run build` emits `frontend/dist`, which `qj serve` picks up automatically.
+
 Webhooks verify GitHub (X-Hub-Signature-256), GitLab (X-Gitlab-Token), or generic
 (X-QJ-Signature) HMAC signatures against the source's `webhook_secret`.
+
+## Run with Docker
+
+```bash
+docker compose up -d                    # build + run; UI on http://localhost:8787
+# or without compose:
+docker build -t quickjoiner .
+docker run -d -p 8787:8787 -v qj-data:/data quickjoiner
+```
+
+Everything persists in the `/data` volume (config, vectors, repo clones, embedding-model cache).
+Set the first-boot provider with `QJ_PROVIDER` (default `anthropic`; pass `ANTHROPIC_API_KEY` for
+it, or use `ollama` and point the base URL at `host.docker.internal:11434` in Settings); after
+first boot, tune everything from the UI. The default image is lean — build with
+`--build-arg WITH_BROWSER=1` to bundle Playwright for the `web_scrape` browser fallback.
 
 ## Briefs, exports, evals
 
@@ -82,12 +105,13 @@ connectors (files/url, git, GitHub, GitLab, Azure DevOps, Jira, Confluence,
    ├─ sync() -> Documents          (pull; incremental via per-source sync state)
    ├─ handle_event(payload)        (push; POST /hooks/<source>, HMAC-verified)
    ├─ tools() -> live agent tools  (JQL, WIQL, code search, log queries, deploy status)
-   └─ ingest pipeline: sha256 dedupe -> content-aware chunking -> embeddings
+   └─ ingest pipeline: normalize -> sha256 dedupe -> content-aware chunking -> embeddings
         ├─ LanceDB  (vector chunks)        <workspace>/lancedb/
-        └─ SQLite   (catalog + sync state) <workspace>/catalog.db
+        ├─ SQLite   (catalog + sync state) <workspace>/catalog.db
+        └─ SQLite   (FTS5 sparse index)    <workspace>/fts.db
 agent: tool-calling loop, max 10 chained rounds (search_memory / remember / connector tools)
    └─ LLM provider: Anthropic Claude API <-> Ollama; streaming + extended thinking
-api: FastAPI — SSE /api/chat, sources, sync, search, briefs + static web UI
+api: FastAPI — SSE /api/chat, sources, sync, search, briefs + React web UI (frontend/dist)
 cli: qj init|learn|connect|sync|test|ask|chat|serve|status|sources|brief|eval|browser
 ```
 
@@ -97,6 +121,12 @@ The agent must call `search_memory` before answering org-specific questions, cit
 claim as `[title or uri]`, and refuse to invent org facts. Retrieval below
 `retrieval.min_score` returns `NO_RESULTS`, which the agent must report as
 "I haven't learned that yet" plus a suggestion of which source to connect.
+
+Search is hybrid by default: a dense cosine leg plus a sparse exact-token leg (BM25),
+fused with reciprocal rank fusion, with an optional cross-encoder reranker
+(`retrieval.reranker = "fastembed"`). The sparse leg rescues error codes, ticket IDs
+and service names that embeddings rank poorly — but the grounding gate above stays
+on the dense cosine score, so hybrid never changes a refusal into an invented answer.
 
 ## Tests
 

@@ -31,12 +31,33 @@ def issue_document(base_url: str, issue: dict[str, Any]) -> Document:
         + f"\nLabels: {', '.join(fields.get('labels', [])) or 'none'} | Updated: {fields.get('updated', '')}\n\n"
         f"{description}"
     )
+    # Knowledge-graph assertions (persisted by the ingest pipeline with this
+    # document as evidence): the ticket, its project, and its epic/parent.
+    key = issue["key"]
+    project_key = key.split("-", 1)[0]
+    graph: dict[str, list] = {
+        "entities": [
+            (f"ticket:{key.lower()}", key, "ticket"),
+            (f"project:{project_key.lower()}", project_key, "project"),
+        ],
+        "aliases": [],
+        "edges": [
+            (f"ticket:{key.lower()}", "part_of", f"project:{project_key.lower()}",
+             str(fields.get("summary", ""))[:80]),
+        ],
+    }
+    if parent:
+        graph["entities"].append((f"ticket:{parent.lower()}", parent, "ticket"))
+        graph["edges"].append(
+            (f"ticket:{key.lower()}", "part_of", f"ticket:{parent.lower()}", "epic/parent")
+        )
     return Document(
         uri=f"{base_url}/browse/{issue['key']}",
         title=f"{issue['key']}: {fields.get('summary', '')}",
         text=text,
         kind="ticket",
         updated_at=fields.get("updated"),
+        metadata={"graph": graph},
     )
 
 

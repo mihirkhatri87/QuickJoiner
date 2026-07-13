@@ -1,0 +1,60 @@
+%% QuickJoiner - AWS cloud architecture
+%% Lucidchart: Import > Mermaid (or paste into a Mermaid shape) to get an editable diagram.
+%% Also renders on GitHub and imports into diagrams.net (draw.io).
+flowchart TB
+    devs["50-100 developers"]
+    idp["Org IdP - OIDC or SAML"]
+    git["Source systems - GitHub, GitLab, Jira, Confluence, Octopus, log platforms"]
+    bedrock["Amazon Bedrock - Claude"]
+
+    subgraph AWS["AWS Account - VPC"]
+        direction TB
+
+        subgraph pub["Public subnets"]
+            alb["Application Load Balancer - HTTPS via ACM"]
+            nat["NAT Gateway"]
+        end
+
+        subgraph appsub["Private subnets - application tier"]
+            web["ECS Fargate - web service - stateless, autoscale 2..N"]
+            worker["ECS Fargate - worker service - clone, embed, ingest, sync"]
+        end
+
+        subgraph datasub["Private subnets - data tier"]
+            aurora[("Aurora PostgreSQL - catalog tables plus pgvector vectors")]
+        end
+
+        eb["EventBridge Scheduler - per-source cron"]
+        sqs["SQS - sync job queue"]
+        secrets["Secrets Manager - connector tokens plus LLM creds"]
+        s3["S3 - exports, briefs, git bundle cache"]
+        cw["CloudWatch - logs and metrics"]
+    end
+
+    devs -->|HTTPS| alb
+    alb -->|authenticate| idp
+    alb --> web
+
+    web -->|read + write metadata and vectors| aurora
+    web -->|inference| bedrock
+    web -->|Sync now enqueues job| sqs
+
+    eb -->|scheduled tick| sqs
+    sqs -->|deliver job| worker
+
+    worker -->|upsert chunks + state| aurora
+    worker -->|fetch per-source token| secrets
+    worker -->|ephemeral clone / pull / API| nat
+    nat --> git
+    worker -->|embeddings if needed| bedrock
+    worker -->|artifacts + bundle cache| s3
+
+    web --> cw
+    worker --> cw
+
+    classDef edge fill:#0d1b2a,stroke:#38c6b4,color:#e9efeb;
+    classDef data fill:#1b263b,stroke:#ddab55,color:#e9efeb;
+    classDef ext fill:#141a1f,stroke:#8fa09b,color:#e9efeb;
+    class alb,web,worker,nat edge;
+    class aurora,s3,secrets,sqs,eb,cw data;
+    class devs,idp,git,bedrock ext;

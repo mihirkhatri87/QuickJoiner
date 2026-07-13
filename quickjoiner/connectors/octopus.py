@@ -25,11 +25,16 @@ def project_document(server: str, project: dict[str, Any]) -> Document:
         f"Slug: {slug} | Lifecycle: {project.get('LifecycleId', '?')}\n\n"
         f"{project.get('Description') or '(no description)'}"
     )
+    name = project.get("Name", "?")
     return Document(
         uri=f"{server}/app#/projects/{slug}",
-        title=f"Octopus project: {project.get('Name', '?')}",
+        title=f"Octopus project: {name}",
         text=text,
         kind="deployment",
+        metadata={"graph": {
+            "entities": [(f"service:{name.lower()}", name, "service")],
+            "aliases": [], "edges": [],
+        }},
     )
 
 
@@ -63,11 +68,26 @@ def dashboard_document(
         f" ({i.get('CompletedTime') or i.get('QueueTime') or ''})"
         for i in items
     ]
+    # Graph: each service deploys to each environment it currently sits in.
+    entities: dict[str, tuple[str, str, str]] = {}
+    edges: list[tuple[str, str, str, str]] = []
+    for i in items:
+        pname = projects.get(i.get("ProjectId"), "")
+        ename = environments.get(i.get("EnvironmentId"), "")
+        if not pname or not ename:
+            continue
+        sid, eid = f"service:{pname.lower()}", f"environment:{ename.lower()}"
+        entities.setdefault(sid, (sid, pname, "service"))
+        entities.setdefault(eid, (eid, ename, "environment"))
+        edges.append((sid, "deploys", eid,
+                      f"{i.get('ReleaseVersion', '?')} — {i.get('State', '?')}"))
     return Document(
         uri=f"{server}/app#/dashboard",
         title="Octopus deployment dashboard: current state per project/environment",
         text="Latest deployment per project and environment:\n" + "\n".join(lines),
         kind="deployment",
+        metadata={"graph": {"entities": sorted(entities.values()), "aliases": [],
+                            "edges": edges}},
     )
 
 

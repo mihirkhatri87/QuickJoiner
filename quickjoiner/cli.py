@@ -10,7 +10,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.table import Table
 
-from quickjoiner.config import Config, SourceConfig, load_config, save_config, workspace_dir
+from quickjoiner.config import Config, SourceConfig, workspace_dir
 
 app = typer.Typer(
     name="qj",
@@ -97,17 +97,23 @@ def init(
     workspace: Optional[Path] = WORKSPACE_OPT,
 ):
     """Create a workspace for an organization."""
-    ws = workspace or workspace_dir(org)
-    config = load_config(ws) if (ws / "config.yaml").exists() else Config(org=org)
-    config.org = org
-    config.llm.provider = provider
-    save_config(ws, config)
-    from quickjoiner.memory.catalog import Catalog
+    from quickjoiner.config import load_env
+    from quickjoiner.memory.factory import create_catalog
 
-    Catalog(ws).close()
-    console.print(f"[green]Workspace created:[/green] {ws}")
-    console.print(f"LLM provider: [bold]{provider}[/bold] (model: {config.llm.resolved_model()})")
-    if provider == "anthropic":
+    ws = workspace or workspace_dir(org)
+    load_env(ws)
+    catalog = create_catalog(ws)  # SQLite on-prem, Postgres when DATABASE_URL is set
+    fresh = catalog.get_setting("config") is None  # first init vs re-run / cloud reboot
+    config = catalog.load_config()  # migrates any legacy config.yaml
+    config.org = org
+    if fresh:
+        config.llm.provider = provider  # don't clobber a provider already tuned via the UI
+    catalog.save_config(config)
+    catalog.close()
+    where = "created" if fresh else "ready"
+    console.print(f"[green]Workspace {where}:[/green] {ws}")
+    console.print(f"LLM provider: [bold]{config.llm.provider}[/bold] (model: {config.llm.resolved_model()})")
+    if config.llm.provider == "anthropic":
         console.print("Set [bold]ANTHROPIC_API_KEY[/bold] in your environment or in a .env file.")
     else:
         console.print(f"Make sure Ollama is running at {config.llm.base_url}.")
@@ -168,7 +174,9 @@ def learn(
 
         tools = {
             t.spec.name: t
-            for t in build_builtin_tools(ctx.store, ctx.catalog, ctx.pipeline, ctx.config.retrieval)
+            for t in build_builtin_tools(
+                ctx.store, ctx.catalog, ctx.pipeline, ctx.config.retrieval, ctx.config.gaps
+            )
         }
         result = tools["remember"].run(fact=target, topic=name)
         console.print(f"[green]{result}[/green]")
@@ -385,8 +393,7 @@ def connect(
             raise typer.Exit(1)
 
     ctx.config.sources = [s for s in ctx.config.sources if s.name != name] + [source]
-    save_config(ctx.workspace, ctx.config)
-    ctx.catalog.upsert_source(connector.source_id, name, type, options)
+    ctx.catalog.save_config(ctx.config)
     scope = "shared with everyone" if source.shared else f"private to {user}" if user else "shared"
     console.print(f"[green]Source '{name}' ({type}) saved — {scope}.[/green] Run [bold]qj sync {name}[/bold] to learn from it.")
 

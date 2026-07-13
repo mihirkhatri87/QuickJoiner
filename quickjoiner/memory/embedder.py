@@ -24,12 +24,20 @@ class Embedder(ABC):
 
 
 class FastEmbedEmbedder(Embedder):
-    """ONNX CPU embeddings via fastembed. Model downloads once, then works offline."""
+    """ONNX CPU embeddings via fastembed. Model downloads once, then works offline.
+
+    FASTEMBED_CACHE_PATH pins the model cache to a writable, persistent location
+    (used by the Docker image so the model survives container restarts).
+    """
 
     def __init__(self, config: EmbeddingConfig):
+        import os
+
         from fastembed import TextEmbedding
 
-        self._model = TextEmbedding(model_name=config.resolved_model())
+        cache = os.environ.get("FASTEMBED_CACHE_PATH")
+        kwargs = {"cache_dir": cache} if cache else {}
+        self._model = TextEmbedding(model_name=config.resolved_model(), **kwargs)
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         return [vec.tolist() for vec in self._model.embed(texts)]
