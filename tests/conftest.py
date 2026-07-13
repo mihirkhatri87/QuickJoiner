@@ -2,8 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 
 import pytest
+
+# The cross-encoder reranker is on by default in production, but tests must stay
+# offline and fast — never download the ~80MB ONNX model. Reranker behavior itself
+# is covered with fake rerankers in tests/test_retrieval.py.
+os.environ.setdefault("QJ_DISABLE_RERANKER", "1")
 
 from quickjoiner.memory.catalog import Catalog
 from quickjoiner.memory.embedder import Embedder

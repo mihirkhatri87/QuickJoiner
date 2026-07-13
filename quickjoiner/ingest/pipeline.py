@@ -9,11 +9,14 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass, field
-from typing import Iterable
+from typing import Callable, Iterable
 
+from quickjoiner.config import GraphConfig, RetrievalConfig
 from quickjoiner.connectors.base import Document
 from quickjoiner.ingest.chunkers import chunk_document
+from quickjoiner.ingest.code_graph import extract_code_graph, looks_like_code
 from quickjoiner.ingest.normalize import normalize_text
+from quickjoiner.ingest.triples import triples_to_graph
 from quickjoiner.memory.catalog import Catalog
 from quickjoiner.memory.store import KnowledgeStore
 
@@ -72,10 +75,38 @@ def _doc_id(source_id: str, uri: str) -> str:
     return hashlib.sha256(f"{source_id}|{uri}".encode()).hexdigest()[:24]
 
 
+def breadcrumb(source_id: str, title: str, uri: str) -> str:
+    """A compact provenance/structure prefix for a chunk: "source · title · path".
+    Gives every chunk's embedding the context it would otherwise be chunked away
+    from (which repo/file/page it belongs to)."""
+    parts: list[str] = [source_id]
+    t = (title or "").strip()
+    if t and t not in parts:
+        parts.append(t)
+    u = (uri or "").strip()
+    if u and u != t and u not in parts:
+        parts.append(u[:120])
+    return " · ".join(p for p in parts if p)
+
+
 class IngestPipeline:
-    def __init__(self, store: KnowledgeStore, catalog: Catalog):
+    def __init__(
+        self,
+        store: KnowledgeStore,
+        catalog: Catalog,
+        retrieval: RetrievalConfig | None = None,
+        graph: GraphConfig | None = None,
+        triple_extractor: Callable[[str, str], list] | None = None,
+    ):
         self._store = store
         self._catalog = catalog
+        # Contextual chunking is a retrieval-quality feature; when no retrieval config
+        # is supplied (direct construction in tests) it stays off so chunk text is raw.
+        self._contextual = bool(retrieval and retrieval.contextual_chunks)
+        self._graph_cfg = graph or GraphConfig()
+        # (text, title) -> list[Triple]; supplied by the app when graph.extract_triples
+        # is on and an LLM is available. None => LLM triple extraction is skipped.
+        self._triple_extractor = triple_extractor
 
     def ingest(self, documents: Iterable[Document], source_id: str) -> IngestStats:
         stats = IngestStats()
@@ -102,6 +133,10 @@ class IngestPipeline:
             return
 
         chunks = chunk_document(text, doc.kind)
+        if self._contextual and chunks:
+            crumb = breadcrumb(source_id, doc.title, doc.uri)
+            if crumb:
+                chunks = [f"[{crumb}]\n{c}" for c in chunks]
         written = self._store.upsert_document(
             doc_id=doc_id,
             source_id=source_id,
@@ -137,14 +172,44 @@ class IngestPipeline:
         alias_rows = [tuple(a) for a in graph.get("aliases", [])]
         edges = [tuple(e) for e in graph.get("edges", [])]
 
+        src_id, src_name, src_kind = source_entity(source_id)
+        src_added = False
+
+        def _add_source_entity() -> None:
+            nonlocal src_added
+            if not src_added:
+                entities.append((src_id, src_name, src_kind))
+                src_added = True
+
         tickets = ticket_keys(text)
         if tickets:
-            src_id, src_name, src_kind = source_entity(source_id)
-            entities.append((src_id, src_name, src_kind))
+            _add_source_entity()
             for key in tickets:
                 entities.append((f"ticket:{key.lower()}", key, "ticket"))
                 edges.append((src_id, "references", f"ticket:{key.lower()}",
                               f"mentioned in {doc.title[:80]}"))
+
+        # Code files contribute structural edges: repo defines <symbol>, imports <module>.
+        is_code = looks_like_code(doc.kind, doc.uri)
+        if is_code:
+            code_ents, code_edges = extract_code_graph(text, doc.uri, src_id)
+            if code_edges:
+                _add_source_entity()
+                entities.extend(code_ents)
+                edges.extend(code_edges)
+
+        # Optional LLM relationship extraction over prose documents (config-gated,
+        # keyless-safe). Fire-and-forget: an extraction failure never breaks ingest.
+        if self._triple_extractor is not None and not is_code and self._triples_apply(doc, text):
+            try:
+                triples = self._triple_extractor(text, doc.title)
+            except Exception:
+                triples = []
+            if triples:
+                g = triples_to_graph(triples, f"stated in {doc.title[:60]}")
+                entities.extend(g["entities"])
+                alias_rows.extend(g["aliases"])
+                edges.extend(g["edges"])
 
         for eid, name, type_ in entities:
             self._catalog.upsert_entity(eid, name, type_, source_id)
@@ -153,3 +218,9 @@ class IngestPipeline:
         # Unconditional: a changed doc that dropped its assertions must also
         # drop its stale edges (hash dedupe means we only get here on change).
         self._catalog.replace_doc_edges(doc_id, edges)
+
+    def _triples_apply(self, doc: Document, text: str) -> bool:
+        """Whether a document qualifies for LLM relationship extraction: a prose-ish
+        kind and long enough to be worth an LLM call."""
+        cfg = self._graph_cfg
+        return doc.kind in cfg.triple_doc_kinds and len(text) >= cfg.triple_min_chars

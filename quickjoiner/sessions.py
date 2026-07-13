@@ -50,40 +50,16 @@ Use names exactly as the conversation gave them. Never invent relationships.
 If a section has nothing, leave it empty. Output nothing else.\
 """
 
-# Distill-time triples (knowledge graph Phase C). LLM output is never trusted
-# into the graph without shape validation against these vocabularies.
-TRIPLE_TYPES = {"repo", "package", "project", "service", "environment", "ticket",
-                "person", "team"}
-TRIPLE_RELS = {"depends_on", "provides", "references", "part_of", "deploys",
-               "owns", "works_on"}
-_TRIPLE_LINE = re.compile(
-    r"^([a-z_]+)\s*:\s*(.{1,80}?)\s*\|\s*([a-z_]+)\s*\|\s*([a-z_]+)\s*:\s*(.{1,80}?)$"
+# Knowledge-graph triples now live in ingest/triples.py (shared with document
+# ingestion); re-exported here so `from quickjoiner.sessions import Triple,
+# parse_triples` keeps working.
+from quickjoiner.ingest.triples import (  # noqa: E402
+    TRIPLE_RELS,
+    TRIPLE_TYPES,
+    Triple,
+    parse_triples,
+    triples_to_graph,
 )
-_MAX_TRIPLES = 20
-
-
-@dataclass(frozen=True)
-class Triple:
-    src_type: str
-    src_name: str
-    rel: str
-    dst_type: str
-    dst_name: str
-
-
-def parse_triples(lines: list[str]) -> list[Triple]:
-    """Validate proposed relationship lines; anything off-vocabulary is dropped."""
-    out: list[Triple] = []
-    for line in lines:
-        m = _TRIPLE_LINE.match(line.strip())
-        if not m:
-            continue
-        src_type, src_name, rel, dst_type, dst_name = m.groups()
-        if src_type in TRIPLE_TYPES and dst_type in TRIPLE_TYPES and rel in TRIPLE_RELS:
-            out.append(Triple(src_type, src_name, rel, dst_type, dst_name))
-            if len(out) >= _MAX_TRIPLES:
-                break
-    return out
 
 
 def estimate_tokens(messages: list[Message], summary: str = "") -> int:
@@ -311,22 +287,7 @@ class SessionManager:
         # with this conversation doc as the evidence for every edge (Phase C).
         metadata: dict = {}
         if triples:
-            from quickjoiner.connectors.deps import aliases, entity_id
-
-            entities: dict[str, tuple[str, str, str]] = {}
-            alias_rows: set[tuple[str, str]] = set()
-            edges: list[tuple[str, str, str, str]] = []
-            for t in triples:
-                src_id = entity_id(t.src_type, t.src_name)
-                dst_id = entity_id(t.dst_type, t.dst_name)
-                entities.setdefault(src_id, (src_id, t.src_name, t.src_type))
-                entities.setdefault(dst_id, (dst_id, t.dst_name, t.dst_type))
-                for name, eid in ((t.src_name, src_id), (t.dst_name, dst_id)):
-                    for form in aliases(name, drop_prefix="." in name):
-                        alias_rows.add((form, eid))
-                edges.append((src_id, t.rel, dst_id, f"said in conversation: {label[:60]}"))
-            metadata = {"graph": {"entities": sorted(entities.values()),
-                                  "aliases": sorted(alias_rows), "edges": edges}}
+            metadata = {"graph": triples_to_graph(triples, f"said in conversation: {label[:60]}")}
         self.ctx.catalog.upsert_source("conversations:learned", "Conversation memory", "conversations", {})
         self.ctx.pipeline.ingest(
             [

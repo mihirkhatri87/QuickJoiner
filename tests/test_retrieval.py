@@ -13,7 +13,7 @@ from __future__ import annotations
 from quickjoiner.config import RetrievalConfig
 from quickjoiner.connectors.base import Document
 from quickjoiner.ingest.normalize import normalize_query, normalize_text
-from quickjoiner.ingest.pipeline import IngestPipeline
+from quickjoiner.ingest.pipeline import IngestPipeline, breadcrumb
 from quickjoiner.memory.factory import create_store
 from quickjoiner.memory.hybrid import rrf_fuse
 from quickjoiner.memory.reranker import create_reranker
@@ -148,9 +148,11 @@ def test_reranker_failure_degrades_to_rrf_order(workspace):
     assert store.search("alpha beta gamma", top_k=2, min_score=0.0)[0].doc_id == "A"
 
 
-def test_create_reranker_off_unless_configured():
+def test_reranker_default_on_but_disableable():
+    # On by default (built lazily on first use, so no download here); "none" disables it.
+    assert RetrievalConfig().reranker == "fastembed"
     assert create_reranker(None) is None
-    assert create_reranker(RetrievalConfig()) is None  # default "none"
+    assert create_reranker(RetrievalConfig(reranker="none")) is None
 
 
 # ------------------------------------------------------------ pipeline wiring
@@ -180,7 +182,42 @@ def test_pipeline_triggers_ann_index_check(workspace, catalog):
 
 
 def test_create_store_wires_retrieval_config(tmp_path):
-    retrieval = RetrievalConfig(hybrid=False)
+    retrieval = RetrievalConfig(hybrid=False, reranker="none")
     store = create_store(tmp_path / "ws", FakeEmbedder(), retrieval)
     assert store._retrieval is retrieval
-    assert store._reranker is None  # reranker off by default
+    assert store._reranker is None  # explicitly disabled -> no cross-encoder built
+
+
+# -------------------------------------------------------- contextual chunking
+
+def test_breadcrumb_composes_source_title_path():
+    assert breadcrumb("files:handbook", "Deploy Guide", "handbook/deploy.md") == (
+        "files:handbook · Deploy Guide · handbook/deploy.md"
+    )
+    # de-duped when title == uri, and empties dropped
+    assert breadcrumb("git:platform", "PaymentProcessor.cs", "PaymentProcessor.cs") == (
+        "git:platform · PaymentProcessor.cs"
+    )
+    assert breadcrumb("wiki", "", "") == "wiki"
+
+
+def test_contextual_chunking_prepends_breadcrumb_when_enabled(workspace, catalog, store):
+    pipe = IngestPipeline(store, catalog, RetrievalConfig(contextual_chunks=True))
+    pipe.ingest(
+        [Document(uri="handbook/deploy.md", title="Deploy Guide",
+                  text="We ship every Tuesday via Octopus.", kind="doc")],
+        "files:handbook",
+    )
+    hit = store.search("octopus tuesday", top_k=1, min_score=0.0)[0]
+    assert hit.text.startswith("[files:handbook · Deploy Guide")
+    assert "We ship every Tuesday via Octopus." in hit.text  # raw content preserved
+
+
+def test_contextual_chunking_off_without_retrieval_config(workspace, catalog, store):
+    IngestPipeline(store, catalog).ingest(  # no retrieval -> raw chunks
+        [Document(uri="handbook/deploy.md", title="Deploy Guide",
+                  text="We ship every Tuesday via Octopus.", kind="doc")],
+        "files:handbook",
+    )
+    hit = store.search("octopus tuesday", top_k=1, min_score=0.0)[0]
+    assert hit.text == "We ship every Tuesday via Octopus."  # unchanged

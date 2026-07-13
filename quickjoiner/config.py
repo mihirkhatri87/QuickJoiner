@@ -63,15 +63,30 @@ class RetrievalConfig(BaseModel):
     hybrid: bool = True
     rrf_k: int = 60  # RRF constant: score = sum(1 / (rrf_k + rank)); 60 is the literature default
     candidate_multiplier: int = 4  # each leg fetches top_k * this before fusion
+    # Contextual chunking: prepend a provenance/structure breadcrumb (source · title ·
+    # path, plus the markdown section heading) to each chunk before embedding + indexing,
+    # so a chunk's vector carries the context it would otherwise be split away from. Biggest
+    # single retrieval-quality win for code/wikis; changes what is embedded, so retune
+    # min_score if you toggle it on an existing corpus (re-sync to re-embed).
+    contextual_chunks: bool = True
     # LanceDB builds an approximate (IVF) vector index once the chunk count crosses
     # this threshold; below it brute-force search is exact and fast enough.
     ann_min_rows: int = 4000
-    # Optional second-stage ranking with a cross-encoder over the fused candidates.
-    # "none" (default) keeps RRF order; "fastembed" downloads a small ONNX
-    # cross-encoder on first use (needs network once, then cached).
-    reranker: str = "none"  # none | fastembed
+    # Second-stage ranking with a cross-encoder over the fused candidates. A
+    # cross-encoder reads query+candidate together, so it resolves nuance (code vs
+    # prose, near-duplicates) that bi-encoder cosine misses. On by default; "none"
+    # disables it. "fastembed" downloads a small ONNX cross-encoder on first use
+    # (needs network once, then cached; failures degrade gracefully to RRF order).
+    reranker: str = "fastembed"  # fastembed | none
     reranker_model: str | None = None  # None -> Xenova/ms-marco-MiniLM-L-6-v2
     rerank_candidates: int = 24  # how many fused candidates the reranker scores
+    # Graph-expansion retrieval: after grounded hits are found, surface documents
+    # linked to them through the knowledge graph (1 hop) that the vector search
+    # missed — the multi-hop / cross-source correlation channel. It NEVER changes the
+    # grounded-vs-refuse decision (it only runs when there are already grounded hits)
+    # and only adds clearly-labeled related leads for the agent to follow/cite.
+    graph_expansion: bool = True
+    graph_expansion_limit: int = 5  # max related documents surfaced per search
 
 
 class ChatConfig(BaseModel):
@@ -95,6 +110,18 @@ class GapsConfig(BaseModel):
     cluster_threshold: float = 0.8
 
 
+class GraphConfig(BaseModel):
+    # Knowledge-graph enrichment. Deterministic extractors (dependency maps, code
+    # structure, ticket refs, connector metadata) ALWAYS run. This gates the optional
+    # LLM relationship extraction over ingested prose documents, which costs one LLM
+    # call per qualifying document at ingest — hence off by default.
+    extract_triples: bool = False
+    triple_doc_kinds: list[str] = Field(
+        default_factory=lambda: ["doc", "page", "issue", "note", "wiki", "ticket", "incident"]
+    )
+    triple_min_chars: int = 400  # skip trivially short documents
+
+
 class SourceConfig(BaseModel):
     name: str
     type: str
@@ -113,6 +140,7 @@ class Config(BaseModel):
     retrieval: RetrievalConfig = Field(default_factory=RetrievalConfig)
     chat: ChatConfig = Field(default_factory=ChatConfig)
     gaps: GapsConfig = Field(default_factory=GapsConfig)
+    graph: GraphConfig = Field(default_factory=GraphConfig)
     sources: list[SourceConfig] = Field(default_factory=list)
 
 

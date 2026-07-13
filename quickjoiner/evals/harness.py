@@ -34,6 +34,8 @@ TEMPLATE = """\
 # Each case is a question plus what a correct outcome looks like:
 #   uris:     substrings of the expected source URI or title (any one matching counts)
 #   keywords: strings the agent's answer should contain (agent layer only)
+#   hops:     substrings for the DISTINCT sources a correct multi-hop answer must touch
+#             (all counted -> hop_coverage metric; use for cross-source questions)
 #   refusal:  true when the CORRECT behavior is "I haven't learned that yet."
 name: my-org-evals
 cases:
@@ -42,6 +44,11 @@ cases:
     expect:
       uris: ["wiki", "confluence"]
       keywords: ["Octopus", "Friday"]
+  - id: cross-source-multihop
+    question: Does proj-a depend on the nautical-models package, and where is it deployed?
+    expect:
+      keywords: ["Nautical.Models", "Production"]
+      hops: ["proj-a", "nautical-models", "octopus"]   # consumer repo -> package -> deploy
   - id: unlearned-topic
     question: What is the Kubernetes cost budget for Q3?
     expect:
@@ -56,6 +63,10 @@ class EvalCase:
     uris: list[str] = field(default_factory=list)
     keywords: list[str] = field(default_factory=list)
     refusal: bool = False
+    # Multi-hop / cross-source: substrings for the distinct sources a correct answer
+    # must touch (e.g. the consumer repo AND the deploy dashboard). Unlike `uris`
+    # ("any one counts"), hop_coverage measures how MANY of these were surfaced/cited.
+    hops: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -65,6 +76,7 @@ class RetrievalCaseResult:
     top_score: float
     cleared_threshold: bool  # the expected hit scored >= retrieval.min_score
     refusal_correct: bool | None  # only set for refusal cases
+    hop_coverage: float | None = None  # fraction of expected hops surfaced in top-k
 
 
 @dataclass
@@ -75,6 +87,7 @@ class AgentCaseResult:
     cited: bool | None  # expected uri substring present in the answer (None: no uris given)
     keywords_missing: list[str]
     answer: str
+    hop_coverage: float | None = None  # fraction of expected hops cited in the answer
 
 
 def load_evalset(path: Path | str) -> tuple[str, list[EvalCase]]:
@@ -89,6 +102,7 @@ def load_evalset(path: Path | str) -> tuple[str, list[EvalCase]]:
                 uris=[str(u) for u in expect.get("uris", [])],
                 keywords=[str(k) for k in expect.get("keywords", [])],
                 refusal=bool(expect.get("refusal", False)),
+                hops=[str(h) for h in expect.get("hops", [])],
             )
         )
     if not cases:
@@ -115,7 +129,13 @@ def run_retrieval_eval(ctx, cases: list[EvalCase]) -> list[RetrievalCaseResult]:
             if any(u in hit.uri or u in hit.title for u in case.uris):
                 hit_rank, cleared = rank, hit.score >= retrieval.min_score
                 break
-        results.append(RetrievalCaseResult(case.id, hit_rank, top_score, cleared, None))
+        hop_cov = None
+        if case.hops:
+            surfaced = " ".join(f"{h.uri} {h.title}" for h in hits)
+            hop_cov = round(sum(1 for hop in case.hops if hop in surfaced) / len(case.hops), 3)
+        results.append(
+            RetrievalCaseResult(case.id, hit_rank, top_score, cleared, None, hop_coverage=hop_cov)
+        )
     return results
 
 
@@ -131,6 +151,10 @@ def summarize_retrieval(results: list[RetrievalCaseResult]) -> dict:
         summary["mrr"] = round(
             sum(1 / r.hit_rank for r in answerable if r.hit_rank) / len(answerable), 3
         )
+    multihop = [r for r in results if r.hop_coverage is not None]
+    if multihop:
+        summary["multi_hop_cases"] = len(multihop)
+        summary["hop_coverage"] = round(sum(r.hop_coverage for r in multihop) / len(multihop), 3)
     if refusals:
         summary["refusal_accuracy"] = round(
             sum(1 for r in refusals if r.refusal_correct) / len(refusals), 3
@@ -162,6 +186,10 @@ def run_agent_eval(
         missing = [] if case.refusal else [
             k for k in case.keywords if k.lower() not in answer.lower()
         ]
+        hop_cov = None
+        if case.hops and not case.refusal:
+            low = answer.lower()
+            hop_cov = round(sum(1 for hop in case.hops if hop.lower() in low) / len(case.hops), 3)
         results.append(
             AgentCaseResult(
                 case_id=case.id,
@@ -170,6 +198,7 @@ def run_agent_eval(
                 cited=cited,
                 keywords_missing=missing,
                 answer=answer,
+                hop_coverage=hop_cov,
             )
         )
     return results
@@ -193,6 +222,12 @@ def summarize_agent(results: list[AgentCaseResult], cases: list[EvalCase]) -> di
         if keyword_total:
             found = keyword_total - sum(len(r.keywords_missing) for r in answerable)
             summary["keyword_coverage"] = round(found / keyword_total, 3)
+        multihop = [r for r in answerable if r.hop_coverage is not None]
+        if multihop:
+            summary["multi_hop_cases"] = len(multihop)
+            summary["hop_coverage"] = round(
+                sum(r.hop_coverage for r in multihop) / len(multihop), 3
+            )
     if refusals:
         summary["refusal_accuracy"] = round(
             sum(1 for r in refusals if r.refusal_correct) / len(refusals), 3

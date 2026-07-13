@@ -76,13 +76,34 @@ class AppContext:
         return [s for s in self.config.sources if visible(s, user, enabled)]
 
 
+def _make_triple_extractor(config: Config):
+    """A lazy (text, title) -> list[Triple] extractor backed by the configured LLM.
+    The provider is built on first use and cached (None on failure), so build_context
+    stays cheap and keyless workspaces just skip extraction."""
+    from quickjoiner.ingest.triples import extract_doc_triples
+    from quickjoiner.llm import create_provider
+
+    state: dict = {}
+
+    def extractor(text: str, title: str) -> list:
+        if "provider" not in state:
+            try:
+                state["provider"] = create_provider(config.llm)
+            except Exception:
+                state["provider"] = None
+        return extract_doc_triples(state["provider"], text, title)
+
+    return extractor
+
+
 def build_context(workspace: Path) -> AppContext:
     load_env(workspace)
     catalog = create_catalog(workspace)
     config = catalog.load_config()
     embedder = create_embedder(config.embedding)
     store = create_store(workspace, embedder, config.retrieval)
-    pipeline = IngestPipeline(store, catalog)
+    triple_extractor = _make_triple_extractor(config) if config.graph.extract_triples else None
+    pipeline = IngestPipeline(store, catalog, config.retrieval, config.graph, triple_extractor)
     return AppContext(
         workspace=workspace, config=config, catalog=catalog, store=store, pipeline=pipeline
     )

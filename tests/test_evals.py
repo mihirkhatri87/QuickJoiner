@@ -86,7 +86,20 @@ def test_template_is_a_valid_evalset(tmp_path):
     path = tmp_path / "starter.yaml"
     path.write_text(TEMPLATE, encoding="utf-8")
     name, cases = load_evalset(path)
-    assert name == "my-org-evals" and len(cases) == 2
+    assert name == "my-org-evals" and len(cases) == 3
+    multihop = next(c for c in cases if c.hops)
+    assert multihop.hops == ["proj-a", "nautical-models", "octopus"]
+
+
+def test_multi_hop_eval_set_file_loads():
+    # The shipped cross-source eval set must always parse (it's the measurement loop).
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "docs" / "evals" / "multi-hop-crosssource.yaml"
+    name, cases = load_evalset(path)
+    assert name == "multi-hop-crosssource"
+    assert any(len(c.hops) >= 2 for c in cases)  # genuinely multi-hop
+    assert any(c.refusal for c in cases)         # honesty cases present
 
 
 def test_empty_evalset_rejected(tmp_path):
@@ -121,6 +134,35 @@ def test_retrieval_eval_reports_misses(learned_ctx):
     )
     assert results[0].hit_rank is None and not results[0].cleared_threshold
     assert summarize_retrieval(results)["recall_at_k"] == 0.0
+
+
+def test_retrieval_hop_coverage(learned_ctx):
+    from quickjoiner.evals.harness import EvalCase
+
+    # learned_ctx has a "Deploys" doc and an "On-call" doc; a cross-source question
+    # touching both should show full hop coverage.
+    results = run_retrieval_eval(
+        learned_ctx,
+        [EvalCase(id="multi", question="deploy octopus rotation monday",
+                  hops=["deploys", "oncall"])],
+    )
+    assert results[0].hop_coverage == 1.0
+    summary = summarize_retrieval(results)
+    assert summary["hop_coverage"] == 1.0 and summary["multi_hop_cases"] == 1
+
+
+def test_agent_hop_coverage(learned_ctx):
+    from quickjoiner.evals.harness import EvalCase
+
+    provider = ScriptedProvider([ChatResult(text="See the deploys wiki and the oncall page.")])
+    agent = OnboardingAgent(provider, [], system="sys")
+    results = run_agent_eval(
+        learned_ctx, [EvalCase(id="m", question="q", hops=["deploys", "oncall"])], agent=agent
+    )
+    assert results[0].hop_coverage == 1.0
+    assert summarize_agent(results, [EvalCase(id="m", question="q", hops=["deploys", "oncall"])])[
+        "hop_coverage"
+    ] == 1.0
 
 
 def test_agent_eval_citations_keywords_and_refusals(learned_ctx, evalset_path):

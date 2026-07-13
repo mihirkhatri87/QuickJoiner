@@ -216,3 +216,72 @@ def test_graph_neighbors_tool_formats_relationships(tmp_path, workspace, catalog
 def test_graph_neighbors_tool_refuses_unknown(catalog, store):
     out = _graph_tool(store, catalog).run(entity="warp drive")
     assert out.startswith("NO_RESULTS")
+
+
+# ------------------------------------------------------- graph-expansion retrieval
+
+def _seed_two_linked_docs(catalog):
+    # d1 and d2 both define symbols in repo:x, so they are one graph hop apart; d3 is
+    # in a different repo and shares nothing with them.
+    for did, uri, title in (("d1", "a.py", "Module A"), ("d2", "b.py", "Payments Module"),
+                            ("d3", "c.py", "Unrelated")):
+        catalog.upsert_document(did, "git:x", uri, title, "code", f"h-{did}", None, 1)
+    for eid, name, type_ in (("repo:x", "x", "repo"), ("repo:z", "z", "repo"),
+                             ("symbol:a", "A", "symbol"), ("symbol:b", "B", "symbol"),
+                             ("symbol:c", "C", "symbol")):
+        catalog.upsert_entity(eid, name, type_)
+    catalog.replace_doc_edges("d1", [("repo:x", "defines", "symbol:a", "in a.py")])
+    catalog.replace_doc_edges("d2", [("repo:x", "defines", "symbol:b", "in b.py")])
+    catalog.replace_doc_edges("d3", [("repo:z", "defines", "symbol:c", "in c.py")])
+
+
+def test_graph_expand_finds_linked_docs_only(catalog):
+    _seed_two_linked_docs(catalog)
+    related = catalog.graph_expand(["d1"])
+    assert {r["doc_id"] for r in related} == {"d2"}  # shares repo:x; d3 is disconnected
+    assert related[0]["title"] == "Payments Module"
+    assert catalog.graph_expand([]) == []
+    assert catalog.graph_expand(["unknown"]) == []
+
+
+def test_search_memory_appends_graph_expansion(store, catalog):
+    _seed_two_linked_docs(catalog)
+    # give d1 real chunk text so the query grounds on it (d2 does NOT match the query)
+    store.upsert_document("d1", "git:x", "a.py", "Module A", "code", ["alpha beta gamma settle"])
+    tools = _tools(store, catalog)
+    out = tools["search_memory"].run(query="alpha beta gamma settle")
+    assert "Module A" in out and "score:" in out          # primary grounded hit
+    assert "RELATED via knowledge graph" in out
+    assert "Payments Module" in out                        # d2 surfaced via the graph
+
+
+def test_search_memory_no_expansion_without_graph(store, catalog):
+    store.upsert_document("d9", "wiki:x", "u", "Lonely", "doc", ["alpha beta gamma"])
+    out = _tools(store, catalog)["search_memory"].run(query="alpha beta gamma")
+    assert "RELATED via knowledge graph" not in out  # no edges -> no expansion section
+
+
+def test_end_to_end_contextual_codegraph_expansion(store, catalog):
+    """Whole correlation stack through the real pipeline: two code files ingested with
+    contextual chunking auto-create repo->defines edges; a query grounds on one file and
+    the sibling file surfaces via the shared repo node in the graph-expansion section."""
+    pipe = IngestPipeline(store, catalog, RetrievalConfig())  # contextual chunking on
+    pipe.ingest(
+        [
+            Document(uri="src/pay.py", title="pay.py",
+                     text="import stripe\nclass PaymentProcessor:\n    def settle(self):\n"
+                          "        return zulu_unique_marker\n", kind="code"),
+            Document(uri="src/ledger.py", title="ledger.py",
+                     text="import stripe\nclass Ledger:\n    def record(self):\n        pass\n",
+                     kind="code"),
+        ],
+        "git:platform",
+    )
+    tools = {
+        t.spec.name: t
+        for t in build_builtin_tools(store, catalog, pipe, RetrievalConfig(min_score=0.1), None)
+    }
+    out = tools["search_memory"].run(query="zulu_unique_marker")
+    assert "git:platform · pay.py" in out           # contextual breadcrumb on the grounded hit
+    assert "RELATED via knowledge graph" in out
+    assert "ledger.py" in out                        # sibling surfaced via shared repo node

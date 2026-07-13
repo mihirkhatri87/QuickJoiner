@@ -204,14 +204,27 @@ Every refusal is a signal about what the org still needs to teach the tool. Quic
 
 API: `GET /api/gaps`, `POST /api/gaps/resolve`.
 
-## Knowledge graph
+## Knowledge graph & cross-source correlation
 
-Entities (repos, packages, Jira tickets/epics, services, environments) and their relationships
-are extracted during ingestion — from dependency maps, ticket-key references, and issue/deploy
-metadata — and surfaced as:
-- the **Waypoints** graph view (type-colored nodes, click for evidence + citations, alias search),
-- agent tools `graph_neighbors` / `graph_path`,
-- `GET /api/graph` and `GET /api/graph/path`.
+The hard part of onboarding across 10–50 systems isn't finding one chunk — it's *joining* facts
+across sources. QuickJoiner builds an entity/relationship graph during ingestion, so correlation
+is a lookup rather than a bet on vector ranking:
+
+- **Entities & edges** (repos, packages, services, environments, tickets, **symbols, modules**)
+  from dependency maps, ticket-key references, issue/deploy metadata, **code structure**
+  (`repo --defines--> symbol`, `repo --imports--> module`, per code file), and — optionally —
+  **LLM-extracted relationships** over prose docs (`graph.extract_triples`, off by default; every
+  edge validated against a fixed vocabulary and cited to its document).
+- **Graph-expansion retrieval** (on by default): once an answer is grounded, QuickJoiner walks one
+  hop out in the graph to surface linked evidence the vector search missed (a ticket → the repo that
+  references it → the deploy that shipped it). It never changes the grounded-vs-refuse decision.
+- Surfaced as the **Waypoints** graph view, agent tools `graph_neighbors` / `graph_path`, and
+  `GET /api/graph` / `GET /api/graph/path`.
+
+Retrieval quality is tuned for this too: **contextual chunking** prepends each chunk with its
+`source · title · path` breadcrumb (and markdown sub-chunks keep their section heading) so a
+chunk's embedding carries the context it was split away from, and a **cross-encoder reranker** runs
+by default over the fused candidates (`retrieval.reranker`; `QJ_DISABLE_RERANKER=1` to turn it off).
 
 ---
 
@@ -221,8 +234,9 @@ metadata — and surfaced as:
 qj brief quick-wins                    # also: architecture | week1 | roadmap (cited, saved, re-ingested)
 qj ask "deploy inventory?" -f pptx     # export answers: md | html | csv | pptx
 qj eval my-evals.yaml --init           # write a starter eval set
-qj eval my-evals.yaml [--agent]        # retrieval metrics (recall@k, MRR, refusal accuracy);
+qj eval my-evals.yaml [--agent]        # retrieval metrics (recall@k, MRR, refusal accuracy, hop_coverage);
                                        # --agent adds end-to-end citation/refusal checks
+qj eval docs/evals/multi-hop-crosssource.yaml   # shipped multi-hop / cross-source eval set
 qj browser login https://sso.acme.com  # persistent Playwright profile (install: pip install -e ".[browser]")
 ```
 
@@ -266,10 +280,11 @@ The agent must call `search_memory` before answering org-specific questions, cit
 source to connect (and logs a knowledge gap).
 
 Search is **hybrid** by default: a dense cosine leg plus a sparse exact-token leg (BM25), fused
-with reciprocal rank fusion, with an optional cross-encoder reranker
-(`retrieval.reranker = "fastembed"`). The sparse leg rescues error codes, ticket IDs, and service
-names that embeddings rank poorly — but the grounding gate stays on the dense cosine score, so
-hybrid never turns a refusal into an invented answer.
+with reciprocal rank fusion, then reordered by a cross-encoder reranker (on by default,
+`retrieval.reranker`). The sparse leg rescues error codes, ticket IDs, and service names that
+embeddings rank poorly; graph-expansion then adds cross-source leads. Through all of it the
+grounding gate stays on the **dense cosine score** alone — fusion, reranking, and graph expansion
+change what surfaces and in what order, but never turn a refusal into an invented answer.
 
 ## Development
 

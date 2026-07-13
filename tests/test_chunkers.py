@@ -26,6 +26,13 @@ def test_markdown_split_at_headings():
     assert any("Beta" in c for c in chunks)
 
 
+def test_markdown_large_section_carries_heading_on_every_subchunk():
+    body = " ".join(f"word{i}" for i in range(2000))  # forces the section to split
+    chunks = chunk_document(f"## Deployments\n{body}")
+    assert len(chunks) > 1
+    assert all("## Deployments" in c for c in chunks)  # heading context on each piece
+
+
 def test_code_split_by_lines():
     code = "\n".join(f"line_{i} = {i}" for i in range(200))
     chunks = chunk_document(code, kind="code")

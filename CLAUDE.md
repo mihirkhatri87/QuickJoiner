@@ -102,15 +102,32 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   `candidate_multiplier=4`). **Grounding contract: `SearchHit.score` is ALWAYS the dense cosine
   and `min_score` gates on it** — fusion changes what surfaces and in what order, never the
   grounded-vs-refuse decision (sparse-only hits get their cosine via a targeted lookup).
-  Optional cross-encoder second stage (`reranker.py`, `retrieval.reranker="fastembed"`, off by
-  default; ~80MB ONNX download on first use, failures degrade to RRF order). `factory.create_store`
-  wires `retrieval` + reranker into both stores. `KnowledgeStore.ensure_ann_index()` builds a
-  LanceDB IVF index past `retrieval.ann_min_rows` (pipeline calls it after each ingest batch).
+  Cross-encoder second stage (`reranker.py`, `retrieval.reranker="fastembed"`, **on by default**;
+  lazy — the ~80MB ONNX model loads on first `rank()`, not at construction, so startup/build_context
+  is free; failures degrade to RRF order; `QJ_DISABLE_RERANKER=1` env kill-switch, set by the test
+  suite to stay offline). `factory.create_store` wires `retrieval` + reranker into both stores.
+  `KnowledgeStore.ensure_ann_index()` builds a LanceDB IVF index past `retrieval.ann_min_rows`
+  (pipeline calls it after each ingest batch). **Graph-expansion retrieval** (`retrieval.graph_expansion`,
+  on): `catalog.graph_expand(seed_doc_ids)` finds documents one knowledge-graph hop from the grounded
+  hits (via shared entities) and `search_memory` appends them as a "RELATED via knowledge graph"
+  section — the multi-hop / cross-source channel. It runs ONLY when there are already grounded hits,
+  so it never turns a refusal into an answer (grounding gate untouched).
 - `quickjoiner/ingest/` — `pipeline.py` (**normalize → sha256 dedupe → chunk → embed → upsert;
-  idempotent**), `chunkers.py` (markdown/code/prose aware), `normalize.py` (NFKC + typographic
+  idempotent**; optionally injected a `triple_extractor`), `chunkers.py` (markdown/code/prose aware;
+  large markdown sections carry their heading onto every sub-chunk), `normalize.py` (NFKC + typographic
   folding: curly quotes/dashes/NBSP/zero-width/CRLF → plain ASCII, applied to doc text before
   hashing and to queries in both stores — cosmetic variants dedupe instead of re-embedding;
   pre-existing docs re-ingest once when their hash changes, then settle).
+  **Contextual chunking** (`retrieval.contextual_chunks`, on in production; off when the pipeline is
+  built without a retrieval config, e.g. direct construction in tests): `pipeline.breadcrumb()`
+  prepends `[source · title · path]` to each chunk before embedding+indexing, so a chunk's vector
+  carries the provenance/structure it was chunked away from. **Structural graph extraction at ingest**
+  (in `_sync_graph`): `code_graph.py` emits `repo --defines--> symbol` / `repo --imports--> module`
+  edges per code file (regex per language: py/js-ts/java-kotlin/c#/go; call graphs are out of scope —
+  need tree-sitter); `triples.py` holds the shared triple vocab + `parse_triples` + `triples_to_graph`
+  (**re-exported from `sessions.py`** for back-compat) and `extract_doc_triples(provider,…)` — optional
+  LLM relationship extraction over prose docs, config-gated by `graph.extract_triples` (OFF by default:
+  one LLM call per qualifying doc), keyless-safe, validated against the vocab, evidence = the document.
 - `quickjoiner/connectors/` — contract in `base.py`: `test()`, `sync(state) -> Iterator[Document]`,
   `tools() -> [AgentTool]` (live agent tools), `handle_event(payload)` (webhooks), and a
   `modes` flag (PULL/PUSH/LIVE/BROWSER/SCRAPE). Register with `@register`; add new imports to
@@ -307,6 +324,20 @@ Post-phase additions (2026-07-07, all tested — suite: **89 passed**):
   <type>** deep-links into the /connect wizard with the type preselected
   (`startWizard(types, preselectType?)` skips the type step), **Teach** prefills `/learn `,
   **Dismiss** resolves the cluster. Suite: gaps + api-gap tests green; frontend rebuilt.
+- LiteLLM provider (2026-07-13): OpenAI-compatible `/chat/completions` over httpx
+  (`llm/litellm_provider.py`), selectable as `llm.provider="litellm"`; point `llm.base_url` at a
+  LiteLLM proxy. Key from `llm.api_key_env` env var; injectable transport for MockTransport tests.
+- Retrieval-quality + correlation pack (2026-07-13, user roadmap a–e — chosen over per-content-type
+  embedding routing after debate: that fragments the vector space and multiplies the grounding gate
+  without touching correlation; deferred pending evals). **(b)** Contextual chunking + reranker
+  on-by-default (see ingest/memory bullets). **(c)** Code-structural graph extractor
+  (`ingest/code_graph.py`): repo→defines→symbol / repo→imports→module edges per code file.
+  **(d)** LLM triple extraction generalized to ingested prose (`ingest/triples.py`,
+  `graph.extract_triples`, keyless-safe). **(e)** Graph-expansion retrieval (`catalog.graph_expand`,
+  `retrieval.graph_expansion`) — grounded hits seed a 1-hop graph walk that surfaces cross-source
+  evidence the vectors missed, without weakening the dense grounding gate. **(a)** Multi-hop eval
+  set (`docs/evals/multi-hop-crosssource.yaml`) + `hops`/`hop_coverage` in the eval harness (the
+  measurement loop for all of the above). Suite: **232 passed, 10 skipped** (pg env-gated).
 
 ## Next steps (agreed with user)
 

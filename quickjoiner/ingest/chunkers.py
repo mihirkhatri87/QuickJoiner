@@ -26,13 +26,23 @@ def _looks_like_markdown(text: str) -> bool:
 
 
 def _chunk_markdown(text: str) -> list[str]:
-    # Split at headings, then size-limit each section.
+    # Split at headings, then size-limit each section. When a section is large enough
+    # to split, every sub-chunk keeps the section heading so its embedding/BM25 tokens
+    # retain the local topic context (structural chunking, cheap version).
     sections = re.split(r"(?=^#{1,4} )", text, flags=re.MULTILINE)
     chunks: list[str] = []
     for section in sections:
         section = section.strip()
-        if section:
-            chunks.extend(_chunk_plain(section))
+        if not section:
+            continue
+        first_line = section.splitlines()[0]
+        heading = first_line.strip() if re.match(r"^#{1,4} ", first_line) else ""
+        parts = _chunk_plain(section)
+        for i, part in enumerate(parts):
+            if heading and i > 0 and not part.startswith(heading):
+                chunks.append(f"{heading}\n{part}")
+            else:
+                chunks.append(part)
     return chunks
 
 

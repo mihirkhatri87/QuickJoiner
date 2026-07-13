@@ -26,6 +26,10 @@ graph_neighbors first — it returns recorded relationships (depends_on / provid
 references) with evidence documents — then search_memory on the evidence for the details. \
 If the graph knows nothing, fall back to search_memory.
 
+When a search_memory result ends with a "RELATED via knowledge graph" section, those are \
+documents linked to your hit that the search itself did not rank — follow the relevant ones \
+(search_memory on their titles) to answer multi-hop / cross-source questions, and cite them.
+
 For cross-system questions, CHAIN your tools across hops instead of stopping at the first \
 result. Example: "has ticket PAY-123 been implemented and deployed?" means (1) fetch the \
 ticket (memory or live Jira/ADO tool), (2) search code/PRs/MRs for the change (live \

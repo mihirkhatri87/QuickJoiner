@@ -53,6 +53,30 @@ def build_builtin_tools(
         except Exception:
             pass
 
+    def _graph_expansion(hits) -> str:
+        """Related documents one knowledge-graph hop from the grounded hits — the
+        multi-hop / cross-source channel. Only runs when there ARE grounded hits, so
+        it never affects the grounded-vs-refuse decision; it adds leads to follow/cite."""
+        if not retrieval.graph_expansion:
+            return ""
+        try:
+            related = catalog.graph_expand(
+                list({h.doc_id for h in hits}), retrieval.graph_expansion_limit
+            )
+        except Exception:
+            return ""
+        if not related:
+            return ""
+        lines = ["RELATED via knowledge graph (linked evidence the search may have missed "
+                 "— follow up or cite as relevant):"]
+        for r in related:
+            label = r.get("title") or r.get("uri") or r["doc_id"]
+            lines.append(
+                f"- [source: {label} | uri: {r.get('uri', '')}] "
+                f"— {r.get('src_name', '?')} {r['rel']} {r.get('dst_name', '?')}"
+            )
+        return "\n".join(lines)
+
     def search_memory(query: str, top_k: int | None = None) -> str:
         hits = store.search(query, top_k=top_k or retrieval.top_k, min_score=retrieval.min_score)
         if not hits:
@@ -67,6 +91,9 @@ def build_builtin_tools(
             parts.append(
                 f"[source: {label} | uri: {h.uri} | kind: {h.kind} | score: {h.score:.2f}]\n{h.text}"
             )
+        expansion = _graph_expansion(hits)
+        if expansion:
+            parts.append(expansion)
         return "\n\n---\n\n".join(parts)
 
     def list_gaps() -> str:

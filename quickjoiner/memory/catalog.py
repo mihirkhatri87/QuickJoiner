@@ -432,6 +432,50 @@ class _SqlCatalog:
                 nodes[entity_id] = {"id": ent["id"], "name": ent["name"], "type": ent["type"]}
         return {"nodes": list(nodes.values()), "edges": edges}
 
+    def graph_expand(self, seed_doc_ids: list[str], limit: int = 5) -> list[dict]:
+        """Documents one graph hop from the seed documents: the entities the seeds
+        evidence, then OTHER documents that evidence edges touching those entities.
+        This is the graph-expansion retrieval channel — it surfaces cross-source
+        evidence the vector search missed. Each row carries the relation, the two
+        entity names, and the related document's title/uri for citation."""
+        if not seed_doc_ids:
+            return []
+        dph = ",".join("?" for _ in seed_doc_ids)
+        seed_entities = [
+            r["e"] for r in self._read_all(
+                f"SELECT src AS e FROM edges WHERE evidence_doc_id IN ({dph}) "
+                f"UNION SELECT dst AS e FROM edges WHERE evidence_doc_id IN ({dph})",
+                (*seed_doc_ids, *seed_doc_ids),
+            )
+        ]
+        if not seed_entities:
+            return []
+        eph = ",".join("?" for _ in seed_entities)
+        rows = self._read_all(
+            f"""SELECT g.rel, g.evidence_doc_id AS doc_id, g.detail,
+                       s.name AS src_name, t.name AS dst_name,
+                       d.title AS title, d.uri AS uri
+                FROM edges g
+                LEFT JOIN entities s ON s.id = g.src
+                LEFT JOIN entities t ON t.id = g.dst
+                LEFT JOIN documents d ON d.doc_id = g.evidence_doc_id
+                WHERE (g.src IN ({eph}) OR g.dst IN ({eph}))
+                  AND g.evidence_doc_id <> ''
+                  AND g.evidence_doc_id NOT IN ({dph})
+                ORDER BY g.rel, g.dst""",
+            (*seed_entities, *seed_entities, *seed_doc_ids),
+        )
+        seen: set[str] = set()
+        out: list[dict] = []
+        for r in rows:
+            if r["doc_id"] in seen:
+                continue
+            seen.add(r["doc_id"])
+            out.append(r)
+            if len(out) >= limit:
+                break
+        return out
+
     # -- knowledge-debt backlog (gaps) ------------------------------------------
     def log_gap(self, query: str, best_score: float, nearest: list,
                 session_id: str = "", store_query: bool = True) -> None:
