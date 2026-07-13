@@ -16,7 +16,7 @@ export interface LLMSettings {
 export interface Settings {
   org: string;
   llm: LLMSettings;
-  embedding: { provider: string; model: string | null; base_url: string };
+  embedding: { provider: string; model: string | null; base_url: string; instruct: boolean };
   retrieval: {
     top_k: number;
     min_score: number;

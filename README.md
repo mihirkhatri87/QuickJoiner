@@ -230,6 +230,14 @@ Retrieval quality is tuned for this too: **contextual chunking** prepends each c
 chunk's embedding carries the context it was split away from, and a **cross-encoder reranker** runs
 by default over the fused candidates (`retrieval.reranker`; `QJ_DISABLE_RERANKER=1` to turn it off).
 
+Embeddings run locally via fastembed (`BAAI/bge-small-en-v1.5` by default; switch
+`embedding.provider` to `ollama` to use `nomic-embed-text`). These models are trained for
+*asymmetric* retrieval — a different task instruction on queries vs passages — which QuickJoiner
+can apply via **`embedding.instruct`** (off by default; toggle in Settings → Embedding). It lifts
+recall but shifts the score distribution, so re-check `retrieval.min_score` after enabling. Whether
+this or an embedding-model swap actually helps is a *measure-it* question — run the
+`docs/plans/05` A/B matrix on your real corpus before changing the default.
+
 ---
 
 ## Briefs, exports, evals

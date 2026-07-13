@@ -314,7 +314,7 @@ function WorkspaceSettings({
           graph_expansion: s.retrieval.graph_expansion,
         },
         chat: s.chat,
-        embedding: { provider: s.embedding.provider, model: s.embedding.model || null },
+        embedding: { provider: s.embedding.provider, model: s.embedding.model || null, instruct: s.embedding.instruct },
         graph: { extract_triples: s.graph.extract_triples },
       });
       setMsg("Saved");
@@ -460,6 +460,12 @@ function WorkspaceSettings({
         <Field label="Model">
           <TextInput value={s.embedding.model ?? ""} placeholder="default for provider" onChange={(e) => set("embedding.model", e.target.value)} />
         </Field>
+        <Toggle
+          checked={s.embedding.instruct}
+          onChange={(v) => set("embedding.instruct", v)}
+          label="Asymmetric query instructions"
+          hint="Embed queries and passages with the model's task instruction (bge, nomic, e5) — how these models were trained, so it lifts recall. Re-check the grounding threshold after enabling. For bge it's query-time (no re-embed); for nomic/e5 passages change too — re-sync."
+        />
       </details>
 
       <div className="mt-4 flex items-center gap-2.5 border-t border-[var(--border)] pt-3.5">

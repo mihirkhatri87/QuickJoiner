@@ -44,6 +44,14 @@ class EmbeddingConfig(BaseModel):
     provider: str = "fastembed"  # fastembed | ollama
     model: str | None = None
     base_url: str = "http://localhost:11434"
+    # Asymmetric retrieval: prepend the model's task instruction to queries vs passages
+    # (bge's "Represent this sentence…" on queries; nomic's search_query:/search_document:;
+    # e5's query:/passage:). These models were TRAINED this way, so it lifts recall — but
+    # it shifts the cosine distribution, so re-check retrieval.min_score after enabling.
+    # For bge the passage side is unchanged (empty prefix) => query-time only, NO re-embed;
+    # for nomic/e5 passages change too => re-sync to re-embed. OFF by default to preserve
+    # existing corpora and the bge-tuned 0.55 gate. See memory/embedder._INSTRUCTIONS.
+    instruct: bool = False
 
     def resolved_model(self) -> str:
         return self.model or DEFAULT_EMBED_MODELS.get(self.provider, "BAAI/bge-small-en-v1.5")

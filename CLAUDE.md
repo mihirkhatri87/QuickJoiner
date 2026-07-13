@@ -90,8 +90,16 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   (SQLite: **workspace config in a `settings` table, connector sources in the `sources` table**
   (columns owner/shared/configured/sync_interval), document hashes, sync state, users/tokens;
   `load_config`/`save_config`/`list_source_configs`/`write_source` are the config API, with
-  one-time YAML migration), `embedder.py` (fastembed bge-small default; `FASTEMBED_CACHE_PATH`
-  pins the model cache). `config.py` is now **models + `load_env` only** (no file persistence).
+  one-time YAML migration), `embedder.py` (fastembed `BAAI/bge-small-en-v1.5` default;
+  `FASTEMBED_CACHE_PATH` pins the model cache; ollama provider defaults to `nomic-embed-text`.
+  **Asymmetric retrieval** (`embedding.instruct`, OFF by default): prepend the model's task
+  instruction to queries vs passages — `_INSTRUCTIONS` table maps a model-name substring to
+  `(query_prefix, passage_prefix)`: bge → "Represent this sentence…" on queries / none on passages,
+  nomic → `search_query:`/`search_document:`, e5 → `query:`/`passage:`. Applied in `embed`
+  (passages) vs `embed_query` (queries); it shifts the cosine distribution so `min_score` must be
+  re-checked. bge passages are unprefixed ⇒ enabling is **query-time, no re-embed**; nomic/e5
+  change passages ⇒ re-sync. `FakeEmbedder` and unlisted models stay symmetric).
+  `config.py` is now **models + `load_env` only** (no file persistence).
   `sources.configured=1` = a real connector; `=0` = an ingestion bucket (taught notes, webhook
   pushes) excluded from `list_source_configs`. `upsert_source` (ingest path) preserves ownership;
   `write_source`/`save_config` (config path) set it.
@@ -232,8 +240,9 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
 ## Conventions & gotchas
 
 - **Grounding threshold**: `retrieval.min_score = 0.55`, empirically tuned for bge-small
-  (relevant ≥ 0.64, unrelated ≤ 0.55). Retune if the embedding model changes. Borderline hits are
-  passed to the LLM with scores; the prompt makes the final relevance judgment.
+  (relevant ≥ 0.64, unrelated ≤ 0.55). Retune if the embedding model changes **or if
+  `embedding.instruct` is toggled** (asymmetric query instructions shift the cosine distribution).
+  Borderline hits are passed to the LLM with scores; the prompt makes the final relevance judgment.
 - Secrets in connector options support env indirection: `token=env:GITHUB_TOKEN`
   (resolved by `connectors/util.resolve_secret`). Never write literal secrets into config.yaml.
 - All tool results for one assistant turn must land in a single Anthropic user message
