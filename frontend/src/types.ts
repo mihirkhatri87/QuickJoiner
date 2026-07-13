@@ -11,6 +11,7 @@ export interface LLMSettings {
   max_tokens: number;
   thinking: boolean;
   thinking_budget: number;
+  api_key_env: string;
 }
 export interface Settings {
   org: string;

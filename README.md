@@ -21,9 +21,10 @@ pip install -e .          # or: uv pip install -e .
 ## Quick start
 
 ```powershell
-qj init acme --provider anthropic     # or --provider ollama for fully local
+qj init acme --provider anthropic     # or: ollama (fully local) / litellm (OpenAI-compatible proxy)
 $env:ANTHROPIC_API_KEY = "sk-ant-..." # or put it in <workspace>/.env
 $env:QJ_WORKSPACE = "$HOME/.quickjoiner/acme"
+# LiteLLM: set llm.base_url to your proxy (e.g. http://localhost:4000) + $env:LITELLM_API_KEY if it needs a key
 
 qj learn C:\work\platform-docs        # ingest a folder (or a single file / URL)
 qj learn "Deploys go out Tuesdays via Octopus; Priya owns the release calendar."

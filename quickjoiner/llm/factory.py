@@ -13,4 +13,10 @@ def create_provider(config: LLMConfig) -> LLMProvider:
         from quickjoiner.llm.ollama_provider import OllamaProvider
 
         return OllamaProvider(config)
-    raise ValueError(f"Unknown LLM provider: {config.provider!r} (expected 'anthropic' or 'ollama')")
+    if config.provider == "litellm":
+        from quickjoiner.llm.litellm_provider import LiteLLMProvider
+
+        return LiteLLMProvider(config)
+    raise ValueError(
+        f"Unknown LLM provider: {config.provider!r} (expected 'anthropic', 'ollama', or 'litellm')"
+    )

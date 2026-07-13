@@ -20,7 +20,7 @@ app = typer.Typer(
 console = Console()
 
 WORKSPACE_OPT = typer.Option(None, "--workspace", "-w", help="Workspace directory (default: QJ_WORKSPACE or ~/.quickjoiner/default)")
-PROVIDER_OPT = typer.Option(None, "--provider", "-p", help="Override LLM provider: anthropic | ollama")
+PROVIDER_OPT = typer.Option(None, "--provider", "-p", help="Override LLM provider: anthropic | ollama | litellm")
 MODEL_OPT = typer.Option(None, "--model", "-m", help="Override LLM model id")
 
 
@@ -93,7 +93,7 @@ def _export_answer(ctx, markdown_text: str, fmt: str, out: Optional[Path], title
 @app.command()
 def init(
     org: str = typer.Argument("default", help="Organization/workspace name"),
-    provider: str = typer.Option("anthropic", help="LLM provider: anthropic | ollama"),
+    provider: str = typer.Option("anthropic", help="LLM provider: anthropic | ollama | litellm"),
     workspace: Optional[Path] = WORKSPACE_OPT,
 ):
     """Create a workspace for an organization."""
@@ -115,6 +115,11 @@ def init(
     console.print(f"LLM provider: [bold]{config.llm.provider}[/bold] (model: {config.llm.resolved_model()})")
     if config.llm.provider == "anthropic":
         console.print("Set [bold]ANTHROPIC_API_KEY[/bold] in your environment or in a .env file.")
+    elif config.llm.provider == "litellm":
+        console.print(
+            f"Point [bold]llm.base_url[/bold] at your LiteLLM proxy (e.g. http://localhost:4000) "
+            f"and set [bold]{config.llm.api_key_env}[/bold] in your environment if it needs a key."
+        )
     else:
         console.print(f"Make sure Ollama is running at {config.llm.base_url}.")
     console.print("Next: [bold]qj learn <path-or-url>[/bold], then [bold]qj ask \"...\"[/bold]")

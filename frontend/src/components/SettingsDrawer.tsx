@@ -252,6 +252,7 @@ function WorkspaceSettings({
           max_tokens: s.llm.max_tokens,
           thinking: s.llm.thinking,
           thinking_budget: s.llm.thinking_budget,
+          api_key_env: s.llm.api_key_env,
         },
         retrieval: { top_k: s.retrieval.top_k, min_score: s.retrieval.min_score },
         chat: s.chat,
@@ -279,14 +280,25 @@ function WorkspaceSettings({
         <Select value={s.llm.provider} onChange={(e) => set("llm.provider", e.target.value)}>
           <option value="anthropic">anthropic</option>
           <option value="ollama">ollama</option>
+          <option value="litellm">litellm</option>
         </Select>
       </Field>
-      <Field label="Model">
+      <Field label="Model" hint={s.llm.provider === "litellm" ? "a model name your proxy is configured to route" : undefined}>
         <TextInput value={s.llm.model ?? ""} placeholder="default for provider" onChange={(e) => set("llm.model", e.target.value)} />
       </Field>
-      <Field label="Ollama base URL">
-        <TextInput value={s.llm.base_url} onChange={(e) => set("llm.base_url", e.target.value)} />
-      </Field>
+      {s.llm.provider !== "anthropic" && (
+        <Field
+          label={s.llm.provider === "litellm" ? "LiteLLM proxy base URL" : "Ollama base URL"}
+          hint={s.llm.provider === "litellm" ? "e.g. http://localhost:4000" : undefined}
+        >
+          <TextInput value={s.llm.base_url} onChange={(e) => set("llm.base_url", e.target.value)} />
+        </Field>
+      )}
+      {s.llm.provider === "litellm" && (
+        <Field label="API key env var" hint="env var holding the proxy bearer key; leave for keyless proxies">
+          <TextInput value={s.llm.api_key_env} placeholder="LITELLM_API_KEY" onChange={(e) => set("llm.api_key_env", e.target.value)} />
+        </Field>
+      )}
       <div className="grid grid-cols-2 gap-2.5">
         <Field label="Max tokens">
           <TextInput value={String(s.llm.max_tokens)} onChange={(e) => set("llm.max_tokens", num(e.target.value))} />

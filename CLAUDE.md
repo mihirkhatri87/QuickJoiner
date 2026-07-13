@@ -26,7 +26,7 @@ with citations — or says "I haven't learned that yet."
 ## Commands
 
 ```
-qj init <org> [--provider anthropic|ollama]   # create workspace (~/.quickjoiner/<org>)
+qj init <org> [--provider anthropic|ollama|litellm]  # create workspace (~/.quickjoiner/<org>)
 qj learn <path|url|"free text fact">          # ad-hoc ingestion / taught notes
 qj connect <type> --name N -o key=value ...   # register a source (types: files git github gitlab
     [--share | --private]                     #   jira confluence azure_devops octopus grafana
@@ -60,10 +60,20 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
 
 ## Architecture
 
-- `quickjoiner/llm/` — provider abstraction. **Neutral message format** documented in
+- `quickjoiner/llm/` — provider abstraction (`factory.create_provider` on `llm.provider`:
+  `anthropic` | `ollama` | `litellm`). **Neutral message format** documented in
   `llm/base.py` (`user` / `assistant`+tool_calls / `tool` dicts); each provider converts to its
   wire format. Anthropic default model: `claude-opus-4-8`. Ollama via native `/api/chat`.
-  Both providers stream via `chat(..., on_stream=(kind, delta))` with kind `text|thinking`;
+  **`litellm_provider.py`** speaks the OpenAI Chat Completions wire format over httpx to
+  `{llm.base_url}/chat/completions` — point `base_url` at a LiteLLM proxy (e.g.
+  `http://localhost:4000`) to reach any of its 100+ backends through one config (works with any
+  OpenAI-compatible endpoint: vanilla OpenAI, vLLM, LocalAI, …). Bearer key read from the env var
+  named by `llm.api_key_env` (default `LITELLM_API_KEY`; unset ⇒ no auth header for keyless local
+  proxies — the secret is never stored). Tool-call `arguments` are JSON strings on the wire
+  (streamed fragments merged by `index`); `reasoning_content` surfaces on the `thinking` channel.
+  Pure `_to_wire`/`accumulate_delta`/`_tool_calls_from_*` are unit-tested and an injectable
+  httpx transport enables MockTransport round-trip tests (`tests/test_litellm_provider.py`).
+  All providers stream via `chat(..., on_stream=(kind, delta))` with kind `text|thinking`;
   extended thinking is config-gated (`llm.thinking`, `llm.thinking_budget`). Anthropic signed
   thinking blocks ride on assistant history messages as `thinking_blocks` and are re-emitted
   FIRST in `_to_wire` (API requirement during tool use).

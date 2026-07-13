@@ -12,6 +12,9 @@ from pydantic import BaseModel, Field
 DEFAULT_MODELS = {
     "anthropic": "claude-opus-4-8",
     "ollama": "llama3.1",
+    # LiteLLM routes by whatever model names its proxy is configured with, so there
+    # is no universal default — this is only a sane fallback the user should override.
+    "litellm": "gpt-4o-mini",
 }
 
 DEFAULT_EMBED_MODELS = {
@@ -21,12 +24,17 @@ DEFAULT_EMBED_MODELS = {
 
 
 class LLMConfig(BaseModel):
-    provider: str = "anthropic"  # anthropic | ollama
+    provider: str = "anthropic"  # anthropic | ollama | litellm
     model: str | None = None  # None -> DEFAULT_MODELS[provider]
-    base_url: str = "http://localhost:11434"  # used by ollama
+    # base_url is used by ollama (native /api/chat) and litellm (OpenAI-compatible
+    # /chat/completions). For a LiteLLM proxy set this to e.g. http://localhost:4000.
+    base_url: str = "http://localhost:11434"
     max_tokens: int = 8192
     thinking: bool = False  # extended thinking (Anthropic) / think mode (Ollama reasoning models)
     thinking_budget: int = 4096  # max thinking tokens (Anthropic)
+    # litellm only: name of the env var holding the proxy's bearer key (never store the
+    # secret itself). Empty/unset var -> no Authorization header (keyless local proxies).
+    api_key_env: str = "LITELLM_API_KEY"
 
     def resolved_model(self) -> str:
         return self.model or DEFAULT_MODELS.get(self.provider, "claude-opus-4-8")
