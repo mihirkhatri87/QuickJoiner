@@ -221,6 +221,12 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
 - Tests use `FakeEmbedder` (`tests/conftest.py`) — no model download, deterministic vectors.
 - Requirement from the user: every connector should support as many connection modes as
   possible (pull, push/webhooks, live tools, browser-with-user-credentials, scrape last).
+- **Keep the docs current — always.** Any change that adds/removes/renames a feature, command,
+  config field, connector, endpoint, or provider must update **both** `CLAUDE.md` (architecture
+  bullet + phase/status notes) and `README.md` (user-facing setup, commands, feature sections)
+  in the same change — treat stale docs as a broken build. `README.md` is written for a new user
+  (setup + how to run); `CLAUDE.md` is the internal source of truth (architecture, conventions,
+  status). When they would disagree, fix them, don't pick one.
 
 ## Strategy & design docs (2026-07-11, "champion team" review)
 

@@ -6,36 +6,138 @@ platforms), **constantly learns** from them into a local vector memory, and answ
 **only from what it has learned** — every answer cited, and "I haven't learned that yet"
 when memory has nothing relevant.
 
-- **Local-first**: LanceDB (embedded vectors) + SQLite (catalog **+ all config and connectors**) + local embeddings (fastembed). Org data stays on your machine, and there's no config file to hand-edit — tune everything from the UI.
-- **Switchable LLM backend**: Anthropic Claude API or Ollama (fully local inference), with token streaming and optional extended thinking.
-- **Multi-mode connectors**: pull APIs, push webhooks, live "read from source" agent tools, authenticated browser sessions with your own credentials, and scraping as a last resort.
-- **Connectors**: files/URLs, git repos, GitHub, GitLab, Jira, Confluence, Azure DevOps, Octopus Deploy, Grafana, Datadog, Dynatrace, Elasticsearch, and a generic web scraper.
+- **Local-first** — LanceDB (embedded vectors) + SQLite (catalog **plus all config and
+  connectors**) + local embeddings (fastembed). Your org's data stays on your machine, and there
+  is no config file to hand-edit; tune everything from the UI. (Optional cloud mode swaps in
+  Postgres + pgvector — see [Cloud mode](#cloud-mode-postgres--pgvector).)
+- **Switchable LLM backend** — Anthropic Claude, Ollama (fully local), or **LiteLLM / any
+  OpenAI-compatible proxy** (one endpoint in front of 100+ models). Token streaming and optional
+  extended thinking on all three.
+- **Multi-mode connectors** — pull APIs, push webhooks, live "read from source" agent tools,
+  authenticated browser sessions with your own credentials, and scraping as a last resort.
+  Types: files/URLs, git, GitHub, GitLab, Jira, Confluence, Azure DevOps, Octopus Deploy,
+  Grafana, Datadog, Dynatrace, Elasticsearch, and a generic web scraper.
+- **Honesty by design** — a grounding contract forces citations and refusals, every refusal is
+  captured as a **knowledge gap** with one-click remediation, and a **knowledge graph** links
+  repos, packages, tickets, services, and environments so you can see how things connect.
 
-## Install
+---
 
-```powershell
-# from the repo root (Python 3.11+)
-pip install -e .          # or: uv pip install -e .
+## Setup
+
+Pick one of two paths. **Docker** is the fastest way to a running UI; the **local install**
+is best if you want the `qj` CLI and to hack on the code.
+
+### Prerequisites
+
+| For… | You need |
+|------|----------|
+| Docker path | Docker Desktop (or Docker Engine + Compose) |
+| Local path | Python **3.11+** and `git` |
+| Building the web UI from source (optional) | Node.js **22+** |
+| An answer to any question | one LLM backend: an **Anthropic API key**, a local **Ollama**, or a **LiteLLM / OpenAI-compatible** endpoint |
+
+Notes:
+- Ingesting and retrieval work with **no LLM and no cloud** (embeddings run locally via
+  fastembed — a small model downloads once on first use, which needs internet that one time).
+  You only need an LLM backend to have the agent *answer* questions.
+- A prebuilt web UI ships with the app, so the Node toolchain is only needed if you want to
+  change the frontend.
+
+### Option A — Docker (recommended for a quick look)
+
+```bash
+git clone <this-repo> quickjoiner && cd quickjoiner
+docker compose up -d --build           # builds UI + app, starts on http://localhost:8787
 ```
 
-## Quick start
+`docker compose up` boots with the **Ollama** provider by default (it reaches an Ollama running
+on your host at `http://host.docker.internal:11434` — set that as the base URL in Settings).
+To use Anthropic instead, edit `docker-compose.yml` (set `QJ_PROVIDER: anthropic` and pass
+`ANTHROPIC_API_KEY`), or just change the provider in the UI's **⚙ Settings** after first boot.
+
+All state (config, vectors, repo clones, model cache) persists in the `qj-data` volume. The image
+is lean by default; add the browser used by the `web_scrape` fallback with
+`docker build --build-arg WITH_BROWSER=1 .` (or uncomment the build args in the compose file).
+
+### Option B — Local install (the `qj` CLI)
 
 ```powershell
-qj init acme --provider anthropic     # or: ollama (fully local) / litellm (OpenAI-compatible proxy)
-$env:ANTHROPIC_API_KEY = "sk-ant-..." # or put it in <workspace>/.env
-$env:QJ_WORKSPACE = "$HOME/.quickjoiner/acme"
-# LiteLLM: set llm.base_url to your proxy (e.g. http://localhost:4000) + $env:LITELLM_API_KEY if it needs a key
+git clone <this-repo> quickjoiner
+cd quickjoiner
 
-qj learn C:\work\platform-docs        # ingest a folder (or a single file / URL)
+# 1. Create and activate a virtual environment (Python 3.11+)
+python -m venv .venv
+.venv\Scripts\Activate.ps1          # Windows PowerShell
+# source .venv/bin/activate         # macOS / Linux
+
+# 2. Install QuickJoiner (editable). Extras: [dev] tests, [browser] scraping, [cloud] Postgres
+pip install -e .                    # or, faster: uv pip install -e .
+
+# 3. Create the default workspace (~/.quickjoiner/default) and pick a provider
+qj init                             # --provider anthropic | ollama | litellm  (default: anthropic)
+```
+
+Then wire up your chosen LLM backend (see [LLM backends](#llm-backends)) and go to
+[First run](#first-run).
+
+> The `qj` command lives in the venv, so keep it activated (or call `.venv\Scripts\qj.exe`).
+
+---
+
+## First run
+
+No external systems required — teach a fact, then ask about it:
+
+```powershell
 qj learn "Deploys go out Tuesdays via Octopus; Priya owns the release calendar."
+qj learn C:\work\platform-docs        # or ingest a folder / single file / URL
 
-qj ask "How do deployments work here?"
-qj chat                               # interactive session
+qj ask "How do deployments work here?" # grounded, cited answer (streams by default)
+qj ask "What is the airspeed of a swallow?"   # -> "I haven't learned that yet."
+
 qj status                             # what has been learned so far
-qj ask "..." --provider ollama        # switch inference backend per command
+qj chat                               # interactive, resumable session
+qj serve                              # web UI + API on http://127.0.0.1:8787
 ```
+
+`qj init` with no argument uses the **`default`** workspace, so the commands above need no extra
+flags. To keep multiple orgs, `qj init acme` creates `~/.quickjoiner/acme`; select it later with
+`--workspace` or by setting `QJ_WORKSPACE`.
+
+---
+
+## LLM backends
+
+Choose one; you can also override per command with `qj ask --provider …`.
+
+**Anthropic Claude** (best quality, cloud):
+```powershell
+qj init --provider anthropic
+$env:ANTHROPIC_API_KEY = "sk-ant-..."   # or put it in <workspace>/.env
+```
+
+**Ollama** (fully local, private — no data leaves your machine):
+```powershell
+# install Ollama, then pull a tool-capable model, e.g.:  ollama pull llama3.1
+qj init --provider ollama               # base URL defaults to http://localhost:11434
+```
+
+**LiteLLM / any OpenAI-compatible endpoint** (one gateway in front of OpenAI, Azure, Bedrock,
+vLLM, …):
+```powershell
+qj init --provider litellm
+# In ⚙ Settings (or via the API), set the LLM base URL to your proxy, e.g. http://localhost:4000,
+# the model to one your proxy routes, and — if it needs a key:
+$env:LITELLM_API_KEY = "sk-..."         # env var name is configurable (llm.api_key_env)
+```
+The secret is read from the environment at runtime and never written to config.
+
+---
 
 ## Connect org systems
+
+Register a source from the CLI (or use the **/connect** wizard in the web UI):
 
 ```powershell
 qj connect git --name platform --option url=https://github.com/acme/platform.git --option token=env:GIT_TOKEN
@@ -45,47 +147,73 @@ qj connect confluence --name wiki --option base_url=https://acme.atlassian.net -
 qj connect azure_devops --name ado --option organization=acme --option project=Payments --option token=env:AZURE_DEVOPS_PAT
 
 qj sync            # incremental pull from every source
-qj sync pay-jira   # or one source
-qj test pay-jira   # credential/reachability check
+qj sync pay-jira   # or just one source
+qj test pay-jira   # credential / reachability check
 ```
 
-Connectors also contribute **live tools** to the agent (GitHub code search/file read,
-Jira JQL, Azure DevOps WIQL), so questions like "what failed in CI last night?" can be
-answered from the source directly, not just from ingested memory.
+Secrets use env indirection (`token=env:GITHUB_TOKEN`) — literal secrets are never stored.
+Connectors also contribute **live tools** to the agent (GitHub code search / file read, Jira JQL,
+Azure DevOps WIQL, log queries, deploy status), so questions like "what failed in CI last night?"
+can be answered from the source directly, not only from ingested memory. QuickJoiner also
+synthesizes a **dependency map** per repo (from package manifests) so cross-repo questions
+("who consumes AppRiver.Nautical.Models?") resolve from either end.
 
-## Web UI, webhooks, scheduled syncs
+---
+
+## Web UI
 
 ```powershell
-qj serve                    # http://127.0.0.1:8787 — streaming chat (with thinking),
-                            # sources dashboard, POST /hooks/<source> webhook receivers
+qj serve            # http://127.0.0.1:8787
 ```
 
-The web UI is a React app (`frontend/` — Vite + TypeScript + Tailwind): streaming chat with a
-provenance ledger (every grounded answer lists its numbered sources in the margin), projects and
-resumable conversations, and a **⚙ Settings** drawer that manages everything without touching a
-file: sign-in and per-user connector sharing, adding/testing/syncing connectors, and tuning
-**workspace settings** (LLM provider/model, retrieval threshold, chat compression, embeddings).
-All of it — config and connectors — is stored in the workspace's SQLite `catalog.db`, not a YAML
-file. To develop the UI: `cd frontend && npm install && npm run dev` (proxies to `qj serve` on
-:8787); `npm run build` emits `frontend/dist`, which `qj serve` picks up automatically.
+A React app (Vite + TypeScript + Tailwind) with:
+- **Streaming chat** and a provenance ledger — every grounded answer lists its numbered sources
+  in the margin; refusals are shown as "not learned yet".
+- **Projects and resumable conversations**, with automatic history compression.
+- **Knowledge gaps** — a badge in the rail opens the knowledge-debt backlog (below).
+- **Waypoints** — the interactive knowledge graph view.
+- **⚙ Settings** — sign-in and per-user connector sharing, add/test/sync connectors (or the
+  conversational `/connect` wizard), and tune workspace settings (LLM provider/model, retrieval
+  threshold, chat compression, embeddings). Everything — config and connectors — lives in the
+  workspace's SQLite `catalog.db`, not a YAML file.
+- Composer commands: `/learn <fact>`, `/connect`, `/scrape <url>` (crawl → a cited report with
+  mermaid diagrams you can then choose to learn).
 
-Webhooks verify GitHub (X-Hub-Signature-256), GitLab (X-Gitlab-Token), or generic
-(X-QJ-Signature) HMAC signatures against the source's `webhook_secret`.
+The prebuilt UI is served automatically. To develop it:
+`cd frontend && npm install && npm run dev` (proxies to `qj serve` on :8787); `npm run build`
+emits `frontend/dist`, which `qj serve` picks up.
 
-## Run with Docker
+**Webhooks & scheduled syncs:** `POST /hooks/<source>` receivers verify GitHub
+(`X-Hub-Signature-256`), GitLab (`X-Gitlab-Token`), or generic (`X-QJ-Signature`) HMAC signatures
+against the source's `webhook_secret`; sources with a sync interval are refreshed by a background
+scheduler.
 
-```bash
-docker compose up -d                    # build + run; UI on http://localhost:8787
-# or without compose:
-docker build -t quickjoiner .
-docker run -d -p 8787:8787 -v qj-data:/data quickjoiner
-```
+---
 
-Everything persists in the `/data` volume (config, vectors, repo clones, embedding-model cache).
-Set the first-boot provider with `QJ_PROVIDER` (default `anthropic`; pass `ANTHROPIC_API_KEY` for
-it, or use `ollama` and point the base URL at `host.docker.internal:11434` in Settings); after
-first boot, tune everything from the UI. The default image is lean — build with
-`--build-arg WITH_BROWSER=1` to bundle Playwright for the `web_scrape` browser fallback.
+## Knowledge-debt backlog (gaps)
+
+Every refusal is a signal about what the org still needs to teach the tool. QuickJoiner logs each
+`search_memory` miss, clusters similar refusals by topic, and suggests a fix:
+
+- **Knowledge gaps** panel in the UI (open-count badge in the rail) lists clusters with one-click
+  CTAs: **Connect** the suggested source (deep-links into the `/connect` wizard with the type
+  preselected), **Teach** the answer, or **Dismiss**.
+- `list_gaps` is also an agent tool — ask "what don't you know yet?".
+- Privacy mode (`gaps.store_queries = false`) keeps only a hash of each query, so shared/cloud
+  deployments never store raw question text.
+
+API: `GET /api/gaps`, `POST /api/gaps/resolve`.
+
+## Knowledge graph
+
+Entities (repos, packages, Jira tickets/epics, services, environments) and their relationships
+are extracted during ingestion — from dependency maps, ticket-key references, and issue/deploy
+metadata — and surfaced as:
+- the **Waypoints** graph view (type-colored nodes, click for evidence + citations, alias search),
+- agent tools `graph_neighbors` / `graph_path`,
+- `GET /api/graph` and `GET /api/graph/path`.
+
+---
 
 ## Briefs, exports, evals
 
@@ -95,8 +223,21 @@ qj ask "deploy inventory?" -f pptx     # export answers: md | html | csv | pptx
 qj eval my-evals.yaml --init           # write a starter eval set
 qj eval my-evals.yaml [--agent]        # retrieval metrics (recall@k, MRR, refusal accuracy);
                                        # --agent adds end-to-end citation/refusal checks
-qj browser login https://sso.acme.com  # persistent Playwright profile (install: pip install -e .[browser])
+qj browser login https://sso.acme.com  # persistent Playwright profile (install: pip install -e ".[browser]")
 ```
+
+## Cloud mode (Postgres + pgvector)
+
+By default QuickJoiner is entirely on-prem (SQLite + LanceDB files). Set `DATABASE_URL` to a
+`postgres://…` DSN and it transparently switches to a Postgres catalog + pgvector store instead —
+no code changes. Install the extra and run the cloud compose file:
+
+```bash
+pip install -e ".[cloud]"
+docker compose -f docker-compose.cloud.yml up -d   # app + pgvector
+```
+
+---
 
 ## Architecture
 
@@ -107,37 +248,42 @@ connectors (files/url, git, GitHub, GitLab, Azure DevOps, Jira, Confluence,
    ├─ handle_event(payload)        (push; POST /hooks/<source>, HMAC-verified)
    ├─ tools() -> live agent tools  (JQL, WIQL, code search, log queries, deploy status)
    └─ ingest pipeline: normalize -> sha256 dedupe -> content-aware chunking -> embeddings
-        ├─ LanceDB  (vector chunks)        <workspace>/lancedb/
-        ├─ SQLite   (catalog + sync state) <workspace>/catalog.db
-        └─ SQLite   (FTS5 sparse index)    <workspace>/fts.db
-agent: tool-calling loop, max 10 chained rounds (search_memory / remember / connector tools)
-   └─ LLM provider: Anthropic Claude API <-> Ollama; streaming + extended thinking
-api: FastAPI — SSE /api/chat, sources, sync, search, briefs + React web UI (frontend/dist)
-cli: qj init|learn|connect|sync|test|ask|chat|serve|status|sources|brief|eval|browser
+        ├─ vectors   LanceDB (on-prem)  /  pgvector (cloud)
+        ├─ catalog   SQLite  (on-prem)  /  Postgres (cloud)   — config, sources, graph, gaps
+        └─ sparse    SQLite FTS5        /  Postgres tsvector  — hybrid retrieval
+agent: grounded tool-calling loop (search_memory / remember / list_gaps / graph_* / connectors)
+   └─ LLM provider: Anthropic  <->  Ollama  <->  LiteLLM (OpenAI-compatible); streaming + thinking
+api: FastAPI — SSE /api/chat, sources, sync, search, briefs, gaps, graph + React web UI
+cli: qj init|learn|connect|sync|test|ask|chat|projects|sessions|serve|status|sources|
+     brief|eval|browser|users|login|logout|whoami
 ```
 
 ## Grounding contract
 
-The agent must call `search_memory` before answering org-specific questions, cite each
-claim as `[title or uri]`, and refuse to invent org facts. Retrieval below
-`retrieval.min_score` returns `NO_RESULTS`, which the agent must report as
-"I haven't learned that yet" plus a suggestion of which source to connect.
+The agent must call `search_memory` before answering org-specific questions, cite each claim as
+`[title or uri]`, and refuse to invent org facts. Retrieval below `retrieval.min_score` returns
+`NO_RESULTS`, which the agent reports as "I haven't learned that yet" plus a suggestion of which
+source to connect (and logs a knowledge gap).
 
-Search is hybrid by default: a dense cosine leg plus a sparse exact-token leg (BM25),
-fused with reciprocal rank fusion, with an optional cross-encoder reranker
-(`retrieval.reranker = "fastembed"`). The sparse leg rescues error codes, ticket IDs
-and service names that embeddings rank poorly — but the grounding gate above stays
-on the dense cosine score, so hybrid never changes a refusal into an invented answer.
+Search is **hybrid** by default: a dense cosine leg plus a sparse exact-token leg (BM25), fused
+with reciprocal rank fusion, with an optional cross-encoder reranker
+(`retrieval.reranker = "fastembed"`). The sparse leg rescues error codes, ticket IDs, and service
+names that embeddings rank poorly — but the grounding gate stays on the dense cosine score, so
+hybrid never turns a refusal into an invented answer.
 
-## Tests
+## Development
 
 ```powershell
-pip install -e .[dev]
-pytest
+pip install -e ".[dev]"
+pytest                                 # or: .venv\Scripts\python.exe -m pytest -q
 ```
+
+Machine-specific dev notes (venv layout, building the frontend, the live Ollama/Playwright
+setup) and the full design/roadmap live in `CLAUDE.md` and `docs/`.
 
 ## Status
 
-All four planned phases are complete (core memory/agent, connector framework + 13 connectors,
-FastAPI/UI/scheduler/webhooks, briefs + browser fallback + evals). See `CLAUDE.md` for the
-detailed status, conventions, and next steps (eval-driven fine-tuning decision).
+Core memory/agent, the connector framework + 13 connectors, FastAPI/UI/scheduler/webhooks,
+briefs + browser fallback + evals, hybrid retrieval, the knowledge graph, the knowledge-debt
+backlog, and cloud (Postgres/pgvector) groundwork are all in place. See `CLAUDE.md` for detailed
+status, conventions, and next steps (an eval-driven fine-tuning decision on a real corpus).
