@@ -100,6 +100,34 @@ function Section({ title, children }: { title: string; children: React.ReactNode
   );
 }
 
+/** Labelled checkbox with an optional sub-hint — used for the retrieval/graph knobs. */
+function Toggle({
+  checked,
+  onChange,
+  label,
+  hint,
+}: {
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  label: string;
+  hint?: string;
+}) {
+  return (
+    <label className="my-2.5 flex items-start gap-2.5 text-[12.5px]">
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(e) => onChange(e.target.checked)}
+        className="mt-0.5 h-[15px] w-[15px] flex-shrink-0 accent-[var(--accent)]"
+      />
+      <span>
+        <span className="text-ink">{label}</span>
+        {hint && <span className="mt-0.5 block text-[11px] leading-snug text-faint">{hint}</span>}
+      </span>
+    </label>
+  );
+}
+
 /* ---------- account ---------- */
 function CredForm({ label, onSubmit }: { label: string; onSubmit: (u: string, p: string) => void }) {
   const [u, setU] = useState("");
@@ -227,6 +255,8 @@ function WorkspaceSettings({
 }) {
   const [s, setS] = useState<Settings | null>(null);
   const [msg, setMsg] = useState("");
+  const [llmMsg, setLlmMsg] = useState("");
+  const [llmOk, setLlmOk] = useState(true);
   useEffect(() => {
     api.settings().then(setS).catch(() => setS(null));
   }, []);
@@ -241,6 +271,27 @@ function WorkspaceSettings({
   };
   const num = (v: string) => (v === "" ? null : Number(v));
 
+  const testLLM = async () => {
+    setLlmMsg("testing…");
+    setLlmOk(true);
+    try {
+      const r = await api.testLLM({
+        provider: s.llm.provider,
+        model: s.llm.model || null,
+        base_url: s.llm.base_url,
+        max_tokens: s.llm.max_tokens,
+        thinking: s.llm.thinking,
+        thinking_budget: s.llm.thinking_budget,
+        api_key_env: s.llm.api_key_env,
+      });
+      setLlmOk(r.ok);
+      setLlmMsg(r.ok ? `✓ ${r.message}` : `✗ ${r.message}`);
+    } catch (e) {
+      setLlmOk(false);
+      setLlmMsg(String((e as Error).message).slice(0, 200));
+    }
+  };
+
   const save = async () => {
     setMsg("saving…");
     try {
@@ -254,9 +305,17 @@ function WorkspaceSettings({
           thinking_budget: s.llm.thinking_budget,
           api_key_env: s.llm.api_key_env,
         },
-        retrieval: { top_k: s.retrieval.top_k, min_score: s.retrieval.min_score },
+        retrieval: {
+          top_k: s.retrieval.top_k,
+          min_score: s.retrieval.min_score,
+          hybrid: s.retrieval.hybrid,
+          contextual_chunks: s.retrieval.contextual_chunks,
+          reranker: s.retrieval.reranker,
+          graph_expansion: s.retrieval.graph_expansion,
+        },
         chat: s.chat,
         embedding: { provider: s.embedding.provider, model: s.embedding.model || null },
+        graph: { extract_triples: s.graph.extract_triples },
       });
       setMsg("Saved");
       onFlash("Workspace settings saved");
@@ -311,6 +370,19 @@ function WorkspaceSettings({
         <input type="checkbox" checked={s.llm.thinking} onChange={(e) => set("llm.thinking", e.target.checked)} className="mt-0.5 h-[15px] w-[15px] accent-[var(--accent)]" />
         Extended thinking (uses more tokens / quota)
       </label>
+      <div className="flex flex-wrap items-center gap-2.5">
+        <Button onClick={testLLM}>Test connection</Button>
+        <span className="text-[11px] text-faint">
+          {s.llm.provider === "litellm"
+            ? "Pings your LiteLLM proxy with the current (unsaved) values."
+            : "One-token round-trip with the current (unsaved) provider."}
+        </span>
+      </div>
+      {llmMsg && (
+        <div className={cn("mt-2 font-mono text-[11px] leading-snug", llmOk ? "text-accent" : "text-danger")}>
+          {llmMsg}
+        </div>
+      )}
 
       <Sub>Retrieval</Sub>
       <div className="grid grid-cols-2 gap-2.5">
@@ -321,6 +393,38 @@ function WorkspaceSettings({
           <TextInput value={String(s.retrieval.min_score)} onChange={(e) => set("retrieval.min_score", num(e.target.value))} />
         </Field>
       </div>
+      <Toggle
+        checked={s.retrieval.hybrid}
+        onChange={(v) => set("retrieval.hybrid", v)}
+        label="Hybrid dense + sparse search"
+        hint="Fuse vector similarity with BM25 full-text so exact tokens (error codes, ticket IDs, service names) still surface. Query-time."
+      />
+      <Toggle
+        checked={s.retrieval.reranker !== "none"}
+        onChange={(v) => set("retrieval.reranker", v ? "fastembed" : "none")}
+        label="Cross-encoder reranker"
+        hint="Re-scores the top candidates with a model that reads query + chunk together. Downloads ~80 MB on first use, then cached. Query-time."
+      />
+      <Toggle
+        checked={s.retrieval.graph_expansion}
+        onChange={(v) => set("retrieval.graph_expansion", v)}
+        label="Graph-expansion retrieval"
+        hint="After grounding, surface documents one knowledge-graph hop away — the cross-source / multi-hop channel. Never turns a refusal into an answer. Query-time."
+      />
+      <Toggle
+        checked={s.retrieval.contextual_chunks}
+        onChange={(v) => set("retrieval.contextual_chunks", v)}
+        label="Contextual chunking"
+        hint="Prepend a source · title · path breadcrumb to each chunk before embedding, so its vector carries the context it was split from. Ingest-time — re-sync every source to take effect; may warrant a grounding-threshold retune."
+      />
+
+      <Sub>Knowledge graph</Sub>
+      <Toggle
+        checked={s.graph.extract_triples}
+        onChange={(v) => set("graph.extract_triples", v)}
+        label="Extract relationships from prose (LLM)"
+        hint="Run an LLM relationship-extraction pass over ingested docs to enrich the graph. Costs one LLM call per qualifying document. Ingest-time — re-sync to apply. Deterministic extractors (deps, code structure, ticket refs) always run regardless."
+      />
 
       <Sub>Conversations</Sub>
       <div className="grid grid-cols-2 gap-2.5">

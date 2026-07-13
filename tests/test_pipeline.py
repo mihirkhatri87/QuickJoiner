@@ -1,3 +1,5 @@
+from quickjoiner.agent.tools import teach_fact
+from quickjoiner.config import RetrievalConfig
 from quickjoiner.connectors.base import Document
 from quickjoiner.ingest.pipeline import IngestPipeline
 
@@ -32,6 +34,30 @@ def test_changed_document_is_updated(store, catalog):
     hits = store.search("deploy daily", top_k=5)
     assert any("daily" in h.text for h in hits)
     assert not any("Fridays" in h.text for h in hits)  # old chunks replaced
+
+
+def test_teach_fact_uri_is_stable_and_timestamp_free(store, catalog):
+    # Regression: the taught-note URI must be content-derived, not wall-clock. With
+    # contextual chunking (ON here) the URI is embedded in each chunk's breadcrumb, so a
+    # volatile timestamp token would perturb the vector run-to-run (flaky retrieval near
+    # the grounding gate). Pin the URI to the content hash to prove it carries no clock.
+    import hashlib
+
+    pipeline = IngestPipeline(store, catalog, RetrievalConfig())
+    fact, topic = "The payments guild owns nautical.", "nautical ownership"
+    expected = hashlib.sha256(f"{topic}\n{fact}".encode("utf-8")).hexdigest()[:10]
+
+    teach_fact(catalog, pipeline, fact, topic=topic)
+    hit = next(h for h in store.search("payments guild owns nautical", top_k=5, min_score=0.0)
+               if h.uri.startswith("note://"))
+    assert hit.uri == f"note://nautical-ownership-{expected}"  # content-derived, no unix ts
+
+    # Same fact again is idempotent — same URI, deduped by content (0 added).
+    stats = teach_fact(catalog, pipeline, fact, topic=topic)
+    assert "0 added" in stats
+    note_uris = {h.uri for h in store.search("payments guild owns nautical", top_k=5, min_score=0.0)
+                 if h.uri.startswith("note://")}
+    assert note_uris == {hit.uri}
 
 
 def test_search_respects_min_score(store, catalog):

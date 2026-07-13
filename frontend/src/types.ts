@@ -17,13 +17,21 @@ export interface Settings {
   org: string;
   llm: LLMSettings;
   embedding: { provider: string; model: string | null; base_url: string };
-  retrieval: { top_k: number; min_score: number };
+  retrieval: {
+    top_k: number;
+    min_score: number;
+    hybrid: boolean;
+    contextual_chunks: boolean;
+    reranker: string; // "fastembed" | "none"
+    graph_expansion: boolean;
+  };
   chat: {
     compress_after_est_tokens: number;
     keep_recent_messages: number;
     tool_result_max_chars: number;
     learn_from_conversations: boolean;
   };
+  graph: { extract_triples: boolean };
   embedding_reindex_required: boolean;
 }
 

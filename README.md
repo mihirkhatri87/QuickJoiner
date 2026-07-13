@@ -173,8 +173,12 @@ A React app (Vite + TypeScript + Tailwind) with:
 - **Knowledge gaps** — a badge in the rail opens the knowledge-debt backlog (below).
 - **Waypoints** — the interactive knowledge graph view.
 - **⚙ Settings** — sign-in and per-user connector sharing, add/test/sync connectors (or the
-  conversational `/connect` wizard), and tune workspace settings (LLM provider/model, retrieval
-  threshold, chat compression, embeddings). Everything — config and connectors — lives in the
+  conversational `/connect` wizard), and tune workspace settings: LLM provider/model (incl. the
+  **LiteLLM proxy URL + API-key env var**, with a **Test connection** button that pings the
+  provider before you save), retrieval knobs (**hybrid** dense+sparse, **cross-encoder reranker**,
+  **graph-expansion**, **contextual chunking**), **knowledge-graph** LLM triple extraction, chat
+  compression, and embeddings. Toggles are labelled query-time (take effect immediately) vs
+  ingest-time (need a re-sync to re-embed). Everything — config and connectors — lives in the
   workspace's SQLite `catalog.db`, not a YAML file.
 - Composer commands: `/learn <fact>`, `/connect`, `/scrape <url>` (crawl → a cited report with
   mermaid diagrams you can then choose to learn).

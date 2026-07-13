@@ -56,6 +56,12 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }),
+  testLLM: (llm: Record<string, unknown>) =>
+    req<{ ok: boolean; model: string; message: string }>("/api/llm/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ llm }),
+    }),
 
   authStatus: () => req<AuthStatus>("/api/auth/status"),
   login: (username: string, password: string) =>

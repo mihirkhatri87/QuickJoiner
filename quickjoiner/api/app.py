@@ -17,7 +17,15 @@ from pydantic import BaseModel
 from quickjoiner.api.hooks import build_hooks_router
 from quickjoiner.app import AppContext, build_context
 from quickjoiner.auth import Auth, can_manage, visible
-from quickjoiner.config import ChatConfig, Config, EmbeddingConfig, LLMConfig, RetrievalConfig, SourceConfig
+from quickjoiner.config import (
+    ChatConfig,
+    Config,
+    EmbeddingConfig,
+    GraphConfig,
+    LLMConfig,
+    RetrievalConfig,
+    SourceConfig,
+)
 
 STATIC_DIR = Path(__file__).parent / "static"  # legacy vanilla UI (fallback)
 
@@ -95,6 +103,12 @@ class SettingsUpdate(BaseModel):
     embedding: dict | None = None
     retrieval: dict | None = None
     chat: dict | None = None
+    graph: dict | None = None
+
+
+class LLMTestRequest(BaseModel):
+    # Optional overrides to test unsaved provider settings from the form.
+    llm: dict | None = None
 
 
 def _secret_keys(type_: str) -> set[str]:
@@ -318,6 +332,7 @@ def create_app(workspace: Path) -> FastAPI:
             "embedding": c.embedding.model_dump(),
             "retrieval": c.retrieval.model_dump(),
             "chat": c.chat.model_dump(),
+            "graph": c.graph.model_dump(),
             # Embedding changes only take effect after a restart + full re-sync
             # (existing vectors are in the old model's space) — the UI warns on this.
             "embedding_reindex_required": True,
@@ -342,10 +357,39 @@ def create_app(workspace: Path) -> FastAPI:
                 c.retrieval = RetrievalConfig.model_validate({**c.retrieval.model_dump(), **req.retrieval})
             if req.chat:
                 c.chat = ChatConfig.model_validate({**c.chat.model_dump(), **req.chat})
+            if req.graph:
+                c.graph = GraphConfig.model_validate({**c.graph.model_dump(), **req.graph})
         except Exception as exc:  # pydantic validation error -> bad input
             raise HTTPException(status_code=400, detail=str(exc))
         ctx.catalog.save_config(c)  # persist; live agents read ctx.config on next build
         return _settings_view()
+
+    @api.post("/api/llm/test")
+    def test_llm(req: LLMTestRequest, authorization: str | None = Header(default=None)):
+        """Probe the configured LLM provider with a one-token round-trip. Accepts
+        optional `llm` overrides so the settings form can test UNSAVED values (proxy
+        URL, model, api-key env var) before persisting. Never saves."""
+        _require_user(_user(authorization))
+        from quickjoiner.llm import create_provider
+
+        try:
+            llm_cfg = LLMConfig.model_validate({**ctx.config.llm.model_dump(), **(req.llm or {})})
+        except Exception as exc:  # invalid overrides
+            raise HTTPException(status_code=400, detail=str(exc))
+        try:
+            provider = create_provider(llm_cfg)
+            result = provider.chat(
+                [{"role": "user", "content": "Reply with the single word: OK"}],
+                system="You are a connection health check. Answer in one word.",
+            )
+        except Exception as exc:
+            return {"ok": False, "model": llm_cfg.resolved_model(), "message": str(exc)[:300]}
+        reply = (result.text or "").strip()
+        return {
+            "ok": True,
+            "model": llm_cfg.resolved_model(),
+            "message": f"Reached {llm_cfg.provider} · replied “{reply[:60] or '(empty)'}”",
+        }
 
     @api.get("/api/sources")
     def sources(authorization: str | None = Header(default=None)):

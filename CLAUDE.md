@@ -185,8 +185,11 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   `visible()` / `can_manage()` are the gate. Ingested *knowledge* stays one communal memory;
   sharing governs who sees/manages a **connector's config + credentials** and gets its live tools.
 - `quickjoiner/api/` — FastAPI (`app.py`: SSE `/api/chat`, sources, sync, search, briefs;
-  `/api/auth/*` status/users/login/logout; `/api/connectors` CRUD + `/test` + `/types`) +
-  `hooks.py` (HMAC-verified `POST /hooks/{source}` push ingestion). Bearer token via
+  `/api/auth/*` status/users/login/logout; `/api/connectors` CRUD + `/test` + `/types`;
+  `GET/PATCH /api/settings` — the whole `Config` (llm/embedding/retrieval/chat/**graph**) as a
+  tunable dict; `POST /api/llm/test` probes the provider with a one-token round-trip, accepting
+  optional unsaved `llm` overrides so the Settings drawer can verify a proxy/model before saving,
+  never persisting) + `hooks.py` (HMAC-verified `POST /hooks/{source}` push ingestion). Bearer token via
   `Authorization` header → `_user()`; secret option values masked (`MASKED`) in responses, and a
   PATCH sending the mask back keeps the stored secret. Live connector tools in chat are scoped to
   `ctx.visible_sources(user)`.
@@ -199,7 +202,12 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   `bg-surface/90` silently emit nothing; use the `fill`/`fill2`/`panel` translucent tokens instead).
   Components: `App` (state + SSE orchestration), `Chat` (provenance ledger: citations dedupe into
   a numbered sources margin on lg screens, streaming caret), `Rail`, `TopBar`, `Composer`,
-  `EmptyState`, `SettingsDrawer` (account + workspace settings + connector plates/forms), `api.ts`
+  `EmptyState`, `SettingsDrawer` (account + workspace settings + connector plates/forms; the
+  workspace pane exposes provider config incl. LiteLLM proxy URL + api-key env var with a
+  **Test connection** button hitting `POST /api/llm/test`, and **Retrieval/Knowledge-graph
+  toggles** — hybrid, cross-encoder reranker, graph-expansion, contextual chunking (ingest-time),
+  and LLM triple extraction — each hinted query-time vs ingest-time; a shared `Toggle` primitive),
+  `api.ts`
   (typed client + SSE reader), `ui.tsx` primitives. Build: `npm run build` → `frontend/dist`;
   dev: `npm run dev` proxies /api+/hooks to :8787. FastAPI serves the UI per `_ui_dir()`:
   `QJ_UI_DIR` env → repo `frontend/dist` → legacy `api/static/index.html` fallback (kept for
@@ -254,9 +262,10 @@ I1–I3 + 20-item retrieval/ragless roadmap), `docs/FRONTEND_ROADMAP.md` (F0–F
 `docs/TEST_STRATEGY.md` (>90% program, T1–T4), `docs/CLOUD_ROADMAP.md` (Y1–Y5),
 `docs/design/DESIGN_VISION.md` + `orrery-prototype.html` (fog-of-war "Orrery" concept,
 published as a Claude artifact). These are the authoritative roadmap references.
-**Execution plans for the 4 highest-ROI features** (each with a ready-to-paste
-implementation prompt): `docs/plans/` — 01 knowledge-debt backlog, 02 retrieval quality
-pack, 03 Slack+Teams connectors, 04 coverage fog (01 must precede 04).
+**Execution plans** (each with a ready-to-paste prompt): `docs/plans/` — 01 knowledge-debt
+backlog, 02 retrieval quality pack, 03 Slack+Teams connectors, 04 coverage fog (01 must precede
+04), **05 evaluate retrieval & correlation on a connected org** (the "decide with data" runbook
+for the a–e stack + embedding-change decision; run on an org-connected machine).
 
 ## Phase status (approved plan: C:\Users\aarti\.claude\plans\happy-cuddling-sutherland.md)
 
@@ -338,6 +347,23 @@ Post-phase additions (2026-07-07, all tested — suite: **89 passed**):
   evidence the vectors missed, without weakening the dense grounding gate. **(a)** Multi-hop eval
   set (`docs/evals/multi-hop-crosssource.yaml`) + `hops`/`hop_coverage` in the eval harness (the
   measurement loop for all of the above). Suite: **232 passed, 10 skipped** (pg env-gated).
+- Settings UI for the retrieval/graph stack + LLM connection test (2026-07-13, user request):
+  `GET/PATCH /api/settings` now round-trips the **`graph`** config too (was llm/embedding/
+  retrieval/chat only), and `POST /api/llm/test` probes the configured provider with a one-token
+  round-trip (accepts unsaved `llm` overrides so the form tests a proxy/model before persisting;
+  never saves). Settings drawer gained a **Test connection** button (LiteLLM-aware hint) plus
+  labelled **Toggle**s for hybrid / cross-encoder reranker / graph-expansion / contextual chunking
+  (ingest-time) / graph LLM-triple extraction (ingest-time), each marked query-time vs ingest-time
+  (re-sync). This closes the standing "settings-drawer toggles for the a–e knobs" item and rounds
+  out the LiteLLM provider config UI (which already had proxy-URL + api-key-env fields). Frontend
+  rebuilt (`frontend/dist`); new API tests in `test_api.py` (settings graph/retrieval round-trip,
+  `/api/llm/test` ok + failure). Also shipped: `docs/plans/05-eval-on-connected-org.md` — the
+  "decide with data" runbook (+ paste-in prompt) to A/B this whole stack on a real connected org.
+  Bug fixed in the same pass: `agent/tools.teach_fact` built the note URI with `int(time.time())`,
+  and since contextual chunking embeds the URI in each chunk's breadcrumb, that wall-clock token
+  polluted every taught-note vector — non-deterministic near the grounding gate (a flaky
+  `test_learn_endpoint_teaches_fact`) and a small persistent degradation in production. Now the
+  suffix is a content sha256 (stable + idempotent); regression-guarded in `test_pipeline.py`.
 
 ## Next steps (agreed with user)
 

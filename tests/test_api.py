@@ -116,6 +116,63 @@ def test_scrape_endpoint_rejects_non_http_url(client):
     assert client.post("/api/scrape", json={"url": "ftp://nope"}).status_code == 400
 
 
+def test_settings_graph_and_retrieval_roundtrip(client):
+    # The retrieval knobs + graph.extract_triples exposed to the UI must round-trip
+    # through PATCH -> persisted -> GET (they drive the Settings drawer toggles).
+    r = client.patch(
+        "/api/settings",
+        json={
+            "retrieval": {
+                "hybrid": False,
+                "reranker": "none",
+                "graph_expansion": False,
+                "contextual_chunks": False,
+            },
+            "graph": {"extract_triples": True},
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["retrieval"]["reranker"] == "none"
+    assert body["retrieval"]["graph_expansion"] is False
+    assert body["retrieval"]["contextual_chunks"] is False
+    assert body["graph"]["extract_triples"] is True
+    # A fresh GET reflects the persisted values.
+    got = client.get("/api/settings").json()
+    assert got["graph"]["extract_triples"] is True
+    assert got["retrieval"]["reranker"] == "none"
+
+
+def test_settings_rejects_bad_retrieval(client):
+    assert client.patch("/api/settings", json={"retrieval": {"min_score": "high"}}).status_code == 400
+
+
+def test_llm_test_endpoint_ok(client, monkeypatch):
+    # /api/llm/test probes the provider with a one-token round-trip using unsaved
+    # form overrides; a scripted provider stands in for a reachable backend.
+    import quickjoiner.llm as llm_mod
+
+    monkeypatch.setattr(llm_mod, "create_provider", lambda cfg: ScriptedProvider([ChatResult(text="OK")]))
+    r = client.post("/api/llm/test", json={"llm": {"provider": "ollama", "model": "qwen3:4b"}})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True and body["model"] == "qwen3:4b"
+    assert "OK" in body["message"]
+
+
+def test_llm_test_endpoint_reports_failure(client, monkeypatch):
+    import quickjoiner.llm as llm_mod
+
+    def boom(cfg):
+        raise RuntimeError("connection refused")
+
+    monkeypatch.setattr(llm_mod, "create_provider", boom)
+    r = client.post("/api/llm/test", json={"llm": {"provider": "litellm"}})
+    assert r.status_code == 200
+    assert r.json()["ok"] is False
+    assert "connection refused" in r.json()["message"]
+
+
 def test_graph_endpoint_resolves_and_snapshots(client):
     # Teaching a fact that mentions a ticket key populates the graph via the
     # pipeline's ticket extractor — the endpoint then resolves it by name.

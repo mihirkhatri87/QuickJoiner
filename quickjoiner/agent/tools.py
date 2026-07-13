@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
-import time
 
 from quickjoiner.config import GapsConfig, RetrievalConfig
 from quickjoiner.connectors.base import Document
@@ -20,8 +20,13 @@ def teach_fact(catalog: Catalog, pipeline: IngestPipeline, fact: str, topic: str
     `remember` tool, `qj learn "<free text>"`, and POST /api/learn."""
     catalog.upsert_source(USER_TAUGHT_SOURCE, "User-taught notes", "notes")
     slug = re.sub(r"[^a-z0-9]+", "-", (topic or fact[:40]).lower()).strip("-") or "note"
+    # Content-derived (not wall-clock) suffix: keeps the URI stable + unique so the
+    # same fact is idempotent, and — since contextual chunking embeds the URI in each
+    # chunk's breadcrumb — avoids folding a volatile timestamp token into the vector
+    # (which perturbed retrieval near the grounding threshold).
+    digest = hashlib.sha256(f"{topic or ''}\n{fact}".encode("utf-8")).hexdigest()[:10]
     doc = Document(
-        uri=f"note://{slug}-{int(time.time())}",
+        uri=f"note://{slug}-{digest}",
         title=topic or f"Note: {fact[:60]}",
         text=fact,
         kind="note",
