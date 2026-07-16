@@ -247,6 +247,13 @@ this or an embedding-model swap actually helps is a *measure-it* question — ru
 
 ```powershell
 qj brief quick-wins                    # also: architecture | week1 | roadmap (cited, saved, re-ingested)
+qj agents-md <source>                  # per-repo architecture brief for principal engineers/
+                                        #   architects, generated from the repo's file tree +
+                                        #   code-graph facts + dependency map + retrieved docs
+                                        #   (never runs code). Refines a real AGENTS.md if the
+                                        #   repo already has one, instead of overwriting it.
+                                        #   Saved to <workspace>/generated/<source>/AGENTS.md
+                                        #   and re-ingested — never written into the repo itself.
 qj ask "deploy inventory?" -f pptx     # export answers: md | html | csv | pptx
 qj eval my-evals.yaml --init           # write a starter eval set
 qj eval my-evals.yaml [--agent]        # retrieval metrics (recall@k, MRR, refusal accuracy, hop_coverage);

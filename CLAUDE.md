@@ -186,6 +186,23 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   saved; wired in `AppContext.build_agent`), tool-call loop (`agent.py`, max 10 rounds),
   onboarding briefs (`briefs.py`: seed queries → retrieved chunks → one-shot LLM call → saved to
   `<workspace>/briefs/` and re-ingested; refuses without hits and without building a provider).
+  **Repo architecture briefs** (`repo_docs.py`, `qj agents-md <source>` / `POST
+  /api/repos/{source}/agents-md`): a per-repo "AGENTS.md from a principal engineer/architect's
+  viewpoint," generated from real evidence, never invented — file tree (local clone/`files`
+  root, depth-capped), code-graph facts (`defines`/`imports` edges from `ingest/code_graph.py`),
+  the repo's dependency-map doc, and retrieved prose (post-filtered to that source_id — `store.search`
+  has no source predicate). Strict evidence-tier prompt (manifest > code-graph > prose > layout;
+  an absent section states so verbatim rather than inventing architecture). **QuickJoiner-internal
+  only**: saved to `<workspace>/generated/<source>/AGENTS.md` + re-ingested (`generated:agents-md`
+  bucket) — never written into the repo's own git working tree. If the repo already has a real
+  AGENTS.md ingested, this is a **refinement**: the existing doc becomes its own evidence block
+  (may carry a stronger model's or a human's judgment) with instructions to preserve/correct/extend
+  it rather than overwrite, so a weaker configured model degrades gracefully instead of downgrading
+  a good baseline. `provider_override`/`model_override` let one call use a stronger model than the
+  workspace default for this specific synthesis. `KnowledgeStore`/`PgVectorStore` gained
+  `get_document_chunks(doc_id)` (chunks are the only place original text lives — the catalog only
+  stores metadata+hash) and the catalog gained `documents_for_source(source_id)`, both needed to
+  read an existing AGENTS.md/dependency-map doc back out. Tests: `tests/test_repo_docs.py`.
 - `quickjoiner/auth.py` — opt-in local auth. `Auth` over the catalog: PBKDF2 password hashing,
   bearer tokens (sha256-hashed at rest in `auth_tokens`), `users` table. **Open mode until the
   first user exists** (no login, everything shared = pre-auth behavior). Sharing model on

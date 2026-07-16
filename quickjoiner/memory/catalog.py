@@ -217,6 +217,11 @@ class _SqlCatalog:
     def get_document(self, doc_id: str) -> dict | None:
         return self._read_one("SELECT * FROM documents WHERE doc_id = ?", (doc_id,))
 
+    def documents_for_source(self, source_id: str) -> list[dict]:
+        return self._read_all(
+            "SELECT * FROM documents WHERE source_id = ? ORDER BY uri", (source_id,)
+        )
+
     def upsert_document(self, doc_id, source_id, uri, title, kind, content_hash,
                         updated_at, chunk_count) -> None:
         self._write(

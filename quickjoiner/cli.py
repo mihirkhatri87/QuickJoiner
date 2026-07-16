@@ -590,6 +590,39 @@ def brief(
         _export_answer(ctx, markdown, format, out, title=f"{type} brief")
 
 
+@app.command("agents-md")
+def agents_md(
+    source: str = typer.Argument(..., help="Name of a configured git/files source (a cloned repo)"),
+    provider: Optional[str] = PROVIDER_OPT,
+    model: Optional[str] = MODEL_OPT,
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """Generate (or refine) a repo's architecture brief from code structure + docs.
+
+    Looks at the repo's file tree, code-graph facts (defines/imports), dependency
+    map, and any retrieved docs — never runs code. If the repo already has a real
+    AGENTS.md, refines it instead of overwriting it. Always saved under
+    <workspace>/generated/<source>/AGENTS.md and re-ingested, never written into
+    the repo's own working tree.
+    """
+    from quickjoiner.agent.repo_docs import generate_agents_md
+
+    ctx = _context(workspace)
+    try:
+        with console.status(f"Writing the architecture brief for {source}..."):
+            markdown, path = generate_agents_md(
+                ctx, source, provider_override=provider, model_override=model
+            )
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    except Exception as exc:  # provider/setup failures (e.g. missing API key)
+        console.print(f"[red]Architecture brief generation failed: {exc}[/red]")
+        raise typer.Exit(1)
+    console.print(Markdown(markdown))
+    console.print(f"\n[green]Saved:[/green] {path} (also ingested into memory)")
+
+
 @app.command("eval")
 def eval_cmd(
     evalset: Path = typer.Argument(..., help="Path to a YAML eval set (create one with --init)"),

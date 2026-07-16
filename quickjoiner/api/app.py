@@ -627,6 +627,20 @@ def create_app(workspace: Path) -> FastAPI:
             raise HTTPException(status_code=502, detail=str(exc))
         return {"brief": markdown, "path": str(path) if path else None, "generated": path is not None}
 
+    @api.post("/api/repos/{source_name}/agents-md")
+    def make_agents_md(source_name: str, provider: str | None = None, model: str | None = None):
+        from quickjoiner.agent.repo_docs import generate_agents_md
+
+        try:
+            markdown, path = generate_agents_md(
+                ctx, source_name, provider_override=provider, model_override=model
+            )
+        except ValueError as exc:  # unknown/unsynced source
+            raise HTTPException(status_code=404, detail=str(exc))
+        except Exception as exc:  # provider/setup failures
+            raise HTTPException(status_code=502, detail=str(exc))
+        return {"brief": markdown, "path": str(path)}
+
     @api.get("/api/projects")
     def list_projects():
         return ctx.catalog.list_projects()
