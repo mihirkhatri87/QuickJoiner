@@ -134,6 +134,13 @@ $env:LITELLM_API_KEY = "sk-..."         # env var name is configurable (llm.api_
 ```
 The secret is read from the environment at runtime and never written to config.
 
+The provider is resilient to a flaky gateway: transient `401/429/5xx` responses and network
+blips are retried with bounded exponential backoff (some proxies intermittently reject a valid
+key under load), and tool names are auto-sanitized to the OpenAI-compatible pattern so
+connector tools whose names contain spaces work with strict backends like gpt-oss. Live tool
+results are capped (`chat.live_tool_result_max_chars`, default 24000) so a large source — e.g. a
+big Octopus deployment dashboard — can't overflow the model's context window.
+
 ---
 
 ## Connect org systems

@@ -10,7 +10,8 @@ import json
 import httpx
 
 from quickjoiner.config import LLMConfig
-from quickjoiner.llm.base import ToolCall, ToolSpec
+from quickjoiner.llm.base import ToolCall, ToolSpec, sanitize_tool_name
+from quickjoiner.llm import litellm_provider
 from quickjoiner.llm.litellm_provider import (
     LiteLLMProvider,
     _parse_arguments,
@@ -198,3 +199,80 @@ def test_no_api_key_header_when_env_unset(monkeypatch):
     monkeypatch.delenv("LITELLM_API_KEY", raising=False)
     prov = LiteLLMProvider(_cfg())
     assert prov._headers == {}
+
+
+# --------------------------------------------------------------- tool-name sanitization
+
+def test_sanitize_tool_name_enforces_openai_pattern():
+    # Spaces (the gpt-oss Harmony "to=functions.<name>" 500 trigger) and other invalid
+    # chars collapse to underscores; length is capped at 64.
+    assert sanitize_tool_name("octopus_deployment_status_Appriver Octopus") == "octopus_deployment_status_Appriver_Octopus"
+    assert sanitize_tool_name("a.b/c d") == "a_b_c_d"
+    assert sanitize_tool_name("  spaced  ") == "spaced"
+    assert sanitize_tool_name("") == "tool"
+    assert len(sanitize_tool_name("x" * 100)) == 64
+
+
+def test_tool_name_sanitized_in_request_payload():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    prov = LiteLLMProvider(_cfg(), transport=httpx.MockTransport(handler))
+    tools = [ToolSpec(name="octopus_status_Appriver Octopus", description="d", input_schema={"type": "object"})]
+    prov.chat([{"role": "user", "content": "hi"}], tools=tools)
+    assert captured["body"]["tools"][0]["function"]["name"] == "octopus_status_Appriver_Octopus"
+
+
+# --------------------------------------------------------------- transient-error retry
+
+def test_retries_transient_status_then_succeeds(monkeypatch):
+    monkeypatch.setattr(litellm_provider.time, "sleep", lambda *_: None)
+    statuses = [503, 401, 200]  # flaky broker: two blips then success
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        code = statuses.pop(0)
+        if code != 200:
+            return httpx.Response(code, json={"error": "transient"})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "recovered"}}]})
+
+    prov = LiteLLMProvider(_cfg(), transport=httpx.MockTransport(handler))
+    result = prov.chat([{"role": "user", "content": "hi"}])
+    assert result.text == "recovered"
+    assert statuses == []  # all three attempts consumed
+
+
+def test_retries_exhaust_then_raise(monkeypatch):
+    monkeypatch.setattr(litellm_provider.time, "sleep", lambda *_: None)
+    attempts = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        return httpx.Response(500, json={"error": "down"})
+
+    prov = LiteLLMProvider(_cfg(), transport=httpx.MockTransport(handler))
+    try:
+        prov.chat([{"role": "user", "content": "hi"}])
+        assert False, "expected HTTPStatusError after exhausting retries"
+    except httpx.HTTPStatusError as exc:
+        assert exc.response.status_code == 500
+    assert attempts["n"] == litellm_provider._MAX_ATTEMPTS  # bounded, not infinite
+
+
+def test_non_retriable_status_raises_immediately(monkeypatch):
+    monkeypatch.setattr(litellm_provider.time, "sleep", lambda *_: None)
+    attempts = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        return httpx.Response(400, json={"error": "bad request"})
+
+    prov = LiteLLMProvider(_cfg(), transport=httpx.MockTransport(handler))
+    try:
+        prov.chat([{"role": "user", "content": "hi"}])
+        assert False, "expected HTTPStatusError"
+    except httpx.HTTPStatusError as exc:
+        assert exc.response.status_code == 400
+    assert attempts["n"] == 1  # 400 is a real client error — no retry

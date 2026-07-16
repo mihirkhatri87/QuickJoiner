@@ -77,6 +77,18 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   extended thinking is config-gated (`llm.thinking`, `llm.thinking_budget`). Anthropic signed
   thinking blocks ride on assistant history messages as `thinking_blocks` and are re-emitted
   FIRST in `_to_wire` (API requirement during tool use).
+  **Tool names are sanitized to OpenAI's `^[a-zA-Z0-9_-]{1,64}$` at `ToolSpec` construction**
+  (`base.sanitize_tool_name` via `__post_init__`) — connector live-tool names embed the source
+  name (e.g. "Appriver Octopus"), and a space breaks the gpt-oss "Harmony" tool-call wire format
+  (`to=functions.<name>`), which returns HTTP 500 "unexpected tokens remaining in message header".
+  Sanitizing at the single choke point keeps the request payload, the model's returned
+  `tool_call.name`, and the agent's dispatch key identical. **Transient-error retry**
+  (`litellm_provider`, `_MAX_ATTEMPTS=4`, exponential backoff): retries `{401,429,500,502,503,504}`
+  + network errors — some fronting proxies (an overloaded internal model broker) intermittently
+  reject a *valid* static key under load (observed live as the same key alternating 200/401), so a
+  bounded retry smooths it; a genuinely bad key still surfaces its 401 after the capped backoffs.
+  Streaming retries only the connection+status handshake (before any token reaches the caller);
+  once tokens flow it's committed. Real client errors (400) are never retried.
 - `quickjoiner/memory/` — **pluggable persistence (Phase 1 cloud groundwork):** `factory.py`
   (`create_catalog`/`create_store`) picks the backend on `DATABASE_URL` — unset ⇒ on-prem
   SQLite + LanceDB files; a `postgres://` DSN ⇒ cloud `PostgresCatalog` (`pg_catalog.py`) +
@@ -201,7 +213,12 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   list_connector_types / add_connector / sync_source — same service functions as the UI
   slash commands; prompt requires explicit user confirmation before add_connector, secrets
   via env: indirection only, scrape only user-given URLs, failed connection tests are not
-  saved; wired in `AppContext.build_agent`), tool-call loop (`agent.py`, max 10 rounds),
+  saved; wired in `AppContext.build_agent`), tool-call loop (`agent.py`, max 10 rounds —
+  **each live tool result is capped to `chat.live_tool_result_max_chars` (default 24000) before
+  re-entering the model context**, so an unbounded connector tool like the full Octopus dashboard
+  can't overflow the window and make the provider reject the follow-up turn; on hitting the round
+  limit the agent makes **one final tool-free turn** so a model that loops on searches still
+  answers or properly refuses from what it gathered, instead of a canned "hit the limit" message),
   onboarding briefs (`briefs.py`: seed queries → retrieved chunks → one-shot LLM call → saved to
   `<workspace>/briefs/` and re-ingested; refuses without hits and without building a provider).
   **Repo architecture briefs** (`repo_docs.py`, `qj agents-md <source>` / `POST
@@ -469,6 +486,28 @@ Post-phase additions (2026-07-07, all tested — suite: **89 passed**):
   count dropped from inflated-by-content-links to the true `1 source`, TFS/GitLab links render as
   normal teal links. Frontend rebuilt; no dedicated frontend test suite exists yet (manual/Playwright
   verification is the current practice, per the markdown-renderer entry above).
+- Live agent robustness against gpt-oss + a flaky broker (2026-07-16, found while live-testing the
+  Octopus connector's real scenarios on the Appriver workspace, provider `litellm`/`gpt-oss-120b`):
+  three real bugs blocked every tool-using answer, now fixed with regression tests.
+  **(1) Tool names with spaces → HTTP 500.** Connector live-tool names embed the source name
+  (`octopus_deployment_status_Appriver Octopus`); the space breaks gpt-oss's Harmony tool-call wire
+  format and the broker returns `500 "unexpected tokens remaining in message header:
+  to=functions.octopus_deployment_status_Appriver"`. Fixed by sanitizing at `ToolSpec.__post_init__`
+  (`base.sanitize_tool_name`, OpenAI's `^[a-zA-Z0-9_-]{1,64}$`) — the single choke point for every
+  tool. This was the "tool use failure" seen the prior night. **(2) Unbounded tool output →
+  context overflow → HTTP 400.** The `octopus_deployment_status` live tool dumps the whole dashboard
+  (one line per project×environment — ~531 KB for 519 projects), pushing the prompt past the model's
+  window; the proxy then computes a *negative* `max_tokens` and rejects with `400 "max_tokens must be
+  at least 1, got -86016"`. Fixed by capping each live tool result to `chat.live_tool_result_max_chars`
+  (default 24000) in the agent loop before it re-enters context. **(3) Flaky broker → raw traceback.**
+  The internal model broker intermittently returns 401/500 for a *valid* static key under load (same
+  key alternates 200/401 within seconds); the LiteLLM provider now retries `{401,429,5xx}` + network
+  errors with bounded exponential backoff. Also: on the 10-round tool-call limit the agent makes one
+  final tool-free turn (a model that loops search→confluence→scrape now still answers/refuses instead
+  of a canned "hit the limit" message). Live-verified scenarios once the broker cooperated: "what
+  environments exist in Octopus?" → 10 environments cited; "which envs is appriver-management-console
+  deployed to + prod version?" → per-env table (DevLab 0.1.16 / Production 0.1.14) cited. Suite:
+  **299 passed, 10 skipped** (pre-existing unrelated `test_evals.py` multi-hop-yaml failure remains).
 
 ## Next steps (agreed with user)
 

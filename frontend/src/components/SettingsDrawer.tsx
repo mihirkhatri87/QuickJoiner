@@ -452,9 +452,14 @@ function WorkspaceSettings({
           <TextInput value={String(s.chat.keep_recent_messages)} onChange={(e) => set("chat.keep_recent_messages", num(e.target.value))} />
         </Field>
       </div>
-      <Field label="Tool-result cap (chars)">
-        <TextInput value={String(s.chat.tool_result_max_chars)} onChange={(e) => set("chat.tool_result_max_chars", num(e.target.value))} />
-      </Field>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Tool-result cap (history)">
+          <TextInput value={String(s.chat.tool_result_max_chars)} onChange={(e) => set("chat.tool_result_max_chars", num(e.target.value))} />
+        </Field>
+        <Field label="Tool-result cap (live)">
+          <TextInput value={String(s.chat.live_tool_result_max_chars)} onChange={(e) => set("chat.live_tool_result_max_chars", num(e.target.value))} />
+        </Field>
+      </div>
       <label className="my-3 flex items-start gap-2 text-[12.5px] text-muted">
         <input type="checkbox" checked={s.chat.learn_from_conversations} onChange={(e) => set("chat.learn_from_conversations", e.target.checked)} className="mt-0.5 h-[15px] w-[15px] accent-[var(--accent)]" />
         Distill durable facts from chats into memory

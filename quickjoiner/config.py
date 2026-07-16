@@ -104,6 +104,10 @@ class ChatConfig(BaseModel):
     compress_after_est_tokens: int = 6000
     keep_recent_messages: int = 12
     tool_result_max_chars: int = 2000  # persisted tool outputs are truncated to this
+    # Live agent-loop cap: a single tool result is truncated to this before being fed
+    # back to the model, so an unbounded connector tool (e.g. the full Octopus dashboard)
+    # can't overflow the context window and make the provider reject the follow-up turn.
+    live_tool_result_max_chars: int = 24000
     learn_from_conversations: bool = True  # distill durable facts into memory on compression
 
 

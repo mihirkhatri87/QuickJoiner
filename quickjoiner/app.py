@@ -50,7 +50,10 @@ class AppContext:
         tools.extend(build_ops_tools(self))
         tools.extend(self.connector_tools(sources))
         system = SYSTEM_PROMPT + (f"\n\n{extra_system}" if extra_system else "")
-        return OnboardingAgent(provider, tools, system)
+        return OnboardingAgent(
+            provider, tools, system,
+            tool_result_max_chars=self.config.chat.live_tool_result_max_chars,
+        )
 
     def connector_tools(self, sources: list | None = None):
         """Live read-from-source tools contributed by configured connectors.
