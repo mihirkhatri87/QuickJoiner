@@ -16,10 +16,20 @@ EventCallback = Callable[[str, str], None]
 
 
 class OnboardingAgent:
-    def __init__(self, provider: LLMProvider, tools: list[AgentTool], system: str):
+    def __init__(
+        self,
+        provider: LLMProvider,
+        tools: list[AgentTool],
+        system: str,
+        tool_result_max_chars: int = 24000,
+    ):
         self._provider = provider
         self._tools = {t.spec.name: t for t in tools}
         self._system = system
+        # Cap a single live tool result before feeding it back to the model, so an
+        # unbounded connector tool (e.g. the whole Octopus dashboard) can't overflow
+        # the context window and make the provider reject the next turn.
+        self._tool_result_max_chars = tool_result_max_chars
 
     def ask(
         self,
@@ -63,6 +73,7 @@ class OnboardingAgent:
                         output = tool.run(**call.input)
                     except Exception as exc:
                         output = f"Error running {call.name}: {exc}"
+                output = self._cap(output)
                 messages.append(
                     {
                         "role": "tool",
@@ -72,6 +83,23 @@ class OnboardingAgent:
                     }
                 )
 
-        fallback = "I hit the tool-call limit before finishing. Here is what I have so far."
+        # Tool-call budget exhausted (often a model looping on searches for something
+        # that isn't in memory). Make one final tool-free turn so it must answer — or
+        # properly refuse ("I haven't learned that yet") — from what it has gathered,
+        # instead of emitting an unhelpful canned message.
+        try:
+            final = self._provider.chat(messages, system=self._system, tools=None, on_stream=on_stream)
+            if final.text:
+                messages.append({"role": "assistant", "content": final.text})
+                return final.text, messages
+        except Exception:
+            pass
+        fallback = "I wasn't able to finish answering that from the sources I have."
         messages.append({"role": "assistant", "content": fallback})
         return fallback, messages
+
+    def _cap(self, output: str) -> str:
+        limit = self._tool_result_max_chars
+        if limit and len(output) > limit:
+            return output[:limit] + "\n…[tool output truncated]"
+        return output

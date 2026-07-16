@@ -15,8 +15,9 @@ when memory has nothing relevant.
   extended thinking on all three.
 - **Multi-mode connectors** — pull APIs, push webhooks, live "read from source" agent tools,
   authenticated browser sessions with your own credentials, and scraping as a last resort.
-  Types: files/URLs, git, GitHub, GitLab, Jira, Confluence, Azure DevOps, Octopus Deploy,
-  Grafana, Datadog, Dynatrace, Elasticsearch, and a generic web scraper.
+  Types: files/URLs, git, GitHub, GitLab, Jira, Confluence, Azure DevOps (cloud **and**
+  on-prem Server/TFS), Octopus Deploy, Grafana, Datadog, Dynatrace, Elasticsearch, and a
+  generic web scraper.
 - **Honesty by design** — a grounding contract forces citations and refusals, every refusal is
   captured as a **knowledge gap** with one-click remediation, and a **knowledge graph** links
   repos, packages, tickets, services, and environments so you can see how things connect.
@@ -133,6 +134,13 @@ $env:LITELLM_API_KEY = "sk-..."         # env var name is configurable (llm.api_
 ```
 The secret is read from the environment at runtime and never written to config.
 
+The provider is resilient to a flaky gateway: transient `401/429/5xx` responses and network
+blips are retried with bounded exponential backoff (some proxies intermittently reject a valid
+key under load), and tool names are auto-sanitized to the OpenAI-compatible pattern so
+connector tools whose names contain spaces work with strict backends like gpt-oss. Live tool
+results are capped (`chat.live_tool_result_max_chars`, default 24000) so a large source — e.g. a
+big Octopus deployment dashboard — can't overflow the model's context window.
+
 ---
 
 ## Connect org systems
@@ -145,6 +153,12 @@ qj connect github --name platform-gh --option repo=acme/platform --option token=
 qj connect jira --name pay-jira --option base_url=https://acme.atlassian.net --option email=me@acme.com --option api_token=env:JIRA_API_TOKEN --option projects=PAY,LEDG
 qj connect confluence --name wiki --option base_url=https://acme.atlassian.net --option email=me@acme.com --option api_token=env:JIRA_API_TOKEN --option spaces=ENG
 qj connect azure_devops --name ado --option organization=acme --option project=Payments --option token=env:AZURE_DEVOPS_PAT
+# on-prem Azure DevOps Server / TFS: use server_url + collection instead of organization
+# (verify_tls=false for a self-signed cert; api_version to match an older server):
+qj connect azure_devops --name tfs --option server_url=https://tfs.company.com/tfs --option collection=DefaultCollection --option project=Payments --option token=env:AZURE_DEVOPS_PAT --option verify_tls=false
+# Octopus paginates all projects (not just the first 100); incremental=true re-fetches a
+# project's releases only when it changed since last sync (dashboard/projects always refresh):
+qj connect octopus --name deploys --option server_url=https://octopus.acme.com --option api_key=env:OCTOPUS_API_KEY --option incremental=true
 
 qj sync            # incremental pull from every source
 qj sync pay-jira   # or just one source
@@ -247,6 +261,16 @@ this or an embedding-model swap actually helps is a *measure-it* question — ru
 
 ```powershell
 qj brief quick-wins                    # also: architecture | week1 | roadmap (cited, saved, re-ingested)
+qj agents-md <source>                  # per-repo architecture brief for principal engineers/
+                                        #   architects, generated from the repo's file tree +
+                                        #   code-graph facts + dependency map + retrieved docs
+                                        #   (never runs code). Refines a real AGENTS.md if the
+                                        #   repo already has one, instead of overwriting it.
+                                        #   Saved to <workspace>/generated/<source>/AGENTS.md
+                                        #   and re-ingested — never written into the repo itself.
+                                        #   Also available per-connector in the web UI
+                                        #   ("Architecture brief" button), and can auto-generate
+                                        #   once on first sync (Settings → Repositories toggle).
 qj ask "deploy inventory?" -f pptx     # export answers: md | html | csv | pptx
 qj eval my-evals.yaml --init           # write a starter eval set
 qj eval my-evals.yaml [--agent]        # retrieval metrics (recall@k, MRR, refusal accuracy, hop_coverage);

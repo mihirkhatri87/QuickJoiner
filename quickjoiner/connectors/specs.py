@@ -81,11 +81,20 @@ FORM_SPECS: dict[str, dict] = {
     },
     "azure_devops": {
         "label": "Azure DevOps",
-        "blurb": "Work items, PRs, pipelines. Live code search across the project.",
+        "blurb": "Work items, PRs, pipelines. Live code search. Cloud or on-prem Server/TFS.",
         "fields": [
-            _f("organization", "Organization", required=True, placeholder="acme"),
+            _f("organization", "Organization (cloud)", placeholder="acme",
+               help="For dev.azure.com SaaS. Leave blank and use Server URL + Collection for on-prem TFS / Azure DevOps Server."),
+            _f("server_url", "Server URL (on-prem)", placeholder="https://tfs.company.com/tfs",
+               help="On-prem Azure DevOps Server / TFS host up to and including /tfs. Use with Collection."),
+            _f("collection", "Collection (on-prem)", placeholder="DefaultCollection",
+               help="On-prem collection name, e.g. the segment after /tfs/ in the server URL."),
             _f("project", "Project", required=True, placeholder="Payments"),
             _f("token", "Personal access token", secret=True, env="AZURE_DEVOPS_PAT"),
+            _f("api_version", "API version", placeholder="7.0",
+               help="Match your server: 2022→7.0, 2020→6.0, 2019→5.0. Default 7.0."),
+            _f("verify_tls", "Verify TLS certificate", placeholder="true",
+               help="Set to false for on-prem servers with a self-signed / internal-CA certificate."),
         ],
     },
     "octopus": {
@@ -95,6 +104,8 @@ FORM_SPECS: dict[str, dict] = {
             _f("server_url", "Server URL", required=True, placeholder="https://octopus.acme.com"),
             _f("api_key", "API key", secret=True, env="OCTOPUS_API_KEY"),
             _f("space_id", "Space", placeholder="Spaces-1"),
+            _f("incremental", "Incremental releases", placeholder="false",
+               help="Set to true to re-fetch a project's releases only when Octopus recorded an event for it since the last sync (project list + deployment dashboard always refresh). Faster on large spaces; leave false for a full refresh every sync."),
         ],
     },
     "grafana": {

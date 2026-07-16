@@ -116,7 +116,11 @@ def build_ops_tools(ctx) -> list[AgentTool]:
         stats = ctx.pipeline.ingest(connector.sync(state), connector.source_id)
         ctx.catalog.set_sync_state(connector.source_id, "since", started)
         errors = f" Errors: {'; '.join(stats.errors[:3])}" if stats.errors else ""
-        return f"Sync of {name!r} finished: {stats.summary()}.{errors}"
+        from quickjoiner.agent.repo_docs import maybe_autogenerate
+
+        brief_path = maybe_autogenerate(ctx, source)
+        brief = f" Generated an architecture brief: {brief_path}." if brief_path else ""
+        return f"Sync of {name!r} finished: {stats.summary()}.{errors}{brief}"
 
     return [
         AgentTool(

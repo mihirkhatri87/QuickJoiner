@@ -147,6 +147,15 @@ def test_settings_rejects_bad_retrieval(client):
     assert client.patch("/api/settings", json={"retrieval": {"min_score": "high"}}).status_code == 400
 
 
+def test_settings_repos_autogen_roundtrip(client):
+    # The auto-AGENTS.md toggle must round-trip through PATCH -> persisted -> GET
+    # (it drives the Settings drawer "auto-generate architecture brief on sync" switch).
+    assert client.get("/api/settings").json()["repos"]["auto_agents_md"] is False
+    r = client.patch("/api/settings", json={"repos": {"auto_agents_md": True}})
+    assert r.status_code == 200 and r.json()["repos"]["auto_agents_md"] is True
+    assert client.get("/api/settings").json()["repos"]["auto_agents_md"] is True
+
+
 def test_llm_test_endpoint_ok(client, monkeypatch):
     # /api/llm/test probes the provider with a one-token round-trip using unsaved
     # form overrides; a scripted provider stands in for a reachable backend.

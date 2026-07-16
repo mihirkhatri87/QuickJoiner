@@ -122,6 +122,41 @@ than get one clarifying question:
   citations already present in the turn, the same way `parse_triples` drops off-vocabulary
   triples rather than repairing them.
 
+### D. Entity-resolution adjudicator needs context, not bare names (blocks §B's corroboration count)
+
+Found while verifying the Connector repo re-sync (2026-07-15), after entity resolution had
+already been running in production for the full Confluence backfill plus the repo re-sync:
+`resolve_entity('webroot connector')` still returns the Confluence-sourced
+`project:webroot connector` unmerged from the repo-sourced `AppRiver.Connector.Web` /
+`AppRiver.Connector.Unity` entities — the exact cross-source merge this feature was built to
+catch never fired for its own motivating case.
+
+Root cause hypothesis: `make_llm_adjudicator`'s prompt
+(`quickjoiner/ingest/entity_resolution.py`) shows the LLM only the bare candidate name
+strings, with none of the surrounding evidence (the document title, kind, or the sentence
+each name was mentioned in). Asked to confirm two names denote the same real-world thing
+with nothing but the strings themselves, the safer LLM behavior is to default to `NONE`
+rather than guess — which is very likely why "Webroot Connector" (a product nickname) never
+gets tied to "AppRiver.Connector.Web" (its actual repo name) even though a human skimming
+the source pages would connect them immediately from context.
+
+This is not a cosmetic gap for this plan specifically: §B's confidence score depends on
+**corroboration count** — how many independent documents assert the same edge — and that
+count is computed per canonical entity id. An unmerged duplicate silently *splits* real
+corroboration across two ids, undercounting both fragments. A fact that should read as
+well-corroborated (repo docs + Confluence agreeing) can end up scored as two separately
+weak, single-source claims instead. Fixing §B's scoring without fixing this means the
+scores it produces are quietly wrong on exactly the multi-source cases the plan cares most
+about.
+
+Proposed direction (not yet implemented, needs its own design pass when this plan is
+picked up): extend the adjudicator prompt to include a short context snippet per
+candidate — the evidence document's title/kind and the sentence or heading the name was
+extracted from, not just the bare string — mirroring how a human actually makes this call.
+`resolve_entity('webroot connector')` merging with `AppRiver.Connector.Web`/`.Unity` once
+this ships is the concrete, already-reproducible acceptance check (no fixture needed — it
+reproduces against the live workspace today).
+
 ## 2. Acceptance criteria
 
 1. The worked example: asking "how are nautical and connector connected?" against the real
@@ -160,6 +195,11 @@ dropped, cap enforced, unresolvable-evidence candidate dropped, empty/no-block i
 Frontend: a Playwright pass (per this session's `/verify`-style live-browser convention,
 not just typecheck) driving a seeded ambiguous question end-to-end and screenshotting the
 carousel.
+`test_entity_resolution.py`: extend the adjudicator test with a context-bearing prompt case
+— two candidate names plus differing evidence snippets that a human (and the scripted/fake
+adjudicator) would only merge given the context, not the names alone; live regression check
+against `resolve_entity('webroot connector')` merging with `AppRiver.Connector.Web`/`.Unity`
+on the real workspace, per §1.D.
 
 ## 4. Related work folded in from the same session (do before or alongside, not instead of)
 
@@ -172,6 +212,11 @@ carousel.
 - Meeting-notes triple-extraction quality is *not* a separate fix in this plan — it's
   absorbed into §B's confidence weighting (lower-confidence, not filtered/deleted; the
   edge is real, it's just less authoritative than a deliberate doc).
+- **Entity-resolution adjudicator context gap** (§1.D): verified live (2026-07-15) that
+  "Webroot Connector" still doesn't merge with `AppRiver.Connector.Web`/`.Unity` even after
+  a full production re-sync with entity resolution on — this is a **prerequisite** for §B's
+  corroboration count to be trustworthy, not an optional nice-to-have alongside it. Do this
+  before or alongside §B, not after.
 
 ---
 
@@ -219,8 +264,11 @@ PROJECT MECHANICS:
   evidence, not just tsc --noEmit.
 
 ORDER: A (graph_path_candidates + tool text + prompt guidance — ships value alone, no UI
-needed) -> B (score_edge, wired into A's tool text) -> C (parse_candidates + SSE event +
-CandidateCarousel).
+needed) -> D (entity-resolution adjudicator context fix — B's corroboration count is
+computed per canonical entity id, so an unmerged duplicate like the still-reproducing
+Webroot-Connector case silently undercounts real corroboration; fix this before trusting
+B's numbers) -> B (score_edge, wired into A's tool text) -> C (parse_candidates + SSE event
++ CandidateCarousel).
 
 WORKED-EXAMPLE GATE (do this last, before calling it done): against a workspace containing
 this session's real Connector/Confluence data (or an equivalent seeded fixture reproducing
@@ -237,7 +285,10 @@ DEFINITION OF DONE:
 - CLAUDE.md updated: agent/ architecture bullet (graph_path_candidates, confidence.py,
   candidates.py), the SSE event list (chat.py docstring already enumerates event types —
   add "candidates"), and a status line under "Next steps."
-- The three related-work items in the plan's §4 are NOT silently done as part of this —
-  call out explicitly in your report whether you did them, deferred them, or they're still
-  blocked (e.g. Nautical/Stevedore not yet connectable).
+- The related-work items in the plan's §4 are NOT silently done as part of this — call out
+  explicitly in your report whether you did them, deferred them, or they're still blocked
+  (e.g. Nautical/Stevedore not yet connectable). §1.D (entity-resolution context) is NOT
+  optional related work — it's a correctness prerequisite for §B; your report must state
+  whether `resolve_entity('webroot connector')` merges with `AppRiver.Connector.Web`/`.Unity`
+  after your change, tested against the real workspace, not just a fixture.
 ```

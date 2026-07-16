@@ -205,6 +205,53 @@ def test_azure_devops_live_tools(tmp_path):
     assert names == ["ado_query_work_items_ado", "ado_search_code_ado", "ado_get_file_ado"]
 
 
+def _ado(tmp_path, **options):
+    return create_connector(
+        SourceConfig(name="ado", type="azure_devops", options=options), tmp_path
+    )
+
+
+def test_azure_devops_saas_url_defaults_unchanged(tmp_path):
+    # Regression guard: existing SaaS configs keep the cloud hosts, verify, and api 7.0.
+    c = _ado(tmp_path, organization="acme", project="Payments")
+    assert c._org_url() == "https://dev.azure.com/acme"
+    assert c._search_url() == "https://almsearch.dev.azure.com/acme"
+    assert c._api() == "api-version=7.0"
+    assert c._verify() is True
+
+
+def test_azure_devops_onprem_url_construction(tmp_path):
+    # On-prem Azure DevOps Server / TFS: {server_url}/{collection}, code search on the
+    # same host (no almsearch.*), api-version overridable, TLS verify off for self-signed.
+    c = _ado(
+        tmp_path,
+        server_url="https://tfs.appriver.com/tfs/",  # trailing slash tolerated
+        collection="AppRiver",
+        project="AppRiver",
+        api_version="7.1",
+        verify_tls="false",
+    )
+    assert c._org_url() == "https://tfs.appriver.com/tfs/AppRiver"
+    assert c._search_url() == "https://tfs.appriver.com/tfs/AppRiver"  # same host, not almsearch
+    assert c._api() == "api-version=7.1"
+    assert c._verify() is False
+
+
+def test_azure_devops_verify_tls_coercion(tmp_path):
+    # Form values arrive as strings; only explicit false-y strings disable verification.
+    assert _ado(tmp_path, organization="a", project="p", verify_tls="false")._verify() is False
+    assert _ado(tmp_path, organization="a", project="p", verify_tls="False")._verify() is False
+    assert _ado(tmp_path, organization="a", project="p", verify_tls="0")._verify() is False
+    assert _ado(tmp_path, organization="a", project="p", verify_tls="true")._verify() is True
+    assert _ado(tmp_path, organization="a", project="p")._verify() is True  # default
+
+
+def test_azure_devops_test_requires_org_or_server(tmp_path):
+    # Neither organization nor server_url -> a clear validation failure, no HTTP attempted.
+    status = _ado(tmp_path, project="Payments").test()
+    assert status.ok is False and "organization" in status.message and "server_url" in status.message
+
+
 def test_github_webhook_event_to_document(tmp_path):
     connector = create_connector(
         SourceConfig(name="x", type="github", options={"repo": "o/r"}), tmp_path

@@ -180,6 +180,22 @@ class KnowledgeStore:
             table.delete(f'doc_id = "{doc_id}"')
         self._fts_write("DELETE FROM chunks_fts WHERE doc_id = ?", (doc_id,))
 
+    def get_document_chunks(self, doc_id: str) -> list[str]:
+        """Full ordered chunk texts for one document — chunks are the only place
+        the original text lives (the catalog only stores metadata + a hash), so
+        anything needing a document's actual content (e.g. repo-doc generation
+        reading an existing AGENTS.md back) reconstructs it from here."""
+        table = self._table()
+        if table is None:
+            return []
+        try:
+            rows = table.to_arrow().select(["doc_id", "chunk_index", "text"]).to_pylist()
+        except Exception:
+            return []
+        matched = [r for r in rows if r["doc_id"] == doc_id]
+        matched.sort(key=lambda r: r["chunk_index"])
+        return [r["text"] for r in matched]
+
     def delete_source(self, source_id: str) -> None:
         table = self._table()
         if table is not None:

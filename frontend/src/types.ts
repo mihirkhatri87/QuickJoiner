@@ -29,9 +29,11 @@ export interface Settings {
     compress_after_est_tokens: number;
     keep_recent_messages: number;
     tool_result_max_chars: number;
+    live_tool_result_max_chars: number;
     learn_from_conversations: boolean;
   };
   graph: { extract_triples: boolean; entity_resolution: boolean };
+  repos: { auto_agents_md: boolean };
   embedding_reindex_required: boolean;
 }
 

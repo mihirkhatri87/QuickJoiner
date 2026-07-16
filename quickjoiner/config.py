@@ -104,6 +104,10 @@ class ChatConfig(BaseModel):
     compress_after_est_tokens: int = 6000
     keep_recent_messages: int = 12
     tool_result_max_chars: int = 2000  # persisted tool outputs are truncated to this
+    # Live agent-loop cap: a single tool result is truncated to this before being fed
+    # back to the model, so an unbounded connector tool (e.g. the full Octopus dashboard)
+    # can't overflow the context window and make the provider reject the follow-up turn.
+    live_tool_result_max_chars: int = 24000
     learn_from_conversations: bool = True  # distill durable facts into memory on compression
 
 
@@ -139,6 +143,16 @@ class GraphConfig(BaseModel):
     entity_resolution: bool = False
 
 
+class ReposConfig(BaseModel):
+    # Per-repo architecture briefs (agent/repo_docs.py, `qj agents-md`). Deterministic
+    # on demand; this only gates the *automatic* one-shot generation on sync.
+    # Auto-generate a repo's AGENTS.md the first time a git/files source is synced and
+    # has no generated brief yet. One LLM call per repo, fired ONCE (guarded on the
+    # generated doc's existence), never on every sync — off by default so a sync stays
+    # free unless the user opts in. Manual `qj agents-md <source>` always works regardless.
+    auto_agents_md: bool = False
+
+
 class SourceConfig(BaseModel):
     name: str
     type: str
@@ -158,6 +172,7 @@ class Config(BaseModel):
     chat: ChatConfig = Field(default_factory=ChatConfig)
     gaps: GapsConfig = Field(default_factory=GapsConfig)
     graph: GraphConfig = Field(default_factory=GraphConfig)
+    repos: ReposConfig = Field(default_factory=ReposConfig)
     sources: list[SourceConfig] = Field(default_factory=list)
 
 

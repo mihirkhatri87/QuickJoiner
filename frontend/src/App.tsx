@@ -335,6 +335,10 @@ export default function App() {
           loadStatus();
           loadSources();
         }}
+        onOpenArtifact={(a) => {
+          setArtifact(a);
+          setLearnState("done"); // repo brief is already ingested by the backend
+        }}
       />
       <ArtifactModal
         artifact={artifact}

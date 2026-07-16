@@ -18,12 +18,22 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from typing import Any
 
 import httpx
 
 from quickjoiner.config import LLMConfig
 from quickjoiner.llm.base import ChatResult, LLMProvider, Message, StreamCallback, ToolCall, ToolSpec
+
+# Transient HTTP statuses worth retrying. 5xx/429 are the usual gateway blips; 401 is
+# included because some fronting proxies (e.g. an overloaded internal LiteLLM/model
+# broker) intermittently reject a *valid* static key under load — observed live as the
+# same key alternating 200/401 within seconds. Retries are capped, so a genuinely bad
+# key still surfaces its 401, just after a few bounded backoffs.
+_RETRY_STATUSES = frozenset({401, 429, 500, 502, 503, 504})
+_MAX_ATTEMPTS = 4
+_BACKOFF_BASE = 0.5  # seconds; exponential: 0.5, 1.0, 2.0 …
 
 
 def _parse_arguments(raw: Any) -> dict[str, Any]:
@@ -157,11 +167,27 @@ class LiteLLMProvider(LLMProvider):
             return self._chat_stream(payload, on_stream)
         return self._chat_once(payload)
 
-    def _chat_once(self, payload: dict[str, Any]) -> ChatResult:
-        with self._client() as client:
-            resp = client.post(self._url, json=payload, headers=self._headers)
+    def _post_json(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """POST the (non-streamed) request, retrying transient failures with backoff."""
+        for attempt in range(_MAX_ATTEMPTS):
+            last = attempt == _MAX_ATTEMPTS - 1
+            try:
+                with self._client() as client:
+                    resp = client.post(self._url, json=payload, headers=self._headers)
+            except httpx.TransportError:
+                if last:
+                    raise
+                time.sleep(_BACKOFF_BASE * (2 ** attempt))
+                continue
+            if resp.status_code in _RETRY_STATUSES and not last:
+                time.sleep(_BACKOFF_BASE * (2 ** attempt))
+                continue
             resp.raise_for_status()
-            data = resp.json()
+            return resp.json()
+        raise RuntimeError("unreachable")  # loop always returns or raises
+
+    def _chat_once(self, payload: dict[str, Any]) -> ChatResult:
+        data = self._post_json(payload)
         choice = (data.get("choices") or [{}])[0]
         message = choice.get("message") or {}
         return ChatResult(
@@ -174,17 +200,35 @@ class LiteLLMProvider(LLMProvider):
     def _chat_stream(self, payload: dict[str, Any], on_stream: StreamCallback) -> ChatResult:
         acc: dict[str, Any] = {"text": "", "thinking": "", "tool_calls": {}}
         finish: str | None = None
-        with self._client() as client:
-            with client.stream("POST", self._url, json=payload, headers=self._headers) as resp:
-                resp.raise_for_status()
-                for line in resp.iter_lines():
-                    data = _sse_json(line)
-                    if data is None:
-                        continue
-                    choice = (data.get("choices") or [{}])[0]
-                    accumulate_delta(choice.get("delta") or {}, acc, on_stream)
-                    if choice.get("finish_reason"):
-                        finish = choice["finish_reason"]
+        # Retry the connection + status check only; once tokens start flowing we are
+        # committed to this response and propagate any mid-stream error.
+        for attempt in range(_MAX_ATTEMPTS):
+            last = attempt == _MAX_ATTEMPTS - 1
+            try:
+                with self._client() as client:
+                    with client.stream("POST", self._url, json=payload, headers=self._headers) as resp:
+                        if resp.status_code in _RETRY_STATUSES and not last:
+                            resp.read()  # drain so the connection can be reused/closed cleanly
+                            time.sleep(_BACKOFF_BASE * (2 ** attempt))
+                            continue
+                        resp.raise_for_status()
+                        for line in resp.iter_lines():
+                            data = _sse_json(line)
+                            if data is None:
+                                continue
+                            choice = (data.get("choices") or [{}])[0]
+                            accumulate_delta(choice.get("delta") or {}, acc, on_stream)
+                            if choice.get("finish_reason"):
+                                finish = choice["finish_reason"]
+            except httpx.TransportError:
+                # If tokens already reached the caller, retrying would duplicate the
+                # visible stream — we are committed, so propagate.
+                committed = acc["text"] or acc["thinking"] or acc["tool_calls"]
+                if last or committed:
+                    raise
+                time.sleep(_BACKOFF_BASE * (2 ** attempt))
+                continue
+            break
         return ChatResult(
             text=acc["text"],
             tool_calls=_tool_calls_from_acc(acc["tool_calls"]),

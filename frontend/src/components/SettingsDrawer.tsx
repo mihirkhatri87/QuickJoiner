@@ -10,10 +10,12 @@ export function SettingsDrawer({
   open,
   onClose,
   onChanged,
+  onOpenArtifact,
 }: {
   open: boolean;
   onClose: () => void;
   onChanged: () => void;
+  onOpenArtifact?: (a: { title: string; markdown: string }) => void;
 }) {
   const [auth, setAuth] = useState<AuthStatus>({ enabled: false, user: null });
   const [status, setStatus] = useState("");
@@ -83,7 +85,7 @@ export function SettingsDrawer({
           </Section>
 
           <Section title="Connectors">
-            <Connectors auth={auth} onFlash={flash} onChanged={onChanged} />
+            <Connectors auth={auth} onFlash={flash} onChanged={onChanged} onOpenArtifact={onOpenArtifact} />
           </Section>
         </div>
       </aside>
@@ -316,6 +318,7 @@ function WorkspaceSettings({
         chat: s.chat,
         embedding: { provider: s.embedding.provider, model: s.embedding.model || null, instruct: s.embedding.instruct },
         graph: { extract_triples: s.graph.extract_triples, entity_resolution: s.graph.entity_resolution },
+        repos: { auto_agents_md: s.repos.auto_agents_md },
       });
       setMsg("Saved");
       onFlash("Workspace settings saved");
@@ -432,6 +435,14 @@ function WorkspaceSettings({
         hint="Before creating a new graph entity, check for a same-type near-duplicate (embedding candidates + LLM adjudication) and merge into it instead — e.g. a wiki's 'Webroot Connector' and a repo's 'AppRiver.Connector.Web' becoming one node. Ingest-time — re-sync to apply."
       />
 
+      <Sub>Repositories</Sub>
+      <Toggle
+        checked={s.repos.auto_agents_md}
+        onChange={(v) => set("repos.auto_agents_md", v)}
+        label="Auto-generate architecture brief on sync"
+        hint="The first time a git/files repo is synced and has no brief yet, generate a principal-engineer AGENTS.md from its code structure + docs (one LLM pass, fired once — never on every sync). You can always generate/refresh one manually per connector, or with qj agents-md."
+      />
+
       <Sub>Conversations</Sub>
       <div className="grid grid-cols-2 gap-2.5">
         <Field label="Compress after (tokens)">
@@ -441,9 +452,14 @@ function WorkspaceSettings({
           <TextInput value={String(s.chat.keep_recent_messages)} onChange={(e) => set("chat.keep_recent_messages", num(e.target.value))} />
         </Field>
       </div>
-      <Field label="Tool-result cap (chars)">
-        <TextInput value={String(s.chat.tool_result_max_chars)} onChange={(e) => set("chat.tool_result_max_chars", num(e.target.value))} />
-      </Field>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Tool-result cap (history)">
+          <TextInput value={String(s.chat.tool_result_max_chars)} onChange={(e) => set("chat.tool_result_max_chars", num(e.target.value))} />
+        </Field>
+        <Field label="Tool-result cap (live)">
+          <TextInput value={String(s.chat.live_tool_result_max_chars)} onChange={(e) => set("chat.live_tool_result_max_chars", num(e.target.value))} />
+        </Field>
+      </div>
       <label className="my-3 flex items-start gap-2 text-[12.5px] text-muted">
         <input type="checkbox" checked={s.chat.learn_from_conversations} onChange={(e) => set("chat.learn_from_conversations", e.target.checked)} className="mt-0.5 h-[15px] w-[15px] accent-[var(--accent)]" />
         Distill durable facts from chats into memory
@@ -489,10 +505,12 @@ function Connectors({
   auth,
   onFlash,
   onChanged,
+  onOpenArtifact,
 }: {
   auth: AuthStatus;
   onFlash: (m: string, ok?: boolean) => void;
   onChanged: () => void;
+  onOpenArtifact?: (a: { title: string; markdown: string }) => void;
 }) {
   const [rows, setRows] = useState<ConnectorRow[] | null>(null);
   const [types, setTypes] = useState<ConnectorType[]>([]);
@@ -556,7 +574,7 @@ function Connectors({
         </p>
       ) : (
         rows.map((c) => (
-          <ConnectorPlate key={c.name} c={c} types={types} auth={auth} reload={() => { load(); onChanged(); }} />
+          <ConnectorPlate key={c.name} c={c} types={types} auth={auth} reload={() => { load(); onChanged(); }} onOpenArtifact={onOpenArtifact} />
         ))
       )}
       {auth.enabled && !auth.user ? (
@@ -583,16 +601,20 @@ function ConnectorPlate({
   types,
   auth,
   reload,
+  onOpenArtifact,
 }: {
   c: ConnectorRow;
   types: ConnectorType[];
   auth: AuthStatus;
   reload: () => void;
+  onOpenArtifact?: (a: { title: string; markdown: string }) => void;
 }) {
   const [pmsg, setPmsg] = useState("");
   const [pok, setPok] = useState(true);
   const [armed, setArmed] = useState(false);
+  const [briefing, setBriefing] = useState(false);
   const label = types.find((t) => t.type === c.type)?.label ?? c.type;
+  const isRepo = c.type === "git" || c.type === "files";
   const flash = (m: string, ok = true) => {
     setPmsg(m);
     setPok(ok);
@@ -664,6 +686,27 @@ function ConnectorPlate({
         >
           Sync now
         </Button>
+        {isRepo && (
+          <Button
+            disabled={briefing}
+            title="Generate a principal-engineer architecture brief from this repo's code structure + docs (no code is run). Refines an existing AGENTS.md if present."
+            onClick={async () => {
+              setBriefing(true);
+              flash("generating architecture brief… (one LLM pass)");
+              try {
+                const r = await api.generateAgentsMd(c.name);
+                flash("Architecture brief ready.", true);
+                onOpenArtifact?.({ title: `${c.name} — Architecture Brief`, markdown: r.brief });
+              } catch (e) {
+                flash(String((e as Error).message), false);
+              } finally {
+                setBriefing(false);
+              }
+            }}
+          >
+            {briefing ? "Generating…" : "Architecture brief"}
+          </Button>
+        )}
         {c.can_manage && auth.enabled && c.owner && (
           <Button
             onClick={async () => {

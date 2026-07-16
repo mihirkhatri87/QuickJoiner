@@ -112,7 +112,9 @@ export const api = {
       { method: "POST" },
     ),
   syncSource: (name: string) =>
-    req<{ result: string }>(`/api/sync/${encodeURIComponent(name)}`, { method: "POST" }),
+    req<{ result: string; brief?: string | null }>(`/api/sync/${encodeURIComponent(name)}`, { method: "POST" }),
+  generateAgentsMd: (name: string) =>
+    req<{ brief: string; path: string }>(`/api/repos/${encodeURIComponent(name)}/agents-md`, { method: "POST" }),
 
   graph: (entity?: string, limit = 400) =>
     req<GraphData>(

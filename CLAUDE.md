@@ -77,6 +77,18 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   extended thinking is config-gated (`llm.thinking`, `llm.thinking_budget`). Anthropic signed
   thinking blocks ride on assistant history messages as `thinking_blocks` and are re-emitted
   FIRST in `_to_wire` (API requirement during tool use).
+  **Tool names are sanitized to OpenAI's `^[a-zA-Z0-9_-]{1,64}$` at `ToolSpec` construction**
+  (`base.sanitize_tool_name` via `__post_init__`) — connector live-tool names embed the source
+  name (e.g. "Appriver Octopus"), and a space breaks the gpt-oss "Harmony" tool-call wire format
+  (`to=functions.<name>`), which returns HTTP 500 "unexpected tokens remaining in message header".
+  Sanitizing at the single choke point keeps the request payload, the model's returned
+  `tool_call.name`, and the agent's dispatch key identical. **Transient-error retry**
+  (`litellm_provider`, `_MAX_ATTEMPTS=4`, exponential backoff): retries `{401,429,500,502,503,504}`
+  + network errors — some fronting proxies (an overloaded internal model broker) intermittently
+  reject a *valid* static key under load (observed live as the same key alternating 200/401), so a
+  bounded retry smooths it; a genuinely bad key still surfaces its 401 after the capped backoffs.
+  Streaming retries only the connection+status handshake (before any token reaches the caller);
+  once tokens flow it's committed. Real client errors (400) are never retried.
 - `quickjoiner/memory/` — **pluggable persistence (Phase 1 cloud groundwork):** `factory.py`
   (`create_catalog`/`create_store`) picks the backend on `DATABASE_URL` — unset ⇒ on-prem
   SQLite + LanceDB files; a `postgres://` DSN ⇒ cloud `PostgresCatalog` (`pg_catalog.py`) +
@@ -161,6 +173,24 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   lives here (files.py re-exports). Tests: `tests/test_deps.py` incl. an end-to-end "loose
   alias query correlates consumer+provider repos" case. The structural entity/edge graph
   layer on top is **designed, not built**: `docs/KNOWLEDGE_GRAPH.md`.
+  `azure_devops.py` works against **both** cloud (`dev.azure.com/{organization}`) and **on-prem
+  Azure DevOps Server / TFS**: set `server_url` (host up to `/tfs`) + `collection` instead of
+  `organization` and the base URL becomes `{server_url}/{collection}`; code search drops the
+  separate `almsearch.*` host and serves from the same collection URL; `verify_tls=false` skips
+  TLS verification for internal-CA/self-signed certs (threaded through `util.get_json`/`post_json`
+  as `verify`); `api_version` is configurable (default 7.0 — Server 2022→7.x, 2020→6.0, 2019→5.0).
+  Auth is unchanged: a PAT via Basic auth works for SaaS and Server 2017+ alike. `util.as_bool`
+  coerces string form values (shared with `octopus`). Tests in `tests/test_connectors.py` (on-prem
+  URL/search-host/api/verify + SaaS regression guard).
+  `octopus.py` **paginates** every list endpoint via `_paged` (follows `Links["Page.Next"]`) — a
+  space with >100 projects previously truncated at the `take=100` first page. Pull is a full refresh
+  (idempotent via hash dedupe); opt-in `incremental=true` fetches per-project releases only for
+  projects with an Octopus event since the last sync (`_changed_project_ids` over `/events?from=`),
+  while the paginated project list + the deployment dashboard (which carries the
+  `service→deploys→environment` edges) always refresh — falls back to a full pull on first sync or
+  any events error. True zero-poll freshness is PUSH via an Octopus Subscription → `/hooks/<source>`.
+  Tests in `tests/test_phase4_connectors.py` (paging walks Page.Next, incremental skips unchanged,
+  no-watermark full fallback).
   `logsearch/` (grafana/datadog/dynatrace/elastic) ingests
   inventory only — logs are queried live via tools, never vectorized. `browser/` holds the
   Playwright persistent-profile session (`session.py`, optional dep `.[browser]`) and the
@@ -183,9 +213,44 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   list_connector_types / add_connector / sync_source — same service functions as the UI
   slash commands; prompt requires explicit user confirmation before add_connector, secrets
   via env: indirection only, scrape only user-given URLs, failed connection tests are not
-  saved; wired in `AppContext.build_agent`), tool-call loop (`agent.py`, max 10 rounds),
+  saved; wired in `AppContext.build_agent`), tool-call loop (`agent.py`, max 10 rounds —
+  **each live tool result is capped to `chat.live_tool_result_max_chars` (default 24000) before
+  re-entering the model context**, so an unbounded connector tool like the full Octopus dashboard
+  can't overflow the window and make the provider reject the follow-up turn; on hitting the round
+  limit the agent makes **one final tool-free turn** so a model that loops on searches still
+  answers or properly refuses from what it gathered, instead of a canned "hit the limit" message),
   onboarding briefs (`briefs.py`: seed queries → retrieved chunks → one-shot LLM call → saved to
   `<workspace>/briefs/` and re-ingested; refuses without hits and without building a provider).
+  **Repo architecture briefs** (`repo_docs.py`, `qj agents-md <source>` / `POST
+  /api/repos/{source}/agents-md`): a per-repo "AGENTS.md from a principal engineer/architect's
+  viewpoint," generated from real evidence, never invented — file tree (local clone/`files`
+  root, depth-capped), code-graph facts (`defines`/`imports` edges from `ingest/code_graph.py`),
+  the repo's dependency-map doc, and retrieved prose (post-filtered to that source_id — `store.search`
+  has no source predicate). Strict evidence-tier prompt (manifest > code-graph > prose > layout;
+  an absent section states so verbatim rather than inventing architecture). **QuickJoiner-internal
+  only**: saved to `<workspace>/generated/<source>/AGENTS.md` + re-ingested (`generated:agents-md`
+  bucket) — never written into the repo's own git working tree. If the repo already has a real
+  AGENTS.md ingested, this is a **refinement**: the existing doc becomes its own evidence block
+  (may carry a stronger model's or a human's judgment) with instructions to preserve/correct/extend
+  it rather than overwrite, so a weaker configured model degrades gracefully instead of downgrading
+  a good baseline. `provider_override`/`model_override` let one call use a stronger model than the
+  workspace default for this specific synthesis. `KnowledgeStore`/`PgVectorStore` gained
+  `get_document_chunks(doc_id)` (chunks are the only place original text lives — the catalog only
+  stores metadata+hash) and the catalog gained `documents_for_source(source_id)`, both needed to
+  read an existing AGENTS.md/dependency-map doc back out. `_graph_facts` resolves the repo entity
+  id through `resolve_entity` first, so code-graph facts still surface if entity resolution merged
+  the repo's node to a canonical id. **Auto-generate on first sync** (opt-in, `Config.repos.auto_agents_md`,
+  OFF by default): `repo_docs.maybe_autogenerate(ctx, source)` fires after a git/files source syncs —
+  once (guarded on the generated doc's existence), never on every sync, and never raising (a doc-gen
+  failure can't break the sync). Wired into all sync paths (CLI `qj sync`, `POST /api/sync`,
+  scheduler, `agent/ops.sync_source`). Exposed in `GET/PATCH /api/settings` under `repos` and the
+  Settings drawer's **Repositories** section; per-connector **Architecture brief** button on each
+  git/files plate (`POST /api/repos/{source}/agents-md`, opens in `ArtifactModal`). Tests:
+  `tests/test_repo_docs.py` (incl. auto-gen fires-once/off-by-default/never-raises), settings
+  round-trip in `test_api.py`. NB: `cli.py` now reconfigures stdout/stderr to UTF-8 at startup so
+  Rich can't crash rendering a brief/answer containing block/box-drawing/emoji glyphs on a legacy
+  cp1252 Windows console (the save+ingest already completed before the render — this stops the
+  cosmetic exit-1 crash it caused for `qj agents-md`/`qj brief`).
 - `quickjoiner/auth.py` — opt-in local auth. `Auth` over the catalog: PBKDF2 password hashing,
   bearer tokens (sha256-hashed at rest in `auth_tokens`), `users` table. **Open mode until the
   first user exists** (no login, everything shared = pre-auth behavior). Sharing model on
@@ -421,6 +486,28 @@ Post-phase additions (2026-07-07, all tested — suite: **89 passed**):
   count dropped from inflated-by-content-links to the true `1 source`, TFS/GitLab links render as
   normal teal links. Frontend rebuilt; no dedicated frontend test suite exists yet (manual/Playwright
   verification is the current practice, per the markdown-renderer entry above).
+- Live agent robustness against gpt-oss + a flaky broker (2026-07-16, found while live-testing the
+  Octopus connector's real scenarios on the Appriver workspace, provider `litellm`/`gpt-oss-120b`):
+  three real bugs blocked every tool-using answer, now fixed with regression tests.
+  **(1) Tool names with spaces → HTTP 500.** Connector live-tool names embed the source name
+  (`octopus_deployment_status_Appriver Octopus`); the space breaks gpt-oss's Harmony tool-call wire
+  format and the broker returns `500 "unexpected tokens remaining in message header:
+  to=functions.octopus_deployment_status_Appriver"`. Fixed by sanitizing at `ToolSpec.__post_init__`
+  (`base.sanitize_tool_name`, OpenAI's `^[a-zA-Z0-9_-]{1,64}$`) — the single choke point for every
+  tool. This was the "tool use failure" seen the prior night. **(2) Unbounded tool output →
+  context overflow → HTTP 400.** The `octopus_deployment_status` live tool dumps the whole dashboard
+  (one line per project×environment — ~531 KB for 519 projects), pushing the prompt past the model's
+  window; the proxy then computes a *negative* `max_tokens` and rejects with `400 "max_tokens must be
+  at least 1, got -86016"`. Fixed by capping each live tool result to `chat.live_tool_result_max_chars`
+  (default 24000) in the agent loop before it re-enters context. **(3) Flaky broker → raw traceback.**
+  The internal model broker intermittently returns 401/500 for a *valid* static key under load (same
+  key alternates 200/401 within seconds); the LiteLLM provider now retries `{401,429,5xx}` + network
+  errors with bounded exponential backoff. Also: on the 10-round tool-call limit the agent makes one
+  final tool-free turn (a model that loops search→confluence→scrape now still answers/refuses instead
+  of a canned "hit the limit" message). Live-verified scenarios once the broker cooperated: "what
+  environments exist in Octopus?" → 10 environments cited; "which envs is appriver-management-console
+  deployed to + prod version?" → per-env table (DevLab 0.1.16 / Production 0.1.14) cited. Suite:
+  **299 passed, 10 skipped** (pre-existing unrelated `test_evals.py` multi-hop-yaml failure remains).
 
 ## Next steps (agreed with user)
 

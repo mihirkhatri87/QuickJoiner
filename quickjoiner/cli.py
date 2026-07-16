@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -11,6 +12,16 @@ from rich.markdown import Markdown
 from rich.table import Table
 
 from quickjoiner.config import Config, SourceConfig, workspace_dir
+
+# Windows consoles default to a legacy code page (cp1252) that can't encode the
+# block/box-drawing/emoji characters an LLM may emit in a brief or answer — Rich then
+# crashes at render time, *after* the command's real work (save + ingest) is done.
+# Force UTF-8 on the standard streams so no command dies on a stray glyph.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+    except (AttributeError, ValueError):  # already-wrapped or non-reconfigurable stream
+        pass
 
 app = typer.Typer(
     name="qj",
@@ -411,6 +422,7 @@ def sync(
     """Pull from configured sources, ingest changes into memory (incremental)."""
     from datetime import datetime, timezone
 
+    from quickjoiner.agent.repo_docs import maybe_autogenerate
     from quickjoiner.connectors.registry import create_connector
 
     ctx = _context(workspace)
@@ -436,6 +448,9 @@ def sync(
         console.print(f"[green]{source.name}:[/green] {stats.summary()}")
         for err in stats.errors[:5]:
             console.print(f"[yellow]warn:[/yellow] {err}")
+        _autogen = maybe_autogenerate(ctx, source, on_log=lambda m: console.print(f"[dim]{m}[/dim]"))
+        if _autogen:
+            console.print(f"[green]Architecture brief:[/green] {_autogen}")
 
 
 @app.command("test")
@@ -588,6 +603,39 @@ def brief(
         console.print(f"\n[green]Saved:[/green] {path} (also ingested into memory)")
     if format and path:
         _export_answer(ctx, markdown, format, out, title=f"{type} brief")
+
+
+@app.command("agents-md")
+def agents_md(
+    source: str = typer.Argument(..., help="Name of a configured git/files source (a cloned repo)"),
+    provider: Optional[str] = PROVIDER_OPT,
+    model: Optional[str] = MODEL_OPT,
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """Generate (or refine) a repo's architecture brief from code structure + docs.
+
+    Looks at the repo's file tree, code-graph facts (defines/imports), dependency
+    map, and any retrieved docs — never runs code. If the repo already has a real
+    AGENTS.md, refines it instead of overwriting it. Always saved under
+    <workspace>/generated/<source>/AGENTS.md and re-ingested, never written into
+    the repo's own working tree.
+    """
+    from quickjoiner.agent.repo_docs import generate_agents_md
+
+    ctx = _context(workspace)
+    try:
+        with console.status(f"Writing the architecture brief for {source}..."):
+            markdown, path = generate_agents_md(
+                ctx, source, provider_override=provider, model_override=model
+            )
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    except Exception as exc:  # provider/setup failures (e.g. missing API key)
+        console.print(f"[red]Architecture brief generation failed: {exc}[/red]")
+        raise typer.Exit(1)
+    console.print(Markdown(markdown))
+    console.print(f"\n[green]Saved:[/green] {path} (also ingested into memory)")
 
 
 @app.command("eval")

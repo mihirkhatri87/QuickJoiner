@@ -110,6 +110,13 @@ class PgVectorStore:
         with self._pool.connection() as conn:
             conn.execute("DELETE FROM chunks WHERE doc_id = %s", (doc_id,))
 
+    def get_document_chunks(self, doc_id: str) -> list[str]:
+        with self._pool.connection() as conn:
+            rows = conn.execute(
+                "SELECT text FROM chunks WHERE doc_id = %s ORDER BY chunk_index", (doc_id,)
+            ).fetchall()
+        return [row["text"] for row in rows]
+
     def delete_source(self, source_id: str) -> None:
         with self._pool.connection() as conn:
             conn.execute("DELETE FROM chunks WHERE source_id = %s", (source_id,))

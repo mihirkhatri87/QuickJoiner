@@ -166,6 +166,96 @@ def test_octopus_event_document_direct():
     assert doc.kind == "deployment" and "m1 down" in doc.text
 
 
+def _octopus(tmp_path, **options):
+    options.setdefault("server_url", "https://octopus.example.com")
+    return create_connector(SourceConfig(name="oct", type="octopus", options=options), tmp_path)
+
+
+class _FakeOctopus:
+    """Records requested URLs and serves canned JSON keyed by substring match, choosing
+    the LONGEST matching needle so specific routes (…/Projects-1/releases) win over
+    general ones (/projects). Exercises the paging loop and incremental gating without a
+    real Octopus server."""
+
+    def __init__(self, routes):
+        self.routes = routes
+        self.calls: list[str] = []
+
+    def __call__(self, url, headers=None, params=None, **kw):
+        self.calls.append(url)
+        best = None
+        for needle, payload in self.routes:
+            if needle in url and (best is None or len(needle) > len(best[0])):
+                best = (needle, payload)
+        return best[1] if best else {"Items": []}
+
+
+def test_octopus_sync_paginates_all_projects(tmp_path, monkeypatch):
+    # Two project pages via Page.Next -> both pages ingest (the >100 truncation fix).
+    routes = [
+        ("projects?skip=100", {"Items": [{"Id": "Projects-2", "Name": "Beta", "Slug": "beta"}], "Links": {}}),
+        ("/projects", {
+            "Items": [{"Id": "Projects-1", "Name": "Alpha", "Slug": "alpha"}],
+            "Links": {"Page.Next": "/api/Spaces-1/projects?skip=100&take=100"},
+        }),
+        ("Projects-1/releases", {"Items": [{"Version": "1.0", "Assembled": "2026-07-01T00:00:00Z"}]}),
+        ("Projects-2/releases", {"Items": [{"Version": "2.0", "Assembled": "2026-07-02T00:00:00Z"}]}),
+        ("/dashboard", {"Items": []}),
+        ("/environments", {"Items": []}),
+    ]
+    fake = _FakeOctopus(routes)
+    monkeypatch.setattr("quickjoiner.connectors.octopus.get_json", fake)
+    docs = list(_octopus(tmp_path).sync({}))
+    titles = [d.title for d in docs]
+    assert "Octopus project: Alpha" in titles and "Octopus project: Beta" in titles
+    # Both projects' releases were fetched (full pull, no incremental).
+    assert any("Projects-1/releases" in u for u in fake.calls)
+    assert any("Projects-2/releases" in u for u in fake.calls)
+
+
+def test_octopus_incremental_skips_unchanged_project_releases(tmp_path, monkeypatch):
+    routes = [
+        ("/projects", {
+            "Items": [
+                {"Id": "Projects-1", "Name": "Alpha", "Slug": "alpha"},
+                {"Id": "Projects-2", "Name": "Beta", "Slug": "beta"},
+            ], "Links": {},
+        }),
+        # only Projects-2 shows up in events since the watermark
+        ("/events", {"Items": [{"RelatedDocumentIds": ["Projects-2", "Deployments-9"]}], "Links": {}}),
+        ("Projects-2/releases", {"Items": [{"Version": "2.0", "Assembled": "2026-07-02T00:00:00Z"}]}),
+        ("Projects-1/releases", {"Items": [{"Version": "1.0", "Assembled": "2026-07-01T00:00:00Z"}]}),
+        ("/dashboard", {"Items": []}),
+        ("/environments", {"Items": []}),
+    ]
+    fake = _FakeOctopus(routes)
+    monkeypatch.setattr("quickjoiner.connectors.octopus.get_json", fake)
+    conn = _octopus(tmp_path, incremental="true")
+    docs = list(conn.sync({"since": "2026-07-10T00:00:00Z"}))
+
+    titles = [d.title for d in docs]
+    # Both project metadata docs still emitted; only the changed project's releases fetched.
+    assert "Octopus project: Alpha" in titles and "Octopus project: Beta" in titles
+    assert any("Projects-2/releases" in u for u in fake.calls)
+    assert not any("Projects-1/releases" in u for u in fake.calls)
+    assert "Octopus releases: Beta" in titles and "Octopus releases: Alpha" not in titles
+
+
+def test_octopus_incremental_falls_back_to_full_without_watermark(tmp_path, monkeypatch):
+    # First sync (no `since`) must do a full pull even with incremental on.
+    routes = [
+        ("/projects", {"Items": [{"Id": "Projects-1", "Name": "Alpha", "Slug": "alpha"}], "Links": {}}),
+        ("Projects-1/releases", {"Items": [{"Version": "1.0", "Assembled": "2026-07-01T00:00:00Z"}]}),
+        ("/dashboard", {"Items": []}),
+        ("/environments", {"Items": []}),
+    ]
+    fake = _FakeOctopus(routes)
+    monkeypatch.setattr("quickjoiner.connectors.octopus.get_json", fake)
+    list(_octopus(tmp_path, incremental="true").sync({}))
+    assert any("Projects-1/releases" in u for u in fake.calls)
+    assert not any("/events" in u for u in fake.calls)  # no watermark -> no events probe
+
+
 # -- log-mining four -----------------------------------------------------------
 
 def test_grafana_documents_and_alert_event(tmp_path):
