@@ -49,6 +49,83 @@ def test_catalog_edges_replace_and_cascade(catalog):
     assert catalog.graph_neighbors("repo:a") == []
 
 
+def test_edge_evidence_carries_document_kind(catalog):
+    """The frontend uses evidence.kind to decide whether an evidence chip may
+    try a local-file view (code) or must behave exactly like a plain external
+    link (doc, e.g. Confluence) — graph_neighbors/graph_snapshot/graph_path all
+    share _EDGE_SELECT, so this locks the contract in one place."""
+    catalog.upsert_document("code-doc", "git:x", "u1", "Api.cs", "code", "h1", None, 1)
+    catalog.upsert_document("wiki-doc", "confluence:x", "u2", "Some Page", "doc", "h2", None, 1)
+    catalog.upsert_entity("repo:x", "x", "repo")
+    catalog.upsert_entity("service:y", "y", "service")
+    catalog.replace_doc_edges("code-doc", [("repo:x", "defines", "service:y", "")])
+    rows = catalog.graph_neighbors("repo:x")
+    assert rows[0]["evidence_kind"] == "code"
+
+    catalog.replace_doc_edges("wiki-doc", [("repo:x", "references", "service:y", "")])
+    rows = {r["evidence_doc_id"]: r for r in catalog.graph_neighbors("repo:x")}
+    assert rows["code-doc"]["evidence_kind"] == "code"
+    assert rows["wiki-doc"]["evidence_kind"] == "doc"
+
+    snap = catalog.graph_snapshot("repo:x")
+    kinds = {e["evidence"]["doc_id"]: e["evidence"]["kind"] for e in snap["edges"]}
+    assert kinds == {"code-doc": "code", "wiki-doc": "doc"}
+
+
+def test_catalog_graph_pending_roundtrip(catalog):
+    catalog.mark_graph_pending("doc1", "confluence:eng")
+    catalog.mark_graph_pending("doc2", "confluence:eng")
+    assert catalog.is_graph_pending("doc1") is True
+    assert catalog.is_graph_pending("doc-unknown") is False
+    assert catalog.count_graph_pending("confluence:eng") == 2
+    assert catalog.count_graph_pending() == 2
+
+    catalog.mark_graph_pending("doc1", "confluence:eng")  # idempotent re-mark
+    assert catalog.count_graph_pending() == 2
+
+    catalog.clear_graph_pending("doc1")
+    assert catalog.is_graph_pending("doc1") is False
+    assert catalog.count_graph_pending("confluence:eng") == 1
+
+    catalog.upsert_document("doc2", "confluence:eng", "u", "t", "doc", "h", None, 1)
+    catalog.delete_document("doc2")  # document lifecycle also clears graph_pending
+    assert catalog.is_graph_pending("doc2") is False
+
+
+def test_catalog_search_entities_matches_name_and_alias(catalog):
+    catalog.upsert_entity("service:appriver-nautical", "AppRiver Nautical", "service")
+    catalog.add_entity_alias("nautical models", "service:appriver-nautical")
+    catalog.upsert_entity("service:unrelated", "Something Else Entirely", "service")
+
+    by_name = catalog.search_entities("nautical")
+    assert {r["id"] for r in by_name} == {"service:appriver-nautical"}
+
+    by_alias = catalog.search_entities("nautical models")
+    assert {r["id"] for r in by_alias} == {"service:appriver-nautical"}
+
+    assert catalog.search_entities("") == []
+    assert catalog.search_entities("zzz-nothing-matches") == []
+
+
+def test_catalog_bridge_entities_needs_two_distinct_sources(catalog):
+    catalog.upsert_document("d1", "git:repo", "u1", "t1", "doc", "h1", None, 1)
+    catalog.upsert_document("d2", "confluence:wiki", "u2", "t2", "doc", "h2", None, 1)
+    catalog.upsert_document("d3", "git:repo", "u3", "t3", "doc", "h3", None, 1)
+    catalog.upsert_entity("service:shared", "Shared", "service")
+    catalog.upsert_entity("service:repo-only", "RepoOnly", "service")
+
+    catalog.replace_doc_edges("d1", [("repo:a", "depends_on", "service:shared", "")])
+    catalog.replace_doc_edges("d2", [("service:shared", "part_of", "service:other", "")])
+    catalog.replace_doc_edges("d3", [("repo:a", "depends_on", "service:repo-only", "")])
+
+    bridges = catalog.bridge_entities()
+    ids = {r["id"] for r in bridges}
+    assert "service:shared" in ids  # touched by both git and confluence evidence
+    assert "service:repo-only" not in ids  # only ever touched by git evidence
+    row = next(r for r in bridges if r["id"] == "service:shared")
+    assert row["source_count"] == 2
+
+
 def test_catalog_graph_snapshot(catalog):
     catalog.upsert_entity("repo:a", "a", "repo")
     catalog.upsert_entity("package:x", "X", "package")
@@ -134,6 +211,26 @@ def test_catalog_graph_path_bfs(catalog):
     assert catalog.graph_path("repo:a", "service:unconnected") is None
 
 
+def test_catalog_graph_path_scans_the_whole_edge_table(catalog):
+    """graph_path's BFS must see every edge, not a truncated prefix of them — a
+    "no known path" answer is treated everywhere as an honest refusal, so a
+    silent row cap could make that refusal wrong (a real path existing just
+    outside the truncated set). Seed well past what an old hardcoded LIMIT
+    would have covered, with the real chain deliberately written LAST, so the
+    test would have failed under the previous unordered `LIMIT 10000`-style cap
+    if it were re-introduced at a smaller threshold."""
+    for i in range(200):
+        catalog.upsert_entity(f"symbol:noise{i}", f"Noise{i}", "symbol")
+        catalog.replace_doc_edges(f"noise-doc-{i}", [(f"symbol:noise{i}", "references", "ticket:decoy", "")])
+
+    catalog.upsert_entity("repo:late-a", "LateA", "repo")
+    catalog.upsert_entity("package:late-x", "LateX", "package")
+    catalog.replace_doc_edges("late-doc", [("repo:late-a", "depends_on", "package:late-x", "")])
+
+    path = catalog.graph_path("repo:late-a", "package:late-x")
+    assert path is not None and path[0]["rel"] == "depends_on"
+
+
 # ------------------------------------------------- connector metadata entities
 
 def test_jira_issue_document_emits_graph_meta():
@@ -202,6 +299,27 @@ def test_graph_path_tool_chains_with_evidence(tmp_path, workspace, catalog, stor
     assert _tools(store, catalog)["graph_path"].run(a="proj-a", b="warp").startswith("NO_RESULTS")
 
 
+def test_graph_path_tool_default_hops_and_retry_hint(catalog, store):
+    """Default max_hops is 5 (matches the web UI's Path Finder — the agent tool
+    used to default to 3, clipping real chains one indirection layer deeper than
+    that). A NO_PATH at a shallow max_hops nudges the model to retry wider
+    before it's allowed to conclude the things are unrelated."""
+    for eid, name, type_ in (("repo:a", "a", "repo"), ("project:mid", "Mid", "project"),
+                             ("service:mid2", "Mid2", "service"), ("service:b", "b", "service")):
+        catalog.upsert_entity(eid, name, type_)
+    catalog.replace_doc_edges("d1", [("repo:a", "part_of", "project:mid", "")])
+    catalog.replace_doc_edges("d2", [("project:mid", "part_of", "service:mid2", "")])
+    catalog.replace_doc_edges("d3", [("service:mid2", "depends_on", "service:b", "")])
+
+    tool = _tools(store, catalog)["graph_path"]
+    out_default = tool.run(a="a", b="b")  # no max_hops passed -> should use the new default of 5
+    assert "3 hop(s)" in out_default and "--depends_on-->" in out_default
+
+    out_shallow = tool.run(a="a", b="b", max_hops=2)
+    assert out_shallow.startswith("NO_PATH")
+    assert "higher max_hops" in out_shallow
+
+
 def test_graph_neighbors_tool_formats_relationships(tmp_path, workspace, catalog, store):
     _write(tmp_path / "a", "src/Api/Api.csproj", CSPROJ_A)
     connector = FilesConnector(name="proj-a", options={"path": str(tmp_path / "a")},
@@ -216,6 +334,45 @@ def test_graph_neighbors_tool_formats_relationships(tmp_path, workspace, catalog
 def test_graph_neighbors_tool_refuses_unknown(catalog, store):
     out = _graph_tool(store, catalog).run(entity="warp drive")
     assert out.startswith("NO_RESULTS")
+
+
+def test_graph_neighbors_tool_caps_hub_entities(catalog, store):
+    """A hub entity (a repo with thousands of relationships, in production) must
+    never dump every row into one tool result — that's an unbounded LLM payload,
+    and was observed to make the actual provider request fail outright rather
+    than degrade gracefully. Past the threshold, output groups by relation type
+    with a bounded sample per group instead of listing exhaustively."""
+    catalog.upsert_entity("repo:hub", "Hub", "repo")
+    for i in range(70):
+        catalog.upsert_entity(f"symbol:s{i}", f"Symbol{i}", "symbol")
+        catalog.replace_doc_edges(f"doc-{i}", [("repo:hub", "defines", f"symbol:s{i}", "")])
+    for i in range(5):
+        catalog.upsert_entity(f"package:p{i}", f"Package{i}", "package")
+        catalog.replace_doc_edges(f"pkgdoc-{i}", [("repo:hub", "depends_on", f"package:p{i}", "")])
+
+    out = _graph_tool(store, catalog).run(entity="Hub")
+    assert "75 relationships" in out
+    assert "too many to list in full" in out
+    assert "graph_path" in out  # steers toward the bounded two-entity tool
+    assert "defines (70 total)" in out
+    assert "…and 62 more not shown" in out  # 70 - 8 sampled
+    assert "depends_on (5 total)" in out
+    assert out.count("--defines-->") == 8  # sampled, not all 70
+    assert out.count("--depends_on-->") == 5  # under the per-relation sample cap, shown in full
+
+
+def test_graph_neighbors_tool_lists_in_full_under_threshold(catalog, store):
+    """The common case (a modest number of relationships) is untouched: no
+    grouping, no sampling, every row shown — exactly as before this fix."""
+    catalog.upsert_entity("repo:small", "Small", "repo")
+    for i in range(3):
+        catalog.upsert_entity(f"package:q{i}", f"Q{i}", "package")
+        catalog.replace_doc_edges(f"d-{i}", [("repo:small", "depends_on", f"package:q{i}", "")])
+
+    out = _graph_tool(store, catalog).run(entity="Small")
+    assert "3 relationship(s):" in out
+    assert "too many to list" not in out
+    assert out.count("--depends_on-->") == 3
 
 
 # ------------------------------------------------------- graph-expansion retrieval

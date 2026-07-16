@@ -28,7 +28,7 @@ export function Composer({
           e.preventDefault();
           onSend();
         }}
-        className="mx-auto flex max-w-[840px] items-end gap-2.5 rounded-[26px] bg-panel p-3 pl-5 shadow-panel backdrop-blur-xl transition-shadow focus-within:shadow-[0_0_0_1.5px_color-mix(in_srgb,var(--accent)_55%,transparent),0_24px_60px_-28px_rgba(0,0,0,.65)]"
+        className="mx-auto flex max-w-[1100px] items-end gap-2.5 rounded-[26px] bg-panel p-3 pl-5 shadow-panel backdrop-blur-xl transition-shadow focus-within:shadow-[0_0_0_1.5px_color-mix(in_srgb,var(--accent)_55%,transparent),0_24px_60px_-28px_rgba(0,0,0,.65)]"
       >
         <textarea
           ref={ref}
@@ -59,7 +59,7 @@ export function Composer({
           <ArrowUp size={19} strokeWidth={2.2} />
         </button>
       </form>
-      <p className="mx-auto mt-3 max-w-[840px] text-center text-[11.5px] text-faint">
+      <p className="mx-auto mt-3 max-w-[1100px] text-center text-[11.5px] text-faint">
         Answers are grounded in learned memory and <b className="font-semibold text-gold">cite their sources</b> — or
         say what hasn't been learned yet. Commands:{" "}
         <code className="font-mono text-[10.5px] text-gold">/learn &lt;fact&gt;</code>,{" "}

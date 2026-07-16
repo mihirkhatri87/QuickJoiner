@@ -1,4 +1,4 @@
-import { ChevronRight, Plus, Radar } from "lucide-react";
+import { ChevronRight, Plus, Radar, Trash2 } from "lucide-react";
 import { useState } from "react";
 import type { ProjectRow, SessionRow, SourceRow, Status } from "../types";
 import { Button, cn, Eyebrow, Select } from "./ui";
@@ -16,6 +16,8 @@ export function Rail({
   activeSession,
   onOpenSession,
   onNewConversation,
+  onDeleteSession,
+  onDeleteAll,
   onDistill,
   canDistill,
   sources,
@@ -35,6 +37,8 @@ export function Rail({
   activeSession: string | null;
   onOpenSession: (id: string) => void;
   onNewConversation: () => void;
+  onDeleteSession: (id: string) => void;
+  onDeleteAll: () => void;
   onDistill: () => void;
   canDistill: boolean;
   sources: SourceRow[];
@@ -43,15 +47,18 @@ export function Rail({
   onOpenGaps: () => void;
 }) {
   const [newProj, setNewProj] = useState("");
+  const [addingProj, setAddingProj] = useState(false);
   const configured = sources.filter((s) => s.configured);
-  const visible = sessions.filter((s) => s.title || s.est_tokens > 0).slice(0, 24);
+  const visible = sessions.filter((s) => s.title || s.est_tokens > 0).slice(0, 40);
 
   return (
     <>
       {open && <div className="fixed inset-0 z-[6] bg-black/50 md:hidden" onClick={onClose} />}
       <aside
         className={cn(
-          "scroll-thin z-[7] flex w-[292px] flex-shrink-0 flex-col gap-6 overflow-y-auto rounded-lg bg-panel p-4 shadow-panel backdrop-blur-xl",
+          // Fixed-height flex column: compact header, scrolling conversations, pinned systems.
+          // min-h-0 lets the aside clamp to the row height so the inner list scrolls (not the page).
+          "z-[7] flex min-h-0 w-[288px] flex-shrink-0 flex-col gap-3 overflow-hidden rounded-lg bg-panel p-3.5 shadow-panel backdrop-blur-xl",
           "mb-3 ml-3 md:transition-[margin,opacity,visibility] md:duration-300",
           collapsed && "md:invisible md:pointer-events-none md:ml-[-304px] md:opacity-0",
           "max-md:fixed max-md:bottom-3 max-md:left-0 max-md:top-3 max-md:m-0 max-md:ml-3 max-md:transition-transform",
@@ -59,31 +66,25 @@ export function Rail({
         )}
         aria-hidden={(collapsed && !open) || undefined}
       >
-        {/* memory readout */}
-        <div className="rounded-2xl bg-fill px-4 py-4">
-          <div className="text-[10.5px] font-semibold uppercase tracking-[0.16em] text-faint">
-            Learned memory
-          </div>
-          <div className="mt-2.5 flex flex-wrap items-baseline gap-1.5">
-            <span className="font-mono text-[27px] font-semibold leading-none tabular-nums">
-              {status?.stats.documents ?? 0}
-            </span>
-            <span className="text-[12.5px] text-muted">docs</span>
-            <span className="ml-3 font-mono text-[27px] font-semibold leading-none tabular-nums">
-              {status?.stats.chunks ?? 0}
-            </span>
-            <span className="text-[12.5px] text-muted">chunks</span>
-          </div>
-          <div className="mt-2 text-[12.5px] text-muted">
-            from <span className="font-mono tabular-nums text-gold">{status?.stats.sources ?? 0}</span> connected
-            system(s)
+        {/* memory readout — compact single card */}
+        <div className="flex-shrink-0 rounded-xl bg-fill px-3.5 py-2.5">
+          <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-faint">Learned memory</div>
+          <div className="mt-1.5 flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5 font-mono text-[15px] tabular-nums">
+            <span className="font-semibold">{status?.stats.documents ?? 0}</span>
+            <span className="text-[11px] text-muted">docs</span>
+            <span className="text-faint">·</span>
+            <span className="font-semibold">{status?.stats.chunks ?? 0}</span>
+            <span className="text-[11px] text-muted">chunks</span>
+            <span className="text-faint">·</span>
+            <span className="font-semibold text-gold">{status?.stats.sources ?? 0}</span>
+            <span className="text-[11px] text-muted">systems</span>
           </div>
         </div>
 
         {/* knowledge gaps */}
         <button
           onClick={onOpenGaps}
-          className="flex items-center gap-2.5 rounded-2xl bg-fill px-4 py-3 text-left transition hover:bg-fill2"
+          className="flex flex-shrink-0 items-center gap-2.5 rounded-xl bg-fill px-3.5 py-2.5 text-left transition hover:bg-fill2"
         >
           <Radar size={15} className="flex-shrink-0 text-unknown" />
           <span className="flex-1 text-[13px] font-medium text-ink">Knowledge gaps</span>
@@ -96,9 +97,21 @@ export function Rail({
           )}
         </button>
 
-        {/* project */}
-        <div className="flex flex-col gap-2.5">
-          <Eyebrow>Project</Eyebrow>
+        {/* project — new-project form hides behind the + toggle so it's not permanent */}
+        <div className="flex flex-shrink-0 flex-col gap-2">
+          <Eyebrow
+            action={
+              <button
+                onClick={() => setAddingProj((v) => !v)}
+                title="New project"
+                className="inline-flex items-center gap-1 text-[11.5px] font-medium text-accent hover:text-accent-hi"
+              >
+                <Plus size={13} /> New
+              </button>
+            }
+          >
+            Project
+          </Eyebrow>
           <Select value={currentProject} onChange={(e) => onProject(e.target.value)} className="text-[13.5px]">
             <option value="">All memory · no project</option>
             {projects.map((p) => (
@@ -107,57 +120,82 @@ export function Rail({
               </option>
             ))}
           </Select>
-          <form
-            className="flex gap-1.5"
-            onSubmit={(e) => {
-              e.preventDefault();
-              if (newProj.trim()) {
-                onNewProject(newProj.trim());
-                setNewProj("");
-              }
-            }}
-          >
-            <input
-              value={newProj}
-              onChange={(e) => setNewProj(e.target.value)}
-              placeholder="New project"
-              className="min-w-0 flex-1 rounded-full border border-transparent bg-fill px-3.5 py-2 text-[13px] outline-none transition placeholder:text-faint focus:border-[color-mix(in_srgb,var(--accent)_55%,transparent)] focus:bg-raised"
-            />
-            <Button type="submit">Add</Button>
-          </form>
+          {addingProj && (
+            <form
+              className="flex gap-1.5"
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (newProj.trim()) {
+                  onNewProject(newProj.trim());
+                  setNewProj("");
+                  setAddingProj(false);
+                }
+              }}
+            >
+              <input
+                autoFocus
+                value={newProj}
+                onChange={(e) => setNewProj(e.target.value)}
+                placeholder="New project name"
+                className="min-w-0 flex-1 rounded-full border border-transparent bg-fill px-3.5 py-2 text-[13px] outline-none transition placeholder:text-faint focus:border-[color-mix(in_srgb,var(--accent)_55%,transparent)] focus:bg-raised"
+              />
+              <Button type="submit">Add</Button>
+            </form>
+          )}
         </div>
 
-        {/* conversations */}
-        <div className="flex min-h-0 flex-col gap-2.5">
-          <Eyebrow>Conversations</Eyebrow>
-          {visible.length === 0 ? (
-            <p className="px-1 text-[13px] leading-relaxed text-muted">
-              No conversations yet — ask something below.
-            </p>
-          ) : (
-            <div className="flex flex-col gap-0.5">
-              {visible.map((s) => (
+        {/* conversations — the flexible, independently-scrolling region */}
+        <div className="flex min-h-0 flex-1 flex-col gap-2">
+          <Eyebrow
+            action={
+              visible.length > 0 ? (
                 <button
+                  onClick={onDeleteAll}
+                  title="Delete all conversations"
+                  className="inline-flex items-center gap-1 text-[11.5px] font-medium text-faint transition hover:text-danger"
+                >
+                  <Trash2 size={12} /> Clear all
+                </button>
+              ) : undefined
+            }
+          >
+            Conversations
+          </Eyebrow>
+          {visible.length === 0 ? (
+            <p className="px-1 text-[13px] leading-relaxed text-muted">No conversations yet — ask something below.</p>
+          ) : (
+            <div className="scroll-thin -mr-1 flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto pr-1">
+              {visible.map((s) => (
+                <div
                   key={s.id}
-                  onClick={() => onOpenSession(s.id)}
                   className={cn(
-                    "rounded-xs px-3 py-2 text-left transition",
+                    "group/row relative flex flex-shrink-0 items-center rounded-xs transition",
                     s.id === activeSession ? "bg-accent-soft" : "hover:bg-fill",
                   )}
                 >
-                  <div className={cn("truncate text-[13.5px]", s.id === activeSession && "text-accent")}>
-                    {s.title || "(untitled)"}
-                  </div>
-                  <div className="mt-0.5 font-mono text-[10px] tabular-nums text-faint">
-                    {s.project_id && !currentProject && <span className="text-gold">{s.project_id}</span>}
-                    {s.project_id && !currentProject ? " · " : ""}
-                    {s.updated_at.slice(0, 16).replace("T", " ")} · ~{s.est_tokens} tok
-                  </div>
-                </button>
+                  <button onClick={() => onOpenSession(s.id)} className="min-w-0 flex-1 px-3 py-1.5 text-left">
+                    <div className={cn("truncate pr-5 text-[13px]", s.id === activeSession && "text-accent")}>
+                      {s.title || "(untitled)"}
+                    </div>
+                    <div className="mt-0.5 truncate font-mono text-[9.5px] tabular-nums text-faint">
+                      {s.project_id && !currentProject && <span className="text-gold">{s.project_id}</span>}
+                      {s.project_id && !currentProject ? " · " : ""}
+                      {s.updated_at.slice(0, 16).replace("T", " ")} · ~{s.est_tokens} tok
+                    </div>
+                  </button>
+                  <button
+                    onClick={() => onDeleteSession(s.id)}
+                    title="Delete conversation"
+                    aria-label="Delete conversation"
+                    className="absolute right-1.5 top-1.5 hidden h-6 w-6 items-center justify-center rounded-full text-faint transition hover:bg-fill2 hover:text-danger group-hover/row:flex"
+                  >
+                    <Trash2 size={13} />
+                  </button>
+                </div>
               ))}
             </div>
           )}
-          <div className="flex gap-1.5">
+          <div className="flex flex-shrink-0 gap-1.5">
             <Button variant="primary" className="flex-1" onClick={onNewConversation}>
               <Plus size={15} /> New
             </Button>
@@ -171,8 +209,8 @@ export function Rail({
           </div>
         </div>
 
-        {/* systems */}
-        <div className="flex flex-col gap-2.5">
+        {/* systems — pinned at the bottom, its own scroll if many */}
+        <div className="flex flex-shrink-0 flex-col gap-2">
           <Eyebrow
             action={
               <button
@@ -190,18 +228,16 @@ export function Rail({
               Nothing connected yet. Open <b>Manage</b> to add a system.
             </p>
           ) : (
-            <div className="flex flex-col">
+            <div className="scroll-thin -mr-1 flex max-h-[148px] flex-col overflow-y-auto pr-1">
               {configured.map((s) => (
                 <div
                   key={s.id}
                   title={`${s.type} · ${s.documents} docs`}
-                  className="flex items-center gap-2.5 rounded-xs px-3 py-2 transition hover:bg-fill"
+                  className="flex flex-shrink-0 items-center gap-2.5 rounded-xs px-3 py-1.5 transition hover:bg-fill"
                 >
                   <span className="h-[7px] w-[7px] flex-shrink-0 rounded-full bg-gold shadow-[0_0_0_3px_var(--gold-soft)]" />
-                  <span className="truncate text-[13.5px]">{s.name}</span>
-                  <span className="ml-auto flex-shrink-0 font-mono text-[10.5px] tabular-nums text-faint">
-                    {s.documents}
-                  </span>
+                  <span className="truncate text-[13px]">{s.name}</span>
+                  <span className="ml-auto flex-shrink-0 font-mono text-[10.5px] tabular-nums text-faint">{s.documents}</span>
                 </div>
               ))}
             </div>

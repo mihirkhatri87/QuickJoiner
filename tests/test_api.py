@@ -187,12 +187,54 @@ def test_graph_endpoint_resolves_and_snapshots(client):
     assert client.get("/api/graph", params={"entity": "warp-drive"}).status_code == 404
 
 
+def test_graph_search_and_bridges_endpoints(client):
+    client.post("/api/learn", json={"fact": "PET-25 tracks the nautical billing migration."})
+    r = client.get("/api/graph/search", params={"q": "pet-25"})
+    assert r.status_code == 200
+    assert any(row["type"] == "ticket" for row in r.json())
+    assert client.get("/api/graph/search", params={"q": "zzz-nothing"}).json() == []
+
+    # A single taught fact only ever has one evidence source -> no bridges yet.
+    assert client.get("/api/graph/bridges").json() == []
+
+
+def test_document_file_endpoint_serves_local_repo_file_and_404s_otherwise(client, api_workspace):
+    from quickjoiner.memory.catalog import Catalog
+
+    cat = Catalog(api_workspace)
+    repo_file = api_workspace / "repos" / "Connector" / "AppRiver.Connector.Web" / "appsettings.json"
+    repo_file.parent.mkdir(parents=True)
+    repo_file.write_text('{"Logging": {}}', encoding="utf-8")
+    cat.upsert_document(
+        doc_id="doc-with-local-file", source_id="git:Connector",
+        uri="https://gitlab.example/x/connector.git::AppRiver.Connector.Web/appsettings.json",
+        title="Connector/AppRiver.Connector.Web/appsettings.json", kind="doc",
+        content_hash="h1", updated_at=None, chunk_count=1,
+    )
+    cat.upsert_document(
+        doc_id="doc-no-local-file", source_id="confluence:eng",
+        uri="https://x.atlassian.net/wiki/spaces/eng/1", title="Some wiki page", kind="doc",
+        content_hash="h2", updated_at=None, chunk_count=1,
+    )
+    cat.close()
+
+    r = client.get("/api/documents/doc-with-local-file/file")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["text"] == '{"Logging": {}}'
+    assert body["title"] == "Connector/AppRiver.Connector.Web/appsettings.json"
+
+    assert client.get("/api/documents/doc-no-local-file/file").status_code == 404
+    assert client.get("/api/documents/does-not-exist/file").status_code == 404
+
+
 def test_graph_path_endpoint(client):
     client.post("/api/learn", json={"fact": "OPS-9 tracks the gateway migration."})
     r = client.get("/api/graph/path", params={"a": "OPS-9", "b": "user-taught"})
     assert r.status_code == 200
     path = r.json()["path"]
     assert len(path) == 1 and path[0]["rel"] == "references"
+    assert path[0]["evidence"]["kind"] != "code"  # a taught note, not a code file
     assert client.get("/api/graph/path", params={"a": "OPS-9", "b": "nope"}).status_code == 404
 
 
@@ -370,6 +412,39 @@ def test_projects_and_sessions_endpoints(client, monkeypatch):
 
     assert client.get("/api/sessions", params={"project": "nope"}).status_code == 404
     assert client.get("/api/sessions/nope").status_code == 404
+
+
+def test_delete_sessions_endpoints(client, monkeypatch):
+    def fake_build_agent(self, provider_override=None, model_override=None, extra_system=None, sources=None):
+        from quickjoiner.agent.agent import OnboardingAgent
+
+        return OnboardingAgent(ScriptedProvider([ChatResult(text="ok")]), [], system="sys")
+
+    monkeypatch.setattr(AppContext, "build_agent", fake_build_agent)
+
+    # Two conversations: one plain, one under a project.
+    client.post("/api/chat", json={"message": "first"})
+    client.post("/api/projects", json={"name": "Ramp"})
+    client.post("/api/chat", json={"message": "second", "project": "ramp"})
+    rows = client.get("/api/sessions").json()
+    assert len(rows) == 2
+
+    # Delete a single conversation: the plain (non-project) one, so the
+    # project-scoped assertions below still have their "ramp" session.
+    victim = next(r["id"] for r in rows if not r.get("project_id"))
+    assert client.delete(f"/api/sessions/{victim}").json() == {"deleted": victim}
+    assert client.get(f"/api/sessions/{victim}").status_code == 404
+    assert len(client.get("/api/sessions").json()) == 1
+    assert client.delete("/api/sessions/gone").status_code == 404
+
+    # Project-scoped clear only removes that project's sessions.
+    assert client.delete("/api/sessions", params={"project": "ramp"}).json() == {"deleted": 1}
+    assert client.delete("/api/sessions", params={"project": "nope"}).status_code == 404
+
+    # Clear-all removes whatever remains.
+    client.post("/api/chat", json={"message": "third"})
+    assert client.delete("/api/sessions").json()["deleted"] >= 1
+    assert client.get("/api/sessions").json() == []
 
 
 # -- webhook receivers ---------------------------------------------------------

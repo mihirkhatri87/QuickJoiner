@@ -79,21 +79,55 @@ class AppContext:
 def _make_triple_extractor(config: Config):
     """A lazy (text, title) -> list[Triple] extractor backed by the configured LLM.
     The provider is built on first use and cached (None on failure), so build_context
-    stays cheap and keyless workspaces just skip extraction."""
+    stays cheap and keyless workspaces just skip extraction. Thread-safe: triple
+    extraction may run concurrently (IngestPipeline's triple_workers), so provider
+    construction is guarded by a lock — a shared, thread-safe httpx-backed provider
+    is still only built once even if several worker threads race on first use."""
+    import threading
+
     from quickjoiner.ingest.triples import extract_doc_triples
     from quickjoiner.llm import create_provider
 
     state: dict = {}
+    lock = threading.Lock()
 
     def extractor(text: str, title: str) -> list:
         if "provider" not in state:
-            try:
-                state["provider"] = create_provider(config.llm)
-            except Exception:
-                state["provider"] = None
+            with lock:
+                if "provider" not in state:
+                    try:
+                        state["provider"] = create_provider(config.llm)
+                    except Exception:
+                        state["provider"] = None
         return extract_doc_triples(state["provider"], text, title)
 
     return extractor
+
+
+def _make_entity_resolver(config: Config, catalog, embedder):
+    """An EntityResolver wired to the configured LLM for merge adjudication
+    (lazy, cached, thread-safe construction — same pattern as the triple
+    extractor above; resolver.resolve() itself is only ever called from the
+    main ingest thread, never concurrently, so no lock is needed there)."""
+    import threading
+
+    from quickjoiner.ingest.entity_resolution import EntityResolver, make_llm_adjudicator
+    from quickjoiner.llm import create_provider
+
+    state: dict = {}
+    lock = threading.Lock()
+
+    def adjudicate(type_: str, name: str, candidate_names: list[str]):
+        if "fn" not in state:
+            with lock:
+                if "fn" not in state:
+                    try:
+                        state["fn"] = make_llm_adjudicator(create_provider(config.llm))
+                    except Exception:
+                        state["fn"] = None
+        return state["fn"](type_, name, candidate_names) if state["fn"] else None
+
+    return EntityResolver(catalog=catalog, embedder=embedder, adjudicate=adjudicate)
 
 
 def build_context(workspace: Path) -> AppContext:
@@ -103,7 +137,11 @@ def build_context(workspace: Path) -> AppContext:
     embedder = create_embedder(config.embedding)
     store = create_store(workspace, embedder, config.retrieval)
     triple_extractor = _make_triple_extractor(config) if config.graph.extract_triples else None
-    pipeline = IngestPipeline(store, catalog, config.retrieval, config.graph, triple_extractor)
+    entity_resolver = _make_entity_resolver(config, catalog, embedder) if config.graph.entity_resolution else None
+    pipeline = IngestPipeline(
+        store, catalog, config.retrieval, config.graph, triple_extractor,
+        entity_resolver, triple_workers=config.graph.triple_workers,
+    )
     return AppContext(
         workspace=workspace, config=config, catalog=catalog, store=store, pipeline=pipeline
     )

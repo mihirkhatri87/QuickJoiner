@@ -193,7 +193,9 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   `visible()` / `can_manage()` are the gate. Ingested *knowledge* stays one communal memory;
   sharing governs who sees/manages a **connector's config + credentials** and gets its live tools.
 - `quickjoiner/api/` — FastAPI (`app.py`: SSE `/api/chat`, sources, sync, search, briefs;
-  `/api/auth/*` status/users/login/logout; `/api/connectors` CRUD + `/test` + `/types`;
+  sessions list/get/distill + `DELETE /api/sessions/{id}` (one) and `DELETE /api/sessions?project=`
+  (all, optionally project-scoped) → `catalog.delete_session`/`delete_sessions` (neutral base, both
+  backends); `/api/auth/*` status/users/login/logout; `/api/connectors` CRUD + `/test` + `/types`;
   `GET/PATCH /api/settings` — the whole `Config` (llm/embedding/retrieval/chat/**graph**) as a
   tunable dict; `POST /api/llm/test` probes the provider with a one-token round-trip, accepting
   optional unsaved `llm` overrides so the Settings drawer can verify a proxy/model before saving,
@@ -208,8 +210,14 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   Instrument Sans body / Geist Mono via @fontsource; teal=agent gold=provenance violet=not-learned
   tokens in `src/index.css`. NOTE: token colors are raw CSS vars — Tailwind alpha modifiers like
   `bg-surface/90` silently emit nothing; use the `fill`/`fill2`/`panel` translucent tokens instead).
-  Components: `App` (state + SSE orchestration), `Chat` (provenance ledger: citations dedupe into
-  a numbered sources margin on lg screens, streaming caret), `Rail`, `TopBar`, `Composer`,
+  Components: `App` (state + SSE orchestration), `Chat` (**full-width answers** — max-w-[1100px],
+  no side panel; citations are inline superscripts with a native hover tooltip = the source; a
+  per-answer **hover toolbar** — download .md, view **cited-sources modal** (also opened by the
+  grounded stamp), 👍/👎; 👎 opens a **feedback modal** that teaches the correction via
+  `/api/learn` (`onLearned` refreshes status/gaps); streaming caret), `Rail` (compact fixed-top /
+  independently-scrolling conversations / pinned-bottom systems layout with `min-h-0`; per-row
+  **delete** on hover + **Clear all** in the Conversations header → `DELETE /api/sessions[/{id}]`,
+  clear-all confirmed + project-scoped to what's shown), `TopBar`, `Composer`,
   `EmptyState`, `SettingsDrawer` (account + workspace settings + connector plates/forms; the
   workspace pane exposes provider config incl. LiteLLM proxy URL + api-key env var with a
   **Test connection** button hitting `POST /api/llm/test`, and **Retrieval/Knowledge-graph
@@ -308,8 +316,8 @@ Post-phase additions (2026-07-07, all tested — suite: **89 passed**):
   the reasoning-trace box, streamed synthesis), report opens in **ArtifactModal**
   (markdown + live mermaid via lazy-loaded `mermaid` npm dep — `MermaidBlock.tsx`, parse
   failures fall back to a code block; download .md; "Learn this" → /api/learn). Chat answers
-  also render ```mermaid fences (shared renderer extracted to `components/markdown.tsx` —
-  the renderInline local-regex gotcha lives there now). After a scrape the UI asks
+  also render ```mermaid fences via the shared `<Markdown>` component (`components/markdown.tsx`;
+  see the markdown-renderer status note below). After a scrape the UI asks
   "persist as a web_scrape connector?" (yes → create with daily sync + immediate sync).
   `/connect` = conversational connector wizard (`src/wizard.ts` state machine over
   `/api/connectors/types`: type → name → each field (secrets hint env: indirection) →
@@ -373,6 +381,46 @@ Post-phase additions (2026-07-07, all tested — suite: **89 passed**):
   polluted every taught-note vector — non-deterministic near the grounding gate (a flaky
   `test_learn_endpoint_teaches_fact`) and a small persistent degradation in production. Now the
   suffix is a content sha256 (stable + idempotent); regression-guarded in `test_pipeline.py`.
+- Markdown renderer — GFM gap-closing + shared `<Markdown>` component (2026-07-15, user request):
+  kept the hand-rolled, **dependency-free** renderer (a react-markdown + remark-gfm swap was tried
+  and reverted — it caused a UI regression in the live browser; the handwritten path renders
+  cleanly and is what ships). Widened `components/markdown.tsx` to a broad GFM subset so it reads
+  close to remark-gfm without the bundle/runtime cost: **GFM pipe tables**, **blockquotes**
+  (nested, recursive), **nested lists** (indentation-based, re-parsed as child blocks) + **task
+  lists** (`- [ ]`/`- [x]` → real checkboxes), **strikethrough**, real **`[text](url)` links** +
+  **bare-URL autolinks** (disambiguated from citations — the link alternative precedes the bare-
+  `[ref]` alternative in the inline regex, so `[x](y)` is a link and `[x]` a citation), **images**,
+  `# … ######` headings, **`---` rules**, and **two citation forms** — bare `[ref]` and
+  `【source: …】` lenticular (`source:` label stripped) — because **every model cites differently
+  and none obeys the prompt's `[uri]` format**: gemma text, gpt-oss uses `【source: Title】`. Both
+  become gold citation superscripts + entries in the sources modal; retune `INLINE_SRC` if a model
+  invents a new form. (`<url>` angle-bracket autolinks were a third citation form until
+  2026-07-15 — see the fix below; they're now plain links, not citations.)
+  One big named-group inline regex (built fresh per
+  `renderInline` call because it recurses into emphasis bodies — a shared global's lastIndex would
+  be clobbered). Extracted a shared **`<Markdown text book? mermaid? className?>`** component
+  (bottom of `markdown.tsx` — same file, since Windows is case-insensitive and a separate
+  `Markdown.tsx` would collide with `markdown.tsx`) as the org-wide entry point; `ArtifactModal`
+  uses it, `Chat` still calls `renderMarkdown(text, book)` directly because it needs `book.refs`
+  for the provenance ledger. `CiteBook`/`renderMarkdown`/`renderInline` remain exported.
+  Verified by SSR-rendering the real engine to HTML + a Playwright screenshot of every feature;
+  typecheck + build green; frontend rebuilt.
+- Clickable citations + `<url>` over-citation fix (2026-07-15, user-reported bug + request): citation
+  superscripts (`[ref]` / `【…】`) are now wrapped in a link (opens in a new tab) when the ref itself
+  is a URL — hover still shows the source via the native `title` tooltip either way, unchanged when
+  the ref is a title/label (no href to point at). Root cause found live: `search_memory` returns raw
+  chunk text verbatim, and when a source document itself contains links (e.g. a Confluence page
+  listing TFS/PR links), the model relays them with GFM `<url>` autolink syntax — legitimate markdown,
+  not a citation gesture — but `<url>` had been folded into the same citation heuristic as `[ref]`/
+  `【…】`, so every content link inside the one retrieved document inflated the "Grounded · N sources"
+  count and cluttered the sources modal (verified: a Confluence-only answer showed 10 "sources", one
+  per TFS/GitLab link mentioned on that single ingested page). Fix: `<url>` (`angleUrl` capture group,
+  `components/markdown.tsx`) now renders as a plain clickable link, same as a bare autolink — it no
+  longer calls `book.number()`. Only bare `[ref]` and `【…】` remain real citation forms. Verified live
+  against a captured production answer (session in `~/.quickjoiner/default`) via Playwright: badge
+  count dropped from inflated-by-content-links to the true `1 source`, TFS/GitLab links render as
+  normal teal links. Frontend rebuilt; no dedicated frontend test suite exists yet (manual/Playwright
+  verification is the current practice, per the markdown-renderer entry above).
 
 ## Next steps (agreed with user)
 

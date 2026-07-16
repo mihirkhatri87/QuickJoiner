@@ -1,5 +1,5 @@
 import { BookmarkPlus, Check, Download, X } from "lucide-react";
-import { CiteBook, renderMarkdown } from "./markdown";
+import { Markdown } from "./markdown";
 import { cn } from "./ui";
 
 export interface Artifact {
@@ -73,7 +73,7 @@ export function ArtifactModal({
           </button>
         </div>
         <div className="scroll-thin overflow-y-auto px-6 py-5 text-[14.5px] leading-[1.75] md:px-8">
-          {renderMarkdown(artifact.markdown, new CiteBook(), { mermaid: true })}
+          <Markdown text={artifact.markdown} mermaid />
         </div>
       </div>
     </div>

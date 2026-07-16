@@ -117,6 +117,27 @@ export default function App() {
 
   const say = (text: string) => setMessages((m) => [...m, { id: uid(), role: "agent", text }]);
   const sayError = (text: string) => setMessages((m) => [...m, { id: uid(), role: "error", text }]);
+
+  const deleteSession = async (id: string) => {
+    try {
+      await api.deleteSession(id);
+      if (sessionId === id) newConversation();
+      loadSessions();
+    } catch (e) {
+      sayError("Could not delete conversation: " + String(e));
+    }
+  };
+
+  const deleteAllSessions = async () => {
+    if (!window.confirm("Delete all conversations shown here? This can't be undone.")) return;
+    try {
+      await api.deleteAllSessions(currentProject || undefined);
+      newConversation();
+      loadSessions();
+    } catch (e) {
+      sayError("Could not delete conversations: " + String(e));
+    }
+  };
   const pushUser = (text: string) => setMessages((m) => [...m, { id: uid(), role: "user", text, ts: now() }]);
 
   // Pipeline stages 1-2 (flows + command registry) live in commands.ts;
@@ -260,6 +281,8 @@ export default function App() {
           activeSession={sessionId}
           onOpenSession={openSession}
           onNewConversation={newConversation}
+          onDeleteSession={deleteSession}
+          onDeleteAll={deleteAllSessions}
           onDistill={distill}
           canDistill={!!sessionId}
           sources={sources}
@@ -292,6 +315,11 @@ export default function App() {
                   onOpenArtifact={(a) => {
                     setArtifact(a);
                     setLearnState("idle");
+                  }}
+                  onLearned={() => {
+                    loadStatus();
+                    loadSources();
+                    loadGaps();
                   }}
                 />
               )}

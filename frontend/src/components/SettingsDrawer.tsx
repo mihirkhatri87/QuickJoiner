@@ -315,7 +315,7 @@ function WorkspaceSettings({
         },
         chat: s.chat,
         embedding: { provider: s.embedding.provider, model: s.embedding.model || null, instruct: s.embedding.instruct },
-        graph: { extract_triples: s.graph.extract_triples },
+        graph: { extract_triples: s.graph.extract_triples, entity_resolution: s.graph.entity_resolution },
       });
       setMsg("Saved");
       onFlash("Workspace settings saved");
@@ -424,6 +424,12 @@ function WorkspaceSettings({
         onChange={(v) => set("graph.extract_triples", v)}
         label="Extract relationships from prose (LLM)"
         hint="Run an LLM relationship-extraction pass over ingested docs to enrich the graph. Costs one LLM call per qualifying document. Ingest-time — re-sync to apply. Deterministic extractors (deps, code structure, ticket refs) always run regardless."
+      />
+      <Toggle
+        checked={s.graph.entity_resolution}
+        onChange={(v) => set("graph.entity_resolution", v)}
+        label="Entity resolution (merge duplicate names)"
+        hint="Before creating a new graph entity, check for a same-type near-duplicate (embedding candidates + LLM adjudication) and merge into it instead — e.g. a wiki's 'Webroot Connector' and a repo's 'AppRiver.Connector.Web' becoming one node. Ingest-time — re-sync to apply."
       />
 
       <Sub>Conversations</Sub>

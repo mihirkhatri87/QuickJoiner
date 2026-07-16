@@ -132,6 +132,22 @@ def build_builtin_tools(
         ]
         return "Connected sources:\n" + "\n".join(lines)
 
+    # A hub entity (a repo touching thousands of `defines`/`imports` edges, say) can have
+    # far more neighbors than is useful — or safe — to hand an LLM in one tool result;
+    # an uncapped dump has been observed to blow past the model's context/request limits
+    # outright (a 500 from the provider, not a graceful truncation). Group by relation and
+    # sample instead of listing exhaustively once past a threshold: still genuinely useful
+    # (a relation-type breakdown is what you'd want from a hub anyway), always bounded.
+    _NEIGHBORS_FULL_LIST_MAX = 60
+    _NEIGHBORS_SAMPLE_PER_REL = 8
+
+    def _format_edge(r) -> str:
+        src = r["src_name"] or r["src"]
+        dst = r["dst_name"] or r["dst"]
+        detail = f" ({r['detail']})" if r["detail"] else ""
+        evidence = r["evidence_title"] or r["evidence_uri"] or r["evidence_doc_id"]
+        return f"- {src} --{r['rel']}--> {dst}{detail} [evidence: {evidence}]"
+
     def graph_neighbors(entity: str) -> str:
         ent = catalog.resolve_entity(entity)
         if ent is None:
@@ -143,19 +159,37 @@ def build_builtin_tools(
         if not rows:
             return (f"{ent['name']} ({ent['type']}) is known but has no recorded "
                     "relationships yet. Use search_memory for unstructured facts.")
-        lines = [f"{ent['name']} ({ent['type']}) — {len(rows)} relationship(s):"]
-        for r in rows:
-            src = r["src_name"] or r["src"]
-            dst = r["dst_name"] or r["dst"]
-            detail = f" ({r['detail']})" if r["detail"] else ""
-            evidence = r["evidence_title"] or r["evidence_uri"] or r["evidence_doc_id"]
-            lines.append(f"- {src} --{r['rel']}--> {dst}{detail} [evidence: {evidence}]")
+
+        if len(rows) <= _NEIGHBORS_FULL_LIST_MAX:
+            lines = [f"{ent['name']} ({ent['type']}) — {len(rows)} relationship(s):"]
+            lines.extend(_format_edge(r) for r in rows)
+        else:
+            by_rel: dict[str, list] = {}
+            for r in rows:
+                by_rel.setdefault(r["rel"], []).append(r)
+            lines = [
+                f"{ent['name']} ({ent['type']}) has {len(rows)} relationships — a hub, too "
+                f"many to list in full. Showing up to {_NEIGHBORS_SAMPLE_PER_REL} examples per "
+                "relation type below; if you're checking a specific other entity, use "
+                "graph_path(a, b) instead — it returns just the connecting chain, not everything."
+            ]
+            for rel, group in sorted(by_rel.items(), key=lambda kv: -len(kv[1])):
+                lines.append(f"\n{rel} ({len(group)} total):")
+                lines.extend(_format_edge(r) for r in group[:_NEIGHBORS_SAMPLE_PER_REL])
+                if len(group) > _NEIGHBORS_SAMPLE_PER_REL:
+                    lines.append(f"  …and {len(group) - _NEIGHBORS_SAMPLE_PER_REL} more not shown.")
         lines.append(
             "Cite the evidence documents; call search_memory on them for the underlying text."
         )
         return "\n".join(lines)
 
-    def graph_path(a: str, b: str, max_hops: int = 3) -> str:
+    # 5, not 3: matches the web UI's Path Finder default. A repo's own
+    # dependency-map/triple layers now routinely add an indirection hop or two
+    # (repo -> project -> service -> service, say) before reaching a genuinely
+    # cross-source relationship, so 3 was clipping real, evidenced chains.
+    _DEFAULT_MAX_HOPS = 5
+
+    def graph_path(a: str, b: str, max_hops: int = _DEFAULT_MAX_HOPS) -> str:
         ent_a, ent_b = catalog.resolve_entity(a), catalog.resolve_entity(b)
         for raw, ent in ((a, ent_a), (b, ent_b)):
             if ent is None:
@@ -165,9 +199,13 @@ def build_builtin_tools(
             return f"{ent_a['name']} and {b!r} resolve to the same entity ({ent_a['id']})."
         path = catalog.graph_path(ent_a["id"], ent_b["id"], max_hops)
         if path is None:
+            retry_hint = (
+                f" Try again with a higher max_hops before concluding that — {max_hops} may "
+                "have been too shallow." if max_hops < 8 else ""
+            )
             return (f"NO_PATH: no recorded chain between {ent_a['name']} and {ent_b['name']} "
-                    f"within {max_hops} hops. That may only mean the link isn't learned yet — "
-                    "try search_memory before concluding they are unrelated.")
+                    f"within {max_hops} hops.{retry_hint} That may only mean the link isn't "
+                    "learned yet — try search_memory before concluding they are unrelated.")
         lines = [f"Path from {ent_a['name']} to {ent_b['name']} ({len(path)} hop(s)):"]
         for i, r in enumerate(path, 1):
             src = r["src_name"] or r["src"]
@@ -274,7 +312,9 @@ def build_builtin_tools(
                     "properties": {
                         "a": {"type": "string", "description": "First entity name/alias/id"},
                         "b": {"type": "string", "description": "Second entity name/alias/id"},
-                        "max_hops": {"type": "integer", "description": "Search depth (default 3)"},
+                        "max_hops": {"type": "integer",
+                                     "description": "Search depth (default 5). Raise it and retry "
+                                     "once before concluding NO_PATH means unrelated."},
                     },
                     "required": ["a", "b"],
                 },

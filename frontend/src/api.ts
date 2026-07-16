@@ -1,10 +1,14 @@
 import type {
   AuthStatus,
+  BridgeEntity,
   ChatEvent,
   ConnectorRow,
   ConnectorType,
+  DocumentFile,
+  EntitySearchResult,
   GapsResponse,
   GraphData,
+  GraphPathResult,
   ProjectRow,
   ScrapeEvent,
   SessionDetail,
@@ -118,6 +122,19 @@ export const api = {
           limit: String(limit),
         }).toString(),
     ),
+  searchEntities: (q: string, limit = 8) =>
+    req<EntitySearchResult[]>(
+      "/api/graph/search?" + new URLSearchParams({ q, limit: String(limit) }).toString(),
+    ),
+  graphBridges: (limit = 20) =>
+    req<BridgeEntity[]>("/api/graph/bridges?" + new URLSearchParams({ limit: String(limit) }).toString()),
+  graphPath: (a: string, b: string, maxHops = 4) =>
+    req<GraphPathResult>(
+      "/api/graph/path?" +
+        new URLSearchParams({ a, b, max_hops: String(maxHops) }).toString(),
+    ),
+  documentFile: (docId: string) =>
+    req<DocumentFile>(`/api/documents/${encodeURIComponent(docId)}/file`),
 
   gaps: () => req<GapsResponse>("/api/gaps"),
   resolveGaps: (gapIds: string[], resolution: string) =>
@@ -140,6 +157,12 @@ export const api = {
   distill: (id: string) =>
     req<{ facts_learned: number }>(`/api/sessions/${encodeURIComponent(id)}/distill`, {
       method: "POST",
+    }),
+  deleteSession: (id: string) =>
+    req<{ deleted: string }>(`/api/sessions/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  deleteAllSessions: (project?: string) =>
+    req<{ deleted: number }>("/api/sessions" + (project ? `?project=${encodeURIComponent(project)}` : ""), {
+      method: "DELETE",
     }),
 };
 

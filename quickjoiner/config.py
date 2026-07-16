@@ -128,6 +128,15 @@ class GraphConfig(BaseModel):
         default_factory=lambda: ["doc", "page", "issue", "note", "wiki", "ticket", "incident"]
     )
     triple_min_chars: int = 400  # skip trivially short documents
+    # Concurrent LLM calls for triple extraction during one ingest batch — the
+    # extractor is the bottleneck on a large corpus (one blocking network call per
+    # qualifying doc); keep modest by default to avoid hammering a shared LLM proxy.
+    triple_workers: int = 4
+    # Entity-resolution dedup (ingest/entity_resolution.py): merge a newly-seen
+    # entity into an existing one of the same type via embedding-candidate search +
+    # LLM adjudication (Graphiti-style), instead of creating a duplicate node every
+    # time the same real-world thing is named differently across sources.
+    entity_resolution: bool = False
 
 
 class SourceConfig(BaseModel):

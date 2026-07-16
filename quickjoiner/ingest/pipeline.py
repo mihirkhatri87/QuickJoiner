@@ -6,6 +6,7 @@ the ingested document itself."""
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import re
 from dataclasses import dataclass, field
@@ -13,8 +14,10 @@ from typing import Callable, Iterable
 
 from quickjoiner.config import GraphConfig, RetrievalConfig
 from quickjoiner.connectors.base import Document
+from quickjoiner.connectors.deps import is_manifest_path
 from quickjoiner.ingest.chunkers import chunk_document
 from quickjoiner.ingest.code_graph import extract_code_graph, looks_like_code
+from quickjoiner.ingest.entity_resolution import EntityResolver
 from quickjoiner.ingest.normalize import normalize_text
 from quickjoiner.ingest.triples import triples_to_graph
 from quickjoiner.memory.catalog import Catalog
@@ -27,6 +30,14 @@ _TICKET_STOPLIST = {
     "CVE", "GPT", "IPV", "OAUTH", "BASE", "X", "S", "EN", "A", "I18N", "L10N",
 }
 _MAX_TICKETS_PER_DOC = 20
+# Auto-generated lockfiles: no deterministic parser bothers with these (their
+# information is transitive-dependency noise, not authored relationships) and
+# they're often huge, so they're excluded from LLM triple extraction the same
+# way deps.py-parsed manifests are (see _triples_apply).
+_LOCKFILE_NAMES = {
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "composer.lock",
+    "gemfile.lock", "poetry.lock", "cargo.lock", "go.sum",
+}
 # "files" included: a folder-ingested project is the same entity the dependency
 # map calls "repo:<name>", so ticket references land on the same node.
 _REPO_SOURCE_TYPES = {"git", "github", "gitlab", "azure_devops", "files"}
@@ -97,6 +108,8 @@ class IngestPipeline:
         retrieval: RetrievalConfig | None = None,
         graph: GraphConfig | None = None,
         triple_extractor: Callable[[str, str], list] | None = None,
+        entity_resolver: EntityResolver | None = None,
+        triple_workers: int = 1,
     ):
         self._store = store
         self._catalog = catalog
@@ -107,29 +120,49 @@ class IngestPipeline:
         # (text, title) -> list[Triple]; supplied by the app when graph.extract_triples
         # is on and an LLM is available. None => LLM triple extraction is skipped.
         self._triple_extractor = triple_extractor
+        # Entity-resolution dedup (ingest/entity_resolution.py); None => every entity
+        # id is created as-is (prior behavior, exact-match only).
+        self._entity_resolver = entity_resolver
+        # Triple extraction is one blocking LLM call per qualifying document — the
+        # bottleneck on a large corpus. Documents needing it are deferred into a batch
+        # and resolved with up to `triple_workers` concurrent calls after the main
+        # (fast, local) chunk/embed/catalog loop finishes, instead of serializing
+        # network round-trips one document at a time. 1 = fully sequential (default).
+        self._triple_workers = max(1, triple_workers)
 
     def ingest(self, documents: Iterable[Document], source_id: str) -> IngestStats:
         stats = IngestStats()
+        pending: list[tuple[str, list, list, list, str, str]] = []
         for doc in documents:
             try:
-                self._ingest_one(doc, source_id, stats)
+                self._ingest_one(doc, source_id, stats, pending)
             except Exception as exc:  # keep syncing the rest of the source
                 stats.errors.append(f"{doc.uri}: {exc}")
+        if pending:
+            self._resolve_pending_triples(pending, source_id)
         if stats.chunks:
             ensure_index = getattr(self._store, "ensure_ann_index", None)
             if ensure_index is not None:
                 ensure_index()
         return stats
 
-    def _ingest_one(self, doc: Document, source_id: str, stats: IngestStats) -> None:
+    def _ingest_one(self, doc: Document, source_id: str, stats: IngestStats, pending: list) -> None:
         doc_id = _doc_id(source_id, doc.uri)
         # Normalize before hashing so cosmetic variants (curly quotes, NBSP, CRLF)
         # of the same content dedupe instead of re-embedding.
         text = normalize_text(doc.text)
         content_hash = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
         existing = self._catalog.get_document_hash(doc_id)
-        if existing == content_hash:
+        unchanged = existing == content_hash
+        if unchanged and not self._catalog.is_graph_pending(doc_id):
             stats.skipped += 1
+            return
+        if unchanged:
+            # Content itself didn't change, but a prior run was interrupted before
+            # this doc's deferred graph work (LLM triples) got persisted — retry
+            # just that, skipping the redundant re-chunk/re-embed below.
+            stats.skipped += 1
+            self._sync_graph(doc, doc_id, source_id, text, pending)
             return
 
         chunks = chunk_document(text, doc.kind)
@@ -156,17 +189,20 @@ class IngestPipeline:
             updated_at=doc.updated_at,
             chunk_count=written,
         )
-        self._sync_graph(doc, doc_id, source_id, text)
+        self._sync_graph(doc, doc_id, source_id, text, pending)
         stats.chunks += written
         if existing is None:
             stats.added += 1
         else:
             stats.updated += 1
 
-    def _sync_graph(self, doc: Document, doc_id: str, source_id: str, text: str) -> None:
-        """Persist this document's knowledge-graph assertions: structured graph
-        metadata (dependency maps) plus ticket keys found in the text. Edges are
-        replaced per evidence document, so re-ingest refreshes and never dupes."""
+    def _sync_graph(self, doc: Document, doc_id: str, source_id: str, text: str, pending: list) -> None:
+        """Compute this document's knowledge-graph assertions: structured graph
+        metadata (dependency maps), ticket keys, and code structure are all fast
+        and deterministic, so they're persisted immediately. Optional LLM triple
+        extraction is a blocking network call, so a qualifying document is queued
+        into `pending` and persisted later (see `_resolve_pending_triples`) instead
+        of serializing the whole ingest loop behind one LLM round-trip per doc."""
         graph = (doc.metadata or {}).get("graph") or {}
         entities = [tuple(e) for e in graph.get("entities", [])]
         alias_rows = [tuple(a) for a in graph.get("aliases", [])]
@@ -198,29 +234,87 @@ class IngestPipeline:
                 entities.extend(code_ents)
                 edges.extend(code_edges)
 
-        # Optional LLM relationship extraction over prose documents (config-gated,
-        # keyless-safe). Fire-and-forget: an extraction failure never breaks ingest.
         if self._triple_extractor is not None and not is_code and self._triples_apply(doc, text):
-            try:
-                triples = self._triple_extractor(text, doc.title)
-            except Exception:
-                triples = []
-            if triples:
-                g = triples_to_graph(triples, f"stated in {doc.title[:60]}")
-                entities.extend(g["entities"])
-                alias_rows.extend(g["aliases"])
-                edges.extend(g["edges"])
+            _add_source_entity()
+            # Written now (fast, synchronous) so it survives a crash/kill between
+            # here and _resolve_pending_triples actually persisting this doc's
+            # triples — see graph_pending's schema comment for why that matters.
+            self._catalog.mark_graph_pending(doc_id, source_id)
+            pending.append((doc_id, entities, alias_rows, edges, text, doc.title))
+            return
 
+        self._persist_graph(doc_id, entities, alias_rows, edges, source_id)
+
+    def _resolve_pending_triples(self, pending: list, source_id: str) -> None:
+        """Resolve the queued LLM triple-extraction calls, then persist each
+        document's full graph assertions. `triple_workers > 1` runs the (network-
+        bound) extractor calls concurrently; all catalog/embedding work still
+        happens back on this thread as each future completes, so no locking is
+        needed beyond what the catalog already provides."""
+        if self._triple_workers > 1 and len(pending) > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self._triple_workers) as pool:
+                futures = {
+                    pool.submit(self._triple_extractor, text, title): (doc_id, entities, alias_rows, edges, title)
+                    for doc_id, entities, alias_rows, edges, text, title in pending
+                }
+                for fut in concurrent.futures.as_completed(futures):
+                    doc_id, entities, alias_rows, edges, title = futures[fut]
+                    try:
+                        triples = fut.result()
+                    except Exception:
+                        triples = []
+                    self._apply_triples(triples, doc_id, entities, alias_rows, edges, title, source_id)
+        else:
+            for doc_id, entities, alias_rows, edges, text, title in pending:
+                try:
+                    triples = self._triple_extractor(text, title)
+                except Exception:
+                    triples = []
+                self._apply_triples(triples, doc_id, entities, alias_rows, edges, title, source_id)
+
+    def _apply_triples(self, triples: list, doc_id: str, entities: list, alias_rows: list,
+                        edges: list, title: str, source_id: str) -> None:
+        if triples:
+            g = triples_to_graph(triples, f"stated in {title[:60]}")
+            entities = entities + g["entities"]
+            alias_rows = alias_rows + g["aliases"]
+            edges = edges + g["edges"]
+        self._persist_graph(doc_id, entities, alias_rows, edges, source_id)
+
+    def _persist_graph(self, doc_id: str, entities: list, alias_rows: list,
+                        edges: list, source_id: str) -> None:
+        """Write entities/aliases/edges for one document. Every new entity is
+        routed through the entity resolver first (if configured): a merge adds
+        an alias to an existing canonical entity instead of creating a
+        duplicate node, and every edge referencing the original id is remapped
+        to the canonical one. Unconditional replace_doc_edges: a changed doc
+        that dropped its assertions must also drop its stale edges (hash
+        dedupe means we only get here on change)."""
+        id_map: dict[str, str] = {}
         for eid, name, type_ in entities:
-            self._catalog.upsert_entity(eid, name, type_, source_id)
+            canonical, merged = (
+                self._entity_resolver.resolve(eid, name, type_) if self._entity_resolver else (eid, False)
+            )
+            id_map[eid] = canonical
+            if not merged:
+                self._catalog.upsert_entity(canonical, name, type_, source_id)
         for alias, eid in alias_rows:
-            self._catalog.add_entity_alias(alias, eid)
-        # Unconditional: a changed doc that dropped its assertions must also
-        # drop its stale edges (hash dedupe means we only get here on change).
-        self._catalog.replace_doc_edges(doc_id, edges)
+            self._catalog.add_entity_alias(alias, id_map.get(eid, eid))
+        remapped = [(id_map.get(s, s), rel, id_map.get(d, d), detail) for s, rel, d, detail in edges]
+        self._catalog.replace_doc_edges(doc_id, remapped)
+        self._catalog.clear_graph_pending(doc_id)
 
     def _triples_apply(self, doc: Document, text: str) -> bool:
         """Whether a document qualifies for LLM relationship extraction: a prose-ish
-        kind and long enough to be worth an LLM call."""
+        kind, long enough to be worth an LLM call, and not a manifest/lockfile —
+        those are either already deterministically parsed by deps.py (redundant
+        LLM call) or auto-generated transitive-dependency noise deps.py doesn't
+        even bother with (package-lock.json etc.), so an LLM call on them is
+        pure waste rather than a meaningful enrichment."""
         cfg = self._graph_cfg
-        return doc.kind in cfg.triple_doc_kinds and len(text) >= cfg.triple_min_chars
+        if doc.kind not in cfg.triple_doc_kinds or len(text) < cfg.triple_min_chars:
+            return False
+        path = doc.uri.split("?")[0].split("#")[0].rstrip("/").lower()
+        if any(path.endswith(lf) for lf in _LOCKFILE_NAMES):
+            return False
+        return not is_manifest_path(doc.uri)

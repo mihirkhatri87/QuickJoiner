@@ -546,7 +546,7 @@ def create_app(workspace: Path) -> FastAPI:
                 "path": None if path is None else [
                     {"src": r["src"], "rel": r["rel"], "dst": r["dst"], "detail": r["detail"],
                      "evidence": {"doc_id": r["evidence_doc_id"], "title": r["evidence_title"],
-                                  "uri": r["evidence_uri"]}}
+                                  "uri": r["evidence_uri"], "kind": r["evidence_kind"]}}
                     for r in path
                 ]}
 
@@ -562,6 +562,41 @@ def create_app(workspace: Path) -> FastAPI:
             return {"entity": {"id": ent["id"], "name": ent["name"], "type": ent["type"]},
                     **ctx.catalog.graph_snapshot(ent["id"], limit)}
         return ctx.catalog.graph_snapshot(None, limit)
+
+    @api.get("/api/graph/search")
+    def graph_search(q: str, limit: int = 10):
+        """Entity autocomplete for the graph view's search box — substring match
+        over names/aliases, not the exact resolve /api/graph does."""
+        return ctx.catalog.search_entities(q, limit)
+
+    @api.get("/api/graph/bridges")
+    def graph_bridges(limit: int = 20):
+        """Entities touched by more than one source's edges — cross-source
+        correlation, and a much better "where do I start?" list than a slice of
+        the raw graph."""
+        return ctx.catalog.bridge_entities(limit)
+
+    @api.get("/api/documents/{doc_id}/file")
+    def document_file(doc_id: str):
+        """The current local file content backing a citation, for connector
+        types that keep a real checkout (git clones, a local files/ source) —
+        so evidence chips can show the file in-app instead of only linking to
+        a remote host, when the content is already sitting in the workspace.
+        404 (not just an empty result) when there's no local file to show, so
+        the frontend can fall back to the remote link cleanly."""
+        from quickjoiner.connectors.local_view import local_file_path
+
+        doc = ctx.catalog.get_document(doc_id)
+        if doc is None:
+            raise HTTPException(status_code=404, detail="Unknown document")
+        path = local_file_path(ctx.workspace, doc["source_id"], doc["uri"])
+        if path is None:
+            raise HTTPException(status_code=404, detail="No local file for this document")
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            raise HTTPException(status_code=404, detail=f"Could not read file: {exc}") from exc
+        return {"path": str(path), "title": doc["title"], "text": text}
 
     @api.get("/api/search")
     def search(q: str, top_k: int = 8):
@@ -627,6 +662,22 @@ def create_app(workspace: Path) -> FastAPI:
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc))
         return {"session": session_id, "facts_learned": facts}
+
+    @api.delete("/api/sessions/{session_id}")
+    def delete_session(session_id: str):
+        if not ctx.catalog.get_session(session_id):
+            raise HTTPException(status_code=404, detail=f"No session {session_id!r}")
+        ctx.catalog.delete_session(session_id)
+        return {"deleted": session_id}
+
+    @api.delete("/api/sessions")
+    def delete_sessions(project: str | None = None):
+        """Delete all conversations, optionally scoped to a project."""
+        project_row = manager.resolve_project(project)
+        if project and not project_row:
+            raise HTTPException(status_code=404, detail=f"No project {project!r}")
+        deleted = ctx.catalog.delete_sessions(project_row["id"] if project_row else None)
+        return {"deleted": deleted}
 
     @api.post("/api/chat")
     def chat(req: ChatRequest, authorization: str | None = Header(default=None)):

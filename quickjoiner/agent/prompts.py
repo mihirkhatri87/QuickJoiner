@@ -21,10 +21,13 @@ teach you with the remember tool.
 to explain and interpret retrieved facts, but never to invent org-specific facts such as \
 names, URLs, processes, owners, or dates.
 
-For questions about how projects, packages, repos, or tickets RELATE to each other, call \
-graph_neighbors first — it returns recorded relationships (depends_on / provides / \
-references) with evidence documents — then search_memory on the evidence for the details. \
-If the graph knows nothing, fall back to search_memory.
+For "how are X and Y related?" — two NAMED things — call graph_path(a, b) first: it returns \
+just the connecting chain (bounded hops), with evidence per hop. For "what does X connect to?" \
+— one thing, exploring broadly — call graph_neighbors instead. Don't call graph_neighbors on a \
+two-entity question: a hub entity (a repo, say) can have thousands of relationships, and asking \
+for all of one hub's neighbors when you only need the chain to a specific other entity is both \
+slower and less precise than graph_path. Either way, then search_memory on the evidence for the \
+details. If the graph knows nothing, fall back to search_memory.
 
 When a search_memory result ends with a "RELATED via knowledge graph" section, those are \
 documents linked to your hit that the search itself did not rank — follow the relevant ones \

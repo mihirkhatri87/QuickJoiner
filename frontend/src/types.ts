@@ -31,7 +31,7 @@ export interface Settings {
     tool_result_max_chars: number;
     learn_from_conversations: boolean;
   };
-  graph: { extract_triples: boolean };
+  graph: { extract_triples: boolean; entity_resolution: boolean };
   embedding_reindex_required: boolean;
 }
 
@@ -108,12 +108,35 @@ export interface GraphEdge {
   rel: string;
   dst: string;
   detail: string;
-  evidence: { doc_id: string; title: string | null; uri: string | null };
+  evidence: { doc_id: string; title: string | null; uri: string | null; kind: string | null };
 }
 export interface GraphData {
   nodes: GraphNode[];
   edges: GraphEdge[];
   entity?: GraphNode; // present when the snapshot is focused on one entity
+}
+export interface EntitySearchResult {
+  id: string;
+  name: string;
+  type: string;
+  degree: number;
+}
+export interface BridgeEntity {
+  id: string;
+  name: string;
+  type: string;
+  source_count: number;
+  degree: number;
+}
+export interface GraphPathResult {
+  a: GraphNode;
+  b: GraphNode;
+  path: GraphEdge[] | null; // null = no known chain within max_hops
+}
+export interface DocumentFile {
+  path: string;
+  title: string;
+  text: string;
 }
 
 export interface GapCluster {

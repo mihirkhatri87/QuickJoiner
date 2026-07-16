@@ -11,6 +11,7 @@ build/
 .claude/settings.local.json
 *.db
 lancedb/
+debugging/
 
 # Local workspace state — never commit. If someone runs qj with the repo as its
 # workspace (or QJ_WORKSPACE points inside it), these appear here:

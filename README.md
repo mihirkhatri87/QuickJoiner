@@ -167,8 +167,11 @@ qj serve            # http://127.0.0.1:8787
 ```
 
 A React app (Vite + TypeScript + Tailwind) with:
-- **Streaming chat** and a provenance ledger — every grounded answer lists its numbered sources
-  in the margin; refusals are shown as "not learned yet".
+- **Streaming chat** with full-width answers — citations are inline superscripts (hover to see the
+  source); each answer has a hover toolbar to **download it as markdown**, **view all cited sources**,
+  and 👍/👎 — a 👎 asks what was wrong and **learns the correction into memory**. Refusals are shown
+  as "not learned yet". Answers render full markdown (tables, task/nested lists, blockquotes, code,
+  links, and live mermaid diagrams).
 - **Projects and resumable conversations**, with automatic history compression.
 - **Knowledge gaps** — a badge in the rail opens the knowledge-debt backlog (below).
 - **Waypoints** — the interactive knowledge graph view.

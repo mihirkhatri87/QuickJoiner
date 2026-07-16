@@ -71,6 +71,15 @@ _SCHEMA_STATEMENTS = [
         session_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'open',
         resolution TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, resolved_at TEXT)""",
     "CREATE INDEX IF NOT EXISTS idx_gaps_status ON gaps(status)",
+    # A row here means this document's deferred graph work (LLM triple extraction,
+    # queued and resolved after the main ingest loop — see pipeline.py) has not yet
+    # been persisted. content_hash is written as soon as a document's fast/deterministic
+    # work (chunk, embed, store) finishes, independently of when its slow LLM-derived
+    # edges land; without this table, a killed/crashed backfill would leave those docs
+    # with a hash that already matches their content, so a later incremental sync would
+    # see them as "unchanged" and skip them forever, never retrying the graph work.
+    """CREATE TABLE IF NOT EXISTS graph_pending (
+        doc_id TEXT PRIMARY KEY, source_id TEXT NOT NULL DEFAULT '')""",
 ]
 
 
@@ -205,6 +214,9 @@ class _SqlCatalog:
         row = self._read_one("SELECT content_hash FROM documents WHERE doc_id = ?", (doc_id,))
         return row["content_hash"] if row else None
 
+    def get_document(self, doc_id: str) -> dict | None:
+        return self._read_one("SELECT * FROM documents WHERE doc_id = ?", (doc_id,))
+
     def upsert_document(self, doc_id, source_id, uri, title, kind, content_hash,
                         updated_at, chunk_count) -> None:
         self._write(
@@ -220,6 +232,28 @@ class _SqlCatalog:
     def delete_document(self, doc_id: str) -> None:
         self._write("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
         self._write("DELETE FROM edges WHERE evidence_doc_id = ?", (doc_id,))
+        self._write("DELETE FROM graph_pending WHERE doc_id = ?", (doc_id,))
+
+    # -- deferred graph work (see graph_pending's comment in the schema) --------
+    def mark_graph_pending(self, doc_id: str, source_id: str) -> None:
+        self._write(
+            "INSERT INTO graph_pending (doc_id, source_id) VALUES (?, ?) "
+            "ON CONFLICT(doc_id) DO NOTHING",
+            (doc_id, source_id),
+        )
+
+    def clear_graph_pending(self, doc_id: str) -> None:
+        self._write("DELETE FROM graph_pending WHERE doc_id = ?", (doc_id,))
+
+    def is_graph_pending(self, doc_id: str) -> bool:
+        return self._read_one("SELECT 1 FROM graph_pending WHERE doc_id = ?", (doc_id,)) is not None
+
+    def count_graph_pending(self, source_id: str | None = None) -> int:
+        if source_id is None:
+            row = self._read_one("SELECT COUNT(*) AS n FROM graph_pending")
+        else:
+            row = self._read_one("SELECT COUNT(*) AS n FROM graph_pending WHERE source_id = ?", (source_id,))
+        return int(row["n"]) if row else 0
 
     def stats(self) -> dict:
         docs = self._read_one(
@@ -276,6 +310,19 @@ class _SqlCatalog:
         query += " ORDER BY updated_at DESC"
         return self._read_all(query, params)
 
+    def delete_session(self, session_id: str) -> None:
+        self._write("DELETE FROM chat_sessions WHERE id = ?", (session_id,))
+
+    def delete_sessions(self, project_id: str | None = None) -> int:
+        """Delete every session (optionally scoped to a project). Returns the count."""
+        if project_id:
+            rows = self._read_all("SELECT id FROM chat_sessions WHERE project_id = ?", (project_id,))
+            self._write("DELETE FROM chat_sessions WHERE project_id = ?", (project_id,))
+        else:
+            rows = self._read_all("SELECT id FROM chat_sessions", ())
+            self._write("DELETE FROM chat_sessions", ())
+        return len(rows)
+
     # -- users & auth tokens --------------------------------------------------
     def create_user(self, username: str, password_hash: str) -> None:
         self._write(
@@ -315,6 +362,11 @@ class _SqlCatalog:
             (entity_id, name, type_, source_id),
         )
 
+    def entities_by_type(self, type_: str) -> list[dict]:
+        """All entities of one type — candidate pool for entity-resolution dedup
+        (ingest/entity_resolution.py), which only ever compares same-typed entities."""
+        return self._read_all("SELECT * FROM entities WHERE type = ? ORDER BY id", (type_,))
+
     def add_entity_alias(self, alias: str, entity_id: str) -> None:
         self._write(
             "INSERT INTO entity_aliases (alias, entity_id) VALUES (?, ?) "
@@ -352,10 +404,52 @@ class _SqlCatalog:
             (needle,),
         )
 
+    def search_entities(self, query: str, limit: int = 10) -> list[dict]:
+        """Entity autocomplete: name/alias substring match (case-insensitive),
+        ranked by how connected the entity is. Powers the graph view's
+        search-as-you-type — a lighter-weight sibling to resolve_entity's exact
+        id/name/alias lookup, for "what might they mean" instead of "resolve this"."""
+        needle = f"%{query.strip().lower()}%"
+        if needle == "%%":
+            return []
+        return self._read_all(
+            """SELECT e.id, e.name, e.type,
+                      (SELECT COUNT(*) FROM edges g WHERE g.src = e.id OR g.dst = e.id) AS degree
+               FROM entities e
+               WHERE LOWER(e.name) LIKE ?
+                  OR e.id IN (SELECT entity_id FROM entity_aliases WHERE alias LIKE ?)
+               ORDER BY degree DESC LIMIT ?""",
+            (needle, needle, limit),
+        )
+
+    def bridge_entities(self, limit: int = 20) -> list[dict]:
+        """Entities touched by edges whose evidence documents come from more than
+        one distinct source — the graph's actual cross-source correlation, and a
+        far more useful "where do I start?" list than an arbitrary graph slice.
+        Ordered by how many sources touch it, then by degree."""
+        return self._read_all(
+            """SELECT e.id, e.name, e.type,
+                      COUNT(DISTINCT d.source_id) AS source_count,
+                      COUNT(*) AS degree
+               FROM entities e
+               JOIN (
+                   SELECT src AS entity_id, evidence_doc_id FROM edges
+                   UNION ALL
+                   SELECT dst AS entity_id, evidence_doc_id FROM edges
+               ) touch ON touch.entity_id = e.id
+               JOIN documents d ON d.doc_id = touch.evidence_doc_id
+               GROUP BY e.id, e.name, e.type
+               HAVING COUNT(DISTINCT d.source_id) > 1
+               ORDER BY source_count DESC, degree DESC
+               LIMIT ?""",
+            (limit,),
+        )
+
     _EDGE_SELECT = """SELECT g.src, g.rel, g.dst, g.detail, g.evidence_doc_id,
                              s.name AS src_name, s.type AS src_type,
                              t.name AS dst_name, t.type AS dst_type,
-                             d.title AS evidence_title, d.uri AS evidence_uri
+                             d.title AS evidence_title, d.uri AS evidence_uri,
+                             d.kind AS evidence_kind
                       FROM edges g
                       LEFT JOIN entities s ON s.id = g.src
                       LEFT JOIN entities t ON t.id = g.dst
@@ -372,10 +466,18 @@ class _SqlCatalog:
     def graph_path(self, src_id: str, dst_id: str, max_hops: int = 3) -> list[dict] | None:
         """Shortest chain of edges linking two entities (undirected BFS, hop-capped),
         each hop carrying names + evidence. [] if src == dst; None if unconnected
-        within reach — the tool reports that as not-learned, never invents a link."""
+        within reach — the tool reports that as not-learned, never invents a link.
+
+        Unbounded on purpose: this loads the full edge table into an in-memory
+        adjacency dict (fast — tens of thousands of rows is sub-second Python, not
+        an LLM payload), but a "no known path" answer is treated everywhere as an
+        honest refusal, not a hedge. A silent row cap here would have meant that
+        refusal could be wrong — reporting "not learned" for a connection that
+        exists just outside the truncated set. Correctness over a hypothetical
+        save that was never the actual bottleneck."""
         if src_id == dst_id:
             return []
-        rows = self._read_all(self._EDGE_SELECT + " LIMIT 10000")
+        rows = self._read_all(self._EDGE_SELECT)
         adjacency: dict[str, list[dict]] = {}
         for r in rows:
             adjacency.setdefault(r["src"], []).append(r)
@@ -409,11 +511,47 @@ class _SqlCatalog:
 
     def graph_snapshot(self, entity_id: str | None = None, limit: int = 400) -> dict:
         """Nodes + edges for /api/graph: one entity's neighborhood, or the whole
-        graph capped at `limit` edges."""
+        graph capped at `limit` edges.
+
+        The whole-graph case is sampled *fairly across source entities*, not just
+        the alphabetically-first `limit` rows: a plain `ORDER BY src, rel LIMIT n`
+        lets one high-degree entity (e.g. a repo with thousands of `defines`
+        edges) consume the entire budget before the scan ever reaches another
+        entity's edges — so a workspace with multiple sources would silently
+        render as a single star, with every other source's edges invisible
+        despite being fully present in the table. Instead every distinct `src`
+        gets an even share of the budget (a windowed per-entity cap) before the
+        overall `limit` is applied, so small/less-connected sources still show up
+        next to a dominant one."""
         if entity_id:
             rows = self.graph_neighbors(entity_id)[:limit]
         else:
-            rows = self._read_all(self._EDGE_SELECT + " ORDER BY g.src, g.rel LIMIT ?", (limit,))
+            distinct = self._read_one("SELECT COUNT(DISTINCT src) AS n FROM edges")
+            n_src = max(1, (distinct["n"] if distinct else 0) or 1)
+            per_entity_cap = max(5, limit // n_src)
+            rows = self._read_all(
+                f"""SELECT src, rel, dst, detail, evidence_doc_id,
+                           src_name, src_type, dst_name, dst_type,
+                           evidence_title, evidence_uri, evidence_kind
+                    FROM (
+                        SELECT g.src, g.rel, g.dst, g.detail, g.evidence_doc_id,
+                               s.name AS src_name, s.type AS src_type,
+                               t.name AS dst_name, t.type AS dst_type,
+                               d.title AS evidence_title, d.uri AS evidence_uri,
+                               d.kind AS evidence_kind,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY g.src ORDER BY g.rel, g.dst
+                               ) AS rn
+                        FROM edges g
+                        LEFT JOIN entities s ON s.id = g.src
+                        LEFT JOIN entities t ON t.id = g.dst
+                        LEFT JOIN documents d ON d.doc_id = g.evidence_doc_id
+                    ) capped
+                    WHERE rn <= ?
+                    ORDER BY src, rel
+                    LIMIT ?""",
+                (per_entity_cap, limit),
+            )
         nodes: dict[str, dict] = {}
         edges = []
         for r in rows:
@@ -423,8 +561,8 @@ class _SqlCatalog:
                                         "type": r["dst_type"] or "unknown"})
             edges.append({
                 "src": r["src"], "rel": r["rel"], "dst": r["dst"], "detail": r["detail"],
-                "evidence": {"doc_id": r["evidence_doc_id"],
-                             "title": r["evidence_title"], "uri": r["evidence_uri"]},
+                "evidence": {"doc_id": r["evidence_doc_id"], "title": r["evidence_title"],
+                             "uri": r["evidence_uri"], "kind": r["evidence_kind"]},
             })
         if entity_id and entity_id not in nodes:
             ent = self._read_one("SELECT * FROM entities WHERE id = ?", (entity_id,))

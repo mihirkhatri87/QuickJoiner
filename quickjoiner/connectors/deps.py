@@ -488,6 +488,27 @@ _NAMED_PARSERS = {
 }
 
 
+def is_manifest_path(uri: str) -> bool:
+    """Whether `scan_tree` already deterministically parses this file for
+    dependency edges — so it's redundant (and, for generated lockfiles, wasteful)
+    to also spend an LLM triple-extraction call on it (see pipeline.py's gate).
+
+    Uses suffix checks rather than isolating a clean basename: connector URIs mix
+    "/"-separated paths with a "repo_url::relative/path" convention (git_repo.py),
+    so a naive rsplit("/") can grab the wrong segment for a repo-root manifest —
+    endswith() sidesteps that ambiguity entirely."""
+    path = uri.split("?")[0].split("#")[0].rstrip("/").lower()
+    if any(path.endswith(ext) for ext in _PARSERS):
+        return True
+    if any(path.endswith(name) for name in _NAMED_PARSERS):
+        return True
+    if re.search(r"(?:^|[/:])requirements[^/:]*\.txt$", path):
+        return True
+    if path.endswith(".versions.toml"):
+        return True
+    return False
+
+
 def scan_tree(root: Path) -> _Scan:
     scan = _Scan()
     for path in sorted(root.rglob("*")):
