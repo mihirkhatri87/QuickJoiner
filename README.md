@@ -157,9 +157,12 @@ qj connect github --name platform-gh --option repo=acme/platform --option token=
 qj connect jira --name pay-jira --option base_url=https://acme.atlassian.net --option email=me@acme.com --option api_token=env:JIRA_API_TOKEN --option projects=PAY,LEDG
 qj connect confluence --name wiki --option base_url=https://acme.atlassian.net --option email=me@acme.com --option api_token=env:JIRA_API_TOKEN --option spaces=ENG
 qj connect azure_devops --name ado --option organization=acme --option project=Payments --option token=env:AZURE_DEVOPS_PAT
+# Work items ingest by team over recent sprints (default last 10); restrict teams and set the
+# window with --option teams=... --option sprints=...  Build pipelines are mapped to the repos
+# they build (a GitLab<->TFS bridge when branches mirror into TFS). Pull requests are not ingested.
 # on-prem Azure DevOps Server / TFS: use server_url + collection instead of organization
 # (verify_tls=false for a self-signed cert; api_version to match an older server):
-qj connect azure_devops --name tfs --option server_url=https://tfs.company.com/tfs --option collection=DefaultCollection --option project=Payments --option token=env:AZURE_DEVOPS_PAT --option verify_tls=false
+qj connect azure_devops --name tfs --option server_url=https://tfs.company.com/tfs --option collection=DefaultCollection --option project=Payments --option token=env:AZURE_DEVOPS_PAT --option teams="Payments Team,Platform Team" --option sprints=10
 # Octopus paginates all projects (not just the first 100); incremental=true re-fetches a
 # project's releases only when it changed since last sync (dashboard/projects always refresh):
 qj connect octopus --name deploys --option server_url=https://octopus.acme.com --option api_key=env:OCTOPUS_API_KEY --option incremental=true

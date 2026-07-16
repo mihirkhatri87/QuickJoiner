@@ -3,7 +3,11 @@ from pathlib import Path
 import pytest
 
 from quickjoiner.config import SourceConfig
-from quickjoiner.connectors.azure_devops import pull_request_document, work_item_document
+from quickjoiner.connectors.azure_devops import (
+    build_map_document,
+    select_recent_iterations,
+    work_item_document,
+)
 from quickjoiner.connectors.base import Mode
 from quickjoiner.connectors.github import issue_document as gh_issue_document
 from quickjoiner.connectors.github import pr_document, runs_document
@@ -133,17 +137,35 @@ def test_azure_devops_documents():
     assert "Nightly settlement job times out" in doc.title
     assert "Chen" in doc.text and "30m" in doc.text and "<div>" not in doc.text
 
-    pr = {
-        "pullRequestId": 55, "title": "Fix retry loop", "status": "active",
-        "createdBy": {"displayName": "Dana"},
-        "sourceRefName": "refs/heads/fix", "targetRefName": "refs/heads/main",
-        "repository": {"name": "settlement"},
-        "creationDate": "2026-07-04T00:00:00Z",
-        "description": "Bounded retries.",
-    }
-    prdoc = pull_request_document("https://dev.azure.com/acme", "Payments", pr)
-    assert "settlement" in prdoc.text and "Dana" in prdoc.text
-    assert prdoc.uri.endswith("/pullrequest/55")
+
+def test_ado_select_recent_iterations_takes_last_started_sprints():
+    iters = [
+        {"id": "1", "name": "Sprint 1", "attributes": {"startDate": "2026-01-01T00:00:00Z", "timeFrame": "past"}},
+        {"id": "3", "name": "Sprint 3", "attributes": {"startDate": "2026-03-01T00:00:00Z", "timeFrame": "current"}},
+        {"id": "2", "name": "Sprint 2", "attributes": {"startDate": "2026-02-01T00:00:00Z", "timeFrame": "past"}},
+        {"id": "f", "name": "Sprint 4", "attributes": {"startDate": "2026-04-01T00:00:00Z", "timeFrame": "future"}},
+        {"id": "b", "name": "Backlog", "attributes": {}},  # no start date -> ignored
+    ]
+    picked = select_recent_iterations(iters, 2)
+    # last 2 that have started (future Sprint 4 excluded, backlog excluded), in order
+    assert [it["name"] for it in picked] == ["Sprint 2", "Sprint 3"]
+    assert [it["name"] for it in select_recent_iterations(iters, 0)] == ["Sprint 1", "Sprint 2", "Sprint 3"]
+
+
+def test_ado_build_map_document_links_pipelines_to_repos():
+    defs = [
+        {"name": "AppRiver.SecureTide.API Publish", "repository": {"name": "AppRiver.SecureTide.API",
+         "defaultBranch": "refs/heads/develop"}},
+        {"name": "No-repo pipeline", "repository": {}},  # skipped
+    ]
+    doc = build_map_document("https://tfs.appriver.com/tfs/AppRiver", "AppRiver", defs)
+    assert doc.kind == "pipeline"
+    assert "AppRiver.SecureTide.API" in doc.text and "develop" in doc.text
+    graph = doc.metadata["graph"]
+    # a repo entity (matches the same-named GitLab repo) and a builds edge exist
+    assert ("repo:appriver.securetide.api", "AppRiver.SecureTide.API", "repo") in graph["entities"]
+    edges = graph["edges"]
+    assert any(rel == "builds" and dst == "repo:appriver.securetide.api" for _s, rel, dst, _d in edges)
 
 
 def test_confluence_page_document():

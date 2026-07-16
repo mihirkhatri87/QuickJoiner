@@ -94,8 +94,10 @@ FORM_SPECS: dict[str, dict] = {
     },
     "azure_devops": {
         "label": "Azure DevOps",
-        "blurb": "Work items, PRs, pipelines. Live code search. Cloud or on-prem Server/TFS.",
-        "suggests": ["What work items are in progress?", "What changed in recent pull requests?"],
+        "blurb": "Work items by team over recent sprints, build pipelines, live code search + WIQL. "
+                 "Cloud or on-prem Server/TFS.",
+        "suggests": ["What work items are in the current sprint?", "What pipeline builds this repo?",
+                     "What is team X working on?"],
         "fields": [
             _f("organization", "Organization (cloud)", placeholder="acme",
                help="For dev.azure.com SaaS. Leave blank and use Server URL + Collection for on-prem TFS / Azure DevOps Server."),
@@ -109,6 +111,13 @@ FORM_SPECS: dict[str, dict] = {
                help="Match your server: 2022→7.0, 2020→6.0, 2019→5.0. Default 7.0."),
             _f("verify_tls", "Verify TLS certificate", placeholder="true",
                help="Set to false for on-prem servers with a self-signed / internal-CA certificate."),
+            _f("teams", "Teams", list_=True, placeholder="Team Rocket, Payments Team",
+               help="Ingest work items from these teams' recent sprints. Empty = every team in the "
+                    "project (teams without sprints are skipped). Narrow this on large projects with "
+                    "hundreds of teams to keep syncs fast."),
+            _f("sprints", "Recent sprints per team", placeholder="10",
+               help="How many of each team's most recent sprints to ingest work items from (default 10). "
+                    "Anything outside this slice is answered live via the WIQL tool."),
         ],
     },
     "octopus": {

@@ -180,8 +180,25 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   TLS verification for internal-CA/self-signed certs (threaded through `util.get_json`/`post_json`
   as `verify`); `api_version` is configurable (default 7.0 — Server 2022→7.x, 2020→6.0, 2019→5.0).
   Auth is unchanged: a PAT via Basic auth works for SaaS and Server 2017+ alike. `util.as_bool`
-  coerces string form values (shared with `octopus`). Tests in `tests/test_connectors.py` (on-prem
-  URL/search-host/api/verify + SaaS regression guard).
+  coerces string form values (shared with `octopus`).
+  **Work items are ingested by team over recent sprints, not flat** — a real project is far too
+  large to pull whole (AppRiver's has 304k work items). `sync` enumerates the project's teams
+  (`teams` option restricts to a named subset; empty = all, paginated), and for each team ingests
+  the work items in its most recent `sprints` iterations (option, default `DEFAULT_SPRINTS=10`;
+  `select_recent_iterations` orders by start date and drops *future* sprints via the server's
+  `timeFrame`). Global dedupe across teams, `MAX_WORK_ITEMS=8000` safety cap. Anything outside that
+  slice — older items, other teams, a specific #id — is answered live by the `ado_query_work_items`
+  WIQL tool (its description says so). **Pull requests are no longer ingested** (AppRiver makes
+  merge requests in GitLab; the ADO PR path and its webhook branch were removed).
+  **Build pipelines → repositories bridge** (`build_map_document`): one call to
+  `build/definitions?includeAllProperties=true` maps every pipeline to the repo + default branch it
+  builds, emitted as a doc with `pipeline --builds--> repo` graph edges. This is the **GitLab↔TFS
+  link**: MRs land in GitLab, each branch mirrors into a same-named TFS Git repo, builds run in TFS,
+  so the TFS repo names match the GitLab repos and the knowledge graph connects a GitLab repo to the
+  TFS pipeline that builds it (repo-name aliasing in `deps.py` reconciles spoken forms). Recent
+  pipeline *runs* still ingest as one summary doc. Tests in `tests/test_connectors.py` (on-prem
+  URL/search-host/api/verify + SaaS guard; `select_recent_iterations` future-exclusion;
+  `build_map_document` builds-edges).
   `octopus.py` **paginates** every list endpoint via `_paged` (follows `Links["Page.Next"]`) — a
   space with >100 projects previously truncated at the `take=100` first page. Pull is a full refresh
   (idempotent via hash dedupe); opt-in `incremental=true` fetches per-project releases only for

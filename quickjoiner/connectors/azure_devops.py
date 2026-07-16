@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 from typing import Any, Iterator
+from urllib.parse import quote
 
 from quickjoiner.connectors.base import ConnectionStatus, Connector, Document, Mode
 from quickjoiner.connectors.registry import register
@@ -12,7 +13,9 @@ from quickjoiner.llm.base import AgentTool, ToolSpec
 
 DEFAULT_API_VERSION = "7.0"
 WORK_ITEM_BATCH = 200
-MAX_WORK_ITEMS = 2000
+DEFAULT_SPRINTS = 10       # per team, most recent N iterations that have started
+TEAM_PAGE = 100            # teams list page size
+MAX_WORK_ITEMS = 8000      # safety cap across all teams' recent sprints
 
 
 def work_item_document(org_url: str, item: dict[str, Any]) -> Document:
@@ -35,20 +38,55 @@ def work_item_document(org_url: str, item: dict[str, Any]) -> Document:
     )
 
 
-def pull_request_document(org_url: str, project: str, pr: dict[str, Any]) -> Document:
-    repo = pr.get("repository", {}).get("name", "?")
-    text = (
-        f"Pull request !{pr['pullRequestId']} in {repo}: {pr.get('title', '')}\n"
-        f"Status: {pr.get('status', '?')} | Author: {pr.get('createdBy', {}).get('displayName', '?')} | "
-        f"{pr.get('sourceRefName', '')} -> {pr.get('targetRefName', '')}\n\n"
-        f"{pr.get('description') or '(no description)'}"
-    )
+def select_recent_iterations(iterations: list[dict[str, Any]], count: int) -> list[dict[str, Any]]:
+    """The most recent `count` iterations (sprints) — current plus the prior ones.
+
+    Iterations without a start date (loose backlog buckets) are ignored, and *future*
+    sprints (the server's `timeFrame`) are excluded so "recent" means current + past
+    rather than upcoming, still-empty ones. The rest are ordered by start date and the
+    trailing `count` returned. `count <= 0` means all such iterations.
+    """
+    dated = [it for it in iterations if (it.get("attributes") or {}).get("startDate")]
+    started = [it for it in dated if (it["attributes"].get("timeFrame") or "").lower() != "future"]
+    pool = started or dated  # fall back to all dated if the server omits timeFrame
+    pool.sort(key=lambda it: it["attributes"]["startDate"])
+    return pool[-count:] if count and count > 0 else pool
+
+
+def build_map_document(org_url: str, project: str, definitions: list[dict[str, Any]]) -> Document:
+    """One doc mapping each build pipeline to the repository it builds, with graph
+    edges `pipeline --builds--> repo`.
+
+    This is the TFS↔GitLab bridge: at AppRiver, merge requests land in GitLab, each
+    branch mirrors into a same-named TFS Git repo, and the build pipelines live in TFS.
+    The TFS repo names therefore match the GitLab repo names, so emitting `repo:` entities
+    here lets the knowledge graph connect a GitLab repo to the TFS pipeline that builds it
+    (repo-name aliasing in connectors/deps.py reconciles the spoken forms).
+    """
+    lines: list[str] = []
+    entities: dict[str, tuple[str, str, str]] = {}
+    edges: list[tuple[str, str, str, str]] = []
+    for d in definitions:
+        name = d.get("name", "?")
+        repo = d.get("repository") or {}
+        rname = repo.get("name")
+        if not rname:
+            continue
+        branch = str(repo.get("defaultBranch") or "").replace("refs/heads/", "")
+        lines.append(f"- Pipeline '{name}' builds repo {rname}"
+                     + (f" (default branch {branch})" if branch else ""))
+        pid, rid = f"pipeline:{name.lower()}", f"repo:{rname.lower()}"
+        entities[pid] = (pid, name, "pipeline")
+        entities[rid] = (rid, rname, "repo")
+        edges.append((pid, "builds", rid, f"default branch {branch}" if branch else "builds"))
     return Document(
-        uri=f"{org_url}/{project}/_git/{repo}/pullrequest/{pr['pullRequestId']}",
-        title=f"{repo} PR !{pr['pullRequestId']}: {pr.get('title', '')}",
-        text=text,
-        kind="ticket",
-        updated_at=pr.get("creationDate"),
+        uri=f"{org_url}/{project}/_build/definitions",
+        title=f"{project}: build pipelines and the repositories they build",
+        text=("Build pipelines and their source repositories. At AppRiver, merge requests are made "
+              "in GitLab, each branch syncs into a same-named TFS Git repo, and the build pipelines "
+              "run in TFS — so these repo names match the GitLab repositories:\n" + "\n".join(lines)),
+        kind="pipeline",
+        metadata={"graph": {"entities": sorted(entities.values()), "aliases": [], "edges": edges}},
     )
 
 
@@ -131,26 +169,64 @@ class AzureDevOpsConnector(Connector):
         except Exception as exc:
             return ConnectionStatus(False, f"Azure DevOps API error: {exc}")
 
+    def _teams(self, org_url: str, headers: dict, api: str, verify: bool) -> list[str]:
+        """Team names to ingest. The `teams` option restricts to a named subset;
+        otherwise every team in the project is enumerated (paginated). Teams without
+        sprints are skipped later, so a project with 100 teams where only a handful use
+        iterations still costs little beyond the one iterations probe per team."""
+        configured = self.options.get("teams")
+        if configured:
+            names = configured if isinstance(configured, list) else str(configured).split(",")
+            return [n.strip() for n in names if n and n.strip()]
+        teams, skip, project = [], 0, self._project()
+        while True:
+            page = get_json(
+                f"{org_url}/_apis/projects/{project}/teams?{api}",
+                headers=headers, params={"$top": TEAM_PAGE, "$skip": skip}, verify=verify,
+            ).get("value", [])
+            teams += [t["name"] for t in page if t.get("name")]
+            if len(page) < TEAM_PAGE:
+                return teams
+            skip += TEAM_PAGE
+
     def sync(self, state: dict[str, str]) -> Iterator[Document]:
         org_url, project, headers = self._org_url(), self._project(), self._headers()
         api, verify = self._api(), self._verify()
-        since = state.get("since", "")
+        sprints = int(self.options.get("sprints") or DEFAULT_SPRINTS)
 
-        # -- Boards work items (WIQL query, then detail batches) -------------
-        changed_clause = f" AND [System.ChangedDate] >= '{since[:10]}'" if since else ""
-        wiql = {
-            "query": (
-                "SELECT [System.Id] FROM WorkItems "
-                f"WHERE [System.TeamProject] = '{project}'{changed_clause} "
-                "ORDER BY [System.ChangedDate] DESC"
-            )
-        }
-        result = post_json(
-            f"{org_url}/{project}/_apis/wit/wiql?{api}", wiql, headers=headers, verify=verify
-        )
-        ids = [w["id"] for w in result.get("workItems", [])][:MAX_WORK_ITEMS]
-        for i in range(0, len(ids), WORK_ITEM_BATCH):
-            batch = ids[i : i + WORK_ITEM_BATCH]
+        # -- Boards work items, by team over the last N sprints ---------------
+        # A 300k-item project is far too large to pull flat; instead we walk each
+        # team's most recent sprints and ingest the work items planned into them.
+        # Anything older / outside these sprints is answered live via the WIQL tool.
+        seen: set[int] = set()
+        wanted: list[int] = []
+        for team in self._teams(org_url, headers, api, verify):
+            tp = quote(team, safe="")
+            try:
+                iters = get_json(
+                    f"{org_url}/{project}/{tp}/_apis/work/teamsettings/iterations?{api}",
+                    headers=headers, verify=verify,
+                ).get("value", [])
+            except Exception:
+                continue  # team has no iteration settings, or no access — skip
+            for it in select_recent_iterations(iters, sprints):
+                try:
+                    rels = get_json(
+                        f"{org_url}/{project}/{tp}/_apis/work/teamsettings/iterations/{it['id']}/workitems?{api}",
+                        headers=headers, verify=verify,
+                    ).get("workItemRelations", [])
+                except Exception:
+                    continue
+                for r in rels:
+                    tid = (r.get("target") or {}).get("id")
+                    if tid and tid not in seen:
+                        seen.add(tid)
+                        wanted.append(tid)
+            if len(wanted) >= MAX_WORK_ITEMS:
+                wanted = wanted[:MAX_WORK_ITEMS]
+                break
+        for i in range(0, len(wanted), WORK_ITEM_BATCH):
+            batch = wanted[i : i + WORK_ITEM_BATCH]
             items = get_json(
                 f"{org_url}/{project}/_apis/wit/workitems?{api}",
                 headers=headers,
@@ -160,15 +236,13 @@ class AzureDevOpsConnector(Connector):
             for item in items:
                 yield work_item_document(org_url, item)
 
-        # -- Repos pull requests ---------------------------------------------
-        prs = get_json(
-            f"{org_url}/{project}/_apis/git/pullrequests?{api}",
-            headers=headers,
-            params={"searchCriteria.status": "all", "$top": 100},
-            verify=verify,
+        # -- Build pipelines -> repositories (TFS↔GitLab bridge) --------------
+        definitions = get_json(
+            f"{org_url}/{project}/_apis/build/definitions?{api}",
+            headers=headers, params={"includeAllProperties": "true", "$top": 2000}, verify=verify,
         ).get("value", [])
-        for pr in prs:
-            yield pull_request_document(org_url, project, pr)
+        if definitions:
+            yield build_map_document(org_url, project, definitions)
 
         # -- Pipelines + recent runs ------------------------------------------
         pipelines = get_json(
@@ -243,8 +317,10 @@ class AzureDevOpsConnector(Connector):
                 spec=ToolSpec(
                     name=f"ado_query_work_items_{self.name}",
                     description=(
-                        "Live-query Azure DevOps Boards with a WIQL query (current state, not memory). "
-                        "Example: SELECT [System.Id] FROM WorkItems WHERE [System.State] = 'Active'"
+                        "Live-query Azure DevOps/TFS Boards with a WIQL query (current state, not memory). "
+                        "Only each team's most recent sprints are ingested into memory, so use THIS tool for "
+                        "any work item outside that slice — older items, other teams, a specific #id, or a "
+                        "custom filter. Example: SELECT [System.Id] FROM WorkItems WHERE [System.State] = 'Active'"
                     ),
                     input_schema={
                         "type": "object",
@@ -288,5 +364,3 @@ class AzureDevOpsConnector(Connector):
         event_type = payload.get("eventType", "")
         if event_type.startswith("workitem.") and resource.get("id"):
             yield work_item_document(self._org_url(), resource)
-        elif event_type.startswith("git.pullrequest") and resource.get("pullRequestId"):
-            yield pull_request_document(self._org_url(), self._project(), resource)
