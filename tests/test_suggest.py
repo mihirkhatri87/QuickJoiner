@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from quickjoiner.suggest import (
     QuestionSuggester,
+    entity_name_match,
     extract_needle_tokens,
     fill_templates,
     rank_suggestions,
@@ -56,6 +57,16 @@ def test_rank_respects_limit():
 
 # --------------------------------------------------------------- QuestionSuggester
 
+def test_entity_name_match_scores_name_over_alias():
+    # exact word > word-prefix > substring > no-name-hit (alias-only)
+    assert entity_name_match(["console"], "Admin Console") == 3.0
+    assert entity_name_match(["manage"], "User Management") == 2.0  # prefix of "Management"
+    assert entity_name_match(["manage"], "CustomerManagement") == 1.0  # substring within one word
+    assert entity_name_match(["manage"], "Black Team") == 0.0  # matched only via an alias
+    # multi-token names accumulate
+    assert entity_name_match(["securetide", "mxchecker"], "AppRiver.SecureTide.MXChecker") == 6.0
+
+
 class FakeCatalog:
     def __init__(self, entities=None, gaps=None, source_types=None):
         self._entities = entities or []
@@ -63,9 +74,14 @@ class FakeCatalog:
         self._types = source_types or []
 
     def search_entities(self, query, limit=10):
+        # match name OR any alias (like the real catalog), so alias-only hits exist
         q = query.lower()
-        hits = [e for e in self._entities if q in e["name"].lower()]
-        return hits[:limit]
+        hits = [
+            e for e in self._entities
+            if q in e["name"].lower() or any(q in a.lower() for a in e.get("aliases", []))
+        ]
+        # the real method orders by degree desc — mimic that so tests exercise re-ranking
+        return sorted(hits, key=lambda e: -int(e.get("degree", 0)))[:limit]
 
     def list_gaps(self, status="open"):
         return list(self._gaps)
@@ -90,6 +106,22 @@ def test_suggester_templates_from_named_entity():
     out = QuestionSuggester(cat).suggest("where is mxchecker", limit=6)
     assert any("SecureTide MXChecker" in s for s in out)
     assert any("deployed" in s.lower() for s in out)
+
+
+def test_suggester_demotes_high_degree_alias_only_match_below_name_match():
+    """A very-connected entity that only matched via an alias must not bury the
+    entity whose actual name contains the typed word."""
+    cat = FakeCatalog(entities=[
+        # alias-only hit for "manage", hugely connected
+        {"id": "team:black", "name": "Black Team", "type": "team", "degree": 94,
+         "aliases": ["management"]},
+        # real name match, far less connected
+        {"id": "svc:usermgmt", "name": "User Management", "type": "service", "degree": 8},
+    ])
+    out = QuestionSuggester(cat).suggest("where is manage", limit=6)
+    # the name match wins the top slot; the alias-only team is pushed down/out
+    assert any("User Management" in s for s in out)
+    assert out[0].endswith("User Management?") or "User Management" in out[0]
 
 
 def test_suggester_completes_past_question_by_prefix():

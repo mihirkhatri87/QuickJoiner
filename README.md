@@ -170,6 +170,11 @@ qj test pay-jira   # credential / reachability check
 ```
 
 Secrets use env indirection (`token=env:GITHUB_TOKEN`) — literal secrets are never stored.
+The value is read from the process environment (or, conveniently, from a `<workspace>/.env`
+file that QuickJoiner loads at startup). **Gotcha on Windows:** a variable you set via System
+Properties → Environment Variables is only inherited by *newly started* processes, so a `qj`
+command or `qj serve` already running won't see it — either restart the terminal / server, or
+add the line to `<workspace>/.env` (e.g. `AZURE_DEVOPS_PAT=…`) which every `qj` invocation picks up.
 Connectors also contribute **live tools** to the agent (GitHub code search / file read, Jira JQL,
 Azure DevOps WIQL, log queries, deploy status), so questions like "what failed in CI last night?"
 can be answered from the source directly, not only from ingested memory. QuickJoiner also

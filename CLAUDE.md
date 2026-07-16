@@ -318,6 +318,11 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   so a new connector ships its own openers. `rank_suggestions` (pure, banded: history-prefix > starter-
   prefix > entity-template > substring) dedupes/caps; `fill_templates` boosts a template whose intent
   verb aligns with what's typed ("dep" → the depend question), prefix-aware so half-typed words match.
+  **Entity re-ranking by match quality** (`entity_name_match`): `search_entities` orders purely by graph
+  degree, so a very-connected entity that only matched via an *alias* (its name lacks the typed word) can
+  bury real name matches — the suggester rescores, preferring name hits (exact word 3 / word-prefix 2 /
+  substring 1 / alias-only 0), then #needle-tokens matched, then degree; so "manage" → the *Management*
+  services (not high-degree alias-only "Black Team"), "securetide mxchecker" → `AppRiver.SecureTide.MXChecker`.
   **Pipeline integration = the ingest pipeline populates the graph** (deps.py maps, code_graph edges,
   ticket/entity extraction in `_sync_graph`) on every sync, and the suggester reads that graph live —
   so connecting+syncing any new source automatically enriches autocomplete with that system's real

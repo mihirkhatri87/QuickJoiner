@@ -137,6 +137,27 @@ def extract_needle_tokens(prefix: str, max_tokens: int = 3) -> list[str]:
     return ordered
 
 
+def entity_name_match(needle_tokens: list[str], name: str) -> float:
+    """How well the typed noun matches an entity's *name* (not its aliases).
+
+    A name is split into words across dots/hyphens/spaces ("AppRiver.Portal.Partner
+    .CustomerManagement" → [...]). Each needle token scores: exact word 3, word-prefix
+    2 ("manage" → "Management"), bare substring 1, no name hit 0 (it only matched via an
+    alias). Used to demote high-degree alias-only matches beneath real name matches.
+    """
+    name_l = name.lower()
+    parts = [p for p in re.split(r"[^a-z0-9]+", name_l) if p]
+    score = 0.0
+    for tok in needle_tokens:
+        if tok in parts:
+            score += 3.0
+        elif any(p.startswith(tok) for p in parts):
+            score += 2.0
+        elif tok in name_l:
+            score += 1.0
+    return score
+
+
 def fill_templates(name: str, entity_type: str, prefix: str = "") -> list[tuple[str, float]]:
     """Templated questions for one entity, each with an intent-alignment score.
 
@@ -227,27 +248,34 @@ class QuestionSuggester:
         needles = extract_needle_tokens(prefix)
         if not needles:
             return []
-        # Merge per-token entity hits, ranking an entity by (#needles it matched,
-        # graph degree) so the most-referenced, best-matching nouns win.
+        # Collect per-token hits (search_entities matches name OR alias, degree-ranked).
         merged: dict[str, dict] = {}
         for tok in needles:
             try:
-                hits = self.catalog.search_entities(tok, limit=6)
+                hits = self.catalog.search_entities(tok, limit=8)
             except Exception:
                 hits = []
             for e in hits:
                 row = merged.setdefault(e["id"], {"e": e, "matches": 0})
                 row["matches"] += 1
-        top = sorted(
-            merged.values(), key=lambda r: (-r["matches"], -int(r["e"].get("degree", 0) or 0))
-        )[:4]
+        # Re-rank by match QUALITY, not raw degree: search_entities orders purely by
+        # connectedness, so a high-degree entity that only matched via an alias (its
+        # name doesn't contain the typed word) can bury the real name matches. Score
+        # each entity by how well the needle hits its *name*, prefer name matches over
+        # alias-only ones, and use #needles-matched then degree only as tie-breakers.
+        scored = [
+            (entity_name_match(needles, r["e"]["name"]), r["matches"],
+             int(r["e"].get("degree", 0) or 0), r["e"])
+            for r in merged.values()
+        ]
+        named = [s for s in scored if s[0] > 0]
+        pool = named if named else scored  # fall back to alias-only when nothing names-matches
+        pool.sort(key=lambda s: (-s[0], -s[1], -s[2]))
         out: list[tuple[str, float]] = []
-        for r in top:
-            e = r["e"]
-            degree = int(e.get("degree", 0) or 0)
+        for name_score, matches, degree, e in pool[:4]:
             for text, intent in fill_templates(e["name"], e.get("type", ""), prefix):
-                # score blends match count, intent alignment, and connectedness
-                out.append((text, r["matches"] * 2.0 + intent * 3.0 + min(degree, 20) * 0.05))
+                score = name_score * 2.0 + matches * 1.5 + intent * 3.0 + min(degree, 20) * 0.05
+                out.append((text, score))
         return out
 
     def _past_questions(self) -> list[str]:
