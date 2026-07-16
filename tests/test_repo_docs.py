@@ -7,6 +7,8 @@ from quickjoiner.agent.repo_docs import (
     AGENTS_MD_SYSTEM,
     MERGE_ADDENDUM,
     generate_agents_md,
+    has_generated_brief,
+    maybe_autogenerate,
 )
 from quickjoiner.app import AppContext
 from quickjoiner.config import Config, SourceConfig
@@ -149,3 +151,73 @@ def test_dependency_map_doc_is_used_as_evidence_not_prose(ctx):
     assert "AppRiver.Ledger.Client 2.0.0" in prompt
     # The dependency-map doc must not also be double-counted as a generic PROSE block.
     assert prompt.count("AppRiver.Ledger.Client 2.0.0") == 1
+
+
+# ---------------------------------------------------------------- auto-generation
+
+def test_maybe_autogenerate_off_by_default_is_noop(ctx):
+    _ingest_code_and_docs(ctx)
+    # config.repos.auto_agents_md defaults to False
+    source = ctx.config.sources[0]
+    monkey = _CountingProvider()
+    ctx.build_provider = lambda *a, **k: monkey
+    assert maybe_autogenerate(ctx, source) is None
+    assert monkey.calls == 0
+    assert not has_generated_brief(ctx.catalog, SOURCE_NAME)
+
+
+def test_maybe_autogenerate_fires_once_when_enabled(ctx):
+    _ingest_code_and_docs(ctx)
+    ctx.config.repos.auto_agents_md = True
+    source = ctx.config.sources[0]
+    provider = _CountingProvider()
+    ctx.build_provider = lambda *a, **k: provider
+
+    first = maybe_autogenerate(ctx, source)
+    assert first is not None and first.exists()
+    assert has_generated_brief(ctx.catalog, SOURCE_NAME)
+    assert provider.calls == 1
+
+    # Second sync of the same repo must NOT regenerate — one-shot guard holds.
+    second = maybe_autogenerate(ctx, source)
+    assert second is None
+    assert provider.calls == 1
+
+
+def test_maybe_autogenerate_skips_non_repo_sources(ctx):
+    ctx.config.repos.auto_agents_md = True
+    from quickjoiner.config import SourceConfig
+
+    web = SourceConfig(name="site", type="confluence", options={})
+    provider = _CountingProvider()
+    ctx.build_provider = lambda *a, **k: provider
+    assert maybe_autogenerate(ctx, web) is None
+    assert provider.calls == 0
+
+
+def test_maybe_autogenerate_never_raises_on_failure(ctx):
+    _ingest_code_and_docs(ctx)
+    ctx.config.repos.auto_agents_md = True
+    source = ctx.config.sources[0]
+
+    def _boom(*a, **k):
+        raise RuntimeError("provider down")
+
+    ctx.build_provider = _boom
+    logs: list[str] = []
+    # Must swallow the error (return None), and must NOT mark a brief as generated.
+    assert maybe_autogenerate(ctx, source, on_log=logs.append) is None
+    assert not has_generated_brief(ctx.catalog, SOURCE_NAME)
+
+
+class _CountingProvider(ScriptedProvider):
+    """A provider that always returns a brief and counts how many times it was called,
+    so 'fires once' is checkable independently of the scripted-result queue length."""
+
+    def __init__(self):
+        super().__init__([])
+        self.calls = 0
+
+    def chat(self, messages, system=None, tools=None, on_stream=None):
+        self.calls += 1
+        return ChatResult(text="# repo — Architecture Brief\nGenerated.")

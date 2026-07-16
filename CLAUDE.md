@@ -202,7 +202,20 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   workspace default for this specific synthesis. `KnowledgeStore`/`PgVectorStore` gained
   `get_document_chunks(doc_id)` (chunks are the only place original text lives — the catalog only
   stores metadata+hash) and the catalog gained `documents_for_source(source_id)`, both needed to
-  read an existing AGENTS.md/dependency-map doc back out. Tests: `tests/test_repo_docs.py`.
+  read an existing AGENTS.md/dependency-map doc back out. `_graph_facts` resolves the repo entity
+  id through `resolve_entity` first, so code-graph facts still surface if entity resolution merged
+  the repo's node to a canonical id. **Auto-generate on first sync** (opt-in, `Config.repos.auto_agents_md`,
+  OFF by default): `repo_docs.maybe_autogenerate(ctx, source)` fires after a git/files source syncs —
+  once (guarded on the generated doc's existence), never on every sync, and never raising (a doc-gen
+  failure can't break the sync). Wired into all sync paths (CLI `qj sync`, `POST /api/sync`,
+  scheduler, `agent/ops.sync_source`). Exposed in `GET/PATCH /api/settings` under `repos` and the
+  Settings drawer's **Repositories** section; per-connector **Architecture brief** button on each
+  git/files plate (`POST /api/repos/{source}/agents-md`, opens in `ArtifactModal`). Tests:
+  `tests/test_repo_docs.py` (incl. auto-gen fires-once/off-by-default/never-raises), settings
+  round-trip in `test_api.py`. NB: `cli.py` now reconfigures stdout/stderr to UTF-8 at startup so
+  Rich can't crash rendering a brief/answer containing block/box-drawing/emoji glyphs on a legacy
+  cp1252 Windows console (the save+ingest already completed before the render — this stops the
+  cosmetic exit-1 crash it caused for `qj agents-md`/`qj brief`).
 - `quickjoiner/auth.py` — opt-in local auth. `Auth` over the catalog: PBKDF2 password hashing,
   bearer tokens (sha256-hashed at rest in `auth_tokens`), `users` table. **Open mode until the
   first user exists** (no login, everything shared = pre-auth behavior). Sharing model on

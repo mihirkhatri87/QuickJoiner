@@ -25,6 +25,11 @@ def _sync_job(ctx: AppContext, source_name: str) -> None:
         stats = ctx.pipeline.ingest(connector.sync(state), connector.source_id)
         ctx.catalog.set_sync_state(connector.source_id, "since", started)
         log.info("scheduled sync %s: %s", source_name, stats.summary())
+        from quickjoiner.agent.repo_docs import maybe_autogenerate
+
+        brief_path = maybe_autogenerate(ctx, source, on_log=lambda m: log.info("%s", m))
+        if brief_path:
+            log.info("scheduled sync %s: generated architecture brief %s", source_name, brief_path)
     except Exception:
         log.exception("scheduled sync failed for %s", source_name)
 

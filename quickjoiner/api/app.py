@@ -23,6 +23,7 @@ from quickjoiner.config import (
     EmbeddingConfig,
     GraphConfig,
     LLMConfig,
+    ReposConfig,
     RetrievalConfig,
     SourceConfig,
 )
@@ -104,6 +105,7 @@ class SettingsUpdate(BaseModel):
     retrieval: dict | None = None
     chat: dict | None = None
     graph: dict | None = None
+    repos: dict | None = None
 
 
 class LLMTestRequest(BaseModel):
@@ -333,6 +335,7 @@ def create_app(workspace: Path) -> FastAPI:
             "retrieval": c.retrieval.model_dump(),
             "chat": c.chat.model_dump(),
             "graph": c.graph.model_dump(),
+            "repos": c.repos.model_dump(),
             # Embedding changes only take effect after a restart + full re-sync
             # (existing vectors are in the old model's space) — the UI warns on this.
             "embedding_reindex_required": True,
@@ -359,6 +362,8 @@ def create_app(workspace: Path) -> FastAPI:
                 c.chat = ChatConfig.model_validate({**c.chat.model_dump(), **req.chat})
             if req.graph:
                 c.graph = GraphConfig.model_validate({**c.graph.model_dump(), **req.graph})
+            if req.repos:
+                c.repos = ReposConfig.model_validate({**c.repos.model_dump(), **req.repos})
         except Exception as exc:  # pydantic validation error -> bad input
             raise HTTPException(status_code=400, detail=str(exc))
         ctx.catalog.save_config(c)  # persist; live agents read ctx.config on next build
@@ -415,6 +420,7 @@ def create_app(workspace: Path) -> FastAPI:
 
     @api.post("/api/sync/{source_name}")
     def sync_source(source_name: str, authorization: str | None = Header(default=None)):
+        from quickjoiner.agent.repo_docs import maybe_autogenerate
         from quickjoiner.connectors.registry import create_connector
 
         source = _find_source(source_name, _user(authorization))
@@ -424,7 +430,13 @@ def create_app(workspace: Path) -> FastAPI:
         started = datetime.now(timezone.utc).isoformat()
         stats = ctx.pipeline.ingest(connector.sync(state), connector.source_id)
         ctx.catalog.set_sync_state(connector.source_id, "since", started)
-        return {"source": source_name, "result": stats.summary(), "errors": stats.errors[:10]}
+        brief_path = maybe_autogenerate(ctx, source)
+        return {
+            "source": source_name,
+            "result": stats.summary(),
+            "errors": stats.errors[:10],
+            "brief": str(brief_path) if brief_path else None,
+        }
 
     @api.post("/api/learn")
     def learn(req: LearnRequest, authorization: str | None = Header(default=None)):

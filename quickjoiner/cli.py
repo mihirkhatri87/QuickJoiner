@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -11,6 +12,16 @@ from rich.markdown import Markdown
 from rich.table import Table
 
 from quickjoiner.config import Config, SourceConfig, workspace_dir
+
+# Windows consoles default to a legacy code page (cp1252) that can't encode the
+# block/box-drawing/emoji characters an LLM may emit in a brief or answer — Rich then
+# crashes at render time, *after* the command's real work (save + ingest) is done.
+# Force UTF-8 on the standard streams so no command dies on a stray glyph.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+    except (AttributeError, ValueError):  # already-wrapped or non-reconfigurable stream
+        pass
 
 app = typer.Typer(
     name="qj",
@@ -411,6 +422,7 @@ def sync(
     """Pull from configured sources, ingest changes into memory (incremental)."""
     from datetime import datetime, timezone
 
+    from quickjoiner.agent.repo_docs import maybe_autogenerate
     from quickjoiner.connectors.registry import create_connector
 
     ctx = _context(workspace)
@@ -436,6 +448,9 @@ def sync(
         console.print(f"[green]{source.name}:[/green] {stats.summary()}")
         for err in stats.errors[:5]:
             console.print(f"[yellow]warn:[/yellow] {err}")
+        _autogen = maybe_autogenerate(ctx, source, on_log=lambda m: console.print(f"[dim]{m}[/dim]"))
+        if _autogen:
+            console.print(f"[green]Architecture brief:[/green] {_autogen}")
 
 
 @app.command("test")

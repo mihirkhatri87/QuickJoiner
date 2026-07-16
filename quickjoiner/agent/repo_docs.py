@@ -23,6 +23,13 @@ from quickjoiner.connectors.deps import SKIP_DIRS
 from quickjoiner.ingest.pipeline import source_entity
 
 _REPO_SOURCE_TYPES = ("git", "files")
+GENERATED_SOURCE_ID = "generated:agents-md"
+
+
+def _generated_uri(source_name: str) -> str:
+    return f"agents-md://{source_name}"
+
+
 MAX_TREE_DEPTH = 3
 MAX_TREE_ENTRIES = 400
 MAX_GRAPH_EDGES = 250
@@ -205,12 +212,26 @@ def _is_dependency_map(doc: dict) -> bool:
     return (doc.get("uri") or "").endswith("::dependency-map")
 
 
-def _graph_facts(catalog, repo_entity_id: str, max_edges: int = MAX_GRAPH_EDGES) -> str:
-    rows = catalog.graph_neighbors(repo_entity_id)
+def _resolved_repo_entity(catalog, repo_entity_id: str, repo_name: str) -> str:
+    """The id the repo's code-graph edges actually hang off. Almost always
+    `repo_entity_id` itself (the resolver returns an exact-id match unchanged, and
+    entities merging *into* the repo don't move the repo's own edges). Only if the
+    repo entity was itself merged away at first ingest — possible only into another
+    `repo`-type entity — do its edges live under a canonical id; recover that by name
+    (type-unambiguous here since repo↔repo is the only merge that can move them)."""
+    if catalog.resolve_entity(repo_entity_id) is not None:
+        return repo_entity_id
+    alt = catalog.resolve_entity(repo_name)
+    return alt["id"] if alt else repo_entity_id
+
+
+def _graph_facts(catalog, repo_entity_id: str, repo_name: str, max_edges: int = MAX_GRAPH_EDGES) -> str:
+    entity_id = _resolved_repo_entity(catalog, repo_entity_id, repo_name)
+    rows = catalog.graph_neighbors(entity_id)
     lines = [
-        f"{repo_entity_id} --{r['rel']}--> {r['dst']} ({r['detail']})"
+        f"{entity_id} --{r['rel']}--> {r['dst']} ({r['detail']})"
         for r in rows
-        if r["src"] == repo_entity_id and r["rel"] in ("defines", "imports")
+        if r["src"] == entity_id and r["rel"] in ("defines", "imports")
     ]
     lines = lines[:max_edges]
     return "\n".join(lines) if lines else "(no code-graph facts extracted for this repo yet)"
@@ -272,7 +293,7 @@ def generate_agents_md(
     prose_hits = collect_repo_prose(ctx.store, ctx.config.retrieval, source_id, repo_display_name, exclude_ids)
 
     file_tree = _walk_tree(root)
-    graph_facts = _graph_facts(ctx.catalog, repo_entity_id)
+    graph_facts = _graph_facts(ctx.catalog, repo_entity_id, repo_display_name)
     depmap_text = _doc_text(ctx.store, depmap, MAX_DEPMAP_CHARS) if depmap else "(no dependency manifest found)"
     depmap_uri = depmap["uri"] if depmap else source_id
 
@@ -322,16 +343,47 @@ def generate_agents_md(
     path = out_dir / "AGENTS.md"
     path.write_text(markdown, encoding="utf-8")
 
-    ctx.catalog.upsert_source("generated:agents-md", "Generated architecture briefs", "generated", {})
+    ctx.catalog.upsert_source(GENERATED_SOURCE_ID, "Generated architecture briefs", "generated", {})
     ctx.pipeline.ingest(
         [
             Document(
-                uri=f"agents-md://{source.name}",
+                uri=_generated_uri(source.name),
                 title=f"{repo_display_name} — Architecture Brief (generated)",
                 text=markdown,
                 kind="note",
             )
         ],
-        "generated:agents-md",
+        GENERATED_SOURCE_ID,
     )
     return markdown, path
+
+
+def has_generated_brief(catalog, source_name: str) -> bool:
+    """Whether an AGENTS.md has already been generated for this source — the guard
+    that keeps auto-generation a one-shot event rather than a per-sync LLM call."""
+    uri = _generated_uri(source_name)
+    return any(d.get("uri") == uri for d in catalog.documents_for_source(GENERATED_SOURCE_ID))
+
+
+def maybe_autogenerate(ctx, source, *, on_log=None) -> "Path | None":
+    """Post-sync hook: if repos.auto_agents_md is on and this git/files source has no
+    generated brief yet, generate one (once). Returns the saved path, or None if it was
+    skipped or failed. NEVER raises — a documentation-generation failure must not fail
+    the sync that triggered it. `source` is a SourceConfig (has .name/.type)."""
+    from pathlib import Path  # local: keep module import surface minimal
+
+    if not getattr(ctx.config, "repos", None) or not ctx.config.repos.auto_agents_md:
+        return None
+    if source.type not in _REPO_SOURCE_TYPES:
+        return None
+    if has_generated_brief(ctx.catalog, source.name):
+        return None
+    try:
+        if on_log:
+            on_log(f"Auto-generating architecture brief for {source.name}…")
+        _markdown, path = generate_agents_md(ctx, source.name)
+        return path
+    except Exception as exc:  # never let doc-gen break a sync
+        if on_log:
+            on_log(f"Architecture-brief auto-generation skipped for {source.name}: {exc}")
+        return None

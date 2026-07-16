@@ -32,6 +32,7 @@ export interface Settings {
     learn_from_conversations: boolean;
   };
   graph: { extract_triples: boolean; entity_resolution: boolean };
+  repos: { auto_agents_md: boolean };
   embedding_reindex_required: boolean;
 }
 

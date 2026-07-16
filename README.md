@@ -254,6 +254,9 @@ qj agents-md <source>                  # per-repo architecture brief for princip
                                         #   repo already has one, instead of overwriting it.
                                         #   Saved to <workspace>/generated/<source>/AGENTS.md
                                         #   and re-ingested — never written into the repo itself.
+                                        #   Also available per-connector in the web UI
+                                        #   ("Architecture brief" button), and can auto-generate
+                                        #   once on first sync (Settings → Repositories toggle).
 qj ask "deploy inventory?" -f pptx     # export answers: md | html | csv | pptx
 qj eval my-evals.yaml --init           # write a starter eval set
 qj eval my-evals.yaml [--agent]        # retrieval metrics (recall@k, MRR, refusal accuracy, hop_coverage);
