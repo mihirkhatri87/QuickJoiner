@@ -90,16 +90,32 @@ def build_map_document(org_url: str, project: str, definitions: list[dict[str, A
     )
 
 
-def pipelines_document(org_url: str, project: str, runs: list[dict[str, Any]]) -> Document:
-    lines = [
-        f"- {r.get('pipeline_name', '?')} run #{r.get('id', '?')}: "
-        f"{r.get('state', '?')}/{r.get('result') or 'pending'} ({r.get('finishedDate') or r.get('createdDate', '')})"
-        for r in runs
-    ]
+def _short_branch(ref: str) -> str:
+    return str(ref or "").replace("refs/heads/", "")
+
+
+def builds_document(org_url: str, project: str, builds: list[dict[str, Any]]) -> Document:
+    """Recent build results, one line per build with its **source branch** and outcome.
+
+    Uses the Build API (not the Pipelines-runs API, which omits the branch). Because
+    every GitLab branch mirrors into a same-named TFS repo/branch and builds run in TFS,
+    these branch + repo names match GitLab — so "did branch X build?" is answerable from
+    here, and correlates directly to the GitLab merge request on that branch.
+    """
+    lines = []
+    for b in builds:
+        name = (b.get("definition") or {}).get("name", "?")
+        branch = _short_branch(b.get("sourceBranch"))
+        repo = (b.get("repository") or {}).get("name") or ""
+        outcome = b.get("result") or b.get("status") or "?"
+        when = str(b.get("finishTime") or b.get("queueTime") or "")[:10]
+        lines.append(f"- {name}: built {branch or '?'}" + (f" of {repo}" if repo else "")
+                     + f" → {outcome} ({when})")
     return Document(
         uri=f"{org_url}/{project}/_build",
-        title=f"{project}: recent Azure Pipelines runs",
-        text=f"Recent pipeline runs in {project}:\n" + "\n".join(lines),
+        title=f"{project}: recent build results by branch",
+        text=("Recent TFS build results. Branch (and repo) names match GitLab — each GitLab branch "
+              "mirrors into the same-named TFS repo and the build runs in TFS:\n" + "\n".join(lines)),
         kind="pipeline",
     )
 
@@ -244,20 +260,16 @@ class AzureDevOpsConnector(Connector):
         if definitions:
             yield build_map_document(org_url, project, definitions)
 
-        # -- Pipelines + recent runs ------------------------------------------
-        pipelines = get_json(
-            f"{org_url}/{project}/_apis/pipelines?{api}", headers=headers, verify=verify
+        # -- Recent build results (with source branch, via the Build API) ------
+        builds = get_json(
+            f"{org_url}/{project}/_apis/build/builds?{api}",
+            headers=headers,
+            # queueTime (not finishTime) so never-started builds don't sort to the top
+            params={"$top": 200, "queryOrder": "queueTimeDescending"},
+            verify=verify,
         ).get("value", [])
-        all_runs: list[dict[str, Any]] = []
-        for p in pipelines[:25]:
-            runs = get_json(
-                f"{org_url}/{project}/_apis/pipelines/{p['id']}/runs?{api}", headers=headers, verify=verify
-            ).get("value", [])
-            for r in runs[:5]:
-                r["pipeline_name"] = p.get("name", "?")
-                all_runs.append(r)
-        if all_runs:
-            yield pipelines_document(org_url, project, all_runs)
+        if builds:
+            yield builds_document(org_url, project, builds)
 
     def tools(self) -> list[AgentTool]:
         org_url, project, headers = self._org_url(), self._project(), self._headers()
@@ -312,6 +324,27 @@ class AzureDevOpsConnector(Connector):
             )
             return str(data.get("content", "(no content returned)"))[:20000]
 
+        def ado_build_status(branch: str, repository: str = "") -> str:
+            ref = branch if branch.startswith("refs/") else f"refs/heads/{branch}"
+            builds = get_json(
+                f"{org_url}/{project}/_apis/build/builds?{api}",
+                headers=headers,
+                params={"branchName": ref, "$top": 10, "queryOrder": "queueTimeDescending"},
+                verify=verify,
+            ).get("value", [])
+            if repository:
+                builds = [b for b in builds
+                          if (b.get("repository") or {}).get("name", "").lower() == repository.lower()]
+            if not builds:
+                return f"No TFS builds found for branch {branch!r}."
+            return "\n".join(
+                f"- {(b.get('definition') or {}).get('name', '?')}"
+                f" [{(b.get('repository') or {}).get('name', '?')}]:"
+                f" {b.get('result') or b.get('status') or '?'}"
+                f" ({str(b.get('finishTime') or b.get('queueTime') or '')[:16]})"
+                for b in builds[:10]
+            )
+
         return [
             AgentTool(
                 spec=ToolSpec(
@@ -356,6 +389,26 @@ class AzureDevOpsConnector(Connector):
                     },
                 ),
                 fn=ado_get_file,
+            ),
+            AgentTool(
+                spec=ToolSpec(
+                    name=f"ado_build_status_{self.name}",
+                    description=(
+                        f"Live TFS build status for a branch in project {project}. Branch names match "
+                        "GitLab (each GitLab branch mirrors into TFS and builds there), so pass a GitLab "
+                        "branch name (e.g. 'develop' or 'feature/x') to see whether/how it built. "
+                        "Optional 'repository' narrows to one repo."
+                    ),
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "branch": {"type": "string"},
+                            "repository": {"type": "string"},
+                        },
+                        "required": ["branch"],
+                    },
+                ),
+                fn=ado_build_status,
             ),
         ]
 

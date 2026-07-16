@@ -5,6 +5,7 @@ import pytest
 from quickjoiner.config import SourceConfig
 from quickjoiner.connectors.azure_devops import (
     build_map_document,
+    builds_document,
     select_recent_iterations,
     work_item_document,
 )
@@ -168,6 +169,19 @@ def test_ado_build_map_document_links_pipelines_to_repos():
     assert any(rel == "builds" and dst == "repo:appriver.securetide.api" for _s, rel, dst, _d in edges)
 
 
+def test_ado_builds_document_shows_source_branch_and_result():
+    builds = [
+        {"definition": {"name": "AppRiver.ExampleApp CI"}, "sourceBranch": "refs/heads/feature/add_gitlab_ci",
+         "repository": {"name": "AppRiver.ExampleApp"}, "result": "succeeded", "finishTime": "2026-07-16T10:00:00Z"},
+    ]
+    doc = builds_document("https://tfs.appriver.com/tfs/AppRiver", "AppRiver", builds)
+    assert doc.kind == "pipeline"
+    # short branch name (matches GitLab), repo, and outcome all surface
+    assert "feature/add_gitlab_ci" in doc.text and "refs/heads" not in doc.text
+    assert "AppRiver.ExampleApp" in doc.text and "succeeded" in doc.text
+    assert "match GitLab" in doc.text
+
+
 def test_confluence_page_document():
     from quickjoiner.connectors.confluence import page_document
 
@@ -224,7 +238,8 @@ def test_azure_devops_live_tools(tmp_path):
         tmp_path,
     )
     names = [t.spec.name for t in connector.tools()]
-    assert names == ["ado_query_work_items_ado", "ado_search_code_ado", "ado_get_file_ado"]
+    assert names == ["ado_query_work_items_ado", "ado_search_code_ado", "ado_get_file_ado",
+                     "ado_build_status_ado"]
 
 
 def _ado(tmp_path, **options):

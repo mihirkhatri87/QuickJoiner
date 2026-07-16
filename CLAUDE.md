@@ -195,10 +195,16 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   builds, emitted as a doc with `pipeline --builds--> repo` graph edges. This is the **GitLab↔TFS
   link**: MRs land in GitLab, each branch mirrors into a same-named TFS Git repo, builds run in TFS,
   so the TFS repo names match the GitLab repos and the knowledge graph connects a GitLab repo to the
-  TFS pipeline that builds it (repo-name aliasing in `deps.py` reconciles spoken forms). Recent
-  pipeline *runs* still ingest as one summary doc. Tests in `tests/test_connectors.py` (on-prem
-  URL/search-host/api/verify + SaaS guard; `select_recent_iterations` future-exclusion;
-  `build_map_document` builds-edges).
+  TFS pipeline that builds it (repo-name aliasing in `deps.py` reconciles spoken forms).
+  **Branch-name parity** extends the bridge: every GitLab branch mirrors into the same-named TFS
+  branch, so recent build results ingest (via the **Build API**, `build/builds?queryOrder=
+  queueTimeDescending` — the Pipelines-runs API omits the branch) as one `builds_document` with each
+  build's **source branch** + repo + outcome, and a live **`ado_build_status(branch, repository?)`**
+  tool answers "did branch X build?" from a GitLab branch name (4th tool alongside WIQL / code-search
+  / get-file). `queueTimeDescending` (not `finishTime`) so never-started builds don't sort to the top.
+  Tests in `tests/test_connectors.py` (on-prem URL/search-host/api/verify + SaaS guard;
+  `select_recent_iterations` future-exclusion; `build_map_document` builds-edges; `builds_document`
+  source-branch; 4-tool name list).
   `octopus.py` **paginates** every list endpoint via `_paged` (follows `Links["Page.Next"]`) — a
   space with >100 projects previously truncated at the `take=100` first page. Pull is a full refresh
   (idempotent via hash dedupe); opt-in `incremental=true` fetches per-project releases only for

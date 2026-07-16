@@ -159,7 +159,8 @@ qj connect confluence --name wiki --option base_url=https://acme.atlassian.net -
 qj connect azure_devops --name ado --option organization=acme --option project=Payments --option token=env:AZURE_DEVOPS_PAT
 # Work items ingest by team over recent sprints (default last 10); restrict teams and set the
 # window with --option teams=... --option sprints=...  Build pipelines are mapped to the repos
-# they build (a GitLab<->TFS bridge when branches mirror into TFS). Pull requests are not ingested.
+# they build and recent builds are recorded per source branch (a GitLab<->TFS bridge when branches
+# mirror into TFS) — ask "did branch X build?" and the agent checks TFS live. PRs are not ingested.
 # on-prem Azure DevOps Server / TFS: use server_url + collection instead of organization
 # (verify_tls=false for a self-signed cert; api_version to match an older server):
 qj connect azure_devops --name tfs --option server_url=https://tfs.company.com/tfs --option collection=DefaultCollection --option project=Payments --option token=env:AZURE_DEVOPS_PAT --option teams="Payments Team,Platform Team" --option sprints=10
