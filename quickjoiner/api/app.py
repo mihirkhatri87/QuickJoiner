@@ -134,12 +134,14 @@ def create_app(workspace: Path) -> FastAPI:
     from quickjoiner.sessions import SessionManager
 
     from quickjoiner.suggest import QuestionSuggester
+    from quickjoiner.sync_manager import SyncManager, _DONE
 
     ctx: AppContext = build_context(workspace)
     api = FastAPI(title="QuickJoiner", version="0.1.0")
     manager = SessionManager(ctx)
     auth = Auth(ctx.catalog)
     suggester = QuestionSuggester(ctx.catalog)
+    syncs = SyncManager(ctx)
     api.include_router(build_hooks_router(ctx))
 
     def _user(authorization: str | None) -> str | None:
@@ -422,24 +424,54 @@ def create_app(workspace: Path) -> FastAPI:
         return rows
 
     @api.post("/api/sync/{source_name}")
-    def sync_source(source_name: str, authorization: str | None = Header(default=None)):
-        from quickjoiner.agent.repo_docs import maybe_autogenerate
-        from quickjoiner.connectors.registry import create_connector
+    def sync_source(source_name: str, clean: bool = False,
+                    authorization: str | None = Header(default=None)):
+        """Start a background sync job (returns immediately). `clean=true` purges the
+        source's documents/vectors/graph first for a from-scratch, non-corrupted resync.
+        Multiple different sources can sync at once; watch progress on the logs stream."""
+        _find_source(source_name, _user(authorization))  # visibility + existence gate
+        try:
+            job = syncs.start(source_name, clean=clean)
+        except RuntimeError as exc:  # already running
+            raise HTTPException(status_code=409, detail=str(exc))
+        return {"job": job.summary()}
 
-        source = _find_source(source_name, _user(authorization))
-        connector = create_connector(source, ctx.workspace)
-        ctx.catalog.upsert_source(connector.source_id, source.name, source.type, source.options)
-        state = ctx.catalog.get_sync_state(connector.source_id)
-        started = datetime.now(timezone.utc).isoformat()
-        stats = ctx.pipeline.ingest(connector.sync(state), connector.source_id)
-        ctx.catalog.set_sync_state(connector.source_id, "since", started)
-        brief_path = maybe_autogenerate(ctx, source)
-        return {
-            "source": source_name,
-            "result": stats.summary(),
-            "errors": stats.errors[:10],
-            "brief": str(brief_path) if brief_path else None,
-        }
+    @api.post("/api/sync/{source_name}/stop")
+    def stop_sync(source_name: str, cleanup: bool = False,
+                  authorization: str | None = Header(default=None)):
+        """Stop a running sync. `cleanup=true` also purges whatever the interrupted run
+        ingested, leaving the source (and the knowledge graph) clean rather than partial."""
+        _find_source(source_name, _user(authorization))
+        try:
+            job = syncs.stop(source_name, cleanup=cleanup)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        return {"job": job.summary()}
+
+    @api.get("/api/syncs")
+    def list_syncs(authorization: str | None = Header(default=None)):
+        """State of every sync job (running + finished this session)."""
+        return {"syncs": syncs.status()}
+
+    @api.get("/api/sync/{source_name}/logs")
+    def sync_logs(source_name: str, authorization: str | None = Header(default=None)):
+        """SSE stream of a sync's live log lines (replays the backlog first), then a
+        terminal `done` event carrying the job's final state."""
+        _find_source(source_name, _user(authorization))
+        job, q = syncs.subscribe(source_name)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"No sync for {source_name!r}")
+
+        def stream():
+            while True:
+                item = q.get()
+                if item is _DONE:
+                    final = syncs.job_for(source_name)
+                    yield f"data: {json.dumps({'type': 'done', 'job': final.summary() if final else None})}\n\n"
+                    return
+                yield f"data: {json.dumps({'type': 'log', 'line': item})}\n\n"
+
+        return StreamingResponse(stream(), media_type="text/event-stream")
 
     @api.post("/api/learn")
     def learn(req: LearnRequest, authorization: str | None = Header(default=None)):

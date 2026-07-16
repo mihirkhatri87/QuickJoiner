@@ -4,6 +4,18 @@ export interface Status {
   stats: { sources: number; documents: number; chunks: number };
 }
 
+export interface SyncJob {
+  id: string;
+  source: string;
+  state: "running" | "stopping" | "stopped" | "done" | "error";
+  clean: boolean;
+  stats: { added: number; updated: number; skipped: number; chunks: number; errors: number } | null;
+  error: string | null;
+  started_at: string;
+  ended_at: string | null;
+  log_lines: number;
+}
+
 export interface LLMSettings {
   provider: string;
   model: string | null;

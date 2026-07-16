@@ -417,9 +417,14 @@ def connect(
 @app.command()
 def sync(
     name: Optional[str] = typer.Argument(None, help="Source name to sync (default: all configured sources)"),
+    clean: bool = typer.Option(False, "--clean", help="Purge the source's documents/vectors/graph first, then full-resync from scratch (leaves everything consistent)."),
     workspace: Optional[Path] = WORKSPACE_OPT,
 ):
-    """Pull from configured sources, ingest changes into memory (incremental)."""
+    """Pull from configured sources, ingest changes into memory (incremental).
+
+    With --clean, each target is purged first (documents, vectors, FTS, and the graph
+    edges they produced, plus orphaned graph nodes) and then fully re-synced — the
+    reusable, non-corrupting resync."""
     from datetime import datetime, timezone
 
     from quickjoiner.agent.repo_docs import maybe_autogenerate
@@ -435,7 +440,13 @@ def sync(
     for source in targets:
         connector = create_connector(source, ctx.workspace)
         ctx.catalog.upsert_source(connector.source_id, source.name, source.type, source.options)
-        state = ctx.catalog.get_sync_state(connector.source_id)
+        if clean:
+            removed = ctx.catalog.delete_documents_for_source(connector.source_id)
+            ctx.store.delete_source(connector.source_id)
+            orphans = ctx.catalog.gc_orphan_entities()
+            ctx.catalog.clear_sync_state(connector.source_id)
+            console.print(f"[dim]cleaned {source.name}: removed {removed} docs, {orphans} orphan graph nodes[/dim]")
+        state = {} if clean else ctx.catalog.get_sync_state(connector.source_id)
         started = datetime.now(timezone.utc).isoformat()
         console.print(f"Syncing [bold]{source.name}[/bold] ({source.type}) ...")
         try:
@@ -451,6 +462,16 @@ def sync(
         _autogen = maybe_autogenerate(ctx, source, on_log=lambda m: console.print(f"[dim]{m}[/dim]"))
         if _autogen:
             console.print(f"[green]Architecture brief:[/green] {_autogen}")
+
+
+@app.command()
+def resync(
+    name: str = typer.Argument(..., help="Source name to purge and fully re-sync"),
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """Purge a source (documents, vectors, graph edges + orphan nodes, sync state) and
+    re-sync it from scratch. Shorthand for `qj sync <name> --clean`."""
+    sync(name=name, clean=True, workspace=workspace)
 
 
 @app.command("test")

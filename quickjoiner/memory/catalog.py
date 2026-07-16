@@ -239,6 +239,33 @@ class _SqlCatalog:
         self._write("DELETE FROM edges WHERE evidence_doc_id = ?", (doc_id,))
         self._write("DELETE FROM graph_pending WHERE doc_id = ?", (doc_id,))
 
+    def delete_documents_for_source(self, source_id: str) -> int:
+        """Remove every document of a source plus the graph edges / pending rows those
+        documents produced. Entities are left to `gc_orphan_entities` because a node may
+        be shared with other sources. Returns the number of documents removed."""
+        doc_ids = [r["doc_id"] for r in self._read_all(
+            "SELECT doc_id FROM documents WHERE source_id = ?", (source_id,))]
+        for doc_id in doc_ids:
+            self.delete_document(doc_id)  # cascades edges + graph_pending
+        return len(doc_ids)
+
+    def gc_orphan_entities(self) -> int:
+        """Drop entities that participate in no edge — dangling graph nodes left behind
+        after a purge/resync — and their aliases, keeping the graph's invariant that
+        every node is part of at least one (cited) relationship. Returns count removed.
+        A node that a re-sync re-asserts with an edge simply comes back."""
+        orphan_ids = [r["id"] for r in self._read_all(
+            "SELECT id FROM entities WHERE id NOT IN "
+            "(SELECT src FROM edges UNION SELECT dst FROM edges)")]
+        for eid in orphan_ids:
+            self._write("DELETE FROM entity_aliases WHERE entity_id = ?", (eid,))
+            self._write("DELETE FROM entities WHERE id = ?", (eid,))
+        return len(orphan_ids)
+
+    def clear_sync_state(self, source_id: str) -> None:
+        """Forget a source's sync watermark so the next sync is a full pull."""
+        self._write("DELETE FROM sync_state WHERE source_id = ?", (source_id,))
+
     # -- deferred graph work (see graph_pending's comment in the schema) --------
     def mark_graph_pending(self, doc_id: str, source_id: str) -> None:
         self._write(

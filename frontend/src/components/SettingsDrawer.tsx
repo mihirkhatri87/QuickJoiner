@@ -2,6 +2,7 @@ import { ChevronLeft, Plug, Settings as Gear, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { api, token } from "../api";
 import type { AuthStatus, ConnectorRow, ConnectorType, Settings } from "../types";
+import { SyncLogModal } from "./SyncLogModal";
 import { Button, cn, Field, schedLabel, Select, SYNC_OPTIONS, TextInput } from "./ui";
 
 const ALL_MODES = ["pull", "hooks", "live", "browser", "scrape"];
@@ -613,6 +614,7 @@ function ConnectorPlate({
   const [pok, setPok] = useState(true);
   const [armed, setArmed] = useState(false);
   const [briefing, setBriefing] = useState(false);
+  const [syncModal, setSyncModal] = useState<{ clean: boolean } | null>(null);
   const label = types.find((t) => t.type === c.type)?.label ?? c.type;
   const isRepo = c.type === "git" || c.type === "files";
   const flash = (m: string, ok = true) => {
@@ -672,19 +674,13 @@ function ConnectorPlate({
         >
           Test
         </Button>
+        <Button onClick={() => setSyncModal({ clean: false })}>Sync now</Button>
         <Button
-          onClick={async () => {
-            flash("syncing…");
-            try {
-              const r = await api.syncSource(c.name);
-              flash(r.result, true);
-              reload();
-            } catch (e) {
-              flash(String((e as Error).message), false);
-            }
-          }}
+          variant="danger"
+          title="Purge this source's documents, vectors and graph edges, then re-sync from scratch — leaves everything consistent."
+          onClick={() => setSyncModal({ clean: true })}
         >
-          Sync now
+          Clean re-sync
         </Button>
         {isRepo && (
           <Button
@@ -767,6 +763,16 @@ function ConnectorPlate({
         )}
       </div>
       {pmsg && <div className={cn("mt-2 font-mono text-[10.5px] leading-snug", pok ? "text-accent" : "text-danger")}>{pmsg}</div>}
+      {syncModal && (
+        <SyncLogModal
+          name={c.name}
+          clean={syncModal.clean}
+          onClose={() => {
+            setSyncModal(null);
+            reload();
+          }}
+        />
+      )}
     </div>
   );
 }

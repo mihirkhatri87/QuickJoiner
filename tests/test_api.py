@@ -318,10 +318,26 @@ def test_index_serves_ui(client):
     assert "<html" in resp.text.lower()
 
 
+def _wait_sync(client, name, timeout=15.0):
+    """Poll the async sync job until it finishes; return its final summary."""
+    import time as _t
+
+    deadline = _t.monotonic() + timeout
+    while _t.monotonic() < deadline:
+        syncs = client.get("/api/syncs").json()["syncs"]
+        job = next((s for s in syncs if s["source"] == name), None)
+        if job and job["state"] in ("done", "error", "stopped"):
+            return job
+        _t.sleep(0.05)
+    raise AssertionError(f"sync for {name!r} did not finish in {timeout}s")
+
+
 def test_sync_then_sources_and_search(client):
     resp = client.post("/api/sync/handbook")
     assert resp.status_code == 200
-    assert "1 added" in resp.json()["result"]
+    assert resp.json()["job"]["source"] == "handbook"  # async job started
+    job = _wait_sync(client, "handbook")
+    assert job["state"] == "done" and job["stats"]["added"] == 1
 
     rows = client.get("/api/sources").json()
     handbook = next(r for r in rows if r["name"] == "handbook")
@@ -332,8 +348,20 @@ def test_sync_then_sources_and_search(client):
     assert "Octopus" in hits[0]["text"]
 
     # Second sync is idempotent: nothing re-added.
-    again = client.post("/api/sync/handbook").json()
-    assert "0 added" in again["result"] or "unchanged" in again["result"]
+    assert client.post("/api/sync/handbook").status_code == 200
+    again = _wait_sync(client, "handbook")
+    assert again["stats"]["added"] == 0
+
+
+def test_clean_resync_purges_then_repopulates(client):
+    client.post("/api/sync/handbook")
+    _wait_sync(client, "handbook")
+    assert next(r for r in client.get("/api/sources").json() if r["name"] == "handbook")["documents"] == 1
+    # a clean resync purges first, then re-adds the same doc from scratch
+    assert client.post("/api/sync/handbook", params={"clean": "true"}).status_code == 200
+    job = _wait_sync(client, "handbook")
+    assert job["state"] == "done" and job["stats"]["added"] == 1  # re-added, not "unchanged"
+    assert next(r for r in client.get("/api/sources").json() if r["name"] == "handbook")["documents"] == 1
 
 
 def test_sync_unknown_source_is_404(client):

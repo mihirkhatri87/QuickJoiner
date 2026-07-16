@@ -357,6 +357,25 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   agent layer (refusal phrasing via `REFUSAL_MARKERS`, citations, keywords). Reports saved to
   `<workspace>/evals/*.json` for before/after comparison when tuning threshold/embedding/chunking.
 - `quickjoiner/scheduler.py` — APScheduler periodic syncs for sources with `sync_interval_minutes`.
+- `quickjoiner/sync_manager.py` — **startable / stoppable / live-logged sync jobs** (`SyncManager`).
+  Each sync runs on its own daemon thread, so **multiple different sources sync concurrently**
+  (a second job for the *same* source is refused). Interruption without touching `pipeline.ingest`:
+  the job wraps the connector's document stream in a generator that checks a `threading.Event` before
+  each document, so a stop halts cleanly between docs (partial, already-committed work is idempotent).
+  Progress lines append to the job and fan out to SSE subscribers (`subscribe` replays the backlog so a
+  late viewer sees the whole run). **Graph-safe cleanup** — a `clean` start (or a stop-with-cleanup)
+  purges first/after via new catalog primitives: `delete_documents_for_source` (deletes docs +
+  cascades their graph **edges**), `store.delete_source` (vectors + FTS), `gc_orphan_entities` (drops
+  dangling graph nodes + aliases, keeping the invariant that every node has ≥1 cited edge), and
+  `clear_sync_state` (next sync = full pull) — so docs, vectors, FTS and the knowledge graph stay
+  mutually consistent (a half-synced or stale-shape source can't leave a corrupted graph). API:
+  `POST /api/sync/{name}[?clean=true]` **now starts a job** (was synchronous) → `{job}`;
+  `POST /api/sync/{name}/stop[?cleanup=true]`; `GET /api/syncs`; `GET /api/sync/{name}/logs` (SSE).
+  CLI `qj sync [--clean]` / `qj resync <name>` and the `sync_source(name, clean=)` agent tool run
+  the same purge synchronously. Web UI: each connector plate has **Sync now** + **Clean re-sync**
+  opening `SyncLogModal` (live log stream, a **Stop** button that asks *"clean up partial data?"*).
+  Tests: `tests/test_sync_manager.py` (interruption, clean-start purge, double-start conflict,
+  stop-with-cleanup, backlog replay) + async-sync/clean-resync round-trips in `test_api.py`.
 
 ## Conventions & gotchas
 

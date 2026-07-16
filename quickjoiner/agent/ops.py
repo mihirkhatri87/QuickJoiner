@@ -102,7 +102,7 @@ def build_ops_tools(ctx) -> list[AgentTool]:
             out += "\n" + sync_source(name)
         return out
 
-    def sync_source(name: str) -> str:
+    def sync_source(name: str, clean: bool = False) -> str:
         from quickjoiner.connectors.registry import create_connector
 
         source = next((s for s in ctx.config.sources if s.name == name), None)
@@ -111,7 +111,12 @@ def build_ops_tools(ctx) -> list[AgentTool]:
             return f"ERROR: no configured source {name!r}. Known sources: {known}."
         connector = create_connector(source, ctx.workspace)
         ctx.catalog.upsert_source(connector.source_id, source.name, source.type, source.options)
-        state = ctx.catalog.get_sync_state(connector.source_id)
+        if clean:  # purge docs/vectors/graph first for a from-scratch, non-corrupting resync
+            ctx.catalog.delete_documents_for_source(connector.source_id)
+            ctx.store.delete_source(connector.source_id)
+            ctx.catalog.gc_orphan_entities()
+            ctx.catalog.clear_sync_state(connector.source_id)
+        state = {} if clean else ctx.catalog.get_sync_state(connector.source_id)
         started = datetime.now(timezone.utc).isoformat()
         stats = ctx.pipeline.ingest(connector.sync(state), connector.source_id)
         ctx.catalog.set_sync_state(connector.source_id, "since", started)

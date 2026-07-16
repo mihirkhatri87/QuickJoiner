@@ -25,6 +25,11 @@ when memory has nothing relevant.
   actually been learned (your services, repos, environments, past questions). It needs no LLM, so
   it's instant, and it **keeps improving as you connect more systems** — each newly synced source
   adds its real entities to the suggestions automatically.
+- **Sync control** — syncs run as background jobs you can **watch live** (streaming logs) and
+  **stop** at any time; stopping asks whether to clean up the partial pull. Multiple sources sync
+  at once, and a **clean re-sync** (`qj resync`, or the button in the UI) purges a source's
+  documents, vectors and graph edges before re-pulling, so the knowledge graph never ends up
+  corrupted or half-populated.
 
 ---
 
@@ -170,6 +175,7 @@ qj connect octopus --name deploys --option server_url=https://octopus.acme.com -
 
 qj sync            # incremental pull from every source
 qj sync pay-jira   # or just one source
+qj resync pay-jira # purge that source (docs, vectors, graph) and re-sync from scratch
 qj test pay-jira   # credential / reachability check
 ```
 

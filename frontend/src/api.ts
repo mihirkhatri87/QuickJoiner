@@ -16,6 +16,7 @@ import type {
   Settings,
   SourceRow,
   Status,
+  SyncJob,
 } from "./types";
 
 const TOKEN_KEY = "qj_token";
@@ -111,8 +112,33 @@ export const api = {
       `/api/connectors/${encodeURIComponent(name)}/test`,
       { method: "POST" },
     ),
-  syncSource: (name: string) =>
-    req<{ result: string; brief?: string | null }>(`/api/sync/${encodeURIComponent(name)}`, { method: "POST" }),
+  // Start an async sync job (optionally a clean/purge-first resync). Different sources
+  // can run at once; watch a job with streamSyncLogs and halt it with stopSync.
+  startSync: (name: string, clean = false) =>
+    req<{ job: SyncJob }>(`/api/sync/${encodeURIComponent(name)}${clean ? "?clean=true" : ""}`, { method: "POST" }),
+  stopSync: (name: string, cleanup = false) =>
+    req<{ job: SyncJob }>(`/api/sync/${encodeURIComponent(name)}/stop${cleanup ? "?cleanup=true" : ""}`, { method: "POST" }),
+  listSyncs: () => req<{ syncs: SyncJob[] }>("/api/syncs"),
+  streamSyncLogs: (name: string, onEvent: (e: { type: string; line?: string; job?: SyncJob }) => void) =>
+    streamGetSSE(`/api/sync/${encodeURIComponent(name)}/logs`, onEvent),
+
+  // Convenience for simple flows (wizard / post-scrape): start a sync and resolve once
+  // it finishes, returning a short result string like the old blocking endpoint did.
+  syncSource: async (name: string): Promise<{ result: string; job: SyncJob }> => {
+    await req(`/api/sync/${encodeURIComponent(name)}`, { method: "POST" });
+    for (;;) {
+      await new Promise((r) => setTimeout(r, 400));
+      const { syncs } = await req<{ syncs: SyncJob[] }>("/api/syncs");
+      const job = syncs.find((s) => s.source === name);
+      if (job && ["done", "error", "stopped"].includes(job.state)) {
+        const s = job.stats;
+        const result = s
+          ? `${s.added} added, ${s.updated} updated, ${s.skipped} unchanged`
+          : job.error || job.state;
+        return { result, job };
+      }
+    }
+  },
   generateAgentsMd: (name: string) =>
     req<{ brief: string; path: string }>(`/api/repos/${encodeURIComponent(name)}/agents-md`, { method: "POST" }),
 
@@ -196,6 +222,25 @@ async function streamSSE<E>(path: string, body: unknown, onEvent: (e: E) => void
     for (const part of parts) {
       if (!part.startsWith("data: ")) continue;
       onEvent(JSON.parse(part.slice(6)) as E);
+    }
+  }
+}
+
+/** Read a GET Server-Sent-Events stream (e.g. live sync logs) until it ends. */
+async function streamGetSSE<E>(path: string, onEvent: (e: E) => void): Promise<void> {
+  const resp = await fetch(path, { headers: { ...authHeaders() } });
+  if (!resp.ok || !resp.body) throw new Error(`${resp.status}`);
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const parts = buffer.split("\n\n");
+    buffer = parts.pop() ?? "";
+    for (const part of parts) {
+      if (part.startsWith("data: ")) onEvent(JSON.parse(part.slice(6)) as E);
     }
   }
 }
