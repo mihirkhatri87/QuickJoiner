@@ -207,6 +207,8 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
 - `quickjoiner/connectors/specs.py` — `FORM_SPECS` per-type field catalog (label/required/secret/
   env/list) + `connector_catalog()` (adds supported `modes`) driving the web-UI connector forms
   and capability stamps. **Keep field keys in sync with what each connector reads from `options`.**
+  Each type also carries `suggests` (seed questions the type contributes to autocomplete —
+  `suggest.py` reads them for configured source types); add them when you add a connector.
 - `quickjoiner/agent/` — grounded system prompt (`prompts.py`), built-in tools
   (search_memory/remember/list_sources + graph_neighbors/graph_path in `tools.py`),
   **operational tools = the agent-tool bridge** (`ops.py`: scrape_website /
@@ -305,6 +307,24 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   facts → ingested as `conversation://<project>/<session>` docs (source `conversations:learned`)
   so past conversations are searchable memory. Project name/description + rolling summary are
   injected via `build_agent(extra_system=...)`.
+- `quickjoiner/suggest.py` — **question autocomplete** (`QuestionSuggester`, `GET /api/suggest?q=&limit=`,
+  composer typeahead). **Keyless + deterministic** (no LLM per keystroke — must be instant and the
+  broker is flaky), computed **live** from the workspace so it self-improves with every connected
+  system: (1) **entity-templated** questions — `extract_needle_tokens` strips question/filler words to
+  find the noun the user is naming, `catalog.search_entities` resolves it against the knowledge graph,
+  and per-type `TEMPLATES` fill natural questions ("Where is {service} deployed?", "What does {repo}
+  depend on?"); (2) **past questions** from the gaps backlog (`catalog.list_gaps`); (3) **source-aware
+  starters** pulled from the connector catalog (`connectors/specs.py` → `FORM_SPECS[type]["suggests"]`),
+  so a new connector ships its own openers. `rank_suggestions` (pure, banded: history-prefix > starter-
+  prefix > entity-template > substring) dedupes/caps; `fill_templates` boosts a template whose intent
+  verb aligns with what's typed ("dep" → the depend question), prefix-aware so half-typed words match.
+  **Pipeline integration = the ingest pipeline populates the graph** (deps.py maps, code_graph edges,
+  ticket/entity extraction in `_sync_graph`) on every sync, and the suggester reads that graph live —
+  so connecting+syncing any new source automatically enriches autocomplete with that system's real
+  entities, no rebuild. Tests: `tests/test_suggest.py` (needle/template/rank pure + a FakeCatalog
+  suggester), `/api/suggest` round-trip in `test_api.py`. Frontend: `api.suggest`, debounced typeahead
+  in `components/Composer.tsx` (↑/↓ navigate, Tab/Enter-on-highlight accept, Esc dismiss, skips
+  slash-commands).
 - `quickjoiner/evals/harness.py` — YAML eval sets; deterministic retrieval layer (no LLM) +
   agent layer (refusal phrasing via `REFUSAL_MARKERS`, citations, keywords). Reports saved to
   `<workspace>/evals/*.json` for before/after comparison when tuning threshold/embedding/chunking.
@@ -486,6 +506,18 @@ Post-phase additions (2026-07-07, all tested — suite: **89 passed**):
   count dropped from inflated-by-content-links to the true `1 source`, TFS/GitLab links render as
   normal teal links. Frontend rebuilt; no dedicated frontend test suite exists yet (manual/Playwright
   verification is the current practice, per the markdown-renderer entry above).
+- Question autocomplete (2026-07-16, user request): `quickjoiner/suggest.py` +
+  `GET /api/suggest` + a debounced typeahead in the composer help a user finish a question fast.
+  **Keyless/deterministic** (no LLM per keystroke) and computed **live from the knowledge graph**,
+  so it self-improves with every connected system — the user's explicit requirement that "this
+  update process be part of the pipeline" is met by the ingest pipeline populating the graph on
+  every sync (deps maps, code-graph edges, ticket/entity extraction) and the suggester reading it
+  live; connecting+syncing a new source immediately surfaces that system's real services/repos/
+  environments as templated questions, no rebuild. Per-connector-type openers live in the connector
+  catalog (`FORM_SPECS[type]["suggests"]`) so a new connector ships its own starters. Verified live
+  on the Appriver workspace: "what env" → "What environments are configured in Octopus?"; "connector"
+  → repo/dependency questions; "production" → deployment questions. Tests: `test_suggest.py` +
+  `/api/suggest` in `test_api.py`; frontend rebuilt.
 - Live agent robustness against gpt-oss + a flaky broker (2026-07-16, found while live-testing the
   Octopus connector's real scenarios on the Appriver workspace, provider `litellm`/`gpt-oss-120b`):
   three real bugs blocked every tool-using answer, now fixed with regression tests.

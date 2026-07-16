@@ -138,6 +138,11 @@ export const api = {
   documentFile: (docId: string) =>
     req<DocumentFile>(`/api/documents/${encodeURIComponent(docId)}/file`),
 
+  suggest: (q: string, limit = 6) =>
+    req<{ suggestions: string[] }>(
+      "/api/suggest?" + new URLSearchParams({ q, limit: String(limit) }).toString(),
+    ),
+
   gaps: () => req<GapsResponse>("/api/gaps"),
   resolveGaps: (gapIds: string[], resolution: string) =>
     req<{ resolved: number }>("/api/gaps/resolve", {

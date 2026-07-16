@@ -133,10 +133,13 @@ def _mask_options(type_: str, options: dict) -> dict:
 def create_app(workspace: Path) -> FastAPI:
     from quickjoiner.sessions import SessionManager
 
+    from quickjoiner.suggest import QuestionSuggester
+
     ctx: AppContext = build_context(workspace)
     api = FastAPI(title="QuickJoiner", version="0.1.0")
     manager = SessionManager(ctx)
     auth = Auth(ctx.catalog)
+    suggester = QuestionSuggester(ctx.catalog)
     api.include_router(build_hooks_router(ctx))
 
     def _user(authorization: str | None) -> str | None:
@@ -472,6 +475,13 @@ def create_app(workspace: Path) -> FastAPI:
         _require_user(_user(authorization))
         ctx.catalog.resolve_gaps(req.gap_ids, req.resolution or "dismissed")
         return {"resolved": len(req.gap_ids)}
+
+    @api.get("/api/suggest")
+    def suggest(q: str = "", limit: int = 6):
+        """Question autocomplete as the user types — keyless/deterministic, drawn
+        from the knowledge graph (entity-templated questions), past questions, and
+        source-aware starters. Fast enough for per-keystroke use (no LLM)."""
+        return {"suggestions": suggester.suggest(q, limit=max(1, min(limit, 10)))}
 
     @api.post("/api/scrape")
     def scrape(req: ScrapeRequest, authorization: str | None = Header(default=None)):

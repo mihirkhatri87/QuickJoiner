@@ -78,6 +78,23 @@ def sse_events(text: str) -> list[dict]:
     return [json.loads(line[len("data: "):]) for line in text.splitlines() if line.startswith("data: ")]
 
 
+def test_suggest_endpoint_returns_source_aware_starters(client):
+    r = client.get("/api/suggest", params={"q": ""})
+    assert r.status_code == 200
+    suggestions = r.json()["suggestions"]
+    assert isinstance(suggestions, list) and suggestions
+    # the fixture has a github source -> a repository starter is offered
+    assert any("repositor" in s.lower() for s in suggestions)
+
+
+def test_suggest_endpoint_completes_typed_prefix(client):
+    r = client.get("/api/suggest", params={"q": "what", "limit": 5})
+    assert r.status_code == 200
+    suggestions = r.json()["suggestions"]
+    assert len(suggestions) <= 5
+    assert all(isinstance(s, str) for s in suggestions)
+
+
 def test_learn_endpoint_teaches_fact(client):
     r = client.post("/api/learn", json={"fact": "The payments guild owns nautical.",
                                         "topic": "nautical ownership"})

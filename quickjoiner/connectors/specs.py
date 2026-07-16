@@ -3,6 +3,12 @@
 Field keys mirror exactly what each connector reads from `options` — keep in
 sync when a connector gains an option. `secret` fields support env indirection
 (value `env:VAR_NAME`); `env` names the conventional variable.
+
+Each type also carries `suggests`: seed questions the connector contributes to
+question autocomplete (`quickjoiner/suggest.py`). They surface as soon as a source
+of that type is configured — so **adding a connector here automatically teaches the
+autocomplete what to offer**, alongside the live entity-based suggestions the ingest
+pipeline mines from that source's data. Keep them short and in the user's voice.
 """
 
 from __future__ import annotations
@@ -22,6 +28,7 @@ FORM_SPECS: dict[str, dict] = {
     "files": {
         "label": "Files & folders",
         "blurb": "Index local documents, wikis exported to disk, or a folder of notes.",
+        "suggests": ["Give me a quick onboarding overview.", "What are the main systems in this org?"],
         "fields": [
             _f("path", "Folder or file path", required=True, placeholder="D:\\docs\\team-wiki"),
         ],
@@ -29,6 +36,8 @@ FORM_SPECS: dict[str, dict] = {
     "git": {
         "label": "Git repository",
         "blurb": "Clone any git remote and learn its files and commit history.",
+        "suggests": ["What are the main repositories?", "What does the codebase do?",
+                     "How do I build and run this project?"],
         "fields": [
             _f("url", "Clone URL (https)", required=True,
                placeholder="https://gitlab.example.com/group/repo.git"),
@@ -40,6 +49,7 @@ FORM_SPECS: dict[str, dict] = {
     "github": {
         "label": "GitHub",
         "blurb": "Pull requests, issues, and CI runs. Live code search at question time.",
+        "suggests": ["What are the main repositories?", "What changed in recent pull requests?"],
         "fields": [
             _f("repo", "Repository (owner/name)", required=True, placeholder="acme/payments"),
             _f("token", "Access token", secret=True, env="GITHUB_TOKEN"),
@@ -50,6 +60,7 @@ FORM_SPECS: dict[str, dict] = {
     "gitlab": {
         "label": "GitLab",
         "blurb": "Merge requests, issues, pipelines, and wikis. Live code search too.",
+        "suggests": ["What are the main repositories?", "What changed in recent merge requests?"],
         "fields": [
             _f("project", "Project (group/name)", required=True, placeholder="platform/payments"),
             _f("token", "Personal access token", secret=True, env="GITLAB_TOKEN"),
@@ -60,6 +71,7 @@ FORM_SPECS: dict[str, dict] = {
     "jira": {
         "label": "Jira",
         "blurb": "Tickets and their history — what was built, why, and by whom.",
+        "suggests": ["What are the active projects?", "What tickets are in progress?"],
         "fields": [
             _f("base_url", "Site URL", required=True, placeholder="https://acme.atlassian.net"),
             _f("email", "Account email", placeholder="you@acme.com"),
@@ -71,6 +83,7 @@ FORM_SPECS: dict[str, dict] = {
     "confluence": {
         "label": "Confluence",
         "blurb": "Wiki spaces and pages. Live CQL search at question time.",
+        "suggests": ["How do I set up my dev environment?", "Where is the onboarding documentation?"],
         "fields": [
             _f("base_url", "Site URL", required=True,
                placeholder="https://acme.atlassian.net/wiki"),
@@ -82,6 +95,7 @@ FORM_SPECS: dict[str, dict] = {
     "azure_devops": {
         "label": "Azure DevOps",
         "blurb": "Work items, PRs, pipelines. Live code search. Cloud or on-prem Server/TFS.",
+        "suggests": ["What work items are in progress?", "What changed in recent pull requests?"],
         "fields": [
             _f("organization", "Organization (cloud)", placeholder="acme",
                help="For dev.azure.com SaaS. Leave blank and use Server URL + Collection for on-prem TFS / Azure DevOps Server."),
@@ -100,6 +114,8 @@ FORM_SPECS: dict[str, dict] = {
     "octopus": {
         "label": "Octopus Deploy",
         "blurb": "Projects, releases, and what is deployed where right now.",
+        "suggests": ["What environments are configured in Octopus?",
+                     "What is deployed to Production?", "What is deployed to Staging?"],
         "fields": [
             _f("server_url", "Server URL", required=True, placeholder="https://octopus.acme.com"),
             _f("api_key", "API key", secret=True, env="OCTOPUS_API_KEY"),
@@ -111,6 +127,7 @@ FORM_SPECS: dict[str, dict] = {
     "grafana": {
         "label": "Grafana / Loki",
         "blurb": "Dashboard inventory now; logs queried live when you ask.",
+        "suggests": ["What dashboards monitor production?", "Are there any errors in the logs?"],
         "fields": [
             _f("base_url", "Grafana URL", required=True, placeholder="https://grafana.acme.com"),
             _f("token", "Service account token", secret=True, env="GRAFANA_TOKEN"),
@@ -120,6 +137,7 @@ FORM_SPECS: dict[str, dict] = {
     "datadog": {
         "label": "Datadog",
         "blurb": "Monitors and dashboards inventory; logs searched live.",
+        "suggests": ["What monitors are alerting?", "Are there any errors in the logs?"],
         "fields": [
             _f("site", "Site", placeholder="datadoghq.com"),
             _f("api_key", "API key", secret=True, env="DD_API_KEY"),
@@ -129,6 +147,7 @@ FORM_SPECS: dict[str, dict] = {
     "dynatrace": {
         "label": "Dynatrace",
         "blurb": "Problems and entities inventory; logs queried live.",
+        "suggests": ["What problems are open in Dynatrace?", "Are there any errors in the logs?"],
         "fields": [
             _f("base_url", "Environment URL", required=True,
                placeholder="https://abc123.live.dynatrace.com"),
@@ -138,6 +157,7 @@ FORM_SPECS: dict[str, dict] = {
     "elastic": {
         "label": "Elasticsearch",
         "blurb": "Index inventory now; log search runs live at question time.",
+        "suggests": ["What indices are available?", "Are there any errors in the logs?"],
         "fields": [
             _f("base_url", "Cluster URL", required=True, placeholder="https://es.acme.com:9200"),
             _f("api_key", "API key", secret=True, env="ELASTIC_API_KEY"),
@@ -149,6 +169,7 @@ FORM_SPECS: dict[str, dict] = {
         "label": "Web pages",
         "blurb": "Crawl internal docs or portals. Polite by default; falls back to a "
                  "real browser when a page refuses a plain fetch. Last resort when there's no API.",
+        "suggests": ["What do the internal docs cover?"],
         "fields": [
             _f("start_urls", "Start URLs", required=True, list_=True,
                placeholder="https://docs.acme.internal/"),
