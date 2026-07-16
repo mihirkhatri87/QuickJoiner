@@ -7,22 +7,12 @@ from typing import Any, Iterator
 
 from quickjoiner.connectors.base import ConnectionStatus, Connector, Document, Mode
 from quickjoiner.connectors.registry import register
-from quickjoiner.connectors.util import get_json, post_json, resolve_secret
+from quickjoiner.connectors.util import as_bool as _as_bool, get_json, post_json, resolve_secret
 from quickjoiner.llm.base import AgentTool, ToolSpec
 
 DEFAULT_API_VERSION = "7.0"
 WORK_ITEM_BATCH = 200
 MAX_WORK_ITEMS = 2000
-
-
-def _as_bool(value: Any, default: bool = True) -> bool:
-    """Coerce a form/option value (bool or string) to bool. Form values arrive as
-    strings, so "false"/"0"/"no"/"off" (any case) read as False."""
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return default
-    return str(value).strip().lower() not in ("false", "0", "no", "off", "")
 
 
 def work_item_document(org_url: str, item: dict[str, Any]) -> Document:

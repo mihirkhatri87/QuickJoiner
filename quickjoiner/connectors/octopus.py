@@ -1,9 +1,16 @@
 """Octopus Deploy connector: projects, environments, releases, and the deployment
 dashboard via the REST API, plus a live deployment-status tool.
 
-Push mode: create an Octopus Subscription (webhook) pointing at POST /hooks/<source>
-with the generic X-QJ-Signature scheme (Octopus can't sign, so front it with a proxy
-that adds the header, or use a secret URL path via the source name).
+Pull is fully paginated (Links["Page.Next"]) so spaces with >100 projects ingest
+completely. Every pull is a full refresh (idempotent — content-hash dedupe skips
+unchanged docs at ingest); an opt-in `incremental=true` option fetches per-project
+releases only for projects that had an Octopus event since the last sync, while the
+project list and the dashboard (current deploy state) always refresh.
+
+Push mode (true real-time, no polling): create an Octopus Subscription (webhook)
+pointing at POST /hooks/<source> with the generic X-QJ-Signature scheme (Octopus
+can't sign, so front it with a proxy that adds the header, or use a secret URL path
+via the source name).
 """
 
 from __future__ import annotations
@@ -12,10 +19,11 @@ from typing import Any, Iterator
 
 from quickjoiner.connectors.base import ConnectionStatus, Connector, Document, Mode
 from quickjoiner.connectors.registry import register
-from quickjoiner.connectors.util import get_json, resolve_secret
+from quickjoiner.connectors.util import as_bool, get_json, resolve_secret
 from quickjoiner.llm.base import AgentTool, ToolSpec
 
 TAKE = 100
+MAX_PAGES = 1000  # safety cap against a pathological Page.Next loop
 
 
 def project_document(server: str, project: dict[str, Any]) -> Document:
@@ -133,19 +141,64 @@ class OctopusConnector(Connector):
         except Exception as exc:
             return ConnectionStatus(False, f"Octopus API error: {exc}")
 
+    def _incremental(self) -> bool:
+        """Opt-in: only re-fetch a project's releases when Octopus recorded an event for
+        it since the last sync (default OFF — a full re-pull is always correct, and the
+        events shape should be verified against your server before trusting it)."""
+        return as_bool(self.options.get("incremental"), default=False)
+
+    def _paged(self, endpoint: str, params: dict[str, Any] | None = None) -> Iterator[dict]:
+        """Yield every item across all Octopus pages. Octopus returns a server-relative
+        `Links["Page.Next"]` while more remain and omits it on the last page; this walks
+        that chain (falling back to nothing when absent) instead of taking only the first
+        page — the reason a >100-project space was previously truncated at 100."""
+        url: str | None = f"{self._api()}/{endpoint}"
+        p = {"take": TAKE, **(params or {})}
+        for _ in range(MAX_PAGES):
+            if not url:
+                return
+            data = get_json(url, headers=self._headers(), params=p)
+            for item in data.get("Items", []):
+                yield item
+            nxt = (data.get("Links") or {}).get("Page.Next")
+            # Page.Next is relative to the server root and already carries skip/take.
+            url = f"{self._server()}{nxt}" if nxt else None
+            p = None
+
+    def _changed_project_ids(self, since: str) -> set[str] | None:
+        """Project ids with an Octopus event since `since` (release created, deployed,
+        variables changed, …). None => couldn't determine, caller must do a full pull."""
+        try:
+            ids: set[str] = set()
+            for ev in self._paged("events", params={"from": since}):
+                for rel in ev.get("RelatedDocumentIds") or []:
+                    if isinstance(rel, str) and rel.startswith("Projects-"):
+                        ids.add(rel)
+            return ids
+        except Exception:
+            return None  # events unavailable/unexpected -> safe fallback to full pull
+
     def _name_map(self, endpoint: str) -> dict[str, str]:
-        items = get_json(
-            f"{self._api()}/{endpoint}", headers=self._headers(), params={"take": TAKE}
-        ).get("Items", [])
-        return {i["Id"]: i.get("Name", i["Id"]) for i in items}
+        return {i["Id"]: i.get("Name", i["Id"]) for i in self._paged(endpoint)}
 
     def sync(self, state: dict[str, str]) -> Iterator[Document]:
         server, headers = self._server(), self._headers()
-        projects = get_json(
-            f"{self._api()}/projects", headers=headers, params={"take": TAKE}
-        ).get("Items", [])
+
+        # Incremental (opt-in, and only once we have a prior watermark): fetch releases
+        # only for projects Octopus recorded an event for since last sync. `changed=None`
+        # means "refresh everything" — first sync, incremental off, or events unavailable.
+        since = state.get("since", "")
+        changed: set[str] | None = None
+        if self._incremental() and since:
+            changed = self._changed_project_ids(since)
+
+        # The project list itself is always fully paginated (cheap; needed for the
+        # dashboard's id->name map regardless) — this is the fix for the 100-cap.
+        projects = list(self._paged("projects"))
         for project in projects:
             yield project_document(server, project)
+            if changed is not None and project["Id"] not in changed:
+                continue  # unchanged since last sync — skip the per-project releases call
             releases = get_json(
                 f"{self._api()}/projects/{project['Id']}/releases",
                 headers=headers,
@@ -154,6 +207,8 @@ class OctopusConnector(Connector):
             if releases:
                 yield releases_document(server, project, releases)
 
+        # The dashboard is a single call and reflects current deploy state, so it is
+        # always refreshed (this is what carries the service->deploys->environment edges).
         dashboard = get_json(f"{self._api()}/dashboard", headers=headers)
         items = dashboard.get("Items", [])
         if items:

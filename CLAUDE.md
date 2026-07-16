@@ -167,9 +167,18 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   separate `almsearch.*` host and serves from the same collection URL; `verify_tls=false` skips
   TLS verification for internal-CA/self-signed certs (threaded through `util.get_json`/`post_json`
   as `verify`); `api_version` is configurable (default 7.0 — Server 2022→7.x, 2020→6.0, 2019→5.0).
-  Auth is unchanged: a PAT via Basic auth works for SaaS and Server 2017+ alike. `_as_bool` coerces
-  string form values. Tests in `tests/test_connectors.py` (on-prem URL/search-host/api/verify + SaaS
-  regression guard).
+  Auth is unchanged: a PAT via Basic auth works for SaaS and Server 2017+ alike. `util.as_bool`
+  coerces string form values (shared with `octopus`). Tests in `tests/test_connectors.py` (on-prem
+  URL/search-host/api/verify + SaaS regression guard).
+  `octopus.py` **paginates** every list endpoint via `_paged` (follows `Links["Page.Next"]`) — a
+  space with >100 projects previously truncated at the `take=100` first page. Pull is a full refresh
+  (idempotent via hash dedupe); opt-in `incremental=true` fetches per-project releases only for
+  projects with an Octopus event since the last sync (`_changed_project_ids` over `/events?from=`),
+  while the paginated project list + the deployment dashboard (which carries the
+  `service→deploys→environment` edges) always refresh — falls back to a full pull on first sync or
+  any events error. True zero-poll freshness is PUSH via an Octopus Subscription → `/hooks/<source>`.
+  Tests in `tests/test_phase4_connectors.py` (paging walks Page.Next, incremental skips unchanged,
+  no-watermark full fallback).
   `logsearch/` (grafana/datadog/dynatrace/elastic) ingests
   inventory only — logs are queried live via tools, never vectorized. `browser/` holds the
   Playwright persistent-profile session (`session.py`, optional dep `.[browser]`) and the

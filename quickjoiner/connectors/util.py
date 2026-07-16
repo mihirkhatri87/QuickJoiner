@@ -8,6 +8,16 @@ from typing import Any
 import httpx
 
 
+def as_bool(value: Any, default: bool = True) -> bool:
+    """Coerce a form/option value (bool or string) to bool. Form option values arrive
+    as strings, so "false"/"0"/"no"/"off"/"" (any case) read as False; None -> default."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() not in ("false", "0", "no", "off", "")
+
+
 def resolve_secret(options: dict[str, Any], key: str, env_var: str | None = None) -> str | None:
     """Resolve a credential from options; 'env:NAME' values and a fallback env var are supported.
 

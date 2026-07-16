@@ -104,6 +104,8 @@ FORM_SPECS: dict[str, dict] = {
             _f("server_url", "Server URL", required=True, placeholder="https://octopus.acme.com"),
             _f("api_key", "API key", secret=True, env="OCTOPUS_API_KEY"),
             _f("space_id", "Space", placeholder="Spaces-1"),
+            _f("incremental", "Incremental releases", placeholder="false",
+               help="Set to true to re-fetch a project's releases only when Octopus recorded an event for it since the last sync (project list + deployment dashboard always refresh). Faster on large spaces; leave false for a full refresh every sync."),
         ],
     },
     "grafana": {

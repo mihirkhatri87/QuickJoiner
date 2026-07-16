@@ -149,6 +149,9 @@ qj connect azure_devops --name ado --option organization=acme --option project=P
 # on-prem Azure DevOps Server / TFS: use server_url + collection instead of organization
 # (verify_tls=false for a self-signed cert; api_version to match an older server):
 qj connect azure_devops --name tfs --option server_url=https://tfs.company.com/tfs --option collection=DefaultCollection --option project=Payments --option token=env:AZURE_DEVOPS_PAT --option verify_tls=false
+# Octopus paginates all projects (not just the first 100); incremental=true re-fetches a
+# project's releases only when it changed since last sync (dashboard/projects always refresh):
+qj connect octopus --name deploys --option server_url=https://octopus.acme.com --option api_key=env:OCTOPUS_API_KEY --option incremental=true
 
 qj sync            # incremental pull from every source
 qj sync pay-jira   # or just one source
