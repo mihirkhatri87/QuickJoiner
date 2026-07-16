@@ -214,8 +214,12 @@ class AzureDevOpsConnector(Connector):
         # A 300k-item project is far too large to pull flat; instead we walk each
         # team's most recent sprints and ingest the work items planned into them.
         # Anything older / outside these sprints is answered live via the WIQL tool.
+        # Stream per team: fetch each team's recent-sprint work items and yield them
+        # right away, rather than enumerating every team first. On a 100-team project
+        # that means documents (and progress) start flowing early and the sync stays
+        # interruptible, instead of a long silent, unstoppable enumeration up front.
         seen: set[int] = set()
-        wanted: list[int] = []
+        total = 0
         for team in self._teams(org_url, headers, api, verify):
             tp = quote(team, safe="")
             try:
@@ -225,6 +229,7 @@ class AzureDevOpsConnector(Connector):
                 ).get("value", [])
             except Exception:
                 continue  # team has no iteration settings, or no access — skip
+            team_ids: list[int] = []
             for it in select_recent_iterations(iters, sprints):
                 try:
                     rels = get_json(
@@ -237,20 +242,20 @@ class AzureDevOpsConnector(Connector):
                     tid = (r.get("target") or {}).get("id")
                     if tid and tid not in seen:
                         seen.add(tid)
-                        wanted.append(tid)
-            if len(wanted) >= MAX_WORK_ITEMS:
-                wanted = wanted[:MAX_WORK_ITEMS]
+                        team_ids.append(tid)
+            for i in range(0, len(team_ids), WORK_ITEM_BATCH):
+                batch = team_ids[i : i + WORK_ITEM_BATCH]
+                items = get_json(
+                    f"{org_url}/{project}/_apis/wit/workitems?{api}",
+                    headers=headers,
+                    params={"ids": ",".join(map(str, batch))},
+                    verify=verify,
+                ).get("value", [])
+                for item in items:
+                    yield work_item_document(org_url, item)
+                    total += 1
+            if total >= MAX_WORK_ITEMS:
                 break
-        for i in range(0, len(wanted), WORK_ITEM_BATCH):
-            batch = wanted[i : i + WORK_ITEM_BATCH]
-            items = get_json(
-                f"{org_url}/{project}/_apis/wit/workitems?{api}",
-                headers=headers,
-                params={"ids": ",".join(map(str, batch))},
-                verify=verify,
-            ).get("value", [])
-            for item in items:
-                yield work_item_document(org_url, item)
 
         # -- Build pipelines -> repositories (TFS↔GitLab bridge) --------------
         definitions = get_json(

@@ -22,11 +22,13 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterator
 
 _MAX_LOG_LINES = 500
+_HEARTBEAT_SECONDS = 20  # "still syncing…" cadence while a connector is mid-pull
 _DONE = object()  # sentinel pushed to subscribers when a job ends
 
 
@@ -45,6 +47,7 @@ class SyncJob:
     logs: list[str] = field(default_factory=list)
     stats: dict[str, Any] | None = None
     error: str | None = None
+    ingested: int = 0
     started_at: str = field(default_factory=_now)
     ended_at: str | None = None
     cancel: threading.Event = field(default_factory=threading.Event)
@@ -143,17 +146,26 @@ class SyncManager:
         self._log(job, f"🧹 cleanup: removed {removed} documents, {orphans} orphan graph nodes")
 
     def _tracked(self, job: SyncJob, docs: Iterator) -> Iterator:
-        n = 0
         for doc in docs:
             if job.cancel.is_set():
-                self._log(job, f"⏹ stopping — {n} document(s) ingested before cancel")
+                self._log(job, f"⏹ stopping — {job.ingested} document(s) ingested before cancel")
                 return
-            n += 1
-            if n <= 3 or n % 25 == 0:
-                self._log(job, f"  · {n}: {getattr(doc, 'title', '')[:72]}")
+            job.ingested += 1
+            if job.ingested <= 3 or job.ingested % 25 == 0:
+                self._log(job, f"  · {job.ingested}: {getattr(doc, 'title', '')[:72]}")
             yield doc
 
+    def _heartbeat(self, job: SyncJob, stop: threading.Event) -> None:
+        """Emit a 'still syncing' line on a timer so long connector-internal phases
+        (e.g. walking many empty teams before the first document) don't look hung."""
+        start = time.monotonic()
+        while not stop.wait(_HEARTBEAT_SECONDS):
+            elapsed = int(time.monotonic() - start)
+            self._log(job, f"⏳ still syncing — {job.ingested} documents so far ({elapsed}s)")
+
     def _run(self, job: SyncJob, source: Any, connector: Any) -> None:
+        hb_stop = threading.Event()
+        threading.Thread(target=self._heartbeat, args=(job, hb_stop), daemon=True).start()
         try:
             self.ctx.catalog.upsert_source(job.source_id, source.name, source.type, source.options)
             if job.clean:
@@ -182,6 +194,7 @@ class SyncManager:
             job.error = str(exc)
             self._log(job, f"✗ error: {exc}")
         finally:
+            hb_stop.set()
             job.ended_at = _now()
             self._close(job)
 
