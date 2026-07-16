@@ -15,8 +15,9 @@ when memory has nothing relevant.
   extended thinking on all three.
 - **Multi-mode connectors** — pull APIs, push webhooks, live "read from source" agent tools,
   authenticated browser sessions with your own credentials, and scraping as a last resort.
-  Types: files/URLs, git, GitHub, GitLab, Jira, Confluence, Azure DevOps, Octopus Deploy,
-  Grafana, Datadog, Dynatrace, Elasticsearch, and a generic web scraper.
+  Types: files/URLs, git, GitHub, GitLab, Jira, Confluence, Azure DevOps (cloud **and**
+  on-prem Server/TFS), Octopus Deploy, Grafana, Datadog, Dynatrace, Elasticsearch, and a
+  generic web scraper.
 - **Honesty by design** — a grounding contract forces citations and refusals, every refusal is
   captured as a **knowledge gap** with one-click remediation, and a **knowledge graph** links
   repos, packages, tickets, services, and environments so you can see how things connect.
@@ -145,6 +146,9 @@ qj connect github --name platform-gh --option repo=acme/platform --option token=
 qj connect jira --name pay-jira --option base_url=https://acme.atlassian.net --option email=me@acme.com --option api_token=env:JIRA_API_TOKEN --option projects=PAY,LEDG
 qj connect confluence --name wiki --option base_url=https://acme.atlassian.net --option email=me@acme.com --option api_token=env:JIRA_API_TOKEN --option spaces=ENG
 qj connect azure_devops --name ado --option organization=acme --option project=Payments --option token=env:AZURE_DEVOPS_PAT
+# on-prem Azure DevOps Server / TFS: use server_url + collection instead of organization
+# (verify_tls=false for a self-signed cert; api_version to match an older server):
+qj connect azure_devops --name tfs --option server_url=https://tfs.company.com/tfs --option collection=DefaultCollection --option project=Payments --option token=env:AZURE_DEVOPS_PAT --option verify_tls=false
 
 qj sync            # incremental pull from every source
 qj sync pay-jira   # or just one source

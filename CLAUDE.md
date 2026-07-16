@@ -161,6 +161,15 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   lives here (files.py re-exports). Tests: `tests/test_deps.py` incl. an end-to-end "loose
   alias query correlates consumer+provider repos" case. The structural entity/edge graph
   layer on top is **designed, not built**: `docs/KNOWLEDGE_GRAPH.md`.
+  `azure_devops.py` works against **both** cloud (`dev.azure.com/{organization}`) and **on-prem
+  Azure DevOps Server / TFS**: set `server_url` (host up to `/tfs`) + `collection` instead of
+  `organization` and the base URL becomes `{server_url}/{collection}`; code search drops the
+  separate `almsearch.*` host and serves from the same collection URL; `verify_tls=false` skips
+  TLS verification for internal-CA/self-signed certs (threaded through `util.get_json`/`post_json`
+  as `verify`); `api_version` is configurable (default 7.0 — Server 2022→7.x, 2020→6.0, 2019→5.0).
+  Auth is unchanged: a PAT via Basic auth works for SaaS and Server 2017+ alike. `_as_bool` coerces
+  string form values. Tests in `tests/test_connectors.py` (on-prem URL/search-host/api/verify + SaaS
+  regression guard).
   `logsearch/` (grafana/datadog/dynatrace/elastic) ingests
   inventory only — logs are queried live via tools, never vectorized. `browser/` holds the
   Playwright persistent-profile session (`session.py`, optional dep `.[browser]`) and the

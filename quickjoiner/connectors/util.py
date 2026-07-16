@@ -29,8 +29,12 @@ def get_json(
     params: dict[str, Any] | None = None,
     auth: tuple[str, str] | None = None,
     timeout: float = 60.0,
+    verify: bool = True,
 ) -> Any:
-    resp = httpx.get(url, headers=headers, params=params, auth=auth, timeout=timeout, follow_redirects=True)
+    resp = httpx.get(
+        url, headers=headers, params=params, auth=auth, timeout=timeout,
+        follow_redirects=True, verify=verify,
+    )
     resp.raise_for_status()
     return resp.json()
 
@@ -42,7 +46,10 @@ def post_json(
     params: dict[str, Any] | None = None,
     auth: tuple[str, str] | None = None,
     timeout: float = 60.0,
+    verify: bool = True,
 ) -> Any:
-    resp = httpx.post(url, json=body, headers=headers, params=params, auth=auth, timeout=timeout)
+    resp = httpx.post(
+        url, json=body, headers=headers, params=params, auth=auth, timeout=timeout, verify=verify,
+    )
     resp.raise_for_status()
     return resp.json()
