@@ -132,7 +132,7 @@ class IngestPipeline:
 
     def ingest(self, documents: Iterable[Document], source_id: str) -> IngestStats:
         stats = IngestStats()
-        pending: list[tuple[str, list, list, list, str, str]] = []
+        pending: list[tuple[str, list, list, list, str, str, str]] = []
         for doc in documents:
             try:
                 self._ingest_one(doc, source_id, stats, pending)
@@ -240,10 +240,11 @@ class IngestPipeline:
             # here and _resolve_pending_triples actually persisting this doc's
             # triples — see graph_pending's schema comment for why that matters.
             self._catalog.mark_graph_pending(doc_id, source_id)
-            pending.append((doc_id, entities, alias_rows, edges, text, doc.title))
+            pending.append((doc_id, entities, alias_rows, edges, text, doc.title, doc.kind))
             return
 
-        self._persist_graph(doc_id, entities, alias_rows, edges, source_id)
+        self._persist_graph(doc_id, entities, alias_rows, edges, source_id,
+                            doc.title, doc.kind)
 
     def _resolve_pending_triples(self, pending: list, source_id: str) -> None:
         """Resolve the queued LLM triple-extraction calls, then persist each
@@ -254,46 +255,50 @@ class IngestPipeline:
         if self._triple_workers > 1 and len(pending) > 1:
             with concurrent.futures.ThreadPoolExecutor(max_workers=self._triple_workers) as pool:
                 futures = {
-                    pool.submit(self._triple_extractor, text, title): (doc_id, entities, alias_rows, edges, title)
-                    for doc_id, entities, alias_rows, edges, text, title in pending
+                    pool.submit(self._triple_extractor, text, title): (doc_id, entities, alias_rows, edges, title, kind)
+                    for doc_id, entities, alias_rows, edges, text, title, kind in pending
                 }
                 for fut in concurrent.futures.as_completed(futures):
-                    doc_id, entities, alias_rows, edges, title = futures[fut]
+                    doc_id, entities, alias_rows, edges, title, kind = futures[fut]
                     try:
                         triples = fut.result()
                     except Exception:
                         triples = []
-                    self._apply_triples(triples, doc_id, entities, alias_rows, edges, title, source_id)
+                    self._apply_triples(triples, doc_id, entities, alias_rows, edges, title, source_id, kind)
         else:
-            for doc_id, entities, alias_rows, edges, text, title in pending:
+            for doc_id, entities, alias_rows, edges, text, title, kind in pending:
                 try:
                     triples = self._triple_extractor(text, title)
                 except Exception:
                     triples = []
-                self._apply_triples(triples, doc_id, entities, alias_rows, edges, title, source_id)
+                self._apply_triples(triples, doc_id, entities, alias_rows, edges, title, source_id, kind)
 
     def _apply_triples(self, triples: list, doc_id: str, entities: list, alias_rows: list,
-                        edges: list, title: str, source_id: str) -> None:
+                        edges: list, title: str, source_id: str, kind: str = "") -> None:
         if triples:
             g = triples_to_graph(triples, f"stated in {title[:60]}")
             entities = entities + g["entities"]
             alias_rows = alias_rows + g["aliases"]
             edges = edges + g["edges"]
-        self._persist_graph(doc_id, entities, alias_rows, edges, source_id)
+        self._persist_graph(doc_id, entities, alias_rows, edges, source_id, title, kind)
 
     def _persist_graph(self, doc_id: str, entities: list, alias_rows: list,
-                        edges: list, source_id: str) -> None:
+                        edges: list, source_id: str,
+                        doc_title: str = "", doc_kind: str = "") -> None:
         """Write entities/aliases/edges for one document. Every new entity is
         routed through the entity resolver first (if configured): a merge adds
         an alias to an existing canonical entity instead of creating a
         duplicate node, and every edge referencing the original id is remapped
         to the canonical one. Unconditional replace_doc_edges: a changed doc
         that dropped its assertions must also drop its stale edges (hash
-        dedupe means we only get here on change)."""
+        dedupe means we only get here on change). The evidence doc's title/kind
+        ride along as adjudication context (plan 06 §1.D)."""
+        context = f'mentioned in "{doc_title}" ({doc_kind})' if doc_title else ""
         id_map: dict[str, str] = {}
         for eid, name, type_ in entities:
             canonical, merged = (
-                self._entity_resolver.resolve(eid, name, type_) if self._entity_resolver else (eid, False)
+                self._entity_resolver.resolve(eid, name, type_, context)
+                if self._entity_resolver else (eid, False)
             )
             id_map[eid] = canonical
             if not merged:

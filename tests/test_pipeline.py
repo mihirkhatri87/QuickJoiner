@@ -85,3 +85,24 @@ def test_error_in_one_doc_does_not_stop_others(store, catalog, monkeypatch):
     stats = pipeline.ingest(_docs(), "test:src")
     assert len(stats.errors) == 1
     assert stats.added == 1
+
+
+def test_persist_graph_passes_doc_context_to_resolver(store, catalog):
+    """Plan 06 §1.D: the evidence doc's title/kind reach the entity resolver as
+    adjudication context, so merges are judged from evidence, not bare names."""
+    seen = []
+
+    class SpyResolver:
+        def resolve(self, entity_id, name, type_, context=""):
+            seen.append((entity_id, context))
+            return entity_id, False
+
+    pipeline = IngestPipeline(store, catalog, entity_resolver=SpyResolver())
+    doc = Document(
+        uri="repo://svc.md", title="Payments service overview", text="x" * 40, kind="doc",
+        metadata={"graph": {"entities": [("service:pay", "Payments", "service")],
+                            "aliases": [], "edges": []}},
+    )
+    pipeline.ingest([doc], "test:src")
+    assert any(ctx == 'mentioned in "Payments service overview" (doc)'
+               for _eid, ctx in seen)

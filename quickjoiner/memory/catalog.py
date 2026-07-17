@@ -495,6 +495,17 @@ class _SqlCatalog:
             (entity_id, entity_id),
         )
 
+    def entity_evidence(self, entity_id: str, limit: int = 3) -> list[dict]:
+        """Titles/kinds of the evidence docs behind edges touching this entity —
+        the context the entity-resolution adjudicator judges merges from
+        (plan 06 §1.D: bare name strings alone made the LLM default to NONE)."""
+        return self._read_all(
+            """SELECT DISTINCT d.title, d.kind FROM edges g
+               JOIN documents d ON d.doc_id = g.evidence_doc_id
+               WHERE g.src = ? OR g.dst = ? ORDER BY d.title LIMIT ?""",
+            (entity_id, entity_id, limit),
+        )
+
     def graph_path(self, src_id: str, dst_id: str, max_hops: int = 3) -> list[dict] | None:
         """Shortest chain of edges linking two entities (undirected BFS, hop-capped),
         each hop carrying names + evidence. [] if src == dst; None if unconnected

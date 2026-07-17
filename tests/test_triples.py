@@ -268,7 +268,7 @@ def test_pipeline_routes_triple_entities_through_resolver(store, catalog):
     catalog.upsert_entity("project:appriver-connector-web", "AppRiver Connector Web", "project")
     resolver = EntityResolver(
         catalog=catalog, embedder=FakeEmbedder(),
-        adjudicate=lambda type_, name, candidates: candidates[0],
+        adjudicate=lambda type_, name, candidates, ctx, cctxs: candidates[0],
     )
 
     def extractor(text, title):

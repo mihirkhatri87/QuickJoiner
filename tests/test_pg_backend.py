@@ -129,6 +129,10 @@ def test_pg_knowledge_graph_roundtrip(pg):
     chains = catalog.graph_path_candidates("repo:a", "package:x.y.z")
     assert chains == [catalog.graph_path("repo:a", "package:x.y.z")]
 
+    # entity_evidence parity: adjudication context rows (plan 06 §1.D)
+    ev = catalog.entity_evidence("repo:a")
+    assert ev == [{"title": "Dep map", "kind": "doc"}]
+
     catalog.replace_doc_edges("d9", [("repo:a", "depends_on", "package:x.y.z", "2.0")])
     assert catalog.graph_neighbors("package:x.y.z")[0]["detail"] == "2.0"  # replaced, not duped
     catalog.delete_document("d9")

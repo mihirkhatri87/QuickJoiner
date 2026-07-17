@@ -52,7 +52,7 @@ def test_llm_confirms_merge_adds_alias_to_canonical(catalog):
     catalog.upsert_entity("project:appriver-connector-web", "AppRiver Connector Web", "project")
     resolver = EntityResolver(
         catalog=catalog, embedder=FakeEmbedder(),
-        adjudicate=lambda type_, name, candidates: candidates[0],  # always confirm the top candidate
+        adjudicate=lambda type_, name, candidates, ctx, cctxs: candidates[0],  # always confirm top
     )
     canonical, merged = resolver.resolve("project:connector-web-service", "Connector Web Service", "project")
     assert merged is True
@@ -65,7 +65,7 @@ def test_llm_rejects_merge_creates_new_entity(catalog):
     catalog.upsert_entity("project:appriver-connector-web", "AppRiver Connector Web", "project")
     resolver = EntityResolver(
         catalog=catalog, embedder=FakeEmbedder(),
-        adjudicate=lambda type_, name, candidates: None,  # never confirms
+        adjudicate=lambda type_, name, candidates, ctx, cctxs: None,  # never confirms
     )
     canonical, merged = resolver.resolve("project:connector-web-service", "Connector Web Service", "project")
     assert merged is False
@@ -112,3 +112,70 @@ def test_make_llm_adjudicator_parses_match_and_none():
 
     none_reply = make_llm_adjudicator(_Provider("NONE"))
     assert none_reply("project", "Webroot Connector", ["AppRiver Connector Web"]) is None
+
+
+# ------------------------------------------- adjudicator context (plan 06 §1.D)
+
+def test_adjudicator_receives_contexts(catalog):
+    """The resolver hands the adjudicator the new entity's evidence context AND
+    per-candidate evidence summaries (from entity_evidence) — not bare names."""
+    catalog.upsert_entity("project:appriver-connector-web", "AppRiver Connector Web", "project")
+    catalog.upsert_document("agents", "git:connector", "file:///repo/AGENTS.md",
+                            "Connector/AGENTS.md", "doc", "h", None, 1)
+    catalog.replace_doc_edges("agents", [
+        ("project:appriver-connector-web", "depends_on", "package:x", ""),
+    ])
+    seen = {}
+
+    def spy(type_, name, candidates, ctx, cctxs):
+        seen.update(type=type_, ctx=ctx, cctxs=cctxs)
+        return None
+
+    resolver = EntityResolver(catalog=catalog, embedder=FakeEmbedder(), adjudicate=spy)
+    resolver.resolve("project:connector-web-service", "Connector Web Service", "project",
+                     context='mentioned in "Jan 6, 2026" (doc)')
+    assert seen["ctx"] == 'mentioned in "Jan 6, 2026" (doc)'
+    assert seen["cctxs"] == ['"Connector/AGENTS.md" (doc)']
+
+
+def test_make_llm_adjudicator_prompt_contains_evidence_context():
+    """The built prompt carries both sides' evidence so the model can judge like a
+    human skimming the source pages (bare names alone defaulted to NONE)."""
+    captured = {}
+
+    class CapturingProvider:
+        def chat(self, messages, system=None, **kw):
+            captured["prompt"] = messages[0]["content"]
+            captured["system"] = system
+            return ChatResult(text="AppRiver Connector Web")
+
+    adj = make_llm_adjudicator(CapturingProvider())
+    out = adj("project", "Webroot Connector", ["AppRiver Connector Web"],
+              'mentioned in "Jan 6, 2026" (doc)', ['"Connector/AGENTS.md" (doc)'])
+    assert out == "AppRiver Connector Web"
+    assert 'context: mentioned in "Jan 6, 2026" (doc)' in captured["prompt"]
+    assert '"AppRiver Connector Web" — evidence: "Connector/AGENTS.md" (doc)' in captured["prompt"]
+    assert "Never guess" in captured["system"]  # NONE-by-default spine kept
+
+
+def test_context_enables_merge_where_bare_names_said_none(catalog):
+    """Webroot-shaped scripted case: an adjudicator that only confirms when it can
+    see evidence context merges the nickname into the canonical repo entity."""
+    catalog.upsert_entity("project:appriver-connector-web", "AppRiver Connector Web", "project")
+    catalog.upsert_document("agents", "git:connector", "file:///repo/AGENTS.md",
+                            "Connector/AGENTS.md", "doc", "h", None, 1)
+    catalog.replace_doc_edges("agents", [
+        ("project:appriver-connector-web", "depends_on", "package:x", ""),
+    ])
+
+    def context_dependent(type_, name, candidates, ctx, cctxs):
+        return candidates[0] if (ctx and any(cctxs)) else None  # NONE without context
+
+    resolver = EntityResolver(catalog=catalog, embedder=FakeEmbedder(),
+                              adjudicate=context_dependent)
+    canonical, merged = resolver.resolve(
+        "project:webroot-connector-web", "Webroot Connector Web", "project",
+        context='mentioned in "Webroot integration overview" (doc)')
+    assert merged is True and canonical == "project:appriver-connector-web"
+    resolved = catalog.resolve_entity("webroot connector web")
+    assert resolved and resolved["id"] == "project:appriver-connector-web"
