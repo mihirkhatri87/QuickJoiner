@@ -21,6 +21,12 @@ when memory has nothing relevant.
 - **Honesty by design** — a grounding contract forces citations and refusals, every refusal is
   captured as a **knowledge gap** with one-click remediation, and a **knowledge graph** links
   repos, packages, tickets, services, and environments so you can see how things connect.
+- **Multi-angle answers with honest confidence** — when the graph has recorded more than one
+  materially different connection between two things, the agent surfaces *all* of them (or asks
+  one clarifying question) instead of silently picking the shortest; every relationship carries a
+  **server-computed confidence** (evidence shape + corroboration — informal meeting notes score
+  below a real architecture doc), and asking for "options" renders a ranked candidate carousel
+  with shared citations.
 - **Question autocomplete** — as you type, the composer suggests real questions drawn from what's
   actually been learned (your services, repos, environments, past questions). It needs no LLM, so
   it's instant, and it **keeps improving as you connect more systems** — each newly synced source

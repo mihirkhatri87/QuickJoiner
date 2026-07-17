@@ -132,6 +132,13 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   hits (via shared entities) and `search_memory` appends them as a "RELATED via knowledge graph"
   section — the multi-hop / cross-source channel. It runs ONLY when there are already grounded hits,
   so it never turns a refusal into an answer (grounding gate untouched).
+  **Plan-06 graph reads (all portable `?`-SQL in the neutral `_SqlCatalog`, no schema change):**
+  `graph_path_candidates(src, dst, max_hops, max_candidates)` — bounded simple-path BFS returning
+  up to k MATERIALLY different chains (signature = frozensets of intermediates/rels/evidence
+  classes; candidate 0 always agrees with the untouched `graph_path`); `edge_corroboration(src,
+  rel, dst)` — distinct evidence docs + distinct sources per exact edge (the
+  `(src,rel,dst,evidence_doc_id)` PK already stores one row per corroborating doc);
+  `entity_evidence(entity_id, limit)` — evidence titles/kinds for adjudication context.
 - `quickjoiner/ingest/` — `pipeline.py` (**normalize → sha256 dedupe → chunk → embed → upsert;
   idempotent**; optionally injected a `triple_extractor`), `chunkers.py` (markdown/code/prose aware;
   large markdown sections carry their heading onto every sub-chunk), `normalize.py` (NFKC + typographic
@@ -148,6 +155,15 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   (**re-exported from `sessions.py`** for back-compat) and `extract_doc_triples(provider,…)` — optional
   LLM relationship extraction over prose docs, config-gated by `graph.extract_triples` (OFF by default:
   one LLM call per qualifying doc), keyless-safe, validated against the vocab, evidence = the document.
+  **Entity-resolution adjudicator gets evidence context (plan 06 §1.D, 2026-07-17):** the
+  `Adjudicator` seam in `entity_resolution.py` is 5-arg — `(type, name, candidates,
+  new_entity_context, candidate_contexts)`. `pipeline._persist_graph` threads the evidence doc's
+  title/kind (`'mentioned in "<title>" (<kind>)'`) into `EntityResolver.resolve(context=)`, and the
+  resolver builds per-candidate evidence summaries via `catalog.entity_evidence`; the LLM prompt
+  shows both sides' evidence so a nickname ("Webroot Connector") can merge with its formal repo
+  name — bare name strings alone made NONE-by-default the only safe reply and the motivating
+  cross-source merge never fired. Correctness prerequisite for confidence corroboration counts
+  (an unmerged duplicate splits real corroboration across two ids).
 - `quickjoiner/connectors/` — contract in `base.py`: `test()`, `sync(state) -> Iterator[Document]`,
   `tools() -> [AgentTool]` (live agent tools), `handle_event(payload)` (webhooks), and a
   `modes` flag (PULL/PUSH/LIVE/BROWSER/SCRAPE). Register with `@register`; add new imports to
@@ -239,6 +255,22 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   `suggest.py` reads them for configured source types); add them when you add a connector.
 - `quickjoiner/agent/` — grounded system prompt (`prompts.py`), built-in tools
   (search_memory/remember/list_sources + graph_neighbors/graph_path in `tools.py`),
+  **multi-angle + confidence layer (plan 06, 2026-07-17)**: `confidence.py` (pure —
+  `classify_evidence(title, uri, kind)` → dependency-map|meeting-notes|authored-doc|generic;
+  `score_edge(class, doc_corr, source_corr)` → [0.05, 0.95], weights in one `_BASE` table;
+  `score_chain` = min over hops; hop count is deliberately NOT a signal). The `graph_path`
+  tool calls `catalog.graph_path_candidates` and, on ≥2 materially different chains, lists all
+  of them with per-chain confidence + weak-hop caveats and instructs the model (in tool text)
+  to state both or ask ONE clarifying question; single healthy chain output is byte-identical
+  to before (golden-tested). `candidates.py` (pure, `parse_triples` strictness): parses the
+  optional ```candidates block (semicolon-separated source tags — evidence titles contain
+  commas), drops anything whose tags don't resolve to refs actually returned by tools this
+  turn, and attaches **server-side** confidence from the per-request **score ledger**
+  (`build_agent` threads one dict into `build_builtin_tools` and `OnboardingAgent`; graph
+  tools record chain scores per evidence ref; the model's own confidence= number is parsed
+  for format and discarded). `agent.py::_finalize` emits the `candidates` SSE event + strips
+  the block from the returned prose (history keeps raw text; exception-proof; no-block turns
+  are byte-for-byte unchanged).
   **operational tools = the agent-tool bridge** (`ops.py`: scrape_website /
   list_connector_types / add_connector / sync_source — same service functions as the UI
   slash commands; prompt requires explicit user confirmation before add_connector, secrets
@@ -325,7 +357,7 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   wheel installs without the built frontend). Docker builds the UI in a node:22 stage and sets
   `QJ_UI_DIR=/app/ui`.
 - `quickjoiner/export.py` — markdown → md/html/csv/pptx (`--format` on `qj ask` / `qj brief`);
-  SSE chat events: `thinking` / `delta` / `tool_call` / `answer` / `error` / `done`.
+  SSE chat events: `thinking` / `delta` / `tool_call` / `candidates` / `answer` / `error` / `done`.
 - `quickjoiner/sessions.py` — `SessionManager`: persistent sessions + projects (catalog tables
   `projects` / `chat_sessions`, messages stored as JSON snapshots). Token optimization: history
   over `chat.compress_after_est_tokens` is folded into a rolling summary at a **user-turn
@@ -592,6 +624,17 @@ Post-phase additions (2026-07-07, all tested — suite: **89 passed**):
   environments exist in Octopus?" → 10 environments cited; "which envs is appriver-management-console
   deployed to + prod version?" → per-env table (DevLab 0.1.16 / Production 0.1.14) cited. Suite:
   **299 passed, 10 skipped** (pre-existing unrelated `test_evals.py` multi-hop-yaml failure remains).
+- Plan 06 — multi-angle, confidence-scored answers (2026-07-17, all four phases A→D→B→C):
+  `graph_path_candidates` + ambiguity in the `graph_path` tool text (materially different chains
+  all surfaced, clarifying-question prompt guidance), entity-resolution adjudicator now judges
+  from evidence context (5-arg seam, `entity_evidence`), deterministic `score_edge`/`score_chain`
+  confidence wired into the graph tools (per-chain scores, weak-hop caveats, meeting-notes flags,
+  `edge_corroboration`), and the `candidates` block → SSE event → `CandidateCarousel` UI (strict
+  parse, server-side score ledger — LLM's self-reported confidence discarded). See the plan doc
+  (`docs/plans/06-…md`, hardened + §6 implementation plan) for the full design. Suite: **378
+  passed** (+54 over the pre-plan baseline), 10 skipped, pre-existing eval-yaml failure unchanged.
+  §2.7's live check (`resolve_entity('webroot connector')` merging after re-sync) is pending the
+  user's next clean re-sync of Connector+Confluence — the merge only fires at ingest time.
 
 ## Next steps (agreed with user)
 
