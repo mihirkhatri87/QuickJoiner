@@ -41,7 +41,7 @@ export function CandidateCarousel({ cards }: { cards: CandidateCard[] }) {
       aria-label="Candidate answers"
       tabIndex={0}
       onKeyDown={onKey}
-      className="mt-4 rounded-lg bg-fill p-4 outline-none focus-visible:shadow-[0_0_0_1.5px_var(--accent)]"
+      className="mt-4 overflow-hidden rounded-lg bg-fill p-4 outline-none focus-visible:shadow-[0_0_0_1.5px_var(--accent)]"
     >
       <div className="mb-2 flex items-center gap-2">
         <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-faint">
@@ -79,9 +79,12 @@ export function CandidateCarousel({ cards }: { cards: CandidateCard[] }) {
         </span>
       </div>
       {/* key on the active index so the card remounts; animate only when motion is OK */}
+      {/* [overflow-wrap:anywhere] contains long relationship chains and dotted
+          entity names (AppRiver.Connector.Monitor → …) that would otherwise spill
+          past the card edge — plain break-words only helps at word boundaries. */}
       <div key={c.rank} className={cn("motion-safe:animate-rise")}>
-        <div className="text-[14.5px] leading-relaxed">{c.summaryNodes}</div>
-        <div className="mt-2 text-[12.5px] text-muted">Sources: {c.sourceNodes}</div>
+        <div className="text-[14.5px] leading-relaxed [overflow-wrap:anywhere]">{c.summaryNodes}</div>
+        <div className="mt-2 text-[12.5px] text-muted [overflow-wrap:anywhere]">Sources: {c.sourceNodes}</div>
       </div>
       {cards.length > 1 && (
         <div className="mt-3 flex justify-center gap-1.5">
