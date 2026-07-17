@@ -1,9 +1,21 @@
-import { ChevronLeft, Plug, Settings as Gear, X } from "lucide-react";
+import {
+  ChevronLeft,
+  FileText,
+  Lock,
+  Plug,
+  RefreshCw,
+  RotateCcw,
+  Settings as Gear,
+  Trash2,
+  Users,
+  X,
+} from "lucide-react";
 import { useEffect, useState } from "react";
 import { api, token } from "../api";
 import type { AuthStatus, ConnectorRow, ConnectorType, Settings } from "../types";
+import { EditConnectorModal } from "./EditConnectorModal";
 import { SyncLogModal } from "./SyncLogModal";
-import { Button, cn, Field, schedLabel, Select, SYNC_OPTIONS, TextInput } from "./ui";
+import { Button, cn, Field, IconButton, schedLabel, Select, SYNC_OPTIONS, TextInput } from "./ui";
 
 const ALL_MODES = ["pull", "hooks", "live", "browser", "scrape"];
 
@@ -615,7 +627,9 @@ function ConnectorPlate({
   const [armed, setArmed] = useState(false);
   const [briefing, setBriefing] = useState(false);
   const [syncModal, setSyncModal] = useState<{ clean: boolean } | null>(null);
-  const label = types.find((t) => t.type === c.type)?.label ?? c.type;
+  const [editing, setEditing] = useState(false);
+  const ctype = types.find((t) => t.type === c.type);
+  const label = ctype?.label ?? c.type;
   const isRepo = c.type === "git" || c.type === "files";
   const flash = (m: string, ok = true) => {
     setPmsg(m);
@@ -628,8 +642,18 @@ function ConnectorPlate({
         <span className="flex h-[36px] w-[36px] flex-shrink-0 items-center justify-center rounded-full bg-fill2 text-muted">
           <Plug size={16} />
         </span>
-        <div>
-          <div className="text-[14.5px] font-semibold">{c.name}</div>
+        <div className="min-w-0">
+          {c.can_manage ? (
+            <button
+              onClick={() => setEditing(true)}
+              title="Edit this connector"
+              className="truncate text-left text-[14.5px] font-semibold text-ink underline decoration-transparent underline-offset-2 transition hover:decoration-accent"
+            >
+              {c.name}
+            </button>
+          ) : (
+            <div className="truncate text-[14.5px] font-semibold">{c.name}</div>
+          )}
           <div className="mt-0.5 text-[11px] uppercase tracking-[0.06em] text-faint">{label}</div>
         </div>
         <span
@@ -640,6 +664,28 @@ function ConnectorPlate({
         >
           {c.shared || !c.owner ? "shared" : "only you"}
         </span>
+        {c.can_manage && (
+          <IconButton
+            className="flex-shrink-0 hover:bg-danger-soft hover:text-danger"
+            title={armed ? "Click again to confirm removal" : "Remove connector (keeps learned memory)"}
+            onClick={async () => {
+              if (!armed) {
+                setArmed(true);
+                flash("Click the trash again to confirm — removes the config; learned memory stays.");
+                setTimeout(() => setArmed(false), 4000);
+                return;
+              }
+              try {
+                await api.deleteConnector(c.name);
+                reload();
+              } catch (e) {
+                flash(String((e as Error).message), false);
+              }
+            }}
+          >
+            <Trash2 size={15} className={armed ? "text-danger" : ""} />
+          </IconButton>
+        )}
       </div>
       <div className="mt-2.5 flex flex-wrap gap-x-2.5 gap-y-1 font-mono text-[10.5px] tabular-nums text-faint">
         <span>{c.owner ? `by ${c.owner}` : "commons"}</span>
@@ -660,8 +706,9 @@ function ConnectorPlate({
           </span>
         ))}
       </div>
-      <div className="mt-3 flex flex-wrap items-center gap-1.5">
-        <Button
+      <div className="mt-3 flex flex-wrap items-center gap-1">
+        <IconButton
+          title="Test connection"
           onClick={async () => {
             flash("testing…");
             try {
@@ -672,18 +719,20 @@ function ConnectorPlate({
             }
           }}
         >
-          Test
-        </Button>
-        <Button onClick={() => setSyncModal({ clean: false })}>Sync now</Button>
-        <Button
-          variant="danger"
-          title="Purge this source's documents, vectors and graph edges, then re-sync from scratch — leaves everything consistent."
+          <Plug size={15} />
+        </IconButton>
+        <IconButton title="Sync now" onClick={() => setSyncModal({ clean: false })}>
+          <RefreshCw size={15} />
+        </IconButton>
+        <IconButton
+          className="hover:bg-danger-soft hover:text-danger"
+          title="Clean re-sync — purge this source's documents, vectors and graph edges, then re-pull from scratch"
           onClick={() => setSyncModal({ clean: true })}
         >
-          Clean re-sync
-        </Button>
+          <RotateCcw size={15} />
+        </IconButton>
         {isRepo && (
-          <Button
+          <IconButton
             disabled={briefing}
             title="Generate a principal-engineer architecture brief from this repo's code structure + docs (no code is run). Refines an existing AGENTS.md if present."
             onClick={async () => {
@@ -700,11 +749,12 @@ function ConnectorPlate({
               }
             }}
           >
-            {briefing ? "Generating…" : "Architecture brief"}
-          </Button>
+            <FileText size={15} className={briefing ? "animate-pulse" : ""} />
+          </IconButton>
         )}
         {c.can_manage && auth.enabled && c.owner && (
-          <Button
+          <IconButton
+            title={c.shared ? "Make private (only you)" : "Share with everyone"}
             onClick={async () => {
               try {
                 await api.patchConnector(c.name, { shared: !c.shared });
@@ -714,13 +764,13 @@ function ConnectorPlate({
               }
             }}
           >
-            {c.shared ? "Make private" : "Share"}
-          </Button>
+            {c.shared ? <Lock size={15} /> : <Users size={15} />}
+          </IconButton>
         )}
         {c.can_manage && (
           <Select
             title="Automatic sync schedule"
-            className="w-auto"
+            className="ml-1 w-auto"
             value={c.sync_interval_minutes ? String(c.sync_interval_minutes) : ""}
             onChange={async (e) => {
               const v = e.target.value;
@@ -740,27 +790,6 @@ function ConnectorPlate({
             ))}
           </Select>
         )}
-        {c.can_manage && (
-          <Button
-            variant={armed ? "danger" : "ghost"}
-            onClick={async () => {
-              if (!armed) {
-                setArmed(true);
-                flash("Removes the config; learned memory stays.");
-                setTimeout(() => setArmed(false), 4000);
-                return;
-              }
-              try {
-                await api.deleteConnector(c.name);
-                reload();
-              } catch (e) {
-                flash(String((e as Error).message), false);
-              }
-            }}
-          >
-            {armed ? "Confirm?" : "Remove"}
-          </Button>
-        )}
       </div>
       {pmsg && <div className={cn("mt-2 font-mono text-[10.5px] leading-snug", pok ? "text-accent" : "text-danger")}>{pmsg}</div>}
       {syncModal && (
@@ -771,6 +800,19 @@ function ConnectorPlate({
             setSyncModal(null);
             reload();
           }}
+        />
+      )}
+      {editing && (
+        <EditConnectorModal
+          c={c}
+          type={ctype}
+          canShare={Boolean(auth.enabled && c.owner)}
+          onSaved={() => {
+            setEditing(false);
+            reload();
+            flash("Saved.", true);
+          }}
+          onClose={() => setEditing(false)}
         />
       )}
     </div>

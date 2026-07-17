@@ -368,6 +368,32 @@ def test_sync_unknown_source_is_404(client):
     assert client.post("/api/sync/nope").status_code == 404
 
 
+def test_patch_connector_edits_options_schedule_and_merges(client):
+    """The edit-connector modal saves via PATCH options: update fields, keep a secret
+    sent back as its mask, preserve untouched fields, set the schedule, and remove a
+    field cleared to empty."""
+    client.patch("/api/connectors/ghrepo", json={"options": {"token": "sekret"}})  # a real secret
+    resp = client.patch(
+        "/api/connectors/ghrepo",
+        json={"options": {"repo": "acme/renamed", "base_url": "https://ghe.acme/api/v3", "token": "•••"},
+              "sync_interval_minutes": 120},
+    )
+    assert resp.status_code == 200
+    row = resp.json()
+    assert row["options"]["repo"] == "acme/renamed"
+    assert row["options"]["base_url"] == "https://ghe.acme/api/v3"
+    assert row["sync_interval_minutes"] == 120
+    assert row["options"]["token"] == "•••"        # secret round-trips as its mask, not wiped
+    assert row["options"]["webhook_secret"]        # an untouched field is preserved by the merge
+
+    # empty value removes just that field; the masked secret is not deleted
+    client.patch("/api/connectors/ghrepo", json={"options": {"base_url": "", "token": "•••"}})
+    again = next(r for r in client.get("/api/connectors").json() if r["name"] == "ghrepo")
+    assert again["options"]["repo"] == "acme/renamed"
+    assert "base_url" not in again["options"]
+    assert again["options"]["token"] == "•••"
+
+
 # -- SSE chat ----------------------------------------------------------------
 
 def test_chat_streams_tool_calls_and_answer(client, monkeypatch):
