@@ -541,6 +541,91 @@ class _SqlCatalog:
                 frontier.append((nxt, hops + 1))
         return None
 
+    def graph_path_candidates(self, src_id: str, dst_id: str, max_hops: int = 3,
+                              max_candidates: int = 3) -> list[list[dict]]:
+        """Up to `max_candidates` MATERIALLY DIFFERENT chains linking two entities,
+        in nondecreasing hop order — so a 1-hop claim from meeting notes and a 3-hop
+        chain through an architecture doc both surface instead of shortest silently
+        winning (plan 06's motivating failure). `graph_path` (singular) is untouched;
+        this is an additive sibling and candidate 0 always agrees with it.
+
+        Bounded simple-path BFS (k-shortest-paths relaxation of "visited"): each
+        non-destination node may be expanded up to `max_candidates` times, so
+        alternate routes survive where plain BFS would prune them. Two chains are
+        materially different iff their signature — (frozenset of intermediate node
+        ids, frozenset of rels, frozenset of evidence classes) — differs; hop count
+        is deliberately NOT a component (same-route chains of equal shape are
+        duplicates, and shortness alone is not a distinct answer). Same-signature
+        chains keep the first (shortest) representative.
+
+        Reachability posture matches graph_path's "unbounded on purpose" note: the
+        full edge table is loaded, and the first path found pops through exactly the
+        states plain node-BFS would settle, so candidate 0 exists iff graph_path
+        finds a path — the search bounds (per-node expansion cap, 20k popped states,
+        raw cap 4*max_candidates) only ever trim EXTRA candidates, never turn a real
+        connection into a false "no path"."""
+        if src_id == dst_id:
+            return []
+        rows = self._read_all(self._EDGE_SELECT)
+        adjacency: dict[str, list[dict]] = {}
+        for r in rows:
+            adjacency.setdefault(r["src"], []).append(r)
+            adjacency.setdefault(r["dst"], []).append(r)
+
+        from collections import defaultdict, deque
+
+        # memory/ stays import-light toward agent/: lazy import keeps layering one-way.
+        from quickjoiner.agent.confidence import classify_evidence
+
+        raw: list[list[dict]] = []
+        raw_cap = 4 * max_candidates
+        budget = 20_000
+        expansions: dict[str, int] = defaultdict(int)
+        frontier: deque = deque([(src_id, [], {src_id})])
+        while frontier and budget > 0 and len(raw) < raw_cap:
+            budget -= 1
+            node, path, on_path = frontier.popleft()
+            if len(path) >= max_hops:
+                continue
+            for edge in adjacency.get(node, ()):
+                nxt = edge["dst"] if edge["src"] == node else edge["src"]
+                if nxt in on_path:
+                    continue  # simple paths only
+                if nxt == dst_id:
+                    raw.append(path + [edge])
+                    if len(raw) >= raw_cap:
+                        break
+                elif expansions[nxt] < max_candidates:
+                    expansions[nxt] += 1
+                    frontier.append((nxt, path + [edge], on_path | {nxt}))
+
+        def signature(chain: list[dict]) -> tuple:
+            nodes, cur = [], src_id
+            for hop in chain:
+                cur = hop["dst"] if hop["src"] == cur else hop["src"]
+                nodes.append(cur)
+            intermediates = frozenset(nodes[:-1])  # strictly between src and dst
+            rels = frozenset(hop["rel"] for hop in chain)
+            classes = frozenset(
+                classify_evidence(hop.get("evidence_title") or "",
+                                  hop.get("evidence_uri") or "",
+                                  hop.get("evidence_kind") or "")
+                for hop in chain
+            )
+            return (intermediates, rels, classes)
+
+        out: list[list[dict]] = []
+        seen_sigs: set = set()
+        for chain in raw:  # BFS order == nondecreasing hop count
+            sig = signature(chain)
+            if sig in seen_sigs:
+                continue
+            seen_sigs.add(sig)
+            out.append(chain)
+            if len(out) >= max_candidates:
+                break
+        return out
+
     def graph_snapshot(self, entity_id: str | None = None, limit: int = 400) -> dict:
         """Nodes + edges for /api/graph: one entity's neighborhood, or the whole
         graph capped at `limit` edges.

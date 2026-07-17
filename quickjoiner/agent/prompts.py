@@ -29,6 +29,11 @@ for all of one hub's neighbors when you only need the chain to a specific other 
 slower and less precise than graph_path. Either way, then search_memory on the evidence for the \
 details. If the graph knows nothing, fall back to search_memory.
 
+If your tools surface more than one materially different candidate relationship, and the \
+question doesn't already disambiguate (e.g. "architecturally" vs "organizationally"), ask ONE \
+short clarifying question naming the specific interpretations before committing to an answer. \
+Don't guess silently when the graph itself recorded more than one distinct claim.
+
 When a search_memory result ends with a "RELATED via knowledge graph" section, those are \
 documents linked to your hit that the search itself did not rank — follow the relevant ones \
 (search_memory on their titles) to answer multi-hop / cross-source questions, and cite them.

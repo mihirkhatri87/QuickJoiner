@@ -189,6 +189,13 @@ def build_builtin_tools(
     # cross-source relationship, so 3 was clipping real, evidenced chains.
     _DEFAULT_MAX_HOPS = 5
 
+    def _format_hop(i, r) -> str:
+        src = r["src_name"] or r["src"]
+        dst = r["dst_name"] or r["dst"]
+        detail = f" ({r['detail']})" if r["detail"] else ""
+        evidence = r["evidence_title"] or r["evidence_uri"] or r["evidence_doc_id"]
+        return f"{i}. {src} --{r['rel']}--> {dst}{detail} [evidence: {evidence}]"
+
     def graph_path(a: str, b: str, max_hops: int = _DEFAULT_MAX_HOPS) -> str:
         ent_a, ent_b = catalog.resolve_entity(a), catalog.resolve_entity(b)
         for raw, ent in ((a, ent_a), (b, ent_b)):
@@ -197,8 +204,9 @@ def build_builtin_tools(
                         "Try the exact repo/package/ticket name, or search_memory.")
         if ent_a["id"] == ent_b["id"]:
             return f"{ent_a['name']} and {b!r} resolve to the same entity ({ent_a['id']})."
-        path = catalog.graph_path(ent_a["id"], ent_b["id"], max_hops)
-        if path is None:
+        chains = catalog.graph_path_candidates(ent_a["id"], ent_b["id"], max_hops,
+                                               max_candidates=3)
+        if not chains:
             retry_hint = (
                 f" Try again with a higher max_hops before concluding that — {max_hops} may "
                 "have been too shallow." if max_hops < 8 else ""
@@ -206,14 +214,26 @@ def build_builtin_tools(
             return (f"NO_PATH: no recorded chain between {ent_a['name']} and {ent_b['name']} "
                     f"within {max_hops} hops.{retry_hint} That may only mean the link isn't "
                     "learned yet — try search_memory before concluding they are unrelated.")
-        lines = [f"Path from {ent_a['name']} to {ent_b['name']} ({len(path)} hop(s)):"]
-        for i, r in enumerate(path, 1):
-            src = r["src_name"] or r["src"]
-            dst = r["dst_name"] or r["dst"]
-            detail = f" ({r['detail']})" if r["detail"] else ""
-            evidence = r["evidence_title"] or r["evidence_uri"] or r["evidence_doc_id"]
-            lines.append(f"{i}. {src} --{r['rel']}--> {dst}{detail} [evidence: {evidence}]")
-        lines.append("Cite the evidence documents for each hop you rely on.")
+        if len(chains) == 1:
+            path = chains[0]
+            lines = [f"Path from {ent_a['name']} to {ent_b['name']} ({len(path)} hop(s)):"]
+            lines.extend(_format_hop(i, r) for i, r in enumerate(path, 1))
+            lines.append("Cite the evidence documents for each hop you rely on.")
+            return "\n".join(lines)
+        # Multiple materially different recorded connections (different intermediates,
+        # relations, or evidence shapes) — surface ALL of them and instruct the model
+        # not to silently pick one. Same prompt-in-tool-text pattern as the hub cap.
+        lines = [f"{len(chains)} distinct recorded connections exist between "
+                 f"{ent_a['name']} and {ent_b['name']}:"]
+        for k, chain in enumerate(chains, 1):
+            lines.append(f"\nChain {k} ({len(chain)} hop(s)):")
+            lines.extend(_format_hop(i, r) for i, r in enumerate(chain, 1))
+        lines.append(
+            "\nThese chains are materially different (different intermediates / relations / "
+            "evidence). State both with their evidence, or ask ONE short clarifying question "
+            "about which the user means — do NOT present only one as the answer. "
+            "Cite the evidence documents for each hop you rely on."
+        )
         return "\n".join(lines)
 
     return [
@@ -302,10 +322,12 @@ def build_builtin_tools(
             spec=ToolSpec(
                 name="graph_path",
                 description=(
-                    "Find the shortest recorded chain of relationships between two "
+                    "Find the recorded chain(s) of relationships between two "
                     "entities (repos, packages, projects, tickets, services) in the "
                     "knowledge graph, with evidence per hop. Use for 'how is A related "
-                    "to B?' questions. Resolves org shorthand aliases."
+                    "to B?' questions. Resolves org shorthand aliases. If multiple "
+                    "distinct chains are recorded, the result lists all of them; "
+                    "present or disambiguate per the system prompt."
                 ),
                 input_schema={
                     "type": "object",

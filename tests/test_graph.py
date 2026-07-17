@@ -320,6 +320,105 @@ def test_graph_path_tool_default_hops_and_retry_hint(catalog, store):
     assert "higher max_hops" in out_shallow
 
 
+# ---------------------------------------------- graph_path_candidates (plan 06 §A)
+
+def _seed_ambiguous_shape(catalog):
+    """The §0 motivating shape at fixture scale: a 1-hop depends_on evidenced only by
+    a meeting-notes page ("Jan 6, 2026"), plus a 2-hop chain through Stevedore
+    evidenced by an AGENTS.md doc — materially different routes between the same two
+    services."""
+    for eid, name, type_ in (("service:connector", "Connector", "service"),
+                             ("service:nautical", "Nautical", "service"),
+                             ("service:stevedore", "Stevedore", "service")):
+        catalog.upsert_entity(eid, name, type_)
+    catalog.upsert_document("notes", "confluence:wiki", "https://wiki/x/jan6",
+                            "Jan 6, 2026", "doc", "h1", None, 1)
+    catalog.upsert_document("agents", "git:connector", "file:///repo/AGENTS.md",
+                            "Connector/AGENTS.md", "doc", "h2", None, 1)
+    catalog.replace_doc_edges("notes", [
+        ("service:connector", "depends_on", "service:nautical", "usage events"),
+    ])
+    catalog.replace_doc_edges("agents", [
+        ("service:connector", "depends_on", "service:stevedore", ""),
+        ("service:nautical", "depends_on", "service:stevedore", ""),
+    ])
+
+
+def test_graph_path_candidates_matches_graph_path_when_single_chain(catalog):
+    # reuse the linear fixture shape from test_catalog_graph_path_bfs
+    for eid, name, type_ in (("repo:a", "a", "repo"), ("repo:b", "b", "repo"),
+                             ("package:x", "X", "package"), ("ticket:t-1", "T-1", "ticket")):
+        catalog.upsert_entity(eid, name, type_)
+    catalog.replace_doc_edges("d1", [("repo:a", "depends_on", "package:x", "")])
+    catalog.replace_doc_edges("d2", [("repo:b", "provides", "package:x", "")])
+    catalog.replace_doc_edges("d3", [("repo:b", "references", "ticket:t-1", "")])
+
+    single = catalog.graph_path("repo:a", "ticket:t-1")
+    candidates = catalog.graph_path_candidates("repo:a", "ticket:t-1")
+    assert candidates == [single]  # §2.2: candidate 0 agrees with graph_path
+    assert catalog.graph_path_candidates("repo:a", "repo:a") == []
+    assert catalog.graph_path_candidates("repo:a", "service:unconnected") == []
+
+
+def test_graph_path_candidates_surfaces_materially_different_chains(catalog):
+    _seed_ambiguous_shape(catalog)
+    chains = catalog.graph_path_candidates("service:connector", "service:nautical")
+    assert len(chains) == 2
+    assert len(chains[0]) == 1 and chains[0][0]["evidence_title"] == "Jan 6, 2026"
+    assert len(chains[1]) == 2  # through Stevedore, AGENTS.md-evidenced
+    assert {h["evidence_title"] for h in chains[1]} == {"Connector/AGENTS.md"}
+
+
+def test_graph_path_candidates_dedupes_same_signature_chains(catalog):
+    """The same route re-evidenced by a second (same-class) doc is a duplicate, not
+    a second answer."""
+    catalog.upsert_entity("repo:a", "a", "repo")
+    catalog.upsert_entity("package:x", "X", "package")
+    catalog.replace_doc_edges("g1", [("repo:a", "depends_on", "package:x", "")])
+    catalog.replace_doc_edges("g2", [("repo:a", "depends_on", "package:x", "")])
+    chains = catalog.graph_path_candidates("repo:a", "package:x")
+    assert len(chains) == 1
+
+
+def test_graph_path_candidates_honors_hop_cap_and_max_candidates(catalog):
+    _seed_ambiguous_shape(catalog)
+    # hop cap 1: only the direct meeting-notes edge fits
+    shallow = catalog.graph_path_candidates("service:connector", "service:nautical", max_hops=1)
+    assert len(shallow) == 1 and len(shallow[0]) == 1
+    # max_candidates=1: only the shortest distinct chain returned
+    capped = catalog.graph_path_candidates("service:connector", "service:nautical",
+                                           max_candidates=1)
+    assert len(capped) == 1 and len(capped[0]) == 1
+
+
+def test_graph_path_tool_single_healthy_chain_output_is_unchanged(catalog, store):
+    """§2.5 golden: one healthy chain must render byte-for-byte today's format."""
+    for eid, name, type_ in (("repo:a", "a", "repo"), ("repo:b", "b", "repo"),
+                             ("package:x", "X", "package"), ("ticket:t-1", "T-1", "ticket")):
+        catalog.upsert_entity(eid, name, type_)
+    catalog.replace_doc_edges("d1", [("repo:a", "depends_on", "package:x", "")])
+    catalog.replace_doc_edges("d2", [("repo:b", "provides", "package:x", "")])
+    catalog.replace_doc_edges("d3", [("repo:b", "references", "ticket:t-1", "")])
+
+    out = _tools(store, catalog)["graph_path"].run(a="a", b="T-1")
+    assert out == (
+        "Path from a to T-1 (3 hop(s)):\n"
+        "1. a --depends_on--> X [evidence: d1]\n"
+        "2. b --provides--> X [evidence: d2]\n"
+        "3. b --references--> T-1 [evidence: d3]\n"
+        "Cite the evidence documents for each hop you rely on."
+    )
+
+
+def test_graph_path_tool_flags_two_materially_different_chains(catalog, store):
+    _seed_ambiguous_shape(catalog)
+    out = _tools(store, catalog)["graph_path"].run(a="Connector", b="Nautical")
+    assert "2 distinct recorded connections exist between Connector and Nautical" in out
+    assert "Chain 1 (1 hop(s)):" in out and "Chain 2 (2 hop(s)):" in out
+    assert "Jan 6, 2026" in out and "Connector/AGENTS.md" in out
+    assert "do NOT present only one as the answer" in out
+
+
 def test_graph_neighbors_tool_formats_relationships(tmp_path, workspace, catalog, store):
     _write(tmp_path / "a", "src/Api/Api.csproj", CSPROJ_A)
     connector = FilesConnector(name="proj-a", options={"path": str(tmp_path / "a")},
