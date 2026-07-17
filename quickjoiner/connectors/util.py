@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 import httpx
@@ -33,6 +34,32 @@ def resolve_secret(options: dict[str, Any], key: str, env_var: str | None = None
     return None
 
 
+# Transient failures worth retrying, so a single network blip / gateway hiccup during a
+# long multi-thousand-call sync doesn't kill the whole run (as a WinError 10060 timeout
+# did to a 3.3-hour TFS sync). Network errors (connect/read timeouts, resets) + 429/5xx.
+_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+_MAX_ATTEMPTS = 4
+_BACKOFF_BASE = 1.0  # seconds; exponential: 1, 2, 4
+
+
+def _request_with_retry(method: str, url: str, **kwargs: Any) -> Any:
+    for attempt in range(_MAX_ATTEMPTS):
+        last = attempt == _MAX_ATTEMPTS - 1
+        try:
+            resp = httpx.request(method, url, **kwargs)
+        except httpx.TransportError:  # timeouts, connection resets, DNS, etc.
+            if last:
+                raise
+            time.sleep(_BACKOFF_BASE * (2 ** attempt))
+            continue
+        if resp.status_code in _RETRY_STATUSES and not last:
+            time.sleep(_BACKOFF_BASE * (2 ** attempt))
+            continue
+        resp.raise_for_status()
+        return resp.json()
+    raise RuntimeError("unreachable")  # loop always returns or raises
+
+
 def get_json(
     url: str,
     headers: dict[str, str] | None = None,
@@ -41,12 +68,10 @@ def get_json(
     timeout: float = 60.0,
     verify: bool = True,
 ) -> Any:
-    resp = httpx.get(
-        url, headers=headers, params=params, auth=auth, timeout=timeout,
+    return _request_with_retry(
+        "GET", url, headers=headers, params=params, auth=auth, timeout=timeout,
         follow_redirects=True, verify=verify,
     )
-    resp.raise_for_status()
-    return resp.json()
 
 
 def post_json(
@@ -58,8 +83,7 @@ def post_json(
     timeout: float = 60.0,
     verify: bool = True,
 ) -> Any:
-    resp = httpx.post(
-        url, json=body, headers=headers, params=params, auth=auth, timeout=timeout, verify=verify,
+    return _request_with_retry(
+        "POST", url, json=body, headers=headers, params=params, auth=auth,
+        timeout=timeout, verify=verify,
     )
-    resp.raise_for_status()
-    return resp.json()

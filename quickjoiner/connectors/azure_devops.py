@@ -210,6 +210,35 @@ class AzureDevOpsConnector(Connector):
         api, verify = self._api(), self._verify()
         sprints = int(self.options.get("sprints") or DEFAULT_SPRINTS)
 
+        # -- Build pipelines -> repositories (TFS↔GitLab bridge) --------------
+        # Emitted FIRST: this is cheap (a couple of calls) but carries the high-value
+        # cross-source graph (pipeline→builds→repo + branch-aware builds), so a failure
+        # later in the long, fragile work-item phase can't cost us the bridge. Wrapped so
+        # a build-API hiccup degrades to "no build docs" rather than aborting the sync.
+        try:
+            definitions = get_json(
+                f"{org_url}/{project}/_apis/build/definitions?{api}",
+                headers=headers, params={"includeAllProperties": "true", "$top": 2000}, verify=verify,
+            ).get("value", [])
+            if definitions:
+                yield build_map_document(org_url, project, definitions)
+        except Exception:
+            pass
+
+        # -- Recent build results (with source branch, via the Build API) ------
+        try:
+            builds = get_json(
+                f"{org_url}/{project}/_apis/build/builds?{api}",
+                headers=headers,
+                # queueTime (not finishTime) so never-started builds don't sort to the top
+                params={"$top": 200, "queryOrder": "queueTimeDescending"},
+                verify=verify,
+            ).get("value", [])
+            if builds:
+                yield builds_document(org_url, project, builds)
+        except Exception:
+            pass
+
         # -- Boards work items, by team over the last N sprints ---------------
         # A 300k-item project is far too large to pull flat; instead we walk each
         # team's most recent sprints and ingest the work items planned into them.
@@ -256,25 +285,6 @@ class AzureDevOpsConnector(Connector):
                     total += 1
             if total >= MAX_WORK_ITEMS:
                 break
-
-        # -- Build pipelines -> repositories (TFS↔GitLab bridge) --------------
-        definitions = get_json(
-            f"{org_url}/{project}/_apis/build/definitions?{api}",
-            headers=headers, params={"includeAllProperties": "true", "$top": 2000}, verify=verify,
-        ).get("value", [])
-        if definitions:
-            yield build_map_document(org_url, project, definitions)
-
-        # -- Recent build results (with source branch, via the Build API) ------
-        builds = get_json(
-            f"{org_url}/{project}/_apis/build/builds?{api}",
-            headers=headers,
-            # queueTime (not finishTime) so never-started builds don't sort to the top
-            params={"$top": 200, "queryOrder": "queueTimeDescending"},
-            verify=verify,
-        ).get("value", [])
-        if builds:
-            yield builds_document(org_url, project, builds)
 
     def tools(self) -> list[AgentTool]:
         org_url, project, headers = self._org_url(), self._project(), self._headers()

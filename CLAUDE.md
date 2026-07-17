@@ -180,7 +180,12 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   TLS verification for internal-CA/self-signed certs (threaded through `util.get_json`/`post_json`
   as `verify`); `api_version` is configurable (default 7.0 — Server 2022→7.x, 2020→6.0, 2019→5.0).
   Auth is unchanged: a PAT via Basic auth works for SaaS and Server 2017+ alike. `util.as_bool`
-  coerces string form values (shared with `octopus`).
+  coerces string form values (shared with `octopus`). **`util.get_json`/`post_json` retry transient
+  failures** (network timeouts/resets + 429/5xx, exp. backoff, `_MAX_ATTEMPTS=4`) — a single
+  `WinError 10060` blip once killed a 3.3-hour TFS sync, so all connectors now ride out gateway
+  hiccups. The **build-map + branch-builds are emitted FIRST** in `sync()` (before the long, fragile
+  work-item phase and wrapped in try/except) so the cheap, high-value cross-source graph always lands
+  even if the work-item pull later fails.
   **Work items are ingested by team over recent sprints, not flat** — a real project is far too
   large to pull whole (AppRiver's has 304k work items). `sync` enumerates the project's teams
   (`teams` option restricts to a named subset; empty = all, paginated), and for each team ingests
