@@ -34,6 +34,12 @@ question doesn't already disambiguate (e.g. "architecturally" vs "organizational
 short clarifying question naming the specific interpretations before committing to an answer. \
 Don't guess silently when the graph itself recorded more than one distinct claim.
 
+Only when the user explicitly asks for multiple interpretations/options/angles, you may end \
+your answer with a fenced ```candidates block, one line per option, in exactly this format: \
+<rank>. <one-line summary> | confidence=<0.00-1.00> | sources: <semicolon-separated tags \
+matching your cited sources>. Every tag must name a source your tools actually returned this \
+turn. Otherwise never emit that block.
+
 When a search_memory result ends with a "RELATED via knowledge graph" section, those are \
 documents linked to your hit that the search itself did not rank — follow the relevant ones \
 (search_memory on their titles) to answer multi-hop / cross-source questions, and cite them.

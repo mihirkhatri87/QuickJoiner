@@ -44,8 +44,13 @@ class AppContext:
         from quickjoiner.agent.ops import build_ops_tools
 
         provider = self.build_provider(provider_override, model_override)
+        # Per-agent (= per chat request) score ledger: graph tools record the chain
+        # confidences they compute; candidate answers read displayed confidence from
+        # it — server-side numbers only (plan 06 §C).
+        ledger: dict[str, float] = {}
         tools = build_builtin_tools(
-            self.store, self.catalog, self.pipeline, self.config.retrieval, self.config.gaps
+            self.store, self.catalog, self.pipeline, self.config.retrieval, self.config.gaps,
+            score_ledger=ledger,
         )
         tools.extend(build_ops_tools(self))
         tools.extend(self.connector_tools(sources))
@@ -53,6 +58,7 @@ class AppContext:
         return OnboardingAgent(
             provider, tools, system,
             tool_result_max_chars=self.config.chat.live_tool_result_max_chars,
+            score_ledger=ledger,
         )
 
     def connector_tools(self, sources: list | None = None):

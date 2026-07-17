@@ -263,7 +263,9 @@ than get one clarifying question:
 - Structured output convention, parsed with exactly `ingest/triples.py::parse_triples`'s
   strictness (anchored bounded regex, off-format dropped silently, capped, never raises,
   never repairs) — a fenced ` ```candidates ` block, one line per candidate:
-  `<rank>. <one-line summary> | confidence=<0.00-1.00> | sources: <comma-separated tags>`.
+  `<rank>. <one-line summary> | confidence=<0.00-1.00> | sources: <semicolon-separated tags>`
+  (semicolons, not commas — evidence titles routinely contain commas, e.g. "Jan 6, 2026";
+  found by the Phase C tests during implementation).
   New `quickjoiner/agent/candidates.py` (pure, no I/O): `Candidate` dataclass +
   `parse_candidates(text) -> tuple[str, list[Candidate]]` (prose-with-block-removed,
   parsed candidates) + `known_refs(messages) -> set[str]` + `filter_resolvable(...)`.

@@ -167,11 +167,21 @@ export interface GapsResponse {
   clusters: GapCluster[];
 }
 
+/** One validated multi-angle candidate answer (plan 06 §C). `confidence` is
+ * server-computed from evidence shape + corroboration — null means "unscored". */
+export interface CandidateItem {
+  rank: number;
+  summary: string;
+  confidence: number | null;
+  sources: string[];
+}
+
 /** Streaming events the /api/chat SSE emits. */
 export type ChatEvent =
   | { type: "thinking"; data: string }
   | { type: "delta"; data: string }
   | { type: "tool_call"; data: string }
+  | { type: "candidates"; data: string }
   | { type: "answer"; data: string; session_id: string }
   | { type: "error"; data: string }
   | { type: "done" };

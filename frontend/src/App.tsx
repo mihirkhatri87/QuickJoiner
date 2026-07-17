@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, streamChat } from "./api";
-import type { GapsResponse, ProjectRow, SessionRow, SourceRow, Status } from "./types";
+import type { CandidateItem, GapsResponse, ProjectRow, SessionRow, SourceRow, Status } from "./types";
 import { buildCommands, startConnectFlow, type CommandCtx, type Flow } from "./commands";
 import { ArtifactModal, type Artifact } from "./components/ArtifactModal";
 import { Chat, type Msg } from "./components/Chat";
@@ -201,7 +201,14 @@ export default function App() {
         if (e.type === "thinking") patch((m) => ({ ...m, thinking: (m.thinking || "") + e.data }));
         else if (e.type === "tool_call") patch((m) => ({ ...m, tools: [...(m.tools || []), e.data] }));
         else if (e.type === "delta") patch((m) => ({ ...m, streamText: (m.streamText || "") + e.data }));
-        else if (e.type === "answer") {
+        else if (e.type === "candidates") {
+          try {
+            const items = JSON.parse(e.data) as CandidateItem[];
+            patch((m) => ({ ...m, candidates: items }));
+          } catch {
+            /* malformed payload: ignore, the prose answer still renders */
+          }
+        } else if (e.type === "answer") {
           setSessionId(e.session_id);
           patch((m) => ({ ...m, answer: e.data, streaming: false, streamText: undefined }));
         } else if (e.type === "error")

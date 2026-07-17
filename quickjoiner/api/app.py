@@ -749,7 +749,10 @@ def create_app(workspace: Path) -> FastAPI:
 
     @api.post("/api/chat")
     def chat(req: ChatRequest, authorization: str | None = Header(default=None)):
-        """SSE stream: {type: thinking|delta|tool_call|answer|error|done, data: ...} events."""
+        """SSE stream: {type: thinking|delta|tool_call|candidates|answer|error|done, data: ...}
+        events. `candidates` (plan 06 §C) carries a JSON list of validated multi-angle
+        candidate answers, emitted before `answer` when the model produced a valid
+        ```candidates block; confidence values in it are server-computed."""
         events: queue.Queue = queue.Queue()
         user = _user(authorization)
 

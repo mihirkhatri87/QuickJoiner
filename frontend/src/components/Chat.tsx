@@ -1,8 +1,10 @@
 import { Check, CircleAlert, Download, Loader2, Quote, ScrollText, ThumbsDown, ThumbsUp, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { api } from "../api";
+import type { CandidateItem } from "../types";
 import type { Artifact } from "./ArtifactModal";
-import { CiteBook, renderMarkdown } from "./markdown";
+import { CandidateCarousel, type CandidateCard } from "./CandidateCarousel";
+import { CiteBook, renderInline, renderMarkdown } from "./markdown";
 import { cn } from "./ui";
 
 export interface Msg {
@@ -10,6 +12,7 @@ export interface Msg {
   role: "user" | "agent" | "error";
   text?: string; // user bubble / error / plain agent note
   answer?: string; // final grounded answer (markdown + [citations])
+  candidates?: CandidateItem[]; // validated multi-angle options (plan 06 §C)
   artifact?: Artifact; // generated document (e.g. scrape report) viewable in the modal
   streaming?: boolean;
   streamText?: string; // live delta accumulation before the final answer arrives
@@ -217,11 +220,13 @@ function MessageActions({
 
 function AnswerBody({
   text,
+  candidates,
   reaction,
   onReact,
   onViewSources,
 }: {
   text: string;
+  candidates?: CandidateItem[];
   reaction?: Reaction;
   onReact: (r: Reaction) => void;
   onViewSources: (refs: string[]) => void;
@@ -229,6 +234,15 @@ function AnswerBody({
   const refused = REFUSAL.test(text.slice(0, 140));
   const book = new CiteBook();
   const blocks = renderMarkdown(text, book, { mermaid: true });
+  // Candidate cards render against the SAME book, eagerly — before refs is read —
+  // so their citation chips continue the answer's numbering and land in the same
+  // sources modal (never a second citation renderer).
+  const cards: CandidateCard[] = (candidates ?? []).map((c, i) => ({
+    rank: c.rank,
+    confidence: c.confidence,
+    summaryNodes: renderInline(c.summary, book, `cand${i}`),
+    sourceNodes: renderInline(c.sources.map((s) => `[${s}]`).join(" "), book, `candsrc${i}`),
+  }));
   const refs = book.refs;
 
   return (
@@ -247,6 +261,7 @@ function AnswerBody({
         {refused ? "Not learned yet" : refs.length ? `Grounded · ${refs.length} source${refs.length > 1 ? "s" : ""}` : "Grounded"}
       </button>
       <div className="break-words text-[15.5px] leading-[1.75]">{blocks}</div>
+      {cards.length > 0 && <CandidateCarousel cards={cards} />}
       {!refused && (
         <MessageActions
           text={text}
@@ -332,7 +347,7 @@ function Message({
         </div>
       )}
       {m.answer != null ? (
-        <AnswerBody text={m.answer} reaction={reaction} onReact={onReact} onViewSources={onViewSources} />
+        <AnswerBody text={m.answer} candidates={m.candidates} reaction={reaction} onReact={onReact} onViewSources={onViewSources} />
       ) : m.text != null ? (
         // plain agent note (wizard prompts, confirmations) — no grounding stamp
         <div className="text-[15px] leading-[1.75] text-ink">{renderMarkdown(m.text, new CiteBook())}</div>

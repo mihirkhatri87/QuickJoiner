@@ -14,7 +14,7 @@ import quickjoiner.app as app_module
 from quickjoiner.api.app import create_app
 from quickjoiner.api.hooks import verify_signature
 from quickjoiner.app import AppContext, build_context
-from quickjoiner.llm.base import ChatResult, ToolCall
+from quickjoiner.llm.base import AgentTool, ChatResult, ToolCall, ToolSpec
 
 from tests.conftest import FakeEmbedder
 from tests.test_agent_loop import ScriptedProvider, _echo_tool
@@ -419,6 +419,40 @@ def test_chat_streams_tool_calls_and_answer(client, monkeypatch):
     answer = next(e for e in events if e["type"] == "answer")
     assert answer["data"] == "grounded answer"
     assert answer["session_id"]  # returned so the client can continue the session
+
+
+def test_chat_forwards_candidates_event(client, monkeypatch):
+    """The chat SSE stream forwards a `candidates` event verbatim, between the
+    streamed deltas and the final answer (plan 06 §C — no endpoint logic change,
+    the forwarding lambda ships arbitrary event types)."""
+    block_answer = (
+        "Two readings exist.\n\n```candidates\n"
+        "1. Weekly cadence | confidence=0.80 | sources: EchoDoc\n```"
+    )
+
+    def fake_build_agent(self, provider_override=None, model_override=None, extra_system=None, sources=None):
+        from quickjoiner.agent.agent import OnboardingAgent
+
+        provider = ScriptedProvider([
+            ChatResult(text="", tool_calls=[ToolCall(id="c1", name="echo", input={})]),
+            ChatResult(text=block_answer),
+        ])
+        tool = AgentTool(
+            spec=ToolSpec(name="echo", description="d", input_schema={"type": "object", "properties": {}}),
+            fn=lambda **kw: "[source: EchoDoc | uri: file://e.md | kind: doc | score: 0.9]\ntext",
+        )
+        return OnboardingAgent(provider, [tool], system="sys", score_ledger={"echodoc": 0.45})
+
+    monkeypatch.setattr(AppContext, "build_agent", fake_build_agent)
+
+    events = sse_events(client.post("/api/chat", json={"message": "options?"}).text)
+    types = [e["type"] for e in events]
+    assert types == ["tool_call", "delta", "candidates", "answer", "done"]
+    cands = json.loads(next(e for e in events if e["type"] == "candidates")["data"])
+    assert cands == [{"rank": 1, "summary": "Weekly cadence", "confidence": 0.45,
+                      "sources": ["EchoDoc"]}]
+    answer = next(e for e in events if e["type"] == "answer")["data"]
+    assert "```candidates" not in answer  # the rendered answer is the stripped prose
 
 
 def test_chat_reuses_session_history(client, monkeypatch):
