@@ -495,6 +495,21 @@ class _SqlCatalog:
             (entity_id, entity_id),
         )
 
+    def edge_corroboration(self, src: str, rel: str, dst: str) -> dict:
+        """How many distinct evidence docs, and distinct sources, assert one exact
+        edge — the corroboration inputs to plan 06's score_edge. No new storage:
+        the (src, rel, dst, evidence_doc_id) PK already keeps one row per
+        corroborating document."""
+        row = self._read_one(
+            """SELECT COUNT(DISTINCT g.evidence_doc_id) AS doc_count,
+                      COUNT(DISTINCT d.source_id) AS source_count
+               FROM edges g LEFT JOIN documents d ON d.doc_id = g.evidence_doc_id
+               WHERE g.src = ? AND g.rel = ? AND g.dst = ? AND g.evidence_doc_id <> ''""",
+            (src, rel, dst),
+        )
+        return {"doc_count": (row or {}).get("doc_count") or 0,
+                "source_count": (row or {}).get("source_count") or 0}
+
     def entity_evidence(self, entity_id: str, limit: int = 3) -> list[dict]:
         """Titles/kinds of the evidence docs behind edges touching this entity —
         the context the entity-resolution adjudicator judges merges from

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 
+from quickjoiner.agent.confidence import classify_evidence, score_chain, score_edge
 from quickjoiner.config import GapsConfig, RetrievalConfig
 from quickjoiner.connectors.base import Document
 from quickjoiner.ingest.pipeline import IngestPipeline
@@ -41,6 +42,7 @@ def build_builtin_tools(
     pipeline: IngestPipeline,
     retrieval: RetrievalConfig,
     gaps: GapsConfig | None = None,
+    score_ledger: dict[str, float] | None = None,
 ) -> list[AgentTool]:
     def _capture_gap(query: str) -> None:
         """Log a refusal as a knowledge gap. Fire-and-forget: any failure here must
@@ -141,12 +143,24 @@ def build_builtin_tools(
     _NEIGHBORS_FULL_LIST_MAX = 60
     _NEIGHBORS_SAMPLE_PER_REL = 8
 
-    def _format_edge(r) -> str:
+    def _evidence_class(r) -> str:
+        return classify_evidence(r["evidence_title"] or "", r["evidence_uri"] or "",
+                                 r["evidence_kind"] or "")
+
+    def _hop_score(r) -> float:
+        """Server-side confidence for one edge row: evidence shape + corroboration."""
+        c = catalog.edge_corroboration(r["src"], r["rel"], r["dst"])
+        return score_edge(_evidence_class(r), c["doc_count"], c["source_count"])
+
+    def _format_edge(r, flag_weak: bool = False) -> str:
         src = r["src_name"] or r["src"]
         dst = r["dst_name"] or r["dst"]
         detail = f" ({r['detail']})" if r["detail"] else ""
         evidence = r["evidence_title"] or r["evidence_uri"] or r["evidence_doc_id"]
-        return f"- {src} --{r['rel']}--> {dst}{detail} [evidence: {evidence}]"
+        suffix = ""
+        if flag_weak and _evidence_class(r) == "meeting-notes":
+            suffix = " (low-confidence: meeting-notes evidence)"
+        return f"- {src} --{r['rel']}--> {dst}{detail} [evidence: {evidence}]{suffix}"
 
     def graph_neighbors(entity: str) -> str:
         ent = catalog.resolve_entity(entity)
@@ -162,7 +176,9 @@ def build_builtin_tools(
 
         if len(rows) <= _NEIGHBORS_FULL_LIST_MAX:
             lines = [f"{ent['name']} ({ent['type']}) — {len(rows)} relationship(s):"]
-            lines.extend(_format_edge(r) for r in rows)
+            # flag_weak only on the full list: the hub branch stays cheap (no
+            # corroboration queries there either — the flag is classification-only).
+            lines.extend(_format_edge(r, flag_weak=True) for r in rows)
         else:
             by_rel: dict[str, list] = {}
             for r in rows:
@@ -214,10 +230,34 @@ def build_builtin_tools(
             return (f"NO_PATH: no recorded chain between {ent_a['name']} and {ent_b['name']} "
                     f"within {max_hops} hops.{retry_hint} That may only mean the link isn't "
                     "learned yet — try search_memory before concluding they are unrelated.")
+        def _weak_hop_caveats(chain, hop_scores) -> list[str]:
+            out = []
+            for i, (r, s) in enumerate(zip(chain, hop_scores), 1):
+                if s < 0.40:
+                    evidence = r["evidence_title"] or r["evidence_uri"] or r["evidence_doc_id"]
+                    out.append(f'   hop {i} is low-confidence ({s:.2f}): sourced only from '
+                               f'informal meeting notes ("{evidence}") — corroborate before '
+                               "relying on it.")
+            return out
+
+        def _record_ledger(chain, chain_score) -> None:
+            """Per-request score ledger (plan 06 §C): remember the confidence computed
+            for each evidence ref this turn, keyed the way the tool prints it, so a
+            later candidates block can carry server-side numbers — never the LLM's."""
+            if score_ledger is None:
+                return
+            for r in chain:
+                ref = str(r["evidence_title"] or r["evidence_uri"] or r["evidence_doc_id"])
+                key = ref.strip().lower()
+                score_ledger[key] = max(score_ledger.get(key, 0.0), chain_score)
+
         if len(chains) == 1:
             path = chains[0]
+            hop_scores = [_hop_score(r) for r in path]
+            _record_ledger(path, score_chain(hop_scores))
             lines = [f"Path from {ent_a['name']} to {ent_b['name']} ({len(path)} hop(s)):"]
             lines.extend(_format_hop(i, r) for i, r in enumerate(path, 1))
+            lines.extend(_weak_hop_caveats(path, hop_scores))  # empty when healthy: golden-safe
             lines.append("Cite the evidence documents for each hop you rely on.")
             return "\n".join(lines)
         # Multiple materially different recorded connections (different intermediates,
@@ -226,13 +266,17 @@ def build_builtin_tools(
         lines = [f"{len(chains)} distinct recorded connections exist between "
                  f"{ent_a['name']} and {ent_b['name']}:"]
         for k, chain in enumerate(chains, 1):
-            lines.append(f"\nChain {k} ({len(chain)} hop(s)):")
+            hop_scores = [_hop_score(r) for r in chain]
+            chain_score = score_chain(hop_scores)
+            _record_ledger(chain, chain_score)
+            lines.append(f"\nChain {k} ({len(chain)} hop(s), confidence {chain_score:.2f}):")
             lines.extend(_format_hop(i, r) for i, r in enumerate(chain, 1))
+            lines.extend(_weak_hop_caveats(chain, hop_scores))
         lines.append(
             "\nThese chains are materially different (different intermediates / relations / "
-            "evidence). State both with their evidence, or ask ONE short clarifying question "
-            "about which the user means — do NOT present only one as the answer. "
-            "Cite the evidence documents for each hop you rely on."
+            "evidence). State both with their evidence and their confidence, or ask ONE short "
+            "clarifying question about which the user means — do NOT present only one as the "
+            "answer. Cite the evidence documents for each hop you rely on."
         )
         return "\n".join(lines)
 

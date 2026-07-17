@@ -414,9 +414,48 @@ def test_graph_path_tool_flags_two_materially_different_chains(catalog, store):
     _seed_ambiguous_shape(catalog)
     out = _tools(store, catalog)["graph_path"].run(a="Connector", b="Nautical")
     assert "2 distinct recorded connections exist between Connector and Nautical" in out
-    assert "Chain 1 (1 hop(s)):" in out and "Chain 2 (2 hop(s)):" in out
+    assert "Chain 1 (1 hop(s)" in out and "Chain 2 (2 hop(s)" in out
     assert "Jan 6, 2026" in out and "Connector/AGENTS.md" in out
     assert "do NOT present only one as the answer" in out
+
+
+def test_edge_corroboration_counts_docs_and_sources(catalog):
+    """One edge asserted by 3 docs across 2 sources: doc_count=3, source_count=2."""
+    catalog.upsert_entity("service:a", "A", "service")
+    catalog.upsert_entity("service:b", "B", "service")
+    for doc_id, src in (("c1", "git:repo"), ("c2", "git:repo"), ("c3", "confluence:wiki")):
+        catalog.upsert_document(doc_id, src, f"u-{doc_id}", f"Doc {doc_id}", "doc", "h", None, 1)
+        catalog.replace_doc_edges(doc_id, [("service:a", "depends_on", "service:b", "")])
+    assert catalog.edge_corroboration("service:a", "depends_on", "service:b") == {
+        "doc_count": 3, "source_count": 2}
+    assert catalog.edge_corroboration("service:a", "depends_on", "service:zzz") == {
+        "doc_count": 0, "source_count": 0}
+
+
+def test_graph_path_tool_annotates_chain_confidence_and_weak_hops(catalog, store):
+    """§0 fixture: the meeting-notes chain carries its low score + caveat; the
+    AGENTS.md chain scores higher — the ordering is stated, not implied."""
+    _seed_ambiguous_shape(catalog)
+    ledger: dict[str, float] = {}
+    pipe = IngestPipeline(store, catalog)
+    tools = {t.spec.name: t for t in build_builtin_tools(
+        store, catalog, pipe, RetrievalConfig(), score_ledger=ledger)}
+    out = tools["graph_path"].run(a="Connector", b="Nautical")
+    assert "Chain 1 (1 hop(s), confidence 0.25):" in out
+    assert "Chain 2 (2 hop(s), confidence 0.55):" in out
+    assert 'low-confidence (0.25): sourced only from informal meeting notes ("Jan 6, 2026")' in out
+    # score ledger (Phase C prep): server-side numbers recorded per evidence ref
+    assert ledger["jan 6, 2026"] == 0.25
+    assert ledger["connector/agents.md"] == 0.55
+
+
+def test_graph_neighbors_flags_meeting_notes_edges(catalog, store):
+    _seed_ambiguous_shape(catalog)
+    out = _graph_tool(store, catalog).run(entity="Connector")
+    assert "(low-confidence: meeting-notes evidence)" in out
+    # only the meeting-notes edge is flagged, not the AGENTS.md one
+    agents_line = next(l for l in out.splitlines() if "Stevedore" in l and "Connector " in l)
+    assert "low-confidence" not in agents_line
 
 
 def test_graph_neighbors_tool_formats_relationships(tmp_path, workspace, catalog, store):

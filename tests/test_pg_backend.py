@@ -133,6 +133,10 @@ def test_pg_knowledge_graph_roundtrip(pg):
     ev = catalog.entity_evidence("repo:a")
     assert ev == [{"title": "Dep map", "kind": "doc"}]
 
+    # edge_corroboration parity (plan 06 §B)
+    assert catalog.edge_corroboration("repo:a", "depends_on", "package:x.y.z") == {
+        "doc_count": 1, "source_count": 1}
+
     catalog.replace_doc_edges("d9", [("repo:a", "depends_on", "package:x.y.z", "2.0")])
     assert catalog.graph_neighbors("package:x.y.z")[0]["detail"] == "2.0"  # replaced, not duped
     catalog.delete_document("d9")

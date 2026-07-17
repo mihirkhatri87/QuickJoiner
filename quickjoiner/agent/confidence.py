@@ -52,3 +52,31 @@ def classify_evidence(title: str, uri: str, kind: str) -> str:
     if _AUTHORED_BASENAME.match(basename):
         return "authored-doc"
     return "generic"
+
+
+# Base confidence by evidence shape. Weights are heuristic and deliberately live in
+# this one table (with exact-value tests) so retuning after plan 05's eval runbook is
+# a one-line diff. Rationale: a deterministic manifest-derived dependency map is the
+# strongest claim; a deliberately authored architecture doc close behind; ordinary
+# prose in the middle; an informal meeting-notes/journal page weakest — real, but
+# never authoritative on its own (the "Jan 6, 2026" lesson).
+_BASE = {"dependency-map": 0.60, "authored-doc": 0.55, "generic": 0.45, "meeting-notes": 0.25}
+
+
+def score_edge(evidence_class: str, doc_corroboration: int, source_corroboration: int) -> float:
+    """Deterministic confidence for one edge, in [0.05, 0.95].
+
+    doc_corroboration = distinct evidence docs asserting this exact edge
+    (+0.075 per extra doc, capped at +0.15 for >=3); source_corroboration =
+    distinct *sources* those docs came from (+0.20 once >=2 agree — code and wiki
+    agreeing means more than two wiki pages). Never 0 or 1: heuristic, not proof.
+    Hop count contributes nothing — that is plan 06's entire lesson."""
+    s = _BASE.get(evidence_class, 0.45)
+    s += 0.15 * (min(max(doc_corroboration, 1), 3) - 1) / 2
+    s += 0.20 * min(max(source_corroboration, 1) - 1, 1)
+    return round(min(max(s, 0.05), 0.95), 2)
+
+
+def score_chain(hop_scores: list[float]) -> float:
+    """A chain is only as trustworthy as its weakest hop."""
+    return min(hop_scores)
