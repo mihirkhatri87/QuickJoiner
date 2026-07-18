@@ -6,9 +6,10 @@ non-coverage dimensions that actually catch bugs (property, parity, mutation, E2
 
 ## 1. Current state (measured honestly)
 
-- **Backend**: 185 tests green (178 local + pg parity suite runs against Docker), but
-  coverage is *unmeasured* — no `pytest-cov` gate. Strong areas: connectors' pure
-  converters, retrieval, graph, API contracts, sessions. Known thin areas listed in §3.
+- **Backend**: ~399 tests green (local + a pg parity suite, env-gated, that runs against
+  Docker), but coverage is *unmeasured* — no `pytest-cov` gate. Strong areas: connectors' pure
+  converters, retrieval, graph, API contracts, sessions, evals (incl. threshold calibration +
+  report comparison), alias query expansion. Known thin areas listed in §3.
 - **Frontend**: **zero automated tests.** TypeScript + one live browser pass is the net.
 - **E2E**: manual browser verification only (it caught the pan crash — proof this layer pays).
 
@@ -46,7 +47,8 @@ non-coverage dimensions that actually catch bugs (property, parity, mutation, E2
 | `connectors/*` live tools | tool fn bodies | each `tools()` fn with MockTransport: JQL/WIQL/code-search request shape + result formatting + HTTP error → readable message |
 | `export.py` | pptx/csv branches | golden files per format; csv from markdown tables; pptx slide count/titles |
 | `memory/embedder.py` | ollama embedder | MockTransport: batch request, dim probe caching |
-| `evals/harness.py` | agent layer branches | refusal-marker matching table; report JSON schema; threshold sweep output |
+| `evals/harness.py` | ✅ agent-layer branches, calibration + comparison covered (`test_evals.py`): calibrate clean-separation, monotone curve, plateau-midpoint (not edge), floor-unreachable, thin-set flag, apply round-trip; `compare_reports` regression/tolerance/direction; remaining: report JSON schema snapshot |
+| `memory/expansion.py` | ✅ covered (`test_expansion.py`): window lookup incl. 4-token, longest-window-first, stopword-only skip, cap, no-double-append, end-to-end retrieval lift on FakeEmbedder store, `search_memory`/config wiring; remaining: `/api/search` wiring assertion |
 | `ingest/pipeline.py` | error accumulation | doc that raises mid-iteration → stats.errors, rest ingested; ensure_ann_index absent on store (PG) is a no-op |
 | `auth.py` | token lifecycle edges | logout unknown token; open-mode → first user flips enabled; PBKDF2 verify negative |
 

@@ -1,5 +1,18 @@
 # Plan 02 — Retrieval Quality Pack (AI_ARCHITECTURE Tier 1: #1 contextual chunks, #3 calibration, #4 alias expansion)
 
+> **STATUS: ✅ COMPLETE (A shipped 2026-07-13; B + C shipped 2026-07-17).**
+> **A. Contextual chunking** — `pipeline.breadcrumb()` + `retrieval.contextual_chunks`, on by
+> default (the shipped mechanism prepends the breadcrumb to the embedded text rather than the
+> plan's dual-column `index_text` design; the effect, context-enriched embeddings, is delivered).
+> **B. Threshold calibration** — `evals/harness.calibrate` + `qj eval --calibrate/--apply/--compare`;
+> recommends the **max-margin midpoint** of the optimal band (a refinement over the plan's
+> tie-break-toward-higher, which over-jumped on thin sets), flags thin eval sets, and `--compare`
+> is a non-zero-exit CI regression gate. **C. Alias query expansion** — `memory/expansion.py`
+> `expand_query`, `retrieval.alias_expansion`, wired into `search_memory` + `/api/search`; reuses
+> the existing `catalog.resolve_entity` (no redundant `alias_entity` method was added), 1–4-token
+> windows to match real org alias shapes. Tests: `test_expansion.py` + calibrate/compare in
+> `test_evals.py`; live-verified on the AppRiver graph. See [STATUS.md](STATUS.md).
+
 Effort: ~5 dev-days · Dependencies: none · Gate: every change proves itself on `qj eval`
 
 ## 1. Design

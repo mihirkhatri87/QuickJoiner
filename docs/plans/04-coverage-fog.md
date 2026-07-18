@@ -1,5 +1,10 @@
 # Plan 04 — Coverage Fog & One-Click Remediation (PRD W10.1 + W2.3, first Orrery slice)
 
+> **STATUS: ⬜ NOT STARTED.** Its dependency (Plan 01 gaps data) is ✅ ready. Nothing built yet:
+> no `coverage.py` / `/api/coverage`, no `frontend/src/fog.ts`, no GraphView fog layer, and
+> **Phase 0's frontend test harness (Vitest/RTL/MSW) does not exist** — the repo still has zero
+> FE unit tests. See [STATUS.md](STATUS.md).
+
 Effort: ~4–5 dev-days (incl. FE test harness) · Dependencies: **Plan 01 (gaps data)**
 Design source: `docs/design/DESIGN_VISION.md` + `orrery-prototype.html` (port its visual
 grammar: dashed frontier, UNCHARTED label, violet heat, "territory lit" instrument).

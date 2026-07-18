@@ -664,12 +664,28 @@ def eval_cmd(
     evalset: Path = typer.Argument(..., help="Path to a YAML eval set (create one with --init)"),
     init: bool = typer.Option(False, "--init", help="Write a starter eval set to the given path and exit"),
     agent: bool = typer.Option(False, "--agent", help="Also run the end-to-end agent layer (needs an LLM)"),
+    calibrate: bool = typer.Option(
+        False, "--calibrate",
+        help="Sweep the grounding threshold and report the value that best separates "
+             "grounded answers from refusals on this set",
+    ),
+    apply: bool = typer.Option(
+        False, "--apply",
+        help="With --calibrate, write the recommended threshold to retrieval.min_score",
+    ),
+    compare: Optional[Path] = typer.Option(
+        None, "--compare",
+        help="Diff this run's summary against a previous report JSON; exits non-zero on "
+             "a >2-point regression of any watched metric",
+    ),
     provider: Optional[str] = PROVIDER_OPT,
     model: Optional[str] = MODEL_OPT,
     workspace: Optional[Path] = WORKSPACE_OPT,
 ):
     """Evaluate grounding quality: retrieval metrics always; agent behavior with --agent."""
-    from quickjoiner.evals.harness import TEMPLATE, run_eval
+    import json as _json
+
+    from quickjoiner.evals.harness import TEMPLATE, compare_reports, run_eval
 
     if init:
         if evalset.exists():
@@ -680,12 +696,17 @@ def eval_cmd(
         console.print(f"[green]Starter eval set written:[/green] {evalset} — edit it, then run: qj eval {evalset}")
         return
 
+    if apply and not calibrate:
+        console.print("[red]--apply requires --calibrate.[/red]")
+        raise typer.Exit(1)
+
     ctx = _context(workspace)
     try:
         with console.status("Running evals..."):
             report = run_eval(
                 ctx, evalset, agent_layer=agent,
                 provider_override=provider, model_override=model,
+                calibrate_threshold=calibrate,
             )
     except (ValueError, FileNotFoundError) as exc:
         console.print(f"[red]{exc}[/red]")
@@ -726,6 +747,85 @@ def eval_cmd(
         console.print(atable)
         console.print(f"Summary: {report['agent']['summary']}")
     console.print(f"[green]Report saved:[/green] {report['report_path']}")
+
+    if calibrate and "calibration" in report:
+        cal = report["calibration"]
+        ctable = Table(title="Threshold calibration")
+        ctable.add_column("recommended", justify="right")
+        ctable.add_column("optimal band", justify="center")
+        ctable.add_column("refusal acc", justify="right")
+        ctable.add_column("grounded recall", justify="right")
+        ctable.add_column("floor met", justify="center")
+        ctable.add_row(
+            f"{cal['threshold']:.2f}",
+            f"{cal['plateau'][0]:.2f}-{cal['plateau'][1]:.2f}",
+            f"{cal['refusal_accuracy']:.3f}",
+            f"{cal['grounded_recall']:.3f}",
+            "[green]yes[/green]" if cal["floor_met"] else f"[red]no (floor {cal['floor']:.2f})[/red]",
+        )
+        console.print(ctable)
+        console.print(
+            "The recommendation is the midpoint of the optimal band (maximum margin); "
+            "grounded recall shows what fraction of answerable cases still clear it."
+        )
+        if not cal["floor_met"]:
+            console.print(
+                "[yellow]No threshold met the refusal-accuracy floor — this set may leak. "
+                "Showing the safest (highest refusal-accuracy) point.[/yellow]"
+            )
+        if cal["thin"]:
+            s = cal["samples"]
+            console.print(
+                f"[yellow]Thin eval set ({s['answerable']} answerable, {s['refusals']} refusal "
+                "cases): the optimal band is wide and this number is not trustworthy. Author "
+                "~30-50 representative cases (incl. borderline + refusals) before trusting or "
+                "applying it.[/yellow]"
+            )
+        current = ctx.config.retrieval.min_score
+        if apply:
+            ctx.config.retrieval.min_score = cal["threshold"]
+            ctx.catalog.save_config(ctx.config)
+            console.print(
+                f"[green]Applied:[/green] retrieval.min_score {current:.2f} -> {cal['threshold']:.2f}"
+            )
+        else:
+            console.print(
+                f"Current retrieval.min_score={current:.2f}. Re-run with --apply to set "
+                f"it to {cal['threshold']:.2f}."
+            )
+
+    if compare is not None:
+        try:
+            old_report = _json.loads(Path(compare).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            console.print(f"[red]Could not read --compare report {compare}: {exc}[/red]")
+            raise typer.Exit(1)
+        diff = compare_reports(old_report, report)
+        dtable = Table(title=f"Compare vs {Path(compare).name}")
+        dtable.add_column("metric")
+        dtable.add_column("layer")
+        dtable.add_column("old", justify="right")
+        dtable.add_column("new", justify="right")
+        dtable.add_column("delta", justify="right")
+        for row in diff["rows"]:
+            old_s = f"{row['old']:.3f}" if isinstance(row["old"], (int, float)) else "-"
+            new_s = f"{row['new']:.3f}" if isinstance(row["new"], (int, float)) else "-"
+            if row["delta"] is None:
+                delta_s = "-"
+            elif row["regressed"]:
+                delta_s = f"[red]v {row['delta']:+.3f}[/red]"
+            elif row["delta"] > 0:
+                delta_s = f"[green]^ {row['delta']:+.3f}[/green]"
+            elif row["delta"] < 0:
+                delta_s = f"[yellow]{row['delta']:+.3f}[/yellow]"
+            else:
+                delta_s = "0.000"
+            dtable.add_row(row["metric"], row["layer"], old_s, new_s, delta_s)
+        console.print(dtable)
+        if diff["regressed"]:
+            console.print("[red]Regression: a watched metric dropped by more than 2 points.[/red]")
+            raise typer.Exit(1)
+        console.print("[green]No watched metric regressed beyond tolerance.[/green]")
 
 
 browser_app = typer.Typer(help="Persistent browser profile for user-credential fallback (SSO/MFA logins).")

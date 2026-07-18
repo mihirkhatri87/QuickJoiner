@@ -95,6 +95,13 @@ class RetrievalConfig(BaseModel):
     # and only adds clearly-labeled related leads for the agent to follow/cite.
     graph_expansion: bool = True
     graph_expansion_limit: int = 5  # max related documents surfaced per search
+    # Alias query expansion (memory/expansion.py): before searching, look up the org's
+    # spoken forms in the query against the knowledge graph and append the canonical
+    # entity name, so a loose question ("nautical models") also retrieves docs indexed
+    # under the formal package name. Query-time (no re-embed); the twin of ingest-time
+    # aliasing in connectors/deps.py. It only ADDS canonical tokens to the query, so it
+    # can surface hits the raw query missed but never invents a match from nothing.
+    alias_expansion: bool = True
 
 
 class ChatConfig(BaseModel):

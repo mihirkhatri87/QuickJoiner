@@ -1,5 +1,10 @@
 # Plan 05 — Evaluate retrieval & correlation on a connected org
 
+> **STATUS: ⏸ DEFERRED (runbook, not yet executed).** This is an operational procedure, not a
+> code change — the eval harness and both layers (`qj eval [--agent]`, `hops`/`hop_coverage`)
+> already exist. The C0–C4 matrix has not been run on a real org; doing so unblocks the deferred
+> embedding/fine-tuning decision. Needs an org-connected machine. See [STATUS.md](STATUS.md).
+
 Goal: on a machine connected to real org systems, measure whether the retrieval/correlation
 stack (contextual chunking, cross-encoder reranker, code-structural graph, LLM-extracted
 relationships, graph-expansion retrieval) actually improves grounded, cited, multi-hop answers —

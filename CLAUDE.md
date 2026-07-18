@@ -132,6 +132,18 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   hits (via shared entities) and `search_memory` appends them as a "RELATED via knowledge graph"
   section — the multi-hop / cross-source channel. It runs ONLY when there are already grounded hits,
   so it never turns a refusal into an answer (grounding gate untouched).
+  **Alias query expansion** (`memory/expansion.py`, `expand_query(catalog, query)`,
+  `retrieval.alias_expansion`, on): the query-side twin of ingest-time aliasing (`connectors/deps.py`).
+  Slides 1–4-token windows over the normalized query, resolves each against the knowledge graph
+  (reuses `catalog.resolve_entity` — exact id/name/alias, case-insensitive), and **appends** the
+  canonical entity name so a loose question ("how is connector monitor built") also retrieves docs
+  indexed under the formal package name (`AppRiver.Connector.Monitor`). Longest window first (claims
+  positions so sub-windows don't re-resolve a parent); skips all-generic/stopword windows (reuses
+  `_GENERIC_TOKENS`); caps at 3 appends; never re-appends a name already in the query. Wired into
+  `agent/tools.search_memory` (the original query is still what's logged as a gap) and
+  `/api/search`; best-effort (any failure falls back to the raw query). It only ADDS canonical
+  tokens, so it can surface hits the raw query missed but never invents a match from nothing — the
+  dense grounding gate is unchanged.
   **Plan-06 graph reads (all portable `?`-SQL in the neutral `_SqlCatalog`, no schema change):**
   `graph_path_candidates(src, dst, max_hops, max_candidates)` — bounded simple-path BFS returning
   up to k MATERIALLY different chains (signature = frozensets of intermediates/rels/evidence
@@ -393,6 +405,17 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
 - `quickjoiner/evals/harness.py` — YAML eval sets; deterministic retrieval layer (no LLM) +
   agent layer (refusal phrasing via `REFUSAL_MARKERS`, citations, keywords). Reports saved to
   `<workspace>/evals/*.json` for before/after comparison when tuning threshold/embedding/chunking.
+  **Threshold calibration** (`calibrate(results, floor=0.90)`, `qj eval SET --calibrate [--apply]`):
+  sweeps `min_score` t ∈ [0.30, 0.80] and reports the value that best separates grounded answers
+  from refusals — maximizes `(grounded_recall + refusal_accuracy)/2` subject to `refusal_accuracy
+  ≥ floor`, then picks the **midpoint of the optimal band** (maximum margin), NOT an edge, so it
+  never sits one document away from false-refusing real content. `RetrievalCaseResult.hit_score`
+  (the expected hit's cosine) is the value swept. Flags **thin** sets (< `CALIBRATION_MIN_CASES`
+  answerable or refusal cases) as untrustworthy; `--apply` writes the threshold via
+  `catalog.save_config` (opt-in — default only prints). **Report comparison** (`compare_reports`,
+  `qj eval SET --compare old.json`): per-metric delta table over `COMPARE_METRICS`
+  (`false_refusal_rate` is lower-is-better), **exits non-zero** if any watched metric regressed by
+  more than `COMPARE_TOLERANCE` (0.02) — the CI merge gate for any retrieval change.
 - `quickjoiner/scheduler.py` — APScheduler periodic syncs for sources with `sync_interval_minutes`.
 - `quickjoiner/sync_manager.py` — **startable / stoppable / live-logged sync jobs** (`SyncManager`).
   Each sync runs on its own daemon thread, so **multiple different sources sync concurrently**
@@ -420,6 +443,9 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   (relevant ≥ 0.64, unrelated ≤ 0.55). Retune if the embedding model changes **or if
   `embedding.instruct` is toggled** (asymmetric query instructions shift the cosine distribution).
   Borderline hits are passed to the LLM with scores; the prompt makes the final relevance judgment.
+  Don't guess the retune by hand — `qj eval SET --calibrate` recommends the value from a real eval
+  set (and `--apply` writes it). It picks the **midpoint of the optimal band**, so it won't jump to
+  a false-refusal-heavy threshold, and it warns when the eval set is too thin to trust.
 - Secrets in connector options support env indirection: `token=env:GITHUB_TOKEN`
   (resolved by `connectors/util.resolve_secret`). Never write literal secrets into config.yaml.
 - All tool results for one assistant turn must land in a single Anthropic user message
@@ -438,6 +464,27 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   in the same change — treat stale docs as a broken build. `README.md` is written for a new user
   (setup + how to run); `CLAUDE.md` is the internal source of truth (architecture, conventions,
   status). When they would disagree, fix them, don't pick one.
+- **Keep the plans current — always.** When a slice of a plan in `docs/plans/` ships (or is
+  deliberately dropped), update its status **in the same change**: (1) the plan file's top
+  **STATUS banner**, (2) the row in `docs/plans/STATUS.md` (the master tracker) and its
+  "genuinely outstanding work" list, and (3) the Status column in `docs/plans/README.md`. A plan
+  that's fully done is marked ✅ and has no residual "outstanding" items lingering. This is the
+  rule that prevents an imaginary pile of already-finished work from reading as a backlog — a
+  reader must be able to trust that anything not ✅ is genuinely unbuilt. Reconcile against the
+  tree, not from memory: a feature counts as shipped only when its code/tests actually exist.
+- **Keep the strategy & design docs live — always.** The docs under `docs/` are **living
+  documents that must give a true snapshot of the repo at all times**, not write-once artifacts.
+  Any change that shifts architecture, capabilities, roadmap position, test posture, or the
+  product story must update the affected doc **in the same change**: `docs/AI_ARCHITECTURE.md`
+  (invariants I1–I3 + the retrieval/ragless roadmap — mark items shipped/changed), `docs/PRD.md`
+  (story/AC/test status + the W-wishlist), `docs/TEST_STRATEGY.md` (coverage program + T1–T4 —
+  reflect new suites, gaps closed, and honest remaining holes), `docs/FRONTEND_ROADMAP.md`
+  (F0–F2), `docs/CLOUD_ROADMAP.md` (Y1–Y5), `docs/MARKET_ASSESSMENT.md` (Appendix A connector
+  matrix + differentiators), `docs/PITCH_DECK.md` (claims must match what actually ships — never
+  let the deck outrun the code), `docs/KNOWLEDGE_GRAPH.md`, and `docs/design/DESIGN_VISION.md`.
+  A roadmap item that's built is marked shipped (not left as "planned"); a claim that's no longer
+  true is corrected, not left to rot. Reconcile against the tree, not from memory. Treat any of
+  these drifting out of sync with the code as a broken build, exactly like `CLAUDE.md`/`README.md`.
 
 ## Strategy & design docs (2026-07-11, "champion team" review)
 
@@ -635,6 +682,19 @@ Post-phase additions (2026-07-07, all tested — suite: **89 passed**):
   passed** (+54 over the pre-plan baseline), 10 skipped, pre-existing eval-yaml failure unchanged.
   §2.7's live check (`resolve_entity('webroot connector')` merging after re-sync) is pending the
   user's next clean re-sync of Connector+Confluence — the merge only fires at ingest time.
+- Plan 02 completed — retrieval quality pack parts B + C (2026-07-17). **B. Threshold calibration**
+  (`evals/harness.calibrate` + `qj eval --calibrate/--apply/--compare`): sweeps `min_score`
+  over an eval set and recommends the **max-margin midpoint** of the optimal band (not an edge —
+  a refinement over the plan's tie-break-toward-higher, which over-jumped to ~0.74 on a thin
+  2-doc set; the midpoint gives ~0.55 there and warns the set is thin), subject to a
+  refusal-accuracy floor; `--apply` persists it, `--compare` is a non-zero-exit CI regression gate
+  over the summary metrics. **C. Alias query expansion** (`memory/expansion.py` `expand_query`,
+  `retrieval.alias_expansion`): appends canonical entity names for org spoken-forms in the query
+  (1–4-token windows, reuses `catalog.resolve_entity`, `_GENERIC_TOKENS` stopword skip, cap 3),
+  wired into `search_memory` + `/api/search`, best-effort. Suite: **399 passed**, 10 skipped,
+  the pre-existing missing-`docs/evals/` eval-yaml failure unchanged. Live-verified on the AppRiver
+  graph (`connector monitor` → `AppRiver.Connector.Monitor`) and via a scratch calibrate/apply/
+  compare run. (Part A, contextual chunking, shipped earlier on 2026-07-13.) Plan 02 is now ✅.
 
 ## Next steps (agreed with user)
 

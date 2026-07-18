@@ -271,6 +271,12 @@ Retrieval quality is tuned for this too: **contextual chunking** prepends each c
 `source · title · path` breadcrumb (and markdown sub-chunks keep their section heading) so a
 chunk's embedding carries the context it was split away from, and a **cross-encoder reranker** runs
 by default over the fused candidates (`retrieval.reranker`; `QJ_DISABLE_RERANKER=1` to turn it off).
+**Alias query expansion** (`retrieval.alias_expansion`, on) closes the last mile on naming: it reads
+the same knowledge graph the ingest pipeline builds and, before searching, appends the formal name
+for any org spoken-form in your question — so "how is connector monitor built" also finds docs
+indexed only under `AppRiver.Connector.Monitor`, with no need to know the exact package name. And
+`qj eval --calibrate` recommends the grounding threshold for *your* corpus from a real eval set,
+so `retrieval.min_score` can be measured rather than guessed.
 
 Embeddings run locally via fastembed (`BAAI/bge-small-en-v1.5` by default; switch
 `embedding.provider` to `ollama` to use `nomic-embed-text`). These models are trained for
@@ -300,6 +306,11 @@ qj ask "deploy inventory?" -f pptx     # export answers: md | html | csv | pptx
 qj eval my-evals.yaml --init           # write a starter eval set
 qj eval my-evals.yaml [--agent]        # retrieval metrics (recall@k, MRR, refusal accuracy, hop_coverage);
                                        # --agent adds end-to-end citation/refusal checks
+qj eval my-evals.yaml --calibrate      # recommend the best retrieval.min_score for this set
+                                       #   (--apply to save it; picks the max-margin midpoint,
+                                       #   warns if the eval set is too thin to trust)
+qj eval my-evals.yaml --compare old.json  # delta table vs a past report; non-zero exit on a
+                                          #   >2-point regression (use it as a CI merge gate)
 qj eval docs/evals/multi-hop-crosssource.yaml   # shipped multi-hop / cross-source eval set
 qj browser login https://sso.acme.com  # persistent Playwright profile (install: pip install -e ".[browser]")
 ```

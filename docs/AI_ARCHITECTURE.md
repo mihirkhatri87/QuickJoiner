@@ -14,8 +14,10 @@ refused?* This yields three architectural invariants that must survive every fut
 enhancement:
 
 - **I1 — The refusal gate is calibrated and conservative.** Today: cosine ≥ 0.55 on the
-  dense leg, empirically tuned per embedding model. Hybrid fusion, rerankers, graph hops —
-  all may change *what surfaces and in what order*, never *whether we claim knowledge*.
+  dense leg, empirically tuned per embedding model — and now **fittable per workspace** via
+  `qj eval --calibrate` (max-margin midpoint over the org's eval pack). Hybrid fusion, rerankers,
+  graph hops, alias expansion — all may change *what surfaces and in what order*, never *whether
+  we claim knowledge*.
 - **I2 — Evidence is a first-class object.** Chunks carry uri/title/source; graph edges
   carry `evidence_doc_id`; conversation-extracted facts cite their conversation. Anything
   that can't name its evidence doesn't enter the answer path.
@@ -66,8 +68,9 @@ Key defended choices:
 
 ## 3. Known limitations (the honest list the roadmap must fix)
 
-1. Single embedding model (bge-small) with a hand-tuned threshold; no per-corpus
-   calibration; the 0.523-vs-0.55 refusal margin is thin on large corpora.
+1. Single embedding model (bge-small). The threshold is no longer only hand-tuned —
+   `qj eval --calibrate` now fits it per corpus (Tier-1 #3, shipped) — but the 0.523-vs-0.55
+   refusal margin is still thin on large corpora until a calibration set is authored and applied.
 2. Chunking is format-aware but not *meaning*-aware; no doc-level context in chunks; code
    chunking is line-based, not AST-based.
 3. No temporal model: stale evidence ranks equal to fresh; no as-of queries.
@@ -84,19 +87,23 @@ Every item ships behind `qj eval` A/B gates on the standard pack + per-org packs
 numbers are targets to beat, not promises.
 
 ### Tier 1 — highest leverage, low risk
-1. **Contextual chunk enrichment** (Anthropic-style contextual retrieval): at ingest,
-   prepend a generated 1–2 sentence doc/section context to each chunk before embedding
-   and BM25 indexing; keyless fallback = title+heading breadcrumb (deterministic). Target:
-   +5–15 pts grounded-recall. Cost: one cheap LLM pass per doc (cacheable, optional).
+1. ✅ **SHIPPED** — **Contextual chunk enrichment** (Anthropic-style contextual retrieval):
+   the deterministic breadcrumb form (`source · title · path` + section heading via
+   `pipeline.breadcrumb()`, `retrieval.contextual_chunks`, on) is live; the optional LLM
+   1–2 sentence context is the remaining upgrade. Target was +5–15 pts grounded-recall.
 2. **AST-aware code chunking** (tree-sitter): functions/classes as chunk units with
    imports+signature context; manifest of symbols per file feeds the graph too. Target:
    large uplift on code questions; enables "explain this function's role."
-3. **Threshold calibration per workspace**: fit the refusal gate on the org's eval pack
-   (isotonic/Platt over cosine), replacing the global 0.55; report a calibration curve.
-   Directly attacks limitation 1 with zero query-time cost.
-4. **Query normalization + expansion with org aliases**: apply the alias table
-   *query-side* (we already do ingest-side): "nautical models" expands to the package id
-   before retrieval. Deterministic, cheap, symmetric with the graph resolver.
+3. ✅ **SHIPPED** — **Threshold calibration per workspace** (`qj eval --calibrate [--apply]`,
+   `evals/harness.calibrate`): sweeps the gate over the org's eval pack and recommends the
+   **midpoint of the optimal band** (maximum margin) subject to a refusal-accuracy floor,
+   replacing hand-tuning of the global 0.55; reports the full calibration curve and flags
+   thin eval sets. Zero query-time cost. (`--compare` adds the before/after regression gate.)
+4. ✅ **SHIPPED** — **Query normalization + expansion with org aliases** (`memory/expansion.py`,
+   `retrieval.alias_expansion`, on): applies the alias table *query-side* (twin of the
+   ingest-side aliasing) — "connector monitor" expands to `AppRiver.Connector.Monitor` before
+   retrieval. Deterministic, cheap, reuses the graph resolver; adds canonical tokens only, so
+   the grounding gate is untouched.
 5. **Recency & authority priors**: small rank features (doc age, source type weight,
    in-graph degree) applied at fusion — never at the gate (I1). Kill-switch per workspace.
 

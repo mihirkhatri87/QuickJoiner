@@ -1,5 +1,9 @@
 # Plan 03 — Slack + Microsoft Teams Connectors (MARKET_ASSESSMENT Appendix A, priority #1 and #9)
 
+> **STATUS: ⬜ NOT STARTED.** No `connectors/slack.py` / `connectors/msteams.py`, no
+> FORM_SPECS/registry entries, no hooks.py Slack-signature branch. No dependencies — ready to
+> pick up. See [STATUS.md](STATUS.md).
+
 Effort: ~5–6 dev-days (Slack 3, Teams 2–3) · Dependencies: none
 Honest scope note: converters and sync logic are fully unit-testable offline (project
 convention); live verification against real Slack/Teams tenants is a separate manual

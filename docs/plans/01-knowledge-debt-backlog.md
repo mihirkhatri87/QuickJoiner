@@ -1,5 +1,9 @@
 # Plan 01 — Knowledge-Debt Backlog (PRD W2.1–W2.3)
 
+> **STATUS: ✅ COMPLETE (shipped 2026-07-13).** `gaps.py`, `gaps` table +
+> `log_gap`/`list_gaps`/`resolve_gaps`, `/api/gaps` + resolve, `list_gaps` agent tool, Rail
+> badge + `GapsPanel`, pg parity — all landed. See [STATUS.md](STATUS.md). Nothing outstanding.
+
 Effort: ~4 dev-days · Dependencies: none · Unblocks: Plan 04 (fog), later W1 (analytics)
 
 ## 1. Design

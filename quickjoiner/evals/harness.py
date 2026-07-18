@@ -77,6 +77,9 @@ class RetrievalCaseResult:
     cleared_threshold: bool  # the expected hit scored >= retrieval.min_score
     refusal_correct: bool | None  # only set for refusal cases
     hop_coverage: float | None = None  # fraction of expected hops surfaced in top-k
+    # Cosine score of the first expected hit (answerable cases) — the value threshold
+    # calibration sweeps over. None on a miss (no expected hit surfaced at all).
+    hit_score: float | None = None
 
 
 @dataclass
@@ -124,17 +127,20 @@ def run_retrieval_eval(ctx, cases: list[EvalCase]) -> list[RetrievalCaseResult]:
                 RetrievalCaseResult(case.id, None, top_score, False, refusal_correct=not grounded)
             )
             continue
-        hit_rank, cleared = None, False
+        hit_rank, cleared, hit_score = None, False, None
         for rank, hit in enumerate(hits, start=1):
             if any(u in hit.uri or u in hit.title for u in case.uris):
-                hit_rank, cleared = rank, hit.score >= retrieval.min_score
+                hit_rank, cleared, hit_score = rank, hit.score >= retrieval.min_score, hit.score
                 break
         hop_cov = None
         if case.hops:
             surfaced = " ".join(f"{h.uri} {h.title}" for h in hits)
             hop_cov = round(sum(1 for hop in case.hops if hop in surfaced) / len(case.hops), 3)
         results.append(
-            RetrievalCaseResult(case.id, hit_rank, top_score, cleared, None, hop_coverage=hop_cov)
+            RetrievalCaseResult(
+                case.id, hit_rank, top_score, cleared, None,
+                hop_coverage=hop_cov, hit_score=hit_score,
+            )
         )
     return results
 
@@ -160,6 +166,117 @@ def summarize_retrieval(results: list[RetrievalCaseResult]) -> dict:
             sum(1 for r in refusals if r.refusal_correct) / len(refusals), 3
         )
     return summary
+
+
+# -- threshold calibration -------------------------------------------------------
+
+# Watched summary metrics for --compare (all "higher is better"). A drop of more than
+# COMPARE_TOLERANCE on any of these fails the comparison (CI-usable merge gate).
+COMPARE_METRICS = (
+    "recall_at_k", "grounded_recall", "mrr", "hop_coverage", "refusal_accuracy",
+    "citation_rate", "keyword_coverage", "false_refusal_rate",
+)
+# false_refusal_rate is the one metric where LOWER is better — track its direction.
+_LOWER_IS_BETTER = {"false_refusal_rate"}
+COMPARE_TOLERANCE = 0.02  # >2-point regression on a watched metric fails the gate
+
+
+# Below this many answerable OR refusal cases the calibration is statistically thin —
+# the optimal plateau is wide (nothing borderline to pin it down) and the recommended
+# threshold is not trustworthy. The CLI surfaces this as a caution.
+CALIBRATION_MIN_CASES = 10
+
+
+def calibrate(results: list[RetrievalCaseResult], floor: float = 0.90) -> dict:
+    """Pick the grounding threshold that best separates grounded answers from
+    refusals on THIS workspace's eval set.
+
+    Sweeps t ∈ [0.30, 0.80] step 0.01. At each t: grounded_recall = fraction of
+    answerable hits scoring ≥ t; refusal_accuracy = fraction of refusal cases whose
+    top hit stays < t. Maximizes (ra + gr) / 2 subject to ra ≥ `floor` (never trade
+    away honesty for recall).
+
+    Among the thresholds that tie at the best objective (the "optimal plateau") it
+    picks the **midpoint**, not an edge — the maximum-margin choice. The top edge sits
+    one epsilon below false-refusing the lowest real hit (brittle as the corpus grows);
+    the bottom edge sits one epsilon above leaking the top refusal. The midpoint is the
+    most robust of the equally-optimal options. (On a representative eval set the
+    plateau is tight, so this ≈ any point in it; on a thin set it prevents the runaway
+    jump to the top that a naive tie-break-high would produce.) If the floor is
+    unreachable, returns the safest point (highest refusal accuracy).
+
+    Returns `{threshold, refusal_accuracy, grounded_recall, objective, floor,
+    floor_met, plateau:[lo,hi], samples:{answerable,refusals}, thin, curve:[{t,ra,gr}]}`.
+    The curve is monotone by construction — gr non-increasing and ra non-decreasing.
+    """
+    answerable = [r for r in results if r.refusal_correct is None and r.hit_score is not None]
+    refusals = [r for r in results if r.refusal_correct is not None]
+    curve: list[dict] = []
+    for i in range(30, 81):  # integer sweep avoids float drift; t = i / 100
+        t = i / 100
+        gr = (sum(1 for r in answerable if r.hit_score >= t) / len(answerable)) if answerable else 1.0
+        ra = (sum(1 for r in refusals if r.top_score < t) / len(refusals)) if refusals else 1.0
+        curve.append({"t": round(t, 2), "ra": round(ra, 3), "gr": round(gr, 3)})
+
+    eligible = [p for p in curve if p["ra"] >= floor]
+    floor_met = bool(eligible)
+    if eligible:
+        best_obj = max((p["ra"] + p["gr"]) / 2 for p in eligible)
+        plateau = [p for p in eligible if abs((p["ra"] + p["gr"]) / 2 - best_obj) < 1e-9]
+        lo, hi = plateau[0]["t"], plateau[-1]["t"]  # curve is ascending in t
+        target = (lo + hi) / 2
+        # nearest plateau point to the midpoint; ties → the lower t (slightly more recall)
+        best = min(plateau, key=lambda p: (abs(p["t"] - target), p["t"]))
+    else:
+        # No acceptable point exists — pick the safest (highest refusal accuracy),
+        # tie-broken toward the higher threshold to minimize leakage.
+        best = max(curve, key=lambda p: (p["ra"], p["t"]))
+        plateau = [best]
+    thin = len(answerable) < CALIBRATION_MIN_CASES or len(refusals) < CALIBRATION_MIN_CASES
+    return {
+        "threshold": best["t"],
+        "refusal_accuracy": best["ra"],
+        "grounded_recall": best["gr"],
+        "objective": round((best["ra"] + best["gr"]) / 2, 3),
+        "floor": floor,
+        "floor_met": floor_met,
+        "plateau": [plateau[0]["t"], plateau[-1]["t"]],
+        "samples": {"answerable": len(answerable), "refusals": len(refusals)},
+        "thin": thin,
+        "curve": curve,
+    }
+
+
+def compare_reports(old: dict, new: dict) -> dict:
+    """Delta table between two eval reports' summaries. Compares the retrieval and
+    (if present in both) agent summaries across COMPARE_METRICS.
+
+    Returns `{rows:[{metric, layer, old, new, delta, regressed}], regressed}` where
+    the top-level `regressed` is True if ANY watched metric dropped by more than
+    COMPARE_TOLERANCE (accounting for false_refusal_rate being lower-is-better) — the
+    signal `qj eval --compare` turns into a non-zero exit for CI.
+    """
+    rows: list[dict] = []
+    any_regressed = False
+    for layer in ("retrieval", "agent"):
+        old_sum = (old.get(layer) or {}).get("summary", {})
+        new_sum = (new.get(layer) or {}).get("summary", {})
+        for metric in COMPARE_METRICS:
+            if metric not in old_sum and metric not in new_sum:
+                continue
+            o = old_sum.get(metric)
+            n = new_sum.get(metric)
+            row = {"metric": metric, "layer": layer, "old": o, "new": n,
+                   "delta": None, "regressed": False}
+            if o is not None and n is not None:
+                delta = round(n - o, 3)
+                # Normalize so a positive "improvement" is always good.
+                improvement = -delta if metric in _LOWER_IS_BETTER else delta
+                row["delta"] = delta
+                row["regressed"] = improvement < -COMPARE_TOLERANCE
+                any_regressed = any_regressed or row["regressed"]
+            rows.append(row)
+    return {"rows": rows, "regressed": any_regressed}
 
 
 # -- agent layer -----------------------------------------------------------------
@@ -244,6 +361,7 @@ def run_eval(
     agent=None,
     provider_override: str | None = None,
     model_override: str | None = None,
+    calibrate_threshold: bool = False,
 ) -> dict:
     """Run the eval set; save and return the JSON report."""
     name, cases = load_evalset(evalset_path)
@@ -261,6 +379,8 @@ def run_eval(
             "cases": [asdict(r) for r in retrieval_results],
         },
     }
+    if calibrate_threshold:
+        report["calibration"] = calibrate(retrieval_results)
     if agent_layer:
         agent_results = run_agent_eval(ctx, cases, agent, provider_override, model_override)
         report["agent"] = {

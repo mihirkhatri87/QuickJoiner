@@ -11,6 +11,7 @@ from quickjoiner.connectors.base import Document
 from quickjoiner.ingest.pipeline import IngestPipeline
 from quickjoiner.llm.base import AgentTool, ToolSpec
 from quickjoiner.memory.catalog import Catalog
+from quickjoiner.memory.expansion import expand_query
 from quickjoiner.memory.store import KnowledgeStore
 
 USER_TAUGHT_SOURCE = "notes:user-taught"
@@ -85,9 +86,15 @@ def build_builtin_tools(
         return "\n".join(lines)
 
     def search_memory(query: str, top_k: int | None = None) -> str:
-        hits = store.search(query, top_k=top_k or retrieval.top_k, min_score=retrieval.min_score)
+        search_q = query
+        if retrieval.alias_expansion:
+            try:
+                search_q = expand_query(catalog, query)
+            except Exception:  # expansion is best-effort; never break a search on it
+                search_q = query
+        hits = store.search(search_q, top_k=top_k or retrieval.top_k, min_score=retrieval.min_score)
         if not hits:
-            _capture_gap(query)
+            _capture_gap(query)  # log the user's ORIGINAL query as the gap, not the expanded one
             return (
                 "NO_RESULTS: nothing relevant found in learned memory for this query. "
                 "Try a rephrased query, or tell the user you haven't learned this yet."

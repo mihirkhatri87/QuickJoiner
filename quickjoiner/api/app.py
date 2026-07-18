@@ -654,7 +654,15 @@ def create_app(workspace: Path) -> FastAPI:
 
     @api.get("/api/search")
     def search(q: str, top_k: int = 8):
-        hits = ctx.store.search(q, top_k=top_k, min_score=ctx.config.retrieval.min_score)
+        search_q = q
+        if ctx.config.retrieval.alias_expansion:
+            try:
+                from quickjoiner.memory.expansion import expand_query
+
+                search_q = expand_query(ctx.catalog, q)
+            except Exception:  # expansion is best-effort; never break a search on it
+                search_q = q
+        hits = ctx.store.search(search_q, top_k=top_k, min_score=ctx.config.retrieval.min_score)
         return [
             {"score": round(h.score, 3), "title": h.title, "uri": h.uri, "kind": h.kind,
              "text": h.text[:500]}
