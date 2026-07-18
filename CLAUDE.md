@@ -163,7 +163,21 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   carries the provenance/structure it was chunked away from. **Structural graph extraction at ingest**
   (in `_sync_graph`): `code_graph.py` emits `repo --defines--> symbol` / `repo --imports--> module`
   edges per code file (regex per language: py/js-ts/java-kotlin/c#/go; call graphs are out of scope —
-  need tree-sitter); `triples.py` holds the shared triple vocab + `parse_triples` + `triples_to_graph`
+  need tree-sitter); **`pubsub.py` (2026-07-17) emits runtime-coupling edges deterministically** —
+  `repo --publishes_to/subscribes_to--> topic` and `repo --stores_in--> datastore` — from per-language
+  Service Bus SDK patterns (C# incl. Functions bindings/`[return: ServiceBus]`/legacy clients; Python
+  `get_*_sender/receiver`; JS/TS `createSender/createReceiver`; Java builder chains matched within one
+  statement + `@JmsListener`/`convertAndSend`; Go `NewSender/NewReceiverFor*`), app config
+  (appsettings*/\*.config/application*.properties|yml — a Subscription* key in the same file marks the
+  consumer, else `references` only; connection strings → `stores_in`), and content-detected CFN/SAM/
+  serverless templates (`references`/`stores_in` only — a template proves existence, not direction).
+  **Honesty rules: literals only; substitution placeholders (Octopus `#{Var}`, `%VAR%`, `${VAR}`,
+  `!Ref`) are skipped, never guessed** — orgs holding real values in deployment tooling get them via
+  ingesting those artifacts (Octopus variable-set extraction = roadmap #22); direction asserted only
+  when the API implies it (legacy `QueueClient` deliberately ignored). Same pure contract as
+  code_graph (`extract_pubsub_graph(text, uri, src_id)`), wired beside it in `_sync_graph`; always on;
+  tests `tests/test_pubsub_graph.py` incl. the cross-repo publisher↔subscriber bridge deps.py can't make.
+  `triples.py` holds the shared triple vocab + `parse_triples` + `triples_to_graph`
   (**re-exported from `sessions.py`** for back-compat) and `extract_doc_triples(provider,…)` — optional
   LLM relationship extraction over prose docs, config-gated by `graph.extract_triples` (OFF by default:
   one LLM call per qualifying doc), keyless-safe, validated against the vocab, evidence = the document.
@@ -517,7 +531,7 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
 not unique as "chat over docs"; differentiators = honesty contract, evidence graph,
 local-first, ramp metrics), `docs/PITCH_DECK.md`, `docs/AI_ARCHITECTURE.md` (descriptive:
 invariants I1–I3, stack-as-built, limitations, model strategy), **`docs/AI_ROADMAP.md`**
-(2026-07-17 — the single forward-looking AI doc: quality tiers #2/#5–#21, speed/cost
+(2026-07-17 — the single forward-looking AI doc: quality tiers #2/#5–#22, speed/cost
 S-track S1–S5, original-research X-track X1–X7 with pre-registered spikes, and the standing
 frontier process — per-change eval/bench gates, monthly frontier scan, quarterly research
 spike, each with a ready-to-paste prompt), `docs/FRONTEND_ROADMAP.md` (F0–F2),

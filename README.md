@@ -23,7 +23,10 @@ when memory has nothing relevant.
   repos, packages, tickets, services, environments, **message topics, and datastores** so you
   can see how things connect — including pub/sub coupling (`publishes_to`/`subscribes_to`) and
   data residence (`stores_in`), the runtime relationships package manifests can never reveal
-  ("if I change this event, who breaks?").
+  ("if I change this event, who breaks?"). These are extracted **deterministically** from Service
+  Bus SDK calls across C#/Python/JS/Java/Go, app config (appsettings, .config, Spring), connection
+  strings, and CloudFormation/serverless templates — no LLM required, and config-substitution
+  placeholders (Octopus `#{Var}`, env vars) are never guessed at.
 - **Multi-angle answers with honest confidence** — when the graph has recorded more than one
   materially different connection between two things, the agent surfaces *all* of them (or asks
   one clarifying question) instead of silently picking the shortest; every relationship carries a

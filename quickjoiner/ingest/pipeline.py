@@ -17,6 +17,7 @@ from quickjoiner.connectors.base import Document
 from quickjoiner.connectors.deps import is_manifest_path
 from quickjoiner.ingest.chunkers import chunk_document
 from quickjoiner.ingest.code_graph import extract_code_graph, looks_like_code
+from quickjoiner.ingest.pubsub import extract_pubsub_graph
 from quickjoiner.ingest.entity_resolution import EntityResolver
 from quickjoiner.ingest.normalize import normalize_text
 from quickjoiner.ingest.triples import triples_to_graph
@@ -233,6 +234,14 @@ class IngestPipeline:
                 _add_source_entity()
                 entities.extend(code_ents)
                 edges.extend(code_edges)
+
+        # Runtime coupling (pub/sub channels, datastores) from code, app config and
+        # infra templates — the edges package manifests can't see (ingest/pubsub.py).
+        ps_ents, ps_edges = extract_pubsub_graph(text, doc.uri, src_id)
+        if ps_edges:
+            _add_source_entity()
+            entities.extend(ps_ents)
+            edges.extend(ps_edges)
 
         if self._triple_extractor is not None and not is_code and self._triples_apply(doc, text):
             _add_source_entity()

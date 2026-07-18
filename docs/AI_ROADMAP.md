@@ -53,6 +53,16 @@ How each works is documented in `CLAUDE.md` — the source of truth for current 
 5. **Recency & authority priors** — *adopt*. Small rank features (doc age, source type
    weight, in-graph degree) applied at RRF fusion — never at the gate (I1). Kill-switch
    per workspace.
+22. **Octopus variable-set → graph extraction** — *adapt*. The indirection resolver for
+    `ingest/pubsub.py`'s honesty rule: when appsettings holds `#{Orders.Topic}`, the real
+    channel/database name lives in the Octopus project's variable set — and the Octopus
+    connector already knows the project (= the service entity). Ingest variable sets and emit
+    `service --references--> topic:<value>` / `--stores_in--> datastore:<value>` edges for
+    Topic/Queue/Database-named variables and connection-string values, evidence = the
+    variable-set document. Closes the placeholder gap for Octopus-centric orgs (this org's
+    live graph literally contains `#{azureusername}` placeholders today). Same conservative
+    direction rules; per-environment variable scoping can carry the environment entity as
+    detail. Extension of the same mechanism: Terraform state/vars, k8s ConfigMaps.
 21. **Relation signatures (ontology-lite domain/range validation)** — *adapt*. A signature
     table over the existing triple vocab (`deploys: service|project → environment`,
     `owns: team|person → repo|service|project`, …) enforced in `parse_triples` alongside the
@@ -254,8 +264,15 @@ Scan log: *(dated one-liners appended here by each scan)*
   `datastore`, rels `publishes_to`/`subscribes_to`/`stores_in` added to `triples.py` —
   runtime coupling (pub/sub, data residence) that manifests can't see. Shipped same day
   with lockstep prompt interpolation. When #21 lands, their signatures:
-  `publishes_to/subscribes_to: service|project → topic`,
+  `publishes_to/subscribes_to: service|project|repo → topic`,
   `stores_in: service|project|repo → datastore`.
+- 2026-07-17 — follow-up shipped: **deterministic pub/sub + datastore extractor**
+  (`ingest/pubsub.py`) — per-language Service Bus SDK patterns (C#/Python/JS/Java/Go), app
+  config incl. Spring, connection strings, CFN/SAM/serverless templates; literals only,
+  placeholders (`#{Var}`/`%VAR%`/`${VAR}`) skipped never guessed, direction asserted only
+  when the API implies it. User intake from the same session: orgs hold real values in
+  deployment tooling (Octopus vars, AWS CFTs) → CFT slice shipped as references-only;
+  **#22 Octopus variable-set extraction** accepted into Tier 1 as the placeholder resolver.
 
 **Intake rejections** (don't re-propose without new evidence; mirrors the research archive):
 - **Full formal ontology** (OWL/RDF class hierarchies, reasoners, triple stores, interop

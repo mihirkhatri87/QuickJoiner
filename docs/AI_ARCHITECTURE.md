@@ -90,7 +90,7 @@ Each maps to a pending item in `docs/AI_ROADMAP.md` (noted in parentheses).
 
 ## 4. Forward roadmap → `docs/AI_ROADMAP.md`
 
-All pending work — the quality tiers (#2, #5–#21), the speed/cost **S-track**, the
+All pending work — the quality tiers (#2, #5–#22), the speed/cost **S-track**, the
 original-research **X-track** (X1–X7), the agentic-layer items, release sequencing, and the
 recurring **frontier process** (monthly scan, quarterly research spikes, per-change
 eval/bench gates) — lives in `docs/AI_ROADMAP.md`, the single forward-looking AI document.
