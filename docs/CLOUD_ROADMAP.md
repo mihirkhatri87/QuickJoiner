@@ -65,7 +65,7 @@ Target: self-serve teams; hundreds of tenants; the compliance conversation start
 - **Embedding service**: dedicated inference (fastembed/bge on CPU autoscaling; GPU
   g5/inferentia if we adopt larger embedders); batch endpoint for backfills; per-tenant
   model version pins (a re-embed is a *migration* with its own runbook: dual-write, eval
-  gate, cutover — the calibration step from AI_ARCHITECTURE #3 runs automatically).
+  gate, cutover — the calibration step from AI_ROADMAP #3 runs automatically).
 - **LLM path**: provider abstraction gains **Amazon Bedrock (Claude)** alongside direct
   Anthropic API — VPC endpoints, zero-retention configuration, per-tenant model choice and
   token budgets/metering (this is also the billing meter).
@@ -92,7 +92,7 @@ Trigger-based, not calendar-based — each has a measured tripwire:
   Kafka/MSK for firehose sources like git events at org scale); freshness SLO per source
   ("Jira changes answerable < 60 s").
 - **Per-tenant retrieval tuning as a service**: SageMaker pipelines for embedding LoRA
-  fine-tunes from tenant eval packs (AI_ARCHITECTURE #9), champion/challenger with automatic
+  fine-tunes from tenant eval packs (AI_ROADMAP #9), champion/challenger with automatic
   rollback on eval regression; conformal-calibrated refusal gates per tenant (#14).
 - **Eval farm**: nightly per-tenant grounding scorecards; drift alarms; a public
   trust page per tenant admin (refusal accuracy, citation validity, staleness histogram).
@@ -119,7 +119,7 @@ The regulated-industry flagship (`MARKET_ASSESSMENT` §6.6):
 Where the category goes if we win:
 
 - **Autonomous knowledge ops**: agents (our own ops tools, matured) that maintain the
-  corpus — detect stale/contradictory evidence (AI_ARCHITECTURE #11/#13), open gap
+  corpus — detect stale/contradictory evidence (AI_ROADMAP #11/#13), open gap
   remediations, re-tune retrieval, and file their own audit trail. Human-approved actions
   only; the confirmation grammar from `add_connector` becomes a platform primitive.
 - **Federation**: org-to-org selective graph/doc sharing (partner onboarding: your vendor's
@@ -128,7 +128,7 @@ Where the category goes if we win:
 - **Connector marketplace**: the Connector protocol (test/sync/tools/handle_event/modes) is
   already a clean SDK; publish it, review submissions, revenue-share. Breadth problem (we
   lose 13 vs 100) solved by ecosystem, not headcount.
-- **Ragless at fleet scale**: provider prompt-cache economics per tenant (AI_ARCHITECTURE
+- **Ragless at fleet scale**: provider prompt-cache economics per tenant (AI_ROADMAP
   #15/#16) managed like a CDN — the router's cost model becomes a first-class FinOps
   surface.
 - **Green/cost SLOs**: tokens and GPU-seconds per answered question reported per tenant;

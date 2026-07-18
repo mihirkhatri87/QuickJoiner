@@ -156,9 +156,10 @@ ACs are Given/When/Then; tests name real files for shipped stories.
 - **W6.2** "What changed since I last asked" daily orbit digest (per project).
   AC: diff computed from sync deltas + graph edge changes; cited. Tests: delta computation unit; digest golden file.
 
-### W7 — Retrieval intelligence (see `AI_ARCHITECTURE.md` §5 for full ladder)
-- **W7.1** Contextual chunk enrichment (prepend doc-level context to each chunk before embedding).
-  AC: eval uplift ≥ +5 pts grounded-recall on the standard pack before merge; ingestion cost documented. Tests: `qj eval` A/B in CI; chunker unit tests.
+### W7 — Retrieval intelligence (see `AI_ROADMAP.md` for the full ladder)
+- **W7.1 ✅** Contextual chunk enrichment — shipped 2026-07-13 as the deterministic breadcrumb
+  form (`retrieval.contextual_chunks`, on by default; see the CLAUDE.md ingest bullet). The
+  LLM-generated 1–2 sentence variant remains open (AI_ROADMAP #10 compares late chunking vs it).
 - **W7.2** Query decomposition + multi-query retrieval for compound questions.
   AC: compound eval set answered with ≥2 sub-retrievals fused; no regression on simple set. Tests: decomposition unit (scripted LLM); eval gate.
 - **W7.3** Embedding fine-tune pipeline from eval + click data; per-workspace threshold recalibration.

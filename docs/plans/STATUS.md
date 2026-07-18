@@ -26,7 +26,7 @@ the current-behavior source of truth.
 | # | Plan | Shipped | Lives now in |
 |---|------|---------|--------------|
 | 01 | Knowledge-debt backlog | 2026-07-13 | `CLAUDE.md` (gaps.py architecture bullet + `/api/gaps`), `docs/PRD.md` W2 (✅ DONE) |
-| 02 | Retrieval quality pack (contextual chunks + threshold calibration + alias query expansion) | A 2026-07-13, B+C 2026-07-17 | `CLAUDE.md` (evals-harness + memory/expansion bullets, min_score note), `docs/AI_ARCHITECTURE.md` §4 Shipped ledger (#1/#3/#4), `docs/TEST_STRATEGY.md` |
+| 02 | Retrieval quality pack (contextual chunks + threshold calibration + alias query expansion) | A 2026-07-13, B+C 2026-07-17 | `CLAUDE.md` (evals-harness + memory/expansion bullets, min_score note), `docs/AI_ROADMAP.md` §2 Shipped ledger (#1/#3/#4), `docs/TEST_STRATEGY.md` |
 
 ## The real backlog, ordered
 

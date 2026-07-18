@@ -471,9 +471,9 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
      truth: the relevant `CLAUDE.md` architecture bullet AND the matching `docs/` architecture/
      strategy section. "What exists" is described there, never only in a plan.
   2. **Remove it from the forward lists** — delete the slice from the plan's outstanding items,
-     and delete the completed item from any **roadmap's pending list** (`AI_ARCHITECTURE.md` Tier
-     lists, `PRD.md` W-wishlist, `FRONTEND_ROADMAP.md` F-items, `CLOUD_ROADMAP.md` Y-items,
-     `MARKET_ASSESSMENT.md` Appendix A). A done item is *moved out*, not left inline marked
+     and delete the completed item from any **roadmap's pending list** (`AI_ROADMAP.md`
+     tier/S/X lists, `PRD.md` W-wishlist, `FRONTEND_ROADMAP.md` F-items, `CLOUD_ROADMAP.md`
+     Y-items, `MARKET_ASSESSMENT.md` Appendix A). A done item is *moved out*, not left inline marked
      "shipped" — record it, if worth it, in that doc's short **Shipped** ledger with a pointer to
      where it's now documented. Keep any cross-reference anchors intact (leave a one-line stub if
      a number is referenced elsewhere).
@@ -491,8 +491,9 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   documents that must give a true snapshot of the repo at all times**, not write-once artifacts —
   they are the destination the rule above graduates finished work INTO. Any change that shifts
   architecture, capabilities, roadmap position, test posture, or the product story must update the
-  affected doc **in the same change**: `docs/AI_ARCHITECTURE.md` (invariants I1–I3 + the
-  retrieval/ragless roadmap), `docs/PRD.md` (story/AC/test status + the W-wishlist),
+  affected doc **in the same change**: `docs/AI_ARCHITECTURE.md` (invariants I1–I3, stack-as-built,
+  limitations — descriptive only), `docs/AI_ROADMAP.md` (ALL pending AI work: quality tiers,
+  speed/cost S-track, research X-track, frontier process), `docs/PRD.md` (story/AC/test status + the W-wishlist),
   `docs/TEST_STRATEGY.md` (coverage program + T1–T4 — reflect new suites, gaps closed, and honest
   remaining holes), `docs/FRONTEND_ROADMAP.md` (F0–F2), `docs/CLOUD_ROADMAP.md` (Y1–Y5),
   `docs/MARKET_ASSESSMENT.md` (Appendix A connector matrix + differentiators), `docs/PITCH_DECK.md`
@@ -505,8 +506,12 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
 
 `docs/PRD.md` (stories+ACs+tests, wishlist W1–W10), `docs/MARKET_ASSESSMENT.md` (honest:
 not unique as "chat over docs"; differentiators = honesty contract, evidence graph,
-local-first, ramp metrics), `docs/PITCH_DECK.md`, `docs/AI_ARCHITECTURE.md` (invariants
-I1–I3 + 20-item retrieval/ragless roadmap), `docs/FRONTEND_ROADMAP.md` (F0–F2),
+local-first, ramp metrics), `docs/PITCH_DECK.md`, `docs/AI_ARCHITECTURE.md` (descriptive:
+invariants I1–I3, stack-as-built, limitations, model strategy), **`docs/AI_ROADMAP.md`**
+(2026-07-17 — the single forward-looking AI doc: quality tiers #2/#5–#20, speed/cost
+S-track S1–S5, original-research X-track X1–X6 with pre-registered spikes, and the standing
+frontier process — per-change eval/bench gates, monthly frontier scan, quarterly research
+spike, each with a ready-to-paste prompt), `docs/FRONTEND_ROADMAP.md` (F0–F2),
 `docs/TEST_STRATEGY.md` (>90% program, T1–T4), `docs/CLOUD_ROADMAP.md` (Y1–Y5),
 `docs/design/DESIGN_VISION.md` + `orrery-prototype.html` (fog-of-war "Orrery" concept,
 published as a Claude artifact). These are the authoritative roadmap references.
@@ -714,8 +719,8 @@ Post-phase additions (2026-07-07, all tested — suite: **89 passed**):
   the pre-existing missing-`docs/evals/` eval-yaml failure unchanged. Live-verified on the AppRiver
   graph (`connector monitor` → `AppRiver.Connector.Monitor`) and via a scratch calibrate/apply/
   compare run. (Part A, contextual chunking, shipped earlier on 2026-07-13.) Plan 02 is fully
-  shipped; its plan file has been removed and its substance graduated here + into
-  `AI_ARCHITECTURE.md` §4 (see the `docs/plans/STATUS.md` "Shipped & removed" ledger).
+  shipped; its plan file has been removed and its substance graduated here + into the
+  `AI_ROADMAP.md` Shipped ledger (see the `docs/plans/STATUS.md` "Shipped & removed" ledger).
 
 ## Next steps (agreed with user)
 

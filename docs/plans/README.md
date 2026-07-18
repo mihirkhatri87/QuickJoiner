@@ -1,6 +1,7 @@
 # Execution plans — highest-ROI features
 
-Selected from the strategy pack (PRD wishlist, MARKET_ASSESSMENT, AI_ARCHITECTURE) by
+Selected from the strategy pack (PRD wishlist, MARKET_ASSESSMENT, and the AI roadmap — now
+`docs/AI_ROADMAP.md`, whose frontier process is the standing intake for new plans) by
 ROI = (differentiation × user value × strategic leverage) ÷ (effort × risk). 2026-07-12.
 
 Each plan file is self-contained: design, acceptance criteria, test matrix, and a
