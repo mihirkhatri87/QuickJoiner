@@ -464,27 +464,42 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   in the same change — treat stale docs as a broken build. `README.md` is written for a new user
   (setup + how to run); `CLAUDE.md` is the internal source of truth (architecture, conventions,
   status). When they would disagree, fix them, don't pick one.
-- **Keep the plans current — always.** When a slice of a plan in `docs/plans/` ships (or is
-  deliberately dropped), update its status **in the same change**: (1) the plan file's top
-  **STATUS banner**, (2) the row in `docs/plans/STATUS.md` (the master tracker) and its
-  "genuinely outstanding work" list, and (3) the Status column in `docs/plans/README.md`. A plan
-  that's fully done is marked ✅ and has no residual "outstanding" items lingering. This is the
-  rule that prevents an imaginary pile of already-finished work from reading as a backlog — a
-  reader must be able to trust that anything not ✅ is genuinely unbuilt. Reconcile against the
-  tree, not from memory: a feature counts as shipped only when its code/tests actually exist.
+- **Plans and roadmaps are forward-looking; graduate finished work OUT of them.** `docs/plans/`
+  and the roadmaps embedded in the strategy docs describe work that is **not yet done**. The
+  moment a slice ships (or is deliberately dropped), in the **same change**:
+  1. **Graduate the substance** — fold *how it actually works* into the descriptive source of
+     truth: the relevant `CLAUDE.md` architecture bullet AND the matching `docs/` architecture/
+     strategy section. "What exists" is described there, never only in a plan.
+  2. **Remove it from the forward lists** — delete the slice from the plan's outstanding items,
+     and delete the completed item from any **roadmap's pending list** (`AI_ARCHITECTURE.md` Tier
+     lists, `PRD.md` W-wishlist, `FRONTEND_ROADMAP.md` F-items, `CLOUD_ROADMAP.md` Y-items,
+     `MARKET_ASSESSMENT.md` Appendix A). A done item is *moved out*, not left inline marked
+     "shipped" — record it, if worth it, in that doc's short **Shipped** ledger with a pointer to
+     where it's now documented. Keep any cross-reference anchors intact (leave a one-line stub if
+     a number is referenced elsewhere).
+  3. **Update the trackers** — `docs/plans/STATUS.md` (master table + outstanding list) and the
+     Status column in `docs/plans/README.md`.
+  4. **Delete emptied plans** — when a plan has **nothing outstanding left**, delete the plan file
+     entirely (git preserves it) and record it in STATUS.md's **"Shipped & removed"** ledger with
+     a pointer to where its substance now lives. Do NOT keep a ✅ tombstone plan around.
+
+  The invariant this buys: an open plan or a pending roadmap item **always** means genuinely
+  unbuilt work — never a finished thing masquerading as a backlog — and the architecture/strategy
+  docs are the single description of what exists. Reconcile against the tree, not from memory: a
+  feature counts as shipped only when its code/tests actually exist.
 - **Keep the strategy & design docs live — always.** The docs under `docs/` are **living
-  documents that must give a true snapshot of the repo at all times**, not write-once artifacts.
-  Any change that shifts architecture, capabilities, roadmap position, test posture, or the
-  product story must update the affected doc **in the same change**: `docs/AI_ARCHITECTURE.md`
-  (invariants I1–I3 + the retrieval/ragless roadmap — mark items shipped/changed), `docs/PRD.md`
-  (story/AC/test status + the W-wishlist), `docs/TEST_STRATEGY.md` (coverage program + T1–T4 —
-  reflect new suites, gaps closed, and honest remaining holes), `docs/FRONTEND_ROADMAP.md`
-  (F0–F2), `docs/CLOUD_ROADMAP.md` (Y1–Y5), `docs/MARKET_ASSESSMENT.md` (Appendix A connector
-  matrix + differentiators), `docs/PITCH_DECK.md` (claims must match what actually ships — never
-  let the deck outrun the code), `docs/KNOWLEDGE_GRAPH.md`, and `docs/design/DESIGN_VISION.md`.
-  A roadmap item that's built is marked shipped (not left as "planned"); a claim that's no longer
-  true is corrected, not left to rot. Reconcile against the tree, not from memory. Treat any of
-  these drifting out of sync with the code as a broken build, exactly like `CLAUDE.md`/`README.md`.
+  documents that must give a true snapshot of the repo at all times**, not write-once artifacts —
+  they are the destination the rule above graduates finished work INTO. Any change that shifts
+  architecture, capabilities, roadmap position, test posture, or the product story must update the
+  affected doc **in the same change**: `docs/AI_ARCHITECTURE.md` (invariants I1–I3 + the
+  retrieval/ragless roadmap), `docs/PRD.md` (story/AC/test status + the W-wishlist),
+  `docs/TEST_STRATEGY.md` (coverage program + T1–T4 — reflect new suites, gaps closed, and honest
+  remaining holes), `docs/FRONTEND_ROADMAP.md` (F0–F2), `docs/CLOUD_ROADMAP.md` (Y1–Y5),
+  `docs/MARKET_ASSESSMENT.md` (Appendix A connector matrix + differentiators), `docs/PITCH_DECK.md`
+  (claims must match what actually ships — never let the deck outrun the code), `docs/KNOWLEDGE_GRAPH.md`,
+  and `docs/design/DESIGN_VISION.md`. A claim that's no longer true is corrected, not left to rot.
+  Reconcile against the tree, not from memory. Treat any of these drifting out of sync with the
+  code as a broken build, exactly like `CLAUDE.md`/`README.md`.
 
 ## Strategy & design docs (2026-07-11, "champion team" review)
 
@@ -495,10 +510,13 @@ I1–I3 + 20-item retrieval/ragless roadmap), `docs/FRONTEND_ROADMAP.md` (F0–F
 `docs/TEST_STRATEGY.md` (>90% program, T1–T4), `docs/CLOUD_ROADMAP.md` (Y1–Y5),
 `docs/design/DESIGN_VISION.md` + `orrery-prototype.html` (fog-of-war "Orrery" concept,
 published as a Claude artifact). These are the authoritative roadmap references.
-**Execution plans** (each with a ready-to-paste prompt): `docs/plans/` — 01 knowledge-debt
-backlog, 02 retrieval quality pack, 03 Slack+Teams connectors, 04 coverage fog (01 must precede
-04), **05 evaluate retrieval & correlation on a connected org** (the "decide with data" runbook
-for the a–e stack + embedding-change decision; run on an org-connected machine).
+**Execution plans** (each with a ready-to-paste prompt): `docs/plans/` — see `docs/plans/STATUS.md`
+for the live tracker. Live plans: 03 Slack+Teams connectors, 04 coverage fog, **05 evaluate
+retrieval & correlation on a connected org** (the "decide with data" runbook for the a–e stack +
+embedding-change decision; run on an org-connected machine), 06 multi-angle confidence (code
+shipped, verification open). Shipped & removed (graduated into these docs): 01 knowledge-debt
+backlog, 02 retrieval quality pack. Finished plans are deleted, not kept — per the house rules
+above, only unbuilt work lives under `docs/plans/`.
 
 ## Phase status (approved plan: C:\Users\aarti\.claude\plans\happy-cuddling-sutherland.md)
 
@@ -551,7 +569,8 @@ Post-phase additions (2026-07-07, all tested — suite: **89 passed**):
   post-scrape follow-up are Flows; App.tsx keeps only the agentic stage). Knowledge graph
   Phase A shipped (see Next steps item 3 for the full inventory). Agent-tool bridge queued
   (item 4). Suite: **164 passed** + 9 pg tests live vs pgvector/pg16 in Docker.
-- Knowledge-debt backlog (2026-07-13, `docs/plans/01`, PRD W2.1–W2.3): **every refusal is a
+- Knowledge-debt backlog (2026-07-13, PRD W2.1–W2.3; plan shipped + removed — see
+  `docs/plans/STATUS.md` ledger): **every refusal is a
   data point about what the org needs to learn.** `agent/tools.py::search_memory` logs a gap
   (fire-and-forget — a gap-write failure never changes the tool's return) on the `NO_RESULTS`
   branch, recording best score + top-3 near-misses (a second `store.search(min_score=0.0)`).
@@ -694,7 +713,9 @@ Post-phase additions (2026-07-07, all tested — suite: **89 passed**):
   wired into `search_memory` + `/api/search`, best-effort. Suite: **399 passed**, 10 skipped,
   the pre-existing missing-`docs/evals/` eval-yaml failure unchanged. Live-verified on the AppRiver
   graph (`connector monitor` → `AppRiver.Connector.Monitor`) and via a scratch calibrate/apply/
-  compare run. (Part A, contextual chunking, shipped earlier on 2026-07-13.) Plan 02 is now ✅.
+  compare run. (Part A, contextual chunking, shipped earlier on 2026-07-13.) Plan 02 is fully
+  shipped; its plan file has been removed and its substance graduated here + into
+  `AI_ARCHITECTURE.md` §4 (see the `docs/plans/STATUS.md` "Shipped & removed" ledger).
 
 ## Next steps (agreed with user)
 

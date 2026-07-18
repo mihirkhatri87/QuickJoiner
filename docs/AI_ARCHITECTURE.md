@@ -84,26 +84,28 @@ Key defended choices:
 ## 4. Retrieval frontier roadmap (ordered by expected ROI ÷ risk)
 
 Every item ships behind `qj eval` A/B gates on the standard pack + per-org packs. Uplift
-numbers are targets to beat, not promises.
+numbers are targets to beat, not promises. Items graduate OUT of this roadmap into the
+"Shipped" ledger below (and are documented as current behavior in `CLAUDE.md`) once built —
+so a numbered item still listed under a Tier is genuinely unbuilt.
+
+### Shipped (graduated from this roadmap)
+Numbers are kept as anchors for the R1–R5 release refs; how each actually works is documented
+in `CLAUDE.md` (memory/ingest/evals bullets) — the source of truth for current behavior.
+- **#1 Contextual chunk enrichment** — the deterministic breadcrumb form
+  (`pipeline.breadcrumb()`, `retrieval.contextual_chunks`). Remaining upgrade: the optional
+  LLM 1–2 sentence context. (2026-07-13)
+- **#3 Threshold calibration per workspace** — `qj eval --calibrate/--apply/--compare`
+  (`evals/harness.calibrate`), max-margin midpoint over the org's eval pack. (2026-07-17)
+- **#4 Query expansion with org aliases** — `memory/expansion.py`, `retrieval.alias_expansion`,
+  the query-side twin of ingest aliasing. (2026-07-17)
 
 ### Tier 1 — highest leverage, low risk
-1. ✅ **SHIPPED** — **Contextual chunk enrichment** (Anthropic-style contextual retrieval):
-   the deterministic breadcrumb form (`source · title · path` + section heading via
-   `pipeline.breadcrumb()`, `retrieval.contextual_chunks`, on) is live; the optional LLM
-   1–2 sentence context is the remaining upgrade. Target was +5–15 pts grounded-recall.
+1. → **shipped** (see ledger above).
 2. **AST-aware code chunking** (tree-sitter): functions/classes as chunk units with
    imports+signature context; manifest of symbols per file feeds the graph too. Target:
    large uplift on code questions; enables "explain this function's role."
-3. ✅ **SHIPPED** — **Threshold calibration per workspace** (`qj eval --calibrate [--apply]`,
-   `evals/harness.calibrate`): sweeps the gate over the org's eval pack and recommends the
-   **midpoint of the optimal band** (maximum margin) subject to a refusal-accuracy floor,
-   replacing hand-tuning of the global 0.55; reports the full calibration curve and flags
-   thin eval sets. Zero query-time cost. (`--compare` adds the before/after regression gate.)
-4. ✅ **SHIPPED** — **Query normalization + expansion with org aliases** (`memory/expansion.py`,
-   `retrieval.alias_expansion`, on): applies the alias table *query-side* (twin of the
-   ingest-side aliasing) — "connector monitor" expands to `AppRiver.Connector.Monitor` before
-   retrieval. Deterministic, cheap, reuses the graph resolver; adds canonical tokens only, so
-   the grounding gate is untouched.
+3. → **shipped** (see ledger above).
+4. → **shipped** (see ledger above).
 5. **Recency & authority priors**: small rank features (doc age, source type weight,
    in-graph degree) applied at fusion — never at the gate (I1). Kill-switch per workspace.
 

@@ -1,11 +1,13 @@
 # Plan 06 — Multi-Angle, Confidence-Scored Answers + Clarifying Questions
 
-> **STATUS: ✅ COMPLETE (shipped 2026-07-17).** All four phases A→D→B→C landed:
-> `graph_path_candidates` + ambiguity text, `entity_evidence`-driven adjudicator, `confidence.py`
-> (`score_edge`/`score_chain`), `candidates.py` + SSE event + `CandidateCarousel`. **One item
-> pending: AC #7 / §1.D live check** — `resolve_entity('webroot connector')` merging fires at
-> ingest time, awaiting the next clean re-sync of Connector + Confluence (code + fixtures done).
-> See [STATUS.md](STATUS.md).
+> **STATUS: ◐ CODE SHIPPED (2026-07-17), verification + related-work open.** All four phases
+> A→D→B→C landed: `graph_path_candidates` + ambiguity text, `entity_evidence`-driven adjudicator,
+> `confidence.py` (`score_edge`/`score_chain`), `candidates.py` + SSE event + `CandidateCarousel`.
+> **Open:** AC #7 / §1.D live check (`resolve_entity('webroot connector')` merging fires at ingest
+> time — awaiting the next clean Connector + Confluence re-sync; code + fixtures done) and the §4
+> related work (repo-graph refresh, connect Nautical↔Stevedore). When these close, graduate the
+> substance into the architecture docs and **delete this plan** (CLAUDE.md house rule). See
+> [STATUS.md](STATUS.md).
 
 Effort: ~7–9 dev-days · Dependencies: none to start section A; C benefits from 01 (gaps) and
 the repo-graph-refresh follow-up · Gate: the worked example below (Connector/Nautical/

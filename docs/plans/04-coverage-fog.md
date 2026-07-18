@@ -1,11 +1,13 @@
 # Plan 04 — Coverage Fog & One-Click Remediation (PRD W10.1 + W2.3, first Orrery slice)
 
-> **STATUS: ⬜ NOT STARTED.** Its dependency (Plan 01 gaps data) is ✅ ready. Nothing built yet:
-> no `coverage.py` / `/api/coverage`, no `frontend/src/fog.ts`, no GraphView fog layer, and
-> **Phase 0's frontend test harness (Vitest/RTL/MSW) does not exist** — the repo still has zero
-> FE unit tests. See [STATUS.md](STATUS.md).
+> **STATUS: ⬜ NOT STARTED.** Its data dependency — the knowledge-debt gaps backlog (`gaps.py`,
+> `/api/gaps`, `cluster_gaps`; formerly Plan 01, now shipped and documented in the CLAUDE.md gaps
+> bullet) — is ✅ ready. Nothing built yet: no `coverage.py` / `/api/coverage`, no
+> `frontend/src/fog.ts`, no GraphView fog layer, and **Phase 0's frontend test harness
+> (Vitest/RTL/MSW) does not exist** — the repo still has zero FE unit tests. See [STATUS.md](STATUS.md).
 
-Effort: ~4–5 dev-days (incl. FE test harness) · Dependencies: **Plan 01 (gaps data)**
+Effort: ~4–5 dev-days (incl. FE test harness) · Dependencies: **gaps backlog (shipped —
+`gaps.py` / `/api/gaps` / `cluster_gaps`, see the CLAUDE.md gaps bullet)**
 Design source: `docs/design/DESIGN_VISION.md` + `orrery-prototype.html` (port its visual
 grammar: dashed frontier, UNCHARTED label, violet heat, "territory lit" instrument).
 
@@ -100,8 +102,9 @@ sheet → Connect → wizard shows preselected type.
 
 ```
 Implement the Coverage Fog & Remediation feature for QuickJoiner exactly per
-docs/plans/04-coverage-fog.md. Read it, docs/plans/01-knowledge-debt-backlog.md (its
-gaps API is your data source — it MUST already be merged; stop and report if not),
+docs/plans/04-coverage-fog.md. Read it; the gaps backlog is your data source and is
+already shipped (quickjoiner/gaps.py, catalog gaps table, GET /api/gaps,
+gaps.cluster_gaps — see the CLAUDE.md gaps bullet),
 docs/design/DESIGN_VISION.md, CLAUDE.md, and frontend/src/components/GraphView.tsx before
 coding. Open docs/design/orrery-prototype.html in a browser once — you are porting its
 visual grammar (dashed violet frontier, UNCHARTED caption, territory-lit instrument) onto
