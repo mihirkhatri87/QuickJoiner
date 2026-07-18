@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS entity_aliases (
 CREATE TABLE IF NOT EXISTS edges (
     src        TEXT NOT NULL,        -- entities.id
     rel        TEXT NOT NULL,        -- depends_on | provides | references | part_of | deploys
+                                     -- | owns | works_on | publishes_to | subscribes_to | stores_in
     dst        TEXT NOT NULL,        -- entities.id
     evidence_doc_id TEXT NOT NULL DEFAULT '',  -- catalog documents.doc_id that proves it
     detail     TEXT NOT NULL DEFAULT '',       -- e.g. "3.2.0 via src/Api/Api.csproj"

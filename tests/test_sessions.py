@@ -116,6 +116,37 @@ def test_parse_compression_relationships_section():
     assert "user: question 0" in digest and "assistant: answer 1" in digest
 
 
+def test_parse_triples_pubsub_and_storage_vocab():
+    """The 2026-07-17 vocab additions: pub/sub verbs to `topic`, stores_in to
+    `datastore` — and near-miss synonyms stay dropped (widened, not opened)."""
+    from quickjoiner.sessions import Triple, parse_triples
+
+    triples = parse_triples([
+        "service: checkout | publishes_to | topic: order-events",
+        "service: billing | subscribes_to | topic: order-events",
+        "service: checkout | stores_in | datastore: OrdersDb",
+        "service: checkout | writes_to | datastore: OrdersDb",   # off-vocab rel -> dropped
+        "service: billing | publishes_to | queue: order-events", # off-vocab type -> dropped
+        "service: billing | stores_in | database: OrdersDb",     # off-vocab type -> dropped
+    ])
+    assert triples == [
+        Triple("service", "checkout", "publishes_to", "topic", "order-events"),
+        Triple("service", "billing", "subscribes_to", "topic", "order-events"),
+        Triple("service", "checkout", "stores_in", "datastore", "OrdersDb"),
+    ]
+
+
+def test_compress_prompt_vocab_in_lockstep_with_validator():
+    """Both LLM prompts enumerate the vocabulary from the sets themselves — a new
+    verb/type must appear in the prompts without any hand-edit."""
+    from quickjoiner.ingest.triples import DOC_TRIPLE_SYSTEM, TRIPLE_RELS, TRIPLE_TYPES
+    from quickjoiner.sessions import COMPRESS_SYSTEM
+
+    for vocab_word in TRIPLE_RELS | TRIPLE_TYPES:
+        assert vocab_word in COMPRESS_SYSTEM
+        assert vocab_word in DOC_TRIPLE_SYSTEM
+
+
 # -- projects & session lifecycle -------------------------------------------------
 
 def test_project_create_and_session_grouping(manager, ctx):

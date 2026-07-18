@@ -27,7 +27,21 @@ from typing import Any
 from quickjoiner.connectors.base import Document
 from quickjoiner.llm.base import Message, ToolCall
 
-COMPRESS_SYSTEM = """\
+# Knowledge-graph triples live in ingest/triples.py (shared with document
+# ingestion); re-exported here so `from quickjoiner.sessions import Triple,
+# parse_triples` keeps working. The ALLOWED_* lines keep this prompt's vocabulary
+# in lockstep with the validator's sets — one source of truth.
+from quickjoiner.ingest.triples import (
+    ALLOWED_RELS_LINE,
+    ALLOWED_TYPES_LINE,
+    TRIPLE_RELS,
+    TRIPLE_TYPES,
+    Triple,
+    parse_triples,
+    triples_to_graph,
+)
+
+COMPRESS_SYSTEM = f"""\
 You compress conversation history for an onboarding assistant. Given older turns of
 a conversation, produce exactly this output format:
 
@@ -43,23 +57,12 @@ RELATIONSHIPS:
 
 RELATIONSHIPS lines record concrete links between two NAMED things that this
 conversation established (e.g. "team: payments guild | owns | repo: proj-a").
-Allowed types: repo, package, project, service, environment, ticket, person, team.
-Allowed relations: depends_on, provides, references, part_of, deploys, owns, works_on.
+{ALLOWED_TYPES_LINE}
+{ALLOWED_RELS_LINE}
 Use names exactly as the conversation gave them. Never invent relationships.
 
 If a section has nothing, leave it empty. Output nothing else.\
 """
-
-# Knowledge-graph triples now live in ingest/triples.py (shared with document
-# ingestion); re-exported here so `from quickjoiner.sessions import Triple,
-# parse_triples` keeps working.
-from quickjoiner.ingest.triples import (  # noqa: E402
-    TRIPLE_RELS,
-    TRIPLE_TYPES,
-    Triple,
-    parse_triples,
-    triples_to_graph,
-)
 
 
 def estimate_tokens(messages: list[Message], summary: str = "") -> int:

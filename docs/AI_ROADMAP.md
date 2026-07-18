@@ -250,6 +250,12 @@ Scan log: *(dated one-liners appended here by each scan)*
 - 2026-07-17 — user-driven intake: "should we add ontology?" evaluated against the rubric →
   **#21 relation signatures** (Tier 1) and **X7 workspace-adaptive ontology induction**
   (X-track) accepted; full formal ontology rejected (below).
+- 2026-07-17 — user-driven vocab curation (the manual fast-path of X7): types `topic` +
+  `datastore`, rels `publishes_to`/`subscribes_to`/`stores_in` added to `triples.py` —
+  runtime coupling (pub/sub, data residence) that manifests can't see. Shipped same day
+  with lockstep prompt interpolation. When #21 lands, their signatures:
+  `publishes_to/subscribes_to: service|project → topic`,
+  `stores_in: service|project|repo → datastore`.
 
 **Intake rejections** (don't re-propose without new evidence; mirrors the research archive):
 - **Full formal ontology** (OWL/RDF class hierarchies, reasoners, triple stores, interop

@@ -211,6 +211,31 @@ def test_catalog_graph_path_bfs(catalog):
     assert catalog.graph_path("repo:a", "service:unconnected") is None
 
 
+def test_graph_path_bridges_pubsub_runtime_coupling(catalog):
+    """The manifest blind spot: two services wired only through a Service Bus topic
+    share NO package dependency, so deps.py can never link them — the pub/sub verbs
+    are what connect them. checkout --publishes_to--> order-events <--subscribes_to--
+    billing, plus billing --stores_in--> BillingDb for the storage hop."""
+    for eid, name, type_ in (
+        ("service:checkout", "Checkout", "service"),
+        ("service:billing", "Billing", "service"),
+        ("topic:order-events", "order-events", "topic"),
+        ("datastore:billingdb", "BillingDb", "datastore"),
+    ):
+        catalog.upsert_entity(eid, name, type_)
+    catalog.replace_doc_edges("wiki1", [("service:checkout", "publishes_to", "topic:order-events", "")])
+    catalog.replace_doc_edges("wiki2", [("service:billing", "subscribes_to", "topic:order-events", "")])
+    catalog.replace_doc_edges("wiki3", [("service:billing", "stores_in", "datastore:billingdb", "")])
+
+    # "If I change the order-events payload, who breaks?" — the impact-analysis path.
+    path = catalog.graph_path("service:checkout", "service:billing")
+    assert path is not None and [p["rel"] for p in path] == ["publishes_to", "subscribes_to"]
+    # "Where does the event's data end up?" — extend one storage hop.
+    path = catalog.graph_path("service:checkout", "datastore:billingdb")
+    assert path is not None and [p["rel"] for p in path] == [
+        "publishes_to", "subscribes_to", "stores_in"]
+
+
 def test_catalog_graph_path_scans_the_whole_edge_table(catalog):
     """graph_path's BFS must see every edge, not a truncated prefix of them — a
     "no known path" answer is treated everywhere as an honest refusal, so a

@@ -43,6 +43,8 @@ TEMPLATES: dict[str, list[str]] = {
         "Where is {name} deployed?",
         "What does {name} depend on?",
         "Who owns {name}?",
+        "What does {name} publish or subscribe to?",
+        "Where does {name} store its data?",
         "What is {name}?",
     ],
     "project": [
@@ -82,6 +84,15 @@ TEMPLATES: dict[str, list[str]] = {
     "symbol": [
         "Where is {name} defined?",
         "What uses {name}?",
+    ],
+    "topic": [
+        "What publishes to {name}?",
+        "What subscribes to {name}?",
+        "Who breaks if the {name} event changes?",
+    ],
+    "datastore": [
+        "Which services store data in {name}?",
+        "What depends on {name}?",
     ],
 }
 DEFAULT_TEMPLATES = ["What is {name}?", "Tell me about {name}."]

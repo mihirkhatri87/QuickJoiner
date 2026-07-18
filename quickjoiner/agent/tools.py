@@ -351,8 +351,9 @@ def build_builtin_tools(
             spec=ToolSpec(
                 name="graph_neighbors",
                 description=(
-                    "Look up an entity (repo, package, project, ticket) in the knowledge "
-                    "graph and list its recorded relationships (depends_on / provides / "
+                    "Look up an entity (repo, package, project, ticket, topic, datastore) "
+                    "in the knowledge graph and list its recorded relationships "
+                    "(depends_on / provides / publishes_to / subscribes_to / stores_in / "
                     "references) with evidence documents. Resolves org shorthand aliases "
                     "(e.g. 'nautical models' for AppRiver.Nautical.Models). Use this FIRST "
                     "for questions about how projects/packages/tickets relate, then "

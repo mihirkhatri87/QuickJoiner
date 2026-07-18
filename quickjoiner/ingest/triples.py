@@ -15,9 +15,18 @@ import re
 from dataclasses import dataclass
 
 TRIPLE_TYPES = {"repo", "package", "project", "service", "environment", "ticket",
-                "person", "team"}
+                "person", "team",
+                # message channels (Service Bus topics/queues, event streams) and data
+                # stores (databases/caches/blob containers): the runtime-coupling nouns
+                # that package manifests can never see — two services wired only through
+                # a topic or a shared table have no compile-time relationship for
+                # deps.py to find, so these edges are the event-driven org's missing map.
+                "topic", "datastore"}
 TRIPLE_RELS = {"depends_on", "provides", "references", "part_of", "deploys",
-               "owns", "works_on"}
+               "owns", "works_on",
+               # pub/sub + storage verbs (2026-07-17, user request): service
+               # publishes_to/subscribes_to topic; service stores_in datastore.
+               "publishes_to", "subscribes_to", "stores_in"}
 _TRIPLE_LINE = re.compile(
     r"^([a-z_]+)\s*:\s*(.{1,80}?)\s*\|\s*([a-z_]+)\s*\|\s*([a-z_]+)\s*:\s*(.{1,80}?)$"
 )
@@ -70,14 +79,25 @@ def triples_to_graph(triples: list[Triple], detail: str) -> dict:
     return {"entities": sorted(entities.values()), "aliases": sorted(alias_rows), "edges": edges}
 
 
-DOC_TRIPLE_SYSTEM = """You extract a knowledge graph of relationships from an \
+# Both extraction prompts (documents here, conversations in sessions.py) enumerate the
+# vocabulary from these strings so the sets above are the single source of truth —
+# extending TRIPLE_TYPES/TRIPLE_RELS updates every prompt automatically.
+ALLOWED_TYPES_LINE = "Allowed types: " + ", ".join(sorted(TRIPLE_TYPES)) + "."
+ALLOWED_RELS_LINE = "Allowed relations: " + ", ".join(sorted(TRIPLE_RELS)) + "."
+
+DOC_TRIPLE_SYSTEM = f"""You extract a knowledge graph of relationships from an \
 organization document. Output ONLY relationship lines, one per line, in exactly \
 this format:
 
 <type>: <name> | <relation> | <type>: <name>
 
-Allowed types: repo, package, project, service, environment, ticket, person, team.
-Allowed relations: depends_on, provides, references, part_of, deploys, owns, works_on.
+{ALLOWED_TYPES_LINE}
+{ALLOWED_RELS_LINE}
+"topic" covers message topics, queues and event streams; "datastore" covers \
+databases, caches and blob/object stores. Use publishes_to/subscribes_to for \
+messaging links (e.g. "service: billing | subscribes_to | topic: order-events") \
+and stores_in for data residence (e.g. "service: checkout | stores_in | \
+datastore: OrdersDb").
 Record only concrete links the document actually states between two NAMED things
 (e.g. "service: checkout | depends_on | service: payments"). Use names exactly as
 written. Never invent relationships. If there are none, output nothing."""

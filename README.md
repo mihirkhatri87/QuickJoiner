@@ -20,7 +20,10 @@ when memory has nothing relevant.
   generic web scraper.
 - **Honesty by design** — a grounding contract forces citations and refusals, every refusal is
   captured as a **knowledge gap** with one-click remediation, and a **knowledge graph** links
-  repos, packages, tickets, services, and environments so you can see how things connect.
+  repos, packages, tickets, services, environments, **message topics, and datastores** so you
+  can see how things connect — including pub/sub coupling (`publishes_to`/`subscribes_to`) and
+  data residence (`stores_in`), the runtime relationships package manifests can never reveal
+  ("if I change this event, who breaks?").
 - **Multi-angle answers with honest confidence** — when the graph has recorded more than one
   materially different connection between two things, the agent surfaces *all* of them (or asks
   one clarifying question) instead of silently picking the shortest; every relationship carries a

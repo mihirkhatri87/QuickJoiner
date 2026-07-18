@@ -167,6 +167,15 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   (**re-exported from `sessions.py`** for back-compat) and `extract_doc_triples(provider,…)` — optional
   LLM relationship extraction over prose docs, config-gated by `graph.extract_triples` (OFF by default:
   one LLM call per qualifying doc), keyless-safe, validated against the vocab, evidence = the document.
+  **Vocab (2026-07-17): types gained `topic` (message topics/queues/streams) + `datastore`
+  (databases/caches/blob stores); rels gained `publishes_to`/`subscribes_to`/`stores_in`** — the
+  runtime-coupling edges package manifests can't see (two services wired only through a Service Bus
+  topic share no compile-time dependency for deps.py to find). Both LLM prompts (doc extraction +
+  conversation distillation in `sessions.py`) enumerate the vocab from `ALLOWED_TYPES_LINE`/
+  `ALLOWED_RELS_LINE` interpolation — the sets are the single source of truth, prompts can't drift
+  (lockstep-guarded by `test_compress_prompt_vocab_in_lockstep_with_validator`). Ingest-time: new
+  verbs mine prose only when `graph.extract_triples` is on + re-sync; distillation picks them up on
+  every compression regardless.
   **Entity-resolution adjudicator gets evidence context (plan 06 §1.D, 2026-07-17):** the
   `Adjudicator` seam in `entity_resolution.py` is 5-arg — `(type, name, candidates,
   new_entity_context, candidate_contexts)`. `pipeline._persist_graph` threads the evidence doc's
