@@ -53,6 +53,15 @@ How each works is documented in `CLAUDE.md` — the source of truth for current 
 5. **Recency & authority priors** — *adopt*. Small rank features (doc age, source type
    weight, in-graph degree) applied at RRF fusion — never at the gate (I1). Kill-switch
    per workspace.
+21. **Relation signatures (ontology-lite domain/range validation)** — *adapt*. A signature
+    table over the existing triple vocab (`deploys: service|project → environment`,
+    `owns: team|person → repo|service|project`, …) enforced in `parse_triples` alongside the
+    type/rel checks — today the checks are independent, so a semantically impossible triple
+    like `environment: prod | owns | person: bob` validates. Closes that hole (strengthens
+    I3), and signature-violating edges from the deterministic extractors become a
+    lower-confidence signal for plan-06 scoring. Pure function, tiny effort, no schema change.
+    This is the full extent of "ontology" we adopt eagerly — see the §5.2 intake-rejection
+    note for what we deliberately do NOT build.
 
 ### Tier 2 — strong, moderate effort
 6. **Query decomposition / multi-query** — *adopt*. LLM splits compound questions;
@@ -180,6 +189,18 @@ ends stay dead). Originality labels re-checked at every frontier scan.
   decisions with the local small model (`qwen3:4b`), verify/execute with the configured
   model only when the draft is low-confidence or the tool is consequential. Hypothesis:
   ≥30% latency + cost reduction on multi-tool answers at unchanged eval-layer quality.
+- **X7 — Workspace-adaptive ontology induction** — *original*. Today `parse_triples` drops
+  every off-vocabulary relation — real org relationships (`monitors`, `alerts_on`,
+  `escalates_to`, `migrates_to`) are discarded at ingest. Induce per-workspace vocabulary
+  extensions: log dropped-but-well-formed proposals; when the same relation recurs across
+  distinct evidence docs above a threshold, propose it for human approval (UI: one-click,
+  like the gaps CTAs); approved relations join that workspace's validator (I3 preserved —
+  the validator becomes extensible, never bypassed) and get a #21 signature at approval
+  time. Each org's graph grows its own schema with zero up-front authoring — the
+  anti-Palantir: their ontology takes a team; ours is induced and approved in one click.
+  Hypothesis: on a connected org, ≥15% more edges serving cited answers and a measurable
+  hop_coverage lift vs the fixed vocab, with zero garbage-edge regressions on the seeded
+  eval pack.
 
 ### Research archive (dead ends, kept honestly)
 *(empty — populated by spike outcomes; an archived idea lists the hypothesis, what was
@@ -226,6 +247,22 @@ a 5-line summary of what moved in the field.
 ```
 
 Scan log: *(dated one-liners appended here by each scan)*
+- 2026-07-17 — user-driven intake: "should we add ontology?" evaluated against the rubric →
+  **#21 relation signatures** (Tier 1) and **X7 workspace-adaptive ontology induction**
+  (X-track) accepted; full formal ontology rejected (below).
+
+**Intake rejections** (don't re-propose without new evidence; mirrors the research archive):
+- **Full formal ontology** (OWL/RDF class hierarchies, reasoners, triple stores, interop
+  ontologies) — rejected 2026-07-17. (a) The useful inference — transitive reachability —
+  already exists at query time via `graph_path`/`graph_expand` BFS *with per-hop evidence*;
+  materialized inferred edges would carry no direct evidence doc (violates I2) and go stale.
+  (b) Contradicts the defended relational-graph choice; reasoner machinery is oversized for
+  10³–10⁵ entities. (c) Up-front ontology authoring is a category error for a product whose
+  buyer is a new joiner on day 1 — that market (staffed ontology teams) belongs to Palantir
+  and prices accordingly. (d) Interop ontologies (schema.org etc.) are irrelevant to
+  org-internal tooling corpora. The accepted scope is exactly #21 + X7: validation
+  signatures now, induced per-org vocabulary growth as research. Re-open only if evals on a
+  connected org show multi-hop failures that BFS + confidence scoring provably cannot fix.
 
 ### 5.3 Quarterly — research spike (time-boxed, pre-registered)
 Pick the top X-item by (expected differentiation ÷ effort). Before writing code, register

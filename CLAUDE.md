@@ -508,8 +508,8 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
 not unique as "chat over docs"; differentiators = honesty contract, evidence graph,
 local-first, ramp metrics), `docs/PITCH_DECK.md`, `docs/AI_ARCHITECTURE.md` (descriptive:
 invariants I1–I3, stack-as-built, limitations, model strategy), **`docs/AI_ROADMAP.md`**
-(2026-07-17 — the single forward-looking AI doc: quality tiers #2/#5–#20, speed/cost
-S-track S1–S5, original-research X-track X1–X6 with pre-registered spikes, and the standing
+(2026-07-17 — the single forward-looking AI doc: quality tiers #2/#5–#21, speed/cost
+S-track S1–S5, original-research X-track X1–X7 with pre-registered spikes, and the standing
 frontier process — per-change eval/bench gates, monthly frontier scan, quarterly research
 spike, each with a ready-to-paste prompt), `docs/FRONTEND_ROADMAP.md` (F0–F2),
 `docs/TEST_STRATEGY.md` (>90% program, T1–T4), `docs/CLOUD_ROADMAP.md` (Y1–Y5),
