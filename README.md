@@ -61,7 +61,9 @@ when memory has nothing relevant.
   memory" that wipes every ingested document, its vectors, and the whole knowledge graph, and clears
   each connector's sync watermark — the workspace goes back to as if nothing had ever synced, while
   your **connectors stay configured** (re-sync any time). Chat history and settings are untouched.
-  (`POST /api/memory/reset`; refuses while a sync is running.)
+  It runs as a background job with a **live log** and shows in the activity bell + sync history, so
+  you can watch it wipe and confirm it finished. (`POST /api/memory/reset`; refuses while a sync is
+  running.)
 - **Activity menu** — the bell in the top bar is the 24-hour view of what the workspace has been
   doing: syncs running right now and everything that finished, with counts or the error. It badges
   what you haven't seen yet, keeps unseen entries visually distinct from ones you've already read,

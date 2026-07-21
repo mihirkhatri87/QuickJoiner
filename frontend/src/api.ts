@@ -137,12 +137,9 @@ export const api = {
     req<{ job: SyncJob }>(`/api/sync/${encodeURIComponent(name)}/resume`, { method: "POST" }),
   listSyncs: () => req<{ syncs: SyncJob[] }>("/api/syncs"),
   // Wipe ALL ingested knowledge (documents, vectors, graph, watermarks); keeps connectors
-  // configured. Refuses (409) while any sync runs.
-  resetMemory: () =>
-    req<{ reset: boolean; removed: { documents: number; entities: number; edges: number } }>(
-      "/api/memory/reset",
-      { method: "POST" },
-    ),
+  // configured. Runs as a background job (streams logs, lands in the activity feed) — the
+  // returned job's source is the sentinel "all memory". Refuses (409) while any sync runs.
+  resetMemory: () => req<{ job: SyncJob }>("/api/memory/reset", { method: "POST" }),
   // Sync activity over a rolling window (running + finished), newest first. Survives a
   // page reload and a server restart — the backend persists it. Backs the bell menu.
   notifications: (hours = 24) => req<NotificationsResponse>(`/api/notifications?hours=${hours}`),

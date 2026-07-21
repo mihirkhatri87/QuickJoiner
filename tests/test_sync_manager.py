@@ -62,6 +62,10 @@ class FakeCatalog:
     def delete_source(self, sid):  # the catalog's `sources` row (distinct from the store's)
         self.calls.append("delete_source")
 
+    def reset_knowledge(self, include_gaps=True):
+        self.calls.append("reset_knowledge")
+        return {"documents": 12, "entities": 5, "edges": 9}
+
 
 class FakeStore:
     def __init__(self):
@@ -69,6 +73,9 @@ class FakeStore:
 
     def delete_source(self, sid):
         self.calls.append("delete_source")
+
+    def reset(self):
+        self.calls.append("reset")
 
 
 class FakePipeline:
@@ -382,6 +389,58 @@ def test_cleanup_refuses_while_a_sync_is_running(monkeypatch):
         mgr.start_cleanup("demo", "files:demo")
     gate.set()
     _wait(mgr, "demo", {"done"})
+
+
+# --------------------------------------------------------------- reset job
+
+def test_reset_runs_as_a_job_and_wipes_via_catalog_and_store():
+    ctx = _ctx([])
+    mgr = SyncManager(ctx)
+    job = mgr.start_reset()
+    assert job.kind == "reset" and job.source_name == "all memory"
+    done = _wait(mgr, "all memory", {"done", "error"})
+    assert done.state == "done"
+    assert "reset_knowledge" in ctx.catalog.calls and "reset" in ctx.store.calls
+    # It streamed logs (the observability the synchronous reset lacked) and recorded history.
+    assert any("reset complete" in line for line in done.logs)
+    assert done.id in ctx.catalog.events and ctx.catalog.events[done.id]["kind"] == "reset"
+
+
+def test_reset_refuses_while_a_sync_is_running(monkeypatch):
+    gate = threading.Event()
+    ctx = _ctx([_source()])
+    monkeypatch.setattr("quickjoiner.connectors.registry.create_connector",
+                        lambda s, ws: FakeConnector([_Doc("a"), _Doc("b"), _Doc("c")], gate=gate))
+    mgr = SyncManager(ctx)
+    mgr.start("demo")
+    _wait(mgr, "demo", {"running"})
+    with pytest.raises(RuntimeError):
+        mgr.start_reset()  # clears every source — must not race a live sync
+    gate.set()
+    _wait(mgr, "demo", {"done"})
+
+
+def test_sync_refuses_while_a_reset_is_running(monkeypatch):
+    """The mirror guard: once a reset is in flight, a new sync/cleanup can't start."""
+    import quickjoiner.sync_manager as sm
+
+    ctx = _ctx([_source()])
+    # Freeze the reset mid-run so we can observe the guard.
+    orig = sm.SyncManager._run_reset
+    gate = threading.Event()
+
+    def slow_reset(self, job):
+        gate.wait(timeout=5)
+        orig(self, job)
+
+    monkeypatch.setattr(sm.SyncManager, "_run_reset", slow_reset)
+    mgr = SyncManager(ctx)
+    mgr.start_reset()
+    _wait(mgr, "all memory", {"running"})
+    with pytest.raises(RuntimeError):
+        mgr.start("demo")
+    gate.set()
+    _wait(mgr, "all memory", {"done"})
 
 
 # --------------------------------------------------------------- 24h history feed

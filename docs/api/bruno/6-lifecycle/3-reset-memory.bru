@@ -11,5 +11,7 @@ post {
 docs {
   DANGER — wipes every ingested document, vector and graph edge across the whole workspace, and
   clears each connector's sync watermark. Keeps connectors configured, users, chat, and settings.
-  Refuses (409) while any sync is running.
+  Runs as a background job (returns {job}, source "all memory") — watch it stream via the
+  "Stream live logs" request (use source `all memory`) or the activity feed. Refuses (409) while
+  any sync is running.
 }

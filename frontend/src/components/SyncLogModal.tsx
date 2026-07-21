@@ -119,8 +119,10 @@ export function SyncLogModal({
   const paused = job?.state === "paused";
   // "active" = the job still owns the source (incl. paused); drives the footer controls.
   const active = !job || job.state === "running" || job.state === "paused" || job.state === "stopping";
-  const isCleanup = (job?.kind ?? kind) === "cleanup";
-  const canPause = !isCleanup && job?.state === "running";
+  const jobKind = job?.kind ?? kind;
+  // Cleanup and reset are short, all-or-nothing purges — neither is pausable or stoppable.
+  const isPurge = jobKind === "cleanup" || jobKind === "reset";
+  const canPause = !isPurge && job?.state === "running";
 
   const doStop = async (cleanup: boolean) => {
     setStopping(true);
@@ -164,11 +166,13 @@ export function SyncLogModal({
         <div className="flex items-center gap-3 border-b border-fill2 px-5 py-3.5">
           <span className={cn("h-[8px] w-[8px] flex-shrink-0 rounded-full", dot)} />
           <div className="truncate text-[14px] font-semibold">
-            {(job?.kind ?? kind) === "cleanup"
-              ? "Cleanup"
-              : (job?.clean ?? clean)
-                ? "Clean re-sync"
-                : "Sync"}{" "}
+            {jobKind === "reset"
+              ? "Memory reset"
+              : jobKind === "cleanup"
+                ? "Cleanup"
+                : (job?.clean ?? clean)
+                  ? "Clean re-sync"
+                  : "Sync"}{" "}
             · {name}
           </div>
           <div className="ml-auto flex-shrink-0 font-mono text-[10px] uppercase tracking-[0.12em] text-faint">
@@ -241,12 +245,12 @@ export function SyncLogModal({
             {active && !confirmStop && (
               <>
                 <Button onClick={onClose}>Run in background</Button>
-                {/* Cleanup is a short, all-or-nothing purge, so it offers neither pause nor
-                    stop — a half-purge is exactly the inconsistent state it prevents. */}
-                {!isCleanup && (canPause || paused) && (
+                {/* Cleanup and reset are short, all-or-nothing purges, so they offer neither
+                    pause nor stop — a half-purge is exactly the inconsistent state they prevent. */}
+                {!isPurge && (canPause || paused) && (
                   <Button onClick={doPauseResume}>{paused ? "Resume" : "Pause"}</Button>
                 )}
-                {!isCleanup && (
+                {!isPurge && (
                   <Button variant="danger" onClick={() => setConfirmStop(true)} disabled={stopping}>
                     Stop
                   </Button>

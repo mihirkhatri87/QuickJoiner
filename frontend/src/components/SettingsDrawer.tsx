@@ -122,7 +122,8 @@ export function SettingsDrawer({
           </Section>
 
           <Section title="Danger zone">
-            <DangerZone locked={auth.enabled && !auth.user} onFlash={flash} onChanged={onChanged} />
+            <DangerZone open={open} locked={auth.enabled && !auth.user} onFlash={flash}
+                        onChanged={onChanged} onOpenSync={onOpenSync} />
           </Section>
         </div>
       </aside>
@@ -133,26 +134,41 @@ export function SettingsDrawer({
 /** Global "reset all memory" — wipes everything ingested, keeps connectors configured.
  * Type-to-confirm, because it's irreversible and workspace-wide. */
 function DangerZone({
+  open,
   locked,
   onFlash,
   onChanged,
+  onOpenSync,
 }: {
+  open: boolean;
   locked: boolean;
   onFlash: (m: string, ok?: boolean) => void;
   onChanged: () => void;
+  onOpenSync: (source: string, clean: boolean) => void;
 }) {
   const [confirming, setConfirming] = useState(false);
   const [typed, setTyped] = useState("");
   const [busy, setBusy] = useState(false);
 
+  // Closing the drawer disarms the confirm step — reopening should never present a
+  // half-armed "type RESET" state as if a reset were mid-way.
+  useEffect(() => {
+    if (!open) {
+      setConfirming(false);
+      setTyped("");
+    }
+  }, [open]);
+
   const reset = async () => {
     setBusy(true);
     try {
-      const r = await api.resetMemory();
-      const c = r.removed;
-      onFlash(`Memory reset — removed ${c.documents} documents, ${c.edges} graph edges. Connectors kept.`, true);
+      const { job } = await api.resetMemory();
       setConfirming(false);
       setTyped("");
+      onFlash("Memory reset started — watch its progress in the log.", true);
+      // Reset now runs as a background job: open its live log so the user can see it wipe
+      // and complete, and it also lands in the activity bell + sync history.
+      onOpenSync(job.source, false);
       onChanged();
     } catch (e) {
       onFlash(String((e as Error).message), false);

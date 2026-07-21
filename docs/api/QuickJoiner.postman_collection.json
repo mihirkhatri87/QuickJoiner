@@ -215,7 +215,7 @@
         },
         {
           "name": "Reset ALL memory (keep connectors)",
-          "description": "DANGER — wipes every ingested document, vector and graph edge across the whole workspace. Refuses (409) while any sync runs.",
+          "description": "DANGER — wipes every ingested document, vector and graph edge across the whole workspace. Runs as a background job (returns {job}, source 'all memory') — watch it via the sync logs stream (source `all memory`) or the activity feed. Refuses (409) while any sync runs.",
           "request": { "method": "POST", "url": "{{baseUrl}}/api/memory/reset" }
         }
       ]

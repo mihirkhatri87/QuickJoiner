@@ -51,23 +51,32 @@ const TONE: Record<string, { dot: string; label: string }> = {
  * opposite of what happened. */
 function toneFor(n: SyncJob) {
   const base = TONE[n.state] ?? TONE.stopped;
+  const running = n.state === "running" || n.state === "stopping";
+  if (n.kind === "reset") {
+    if (running) return { ...base, label: "resetting memory" };
+    if (n.state === "done") return { ...base, label: "memory reset" };
+    return base;
+  }
   if (n.kind !== "cleanup") return base;
-  if (n.state === "running" || n.state === "stopping") return { ...base, label: "cleaning up" };
+  if (running) return { ...base, label: "cleaning up" };
   if (n.state === "done") return { ...base, label: "cleaned up" };
   return base;
 }
 
 function detail(n: SyncJob): string {
   const cleanup = n.kind === "cleanup";
+  const reset = n.kind === "reset";
   // A live run leads with its stage + %, so the menu answers "how far along?" at a glance.
   const stage = n.phase ? `${n.phase}${n.percent != null ? ` · ${n.percent}%` : ""}` : "";
   if (n.state === "paused") return stage ? `paused · ${stage}` : `paused · started ${ago(n.started_at)}`;
   if (n.state === "running" || n.state === "stopping") {
     if (stage) return stage;
+    if (reset) return `wiping all memory · started ${ago(n.started_at)}`;
     return `${cleanup ? "forgetting this source" : "started"} ${ago(n.started_at)}`;
   }
   if (n.state === "error") return n.error || "failed";
   if (n.state === "interrupted") return "server restarted before it finished";
+  if (reset && n.state === "done") return "all documents, vectors and graph wiped · connectors kept";
   if (cleanup && n.state === "done") return "documents, vectors and graph edges removed";
   if (n.stats) {
     const s = n.stats;

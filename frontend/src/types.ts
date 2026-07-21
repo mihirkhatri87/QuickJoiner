@@ -10,8 +10,9 @@ export interface SyncJob {
   id: string;
   source: string;
   state: SyncState;
-  /** "sync" pulls documents in; "cleanup" purges what a source taught us (no re-pull). */
-  kind: "sync" | "cleanup";
+  /** "sync" pulls documents in; "cleanup" purges what a source taught us; "reset" wipes ALL
+   * ingested memory across the workspace (source is the sentinel "all memory"). */
+  kind: "sync" | "cleanup" | "reset";
   clean: boolean;
   stats: { added: number; updated: number; skipped: number; chunks: number; errors: number } | null;
   error: string | null;

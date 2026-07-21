@@ -35,6 +35,7 @@ _MAX_LOG_LINES = 500
 _HEARTBEAT_SECONDS = 20  # "still syncing…" cadence while a connector is mid-pull
 _DONE = object()  # sentinel pushed to subscribers when a job ends
 _HISTORY_RETENTION_DAYS = 7  # rolling window kept in sync_events (UI asks for 24h of it)
+RESET_SOURCE = "all memory"  # sentinel "source" name for the workspace-wide memory-reset job
 
 
 def _now() -> str:
@@ -158,11 +159,18 @@ class SyncManager:
         j = self._jobs.get(source_name)
         return bool(j and j.state in ("running", "paused", "stopping"))
 
+    def active_sources(self) -> list[str]:
+        """Every source with a job currently in flight (running/paused/stopping)."""
+        return sorted(j.source_name for j in self._jobs.values()
+                      if j.state in ("running", "paused", "stopping"))
+
     # -- control --------------------------------------------------------------
     def start(self, source_name: str, clean: bool = False) -> SyncJob:
         with self._lock:
             if self.is_running(source_name):
                 raise RuntimeError(f"A sync is already running for {source_name!r}")
+            if self.is_running(RESET_SOURCE):
+                raise RuntimeError("A memory reset is running — wait for it to finish")
             source = next((s for s in self.ctx.config.sources if s.name == source_name), None)
             if source is None:
                 raise KeyError(f"No configured source {source_name!r}")
@@ -189,6 +197,8 @@ class SyncManager:
         with self._lock:
             if self.is_running(source_name):
                 raise RuntimeError(f"A job is already running for {source_name!r}")
+            if self.is_running(RESET_SOURCE):
+                raise RuntimeError("A memory reset is running — wait for it to finish")
             self._counter += 1
             job = SyncJob(id=f"cleanup-{self._counter}-{uuid.uuid4().hex[:8]}",
                           source_name=source_name, source_id=source_id, kind="cleanup")
@@ -210,6 +220,43 @@ class SyncManager:
             job.state = "error"
             job.error = str(exc)
             self._log(job, f"✗ cleanup failed: {exc}")
+        finally:
+            job.ended_at = _now()
+            self._record(job)
+            self._close(job)
+
+    def start_reset(self) -> SyncJob:
+        """Wipe ALL ingested knowledge as a background job — so it streams logs and lands in
+        the activity feed / history exactly like a sync or cleanup, instead of a silent,
+        invisible operation. Refuses while ANY job is in flight (it clears every source)."""
+        with self._lock:
+            active = self.active_sources()
+            if active:
+                raise RuntimeError(f"A job is running ({', '.join(active)}) — wait before resetting memory")
+            self._counter += 1
+            job = SyncJob(id=f"reset-{self._counter}-{uuid.uuid4().hex[:8]}",
+                          source_name=RESET_SOURCE, source_id="", kind="reset")
+            self._jobs[RESET_SOURCE] = job
+        self._record(job)
+        threading.Thread(target=self._run_reset, args=(job,), daemon=True).start()
+        return job
+
+    def _run_reset(self, job: SyncJob) -> None:
+        try:
+            self._log(job, "🧨 resetting all learned memory…")
+            counts = self.ctx.catalog.reset_knowledge()
+            self._log(job, f"🧹 removed {counts['documents']} documents, "
+                           f"{counts['entities']} entities, {counts['edges']} graph edges")
+            self.ctx.store.reset()
+            self._log(job, "🧹 cleared all vectors + the full-text index")
+            # Stats stay None (the sync-shaped {added,updated,…} doesn't fit a reset); the
+            # counts live in the log line, and the UI renders reset by its `kind`.
+            self._log(job, "✓ reset complete — the workspace is back to a clean state. Connectors kept.")
+            job.state = "done"
+        except Exception as exc:  # noqa: BLE001
+            job.state = "error"
+            job.error = str(exc)
+            self._log(job, f"✗ reset failed: {exc}")
         finally:
             job.ended_at = _now()
             self._record(job)

@@ -512,8 +512,16 @@ def test_reset_memory_wipes_knowledge_keeps_connectors(client):
     assert client.get("/api/status").json()["stats"]["documents"] >= 1
 
     r = client.post("/api/memory/reset")
-    assert r.status_code == 200 and r.json()["reset"] is True
-    assert r.json()["removed"]["documents"] >= 1
+    assert r.status_code == 200
+    job = r.json()["job"]
+    assert job["kind"] == "reset" and job["source"] == "all memory"
+    # It runs as a background job — wait for it, then verify the wipe. It also lands in the
+    # activity feed + streams logs (the observability the synchronous version lacked).
+    done = _wait_job(client, "all memory")
+    assert done["state"] == "done"
+    assert any(n["kind"] == "reset" for n in client.get("/api/notifications").json()["notifications"])
+    events = sse_events(client.get("/api/sync/all memory/logs").text)
+    assert any(e.get("type") == "log" and "reset complete" in e.get("line", "") for e in events)
 
     st = client.get("/api/status").json()["stats"]
     assert st["documents"] == 0 and st["chunks"] == 0  # vectors gone too (store.reset)
@@ -530,11 +538,11 @@ def test_reset_memory_wipes_knowledge_keeps_connectors(client):
     assert _wait_sync(client, "handbook")["stats"]["added"] == 1
 
 
-def test_reset_memory_refuses_while_a_sync_runs(client, monkeypatch):
+def test_reset_memory_refuses_while_a_job_runs(client, monkeypatch):
+    """Reset clears every source, so it must not race an in-flight job."""
     import quickjoiner.sync_manager as sm
 
-    monkeypatch.setattr(sm.SyncManager, "status",
-                        lambda self: [{"source": "handbook", "state": "running"}])
+    monkeypatch.setattr(sm.SyncManager, "active_sources", lambda self: ["handbook"])
     assert client.post("/api/memory/reset").status_code == 409
 
 

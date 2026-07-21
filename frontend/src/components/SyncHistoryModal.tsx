@@ -29,6 +29,8 @@ function runLine(n: SyncJob): string {
   if (isLive(n)) return n.phase ? `${n.phase}${n.percent != null ? ` · ${n.percent}%` : ""}` : "in progress";
   if (n.state === "error") return n.error || "failed";
   if (n.state === "interrupted") return "server restarted before it finished";
+  if (n.kind === "reset" && n.state === "done") return "all memory wiped · connectors kept";
+  if (n.kind === "cleanup" && n.state === "done") return "documents, vectors and graph removed";
   if (n.stats) {
     const s = n.stats;
     return `${s.added} added · ${s.updated} updated · ${s.skipped} unchanged` + (s.errors ? ` · ${s.errors} err` : "");
@@ -92,7 +94,7 @@ export function SyncHistoryModal({
           <span className="flex items-baseline gap-1.5">
             <span className="font-mono text-[9.5px] uppercase tracking-[0.1em] text-faint">
               {n.clean ? "clean " : ""}
-              {n.kind === "cleanup" ? "cleanup" : tone.label}
+              {n.kind === "cleanup" ? "cleanup" : n.kind === "reset" ? "reset" : tone.label}
             </span>
             {live && n.percent != null && (
               <span className="font-mono text-[10px] tabular-nums text-accent">{n.percent}%</span>

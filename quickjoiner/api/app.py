@@ -567,22 +567,21 @@ def create_app(workspace: Path) -> FastAPI:
         """State of every sync job (running + finished this session)."""
         return {"syncs": syncs.status()}
 
-    @api.post("/api/memory/reset", tags=["Sync & ingestion"], summary="DANGER: wipe ALL ingested knowledge — documents, vectors, the whole knowledge graph, and every sync watermark — leaving the workspace as if nothing had synced. KEEPS connectors, users, chat, and settings. Refuses while any sync is running.")
+    @api.post("/api/memory/reset", tags=["Sync & ingestion"], summary="DANGER: wipe ALL ingested knowledge — documents, vectors, the whole knowledge graph, and every sync watermark — leaving the workspace as if nothing had synced. KEEPS connectors, users, chat, and settings. Runs as a background job (returns {job}); watch it via the logs SSE / notifications. Refuses (409) while any sync is running.")
     def reset_memory(authorization: str | None = Header(default=None)):
         """Wipe ALL ingested knowledge — documents, vectors, FTS, the whole knowledge
         graph, and every sync watermark — leaving the workspace as if nothing had synced.
         KEEPS connector configs, users, chat sessions/projects, and settings; the next
-        sync of each connector is a full pull. Refuses (409) while any sync/cleanup job is
-        active, since it clears every source at once."""
+        sync of each connector is a full pull. Runs as a **background job** (returns
+        `{job}`, source `"all memory"`) so it streams logs and lands in the activity feed —
+        watch it via `GET /api/sync/all%20memory/logs` or `/api/notifications`. Refuses
+        (409) while any sync/cleanup job is active, since it clears every source at once."""
         _require_user(_user(authorization))
-        active = [j for j in syncs.status() if j["state"] in ("running", "paused", "stopping")]
-        if active:
-            names = ", ".join(sorted(j["source"] for j in active))
-            raise HTTPException(status_code=409,
-                                detail=f"A sync is running ({names}) — stop it before resetting memory")
-        counts = ctx.catalog.reset_knowledge()
-        ctx.store.reset()
-        return {"reset": True, "removed": counts}
+        try:
+            job = syncs.start_reset()  # runs as a background job → logs, notifications, history
+        except RuntimeError as exc:  # a sync/cleanup is in flight
+            raise HTTPException(status_code=409, detail=str(exc))
+        return {"job": job.summary()}
 
     @api.get("/api/notifications", tags=["Sync & ingestion"], summary="Sync activity feed over the last N hours (default 24) — running jobs with live state plus finished ones from persisted history. Survives a server restart.")
     def notifications(hours: int = 24, authorization: str | None = Header(default=None)):
@@ -596,9 +595,18 @@ def create_app(workspace: Path) -> FastAPI:
 
     @api.get("/api/sync/{source_name}/logs", tags=["Sync & ingestion"], summary="Server-Sent Events stream of a sync's live log lines (replays the backlog first), ending with a terminal `done` event.")
     def sync_logs(source_name: str, authorization: str | None = Header(default=None)):
-        """SSE stream of a sync's live log lines (replays the backlog first), then a
-        terminal `done` event carrying the job's final state."""
-        _find_source(source_name, _user(authorization))
+        """SSE stream of a job's live log lines (replays the backlog first), then a
+        terminal `done` event carrying the job's final state. Serves sync/cleanup jobs and
+        the manager-only jobs that aren't a configured source — the memory reset, and a
+        cleanup for a connector that was just deleted."""
+        user = _user(authorization)
+        # Honor visibility for a real configured source; manager-only jobs (reset / a
+        # just-deleted connector's cleanup) aren't in the config, so gate them on auth only.
+        src = next((s for s in ctx.config.sources if s.name == source_name), None)
+        if src is not None and not visible(src, user, auth.enabled):
+            raise HTTPException(status_code=404, detail=f"No configured source {source_name!r}")
+        if src is None:
+            _require_user(user)
         job, q = syncs.subscribe(source_name)
         if job is None:
             raise HTTPException(status_code=404, detail=f"No sync for {source_name!r}")

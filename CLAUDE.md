@@ -435,7 +435,11 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   carry `phase`/`percent`; `POST /api/sync/{name}/pause`+`/resume` hold/continue a running job;
   **`POST /api/memory/reset`** wipes ALL ingested knowledge (docs/vectors/FTS/graph/watermarks +
   buckets + gaps) via `catalog.reset_knowledge` + `store.reset`, keeping connectors configured —
-  refuses 409 while any sync is active;
+  **runs as a background job** (`SyncManager.start_reset`, `kind="reset"`, source sentinel
+  `"all memory"`) so it streams logs + lands in the activity feed/history like a cleanup; returns
+  `{job}`; refuses 409 while any sync is active (and syncs refuse while a reset runs). The logs SSE
+  endpoint was relaxed to serve manager-only jobs (reset, or a just-deleted connector's cleanup) —
+  auth-gated, not requiring a configured source;
   `GET/PATCH /api/settings` — the whole `Config` (llm/embedding/retrieval/chat/**graph**) as a
   tunable dict; `GET /api/settings/defaults` — the same groups built from **freshly-constructed
   config models** (never the saved config, or every field would read as default forever), so the
@@ -650,6 +654,23 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   in the same change — treat stale docs as a broken build. `README.md` is written for a new user
   (setup + how to run); `CLAUDE.md` is the internal source of truth (architecture, conventions,
   status). When they would disagree, fix them, don't pick one.
+- **Keep the API surface fully documented — always.** Any change to an HTTP endpoint (adding,
+  removing, renaming, or changing the method/path/params/request body/response shape/status codes
+  of a route in `quickjoiner/api/`) must, **in the same change**, keep all of the following in sync
+  — treat any of them drifting as a broken build:
+  1. **OpenAPI/Swagger** — every route carries an accurate `tags=[...]` (one of the existing
+     `_OPENAPI_TAGS` groups; add a group there if a genuinely new area appears) and a plain-English
+     `summary=`; a docstring serves as the longer description. A new endpoint is untagged/unsummarized
+     = incomplete. `/docs` is generated from these, so this IS the API documentation.
+  2. **The runbooks in `docs/api/`** — the **Postman** collection (`QuickJoiner.postman_collection.json`)
+     AND the **Bruno** collection (`docs/api/bruno/`): add/rename/remove the request in the right flow
+     folder, keep bodies/params matching the real request models, and put any new tunable value in the
+     **one** variables place (Postman collection Variables / Bruno `environments/Local.bru`) — never
+     hardcode it in a request. Update `docs/api/README.md` if the flow or variable set changes.
+  3. The endpoint's user-facing mention in `README.md` / its architecture bullet in `CLAUDE.md`
+     (per the rule above).
+  Verify the schema still builds (`app.openapi()`), and that request bodies/params in the runbooks
+  match the models — a runbook that 4xxs against the real API is worse than none.
 - **Plans and roadmaps are forward-looking; graduate finished work OUT of them.** `docs/plans/`
   and the roadmaps embedded in the strategy docs describe work that is **not yet done**. The
   moment a slice ships (or is deliberately dropped), in the **same change**:
@@ -1013,6 +1034,16 @@ Post-phase additions (2026-07-07, all tested — suite: **89 passed**):
   confirm. Suite: **470 passed** (+4; catalog wipe/keep-gaps, full-stack API reset + refuse-while-
   syncing, pg parity), 12 skipped, pre-existing eval-yaml failure unchanged. Verified live in Chrome:
   57 docs → 0, graph 0 nodes/0 edges, connector kept, re-sync repopulated 71 docs as a full pull.
+- Reset made observable — as a background job (2026-07-20, user report: after clicking reset the UX
+  gave no log/notification/way to know it finished, and reopening the drawer re-showed the confirm
+  prompt). Reset now runs through `SyncManager.start_reset`/`_run_reset` (`kind="reset"`, sentinel
+  source `"all memory"`), so it streams a log ("removed N documents, M entities, K edges → cleared
+  vectors + FTS → ✓ reset complete"), opens the log modal on confirm, and appears in the activity
+  bell + sync history (kind-aware labels). The logs SSE endpoint now serves manager-only jobs. Fixed
+  the confirm-persists bug (DangerZone resets its armed state when the drawer closes). Reset↔sync
+  mutual-exclusion guard added both ways. Suite: **473 passed** (+3), verified live in Chrome (log
+  modal + bell + no re-prompt on reopen). **New house rule added** (Conventions): any API change
+  must keep Swagger tags/summaries, the Postman + Bruno runbooks, and README/CLAUDE in sync.
 
 ## Next steps (agreed with user)
 
