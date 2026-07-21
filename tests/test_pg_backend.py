@@ -25,7 +25,7 @@ pytestmark = pytest.mark.skipif(
 
 _TABLES = ("settings", "sources", "documents", "sync_state", "projects",
            "chat_sessions", "users", "auth_tokens", "chunks",
-           "entities", "entity_aliases", "edges", "gaps")
+           "entities", "entity_aliases", "edges", "gaps", "sync_events")
 
 
 def _reset():
@@ -162,6 +162,43 @@ def test_pg_gaps_roundtrip(pg):
     assert len(catalog.list_gaps("open")) == 1
     resolved = catalog.list_gaps("resolved")
     assert resolved[0]["resolution"] == "connected:octopus" and resolved[0]["resolved_at"]
+
+
+def test_pg_reset_knowledge(pg):
+    """The global memory reset runs the same neutral SQL on Postgres."""
+    catalog, _ = pg
+    catalog.write_source(SourceConfig(name="repo", type="git", options={"url": "u"}))
+    catalog.upsert_source("notes:taught", "taught", "notes")
+    catalog.upsert_document("d1", "git:repo", "u::a", "A", "code", "h1", "2026-07-01", 2)
+    catalog.upsert_entity("repo:repo", "repo", "repo", "git:repo")
+    catalog.replace_doc_edges("d1", [("repo:repo", "defines", "symbol:foo", "")])
+    catalog.set_sync_state("git:repo", "since", "2026-07-01")
+
+    counts = catalog.reset_knowledge()
+    assert counts["documents"] == 1 and counts["edges"] == 1
+    assert catalog.stats()["documents"] == 0
+    assert catalog.graph_snapshot()["edges"] == []
+    assert catalog.get_sync_state("git:repo") == {}
+    assert [s.name for s in catalog.list_source_configs()] == ["repo"]  # connector kept
+
+
+def test_pg_sync_events_roundtrip(pg):
+    """The 24h activity history is written on both backends by the same neutral SQL —
+    including the upsert that turns the 'running' row into its final state."""
+    catalog, _ = pg
+    catalog.record_sync_event("sync-1-abc", "handbook", "running", False, "2026-07-20T10:00:00+00:00")
+    catalog.record_sync_event("sync-1-abc", "handbook", "done", False, "2026-07-20T10:00:00+00:00",
+                              ended_at="2026-07-20T10:04:00+00:00",
+                              stats={"added": 3, "updated": 0, "skipped": 1, "chunks": 9, "errors": 0})
+    catalog.record_sync_event("sync-0-old", "handbook", "done", True, "2026-07-01T09:00:00+00:00")
+
+    rows = catalog.list_sync_events("2026-07-20T00:00:00+00:00")
+    assert len(rows) == 1 and rows[0]["state"] == "done"  # upserted in place, older run filtered out
+    import json
+
+    assert json.loads(rows[0]["stats_json"])["added"] == 3
+    assert catalog.prune_sync_events("2026-07-20T00:00:00+00:00") == 1  # drops the July 1 run
+    assert len(catalog.list_sync_events("2000-01-01T00:00:00+00:00")) == 1
 
 
 def test_pg_sessions(pg):

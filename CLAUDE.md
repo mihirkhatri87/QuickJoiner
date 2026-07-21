@@ -74,9 +74,31 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   Pure `_to_wire`/`accumulate_delta`/`_tool_calls_from_*` are unit-tested and an injectable
   httpx transport enables MockTransport round-trip tests (`tests/test_litellm_provider.py`).
   All providers stream via `chat(..., on_stream=(kind, delta))` with kind `text|thinking`;
-  extended thinking is config-gated (`llm.thinking`, `llm.thinking_budget`). Anthropic signed
+  extended thinking is config-gated (`llm.thinking`; Anthropic sends **adaptive** thinking —
+  the old `{"type": "enabled", "budget_tokens"}` form is a 400 on the default model Opus 4.8;
+  `llm.thinking_budget` now only adds `max_tokens` headroom). Anthropic signed
   thinking blocks ride on assistant history messages as `thinking_blocks` and are re-emitted
   FIRST in `_to_wire` (API requirement during tool use).
+  **Anthropic prompt caching** (`llm.prompt_cache`, ON by default; 2026-07-18): the prompt is a
+  prefix match over tools → system → messages, so `_build_kwargs` places one `cache_control`
+  breakpoint on the system block (caches tools+system together) and
+  `_mark_cache_breakpoints` (pure, tested in `tests/test_prompt_cache.py`) puts a **moving
+  breakpoint on the last block of the last message** plus an intermediate marker every
+  ~15 blocks walking backward (max 3 message marks + 1 system = the API's 4-breakpoint cap;
+  15 keeps every new breakpoint inside the API's **20-block cache lookback**, which a
+  tool-heavy 10-round turn would otherwise outrun). Rounds 2..N of a tool loop and follow-up
+  turns then read the prefix at ~0.1× input price (writes 1.25× ⇒ break-even at 2 requests —
+  guaranteed whenever a tool fires). Markers are attached to **copies** of blocks — history
+  `thinking_blocks` ride `_to_wire` by reference and are never mutated (cache_control is also
+  invalid on thinking blocks, so they're skipped). Caveats: min cacheable prefix on Opus 4.8
+  is 4096 tokens (shorter ⇒ silently uncached, no error); verify live via
+  `usage.cache_read_input_tokens`, logged at DEBUG in `_to_result`. Session compression
+  rewrites history and invalidates the whole prefix on the turn it fires — expected; don't
+  lower `chat.compress_after_est_tokens` aggressively. **Stable-prefix discipline** (the same
+  change serves all three providers): `OnboardingAgent` sorts tool specs by name so the tool
+  list is byte-stable across requests/processes — feeds Anthropic explicit caching, automatic
+  prefix caching on OpenAI-compatible backends behind LiteLLM, and llama.cpp/Ollama KV-cache
+  prefix reuse.
   **Tool names are sanitized to OpenAI's `^[a-zA-Z0-9_-]{1,64}$` at `ToolSpec` construction**
   (`base.sanitize_tool_name` via `__post_init__`) — connector live-tool names embed the source
   name (e.g. "Appriver Octopus"), and a space breaks the gpt-oss "Harmony" tool-call wire format
@@ -88,7 +110,27 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   reject a *valid* static key under load (observed live as the same key alternating 200/401), so a
   bounded retry smooths it; a genuinely bad key still surfaces its 401 after the capped backoffs.
   Streaming retries only the connection+status handshake (before any token reaches the caller);
-  once tokens flow it's committed. Real client errors (400) are never retried.
+  once tokens flow it's committed. `Retry-After` is honored on retryable statuses when it beats
+  the backoff (numeric seconds only, capped 30s). Real client errors (400) are never retried —
+  EXCEPT via **strip-and-retry** (`_strip_rejected`, pure): a 400 whose body names an optional
+  enhancement (`stream_options`, `reasoning_effort`, `parallel_tool_calls`, message-level
+  `reasoning_content`, content-part `cache_control`) or an impossible `max_tokens` (the observed
+  "must be at least 1, got -86016" negative-budget failure) removes just that piece and retries,
+  so enhancements can't hard-break a stricter backend; a 400 naming none of them raises
+  immediately as before. **gpt-oss / reasoning-model enhancements (2026-07-18):** (1) **Harmony
+  reasoning round-trip** — gpt-oss expects the CoT that produced a tool call passed back until
+  the turn completes; the agent stores `result.thinking` as `reasoning` on tool-call assistant
+  history messages, `_to_wire` re-emits it as `reasoning_content` (tool-call turns only —
+  finished turns' CoT is dropped by the chat template anyway), and `sessions.messages_to_json`
+  strips it on persist (live-turn plumbing, never stored). (2) **`llm.reasoning_effort`**
+  (low|medium|high, None ⇒ not sent) — the cost/latency dial for reasoning backends.
+  (3) **`llm.parallel_tool_calls`** (None ⇒ not sent; False forces single tool calls — Harmony's
+  happy path). (4) **Usage visibility**: streams request `stream_options.include_usage`; usage
+  incl. `prompt_tokens_details.cached_tokens` (the vLLM automatic-prefix-cache hit counter — the
+  LiteLLM-side verification of the stable-prefix work) logged at DEBUG via `_log_usage`.
+  (5) **`llm.proxy_cache_control`** (OFF) — Anthropic-style cache marker on the system message as
+  a content-part extra for proxies fronting Claude. (6) One pooled `httpx.Client` reused across
+  requests (one TLS handshake per tool loop, not per round). Tests: `tests/test_litellm_provider.py`.
 - `quickjoiner/memory/` — **pluggable persistence (Phase 1 cloud groundwork):** `factory.py`
   (`create_catalog`/`create_store`) picks the backend on `DATABASE_URL` — unset ⇒ on-prem
   SQLite + LanceDB files; a `postgres://` DSN ⇒ cloud `PostgresCatalog` (`pg_catalog.py`) +
@@ -100,7 +142,13 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   Postgres path verified by `tests/test_pg_backend.py` (env-gated on `QJ_TEST_DATABASE_URL`,
   incl. a SQLite-parity retrieval test). `store.py` (LanceDB, cosine; score = 1 − distance), `catalog.py`
   (SQLite: **workspace config in a `settings` table, connector sources in the `sources` table**
-  (columns owner/shared/configured/sync_interval), document hashes, sync state, users/tokens;
+  (columns owner/shared/configured/sync_interval), document hashes, sync state, users/tokens,
+  `sync_events` (the rolling sync/cleanup history behind the notification menu, incl. a `kind`
+  column — see `sync_manager.py`; late-added columns live in the shared `_MIGRATION_STATEMENTS`
+  applied best-effort by **both** adapters on open). **`reset_knowledge(include_gaps=True)`** is the
+  global memory reset: DELETEs all documents/edges/entities/aliases/graph_pending/sync_state + the
+  ingestion-bucket source rows (`configured=0`) + gaps, keeping configured connectors, users,
+  sessions and settings (neutral `?`-SQL ⇒ both backends; caller wipes vectors via `store.reset()`);
   `load_config`/`save_config`/`list_source_configs`/`write_source` are the config API, with
   one-time YAML migration), `embedder.py` (fastembed `BAAI/bge-small-en-v1.5` default;
   `FASTEMBED_CACHE_PATH` pins the model cache; ollama provider defaults to `nomic-embed-text`.
@@ -202,7 +250,12 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
 - `quickjoiner/connectors/` — contract in `base.py`: `test()`, `sync(state) -> Iterator[Document]`,
   `tools() -> [AgentTool]` (live agent tools), `handle_event(payload)` (webhooks), and a
   `modes` flag (PULL/PUSH/LIVE/BROWSER/SCRAPE). Register with `@register`; add new imports to
-  `registry._load_builtin_connectors`. Payload→Document converters are **module-level pure
+  `registry._load_builtin_connectors`. **Cooperative sync control**: a running sync attaches a
+  `SyncControl` to the connector instance (`self._control`); connectors call `self._checkpoint()`
+  in long non-yielding loops (paginating an API, walking teams) so stop/pause is honored within
+  seconds, and `self._stage(name, done, total)` to report the phase + estimated % (see
+  `sync_manager`/`sync_control.py`). Both are no-ops by default, so a connector that ignores them —
+  or a direct/CLI construction — just works. Payload→Document converters are **module-level pure
   functions** so tests can hit them without HTTP mocking (see `tests/test_connectors.py`,
   `tests/test_phase4_connectors.py`). `deps.py` — **dependency mapping + semantic aliasing**:
   parses package manifests found in a synced tree and emits one synthesized
@@ -354,12 +407,39 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   `SourceConfig` (`owner`, `shared`): ownerless = commons; owned = owner-only unless `shared`.
   `visible()` / `can_manage()` are the gate. Ingested *knowledge* stays one communal memory;
   sharing governs who sees/manages a **connector's config + credentials** and gets its live tools.
-- `quickjoiner/api/` — FastAPI (`app.py`: SSE `/api/chat`, sources, sync, search, briefs;
+  (PLANNED, not built: per-user **knowledge scopes** — query-time union of commons + own +
+  shared over the one store, with an ingest-time entity-merge guard and a promotion flow;
+  intake 2026-07-18 → `CLOUD_ROADMAP.md` Y1 workstream 8 / PRD W9.3. Must precede multi-user GA.)
+- `quickjoiner/api/` — FastAPI. **OpenAPI/Swagger is grouped + documented** (2026-07-20): the app
+  carries a top-level `description` + `openapi_tags`, and every route decorator has `tags=[...]` +
+  a plain-English `summary=` (the HTML `/` route is `include_in_schema=False`). 43 endpoints across
+  11 tag groups (Status / Authentication / Connectors / Sync & ingestion / Ask & search / Knowledge
+  graph / Knowledge gaps / Sessions & projects / Briefs & repo docs / Settings / Webhooks). Interactive
+  docs at **`/docs`** (Swagger UI — note: pulls its JS/CSS from a CDN, so blank offline; `/openapi.json`
+  is self-contained), **`/redoc`**. Import-ready **Postman + Bruno runbooks** for the end-to-end flow
+  live in `docs/api/` (all common config in one place: Postman collection Variables / Bruno `Local`
+  environment; login captures the bearer token; SSE endpoints noted). Keep tags/summaries current
+  when adding an endpoint. (`app.py`: SSE `/api/chat`, sources, sync, search, briefs;
   sessions list/get/distill + `DELETE /api/sessions/{id}` (one) and `DELETE /api/sessions?project=`
   (all, optionally project-scoped) → `catalog.delete_session`/`delete_sessions` (neutral base, both
-  backends); `/api/auth/*` status/users/login/logout; `/api/connectors` CRUD + `/test` + `/types`;
+  backends); `/api/auth/*` status/users/login/logout; `/api/connectors` CRUD + `/test` + `/types` +
+  **`/cleanup`** (starts a cleanup job, keeping the config). **`DELETE /api/connectors/{name}`
+  purges by default** (2026-07-20): a source_id is `type:name`, so a deleted connector's documents
+  are unreachable — nothing can re-sync, refresh or purge them, yet they still answer questions —
+  so deletion starts a cleanup job and returns it. `?keep_memory=true` is the explicit opt-out
+  (retire the connector, keep what it taught). Both refuse with 409 while a job runs for that
+  source, so a purge can never race a live ingest;
+  `GET /api/notifications?hours=` (default 24, clamped 1..168) → `SyncManager.recent` — the bell
+  menu's feed: running jobs with live state + finished runs from the persisted history, newest
+  first, plus an `active` count (read-state is client-side, not stored server-side). Job summaries
+  carry `phase`/`percent`; `POST /api/sync/{name}/pause`+`/resume` hold/continue a running job;
+  **`POST /api/memory/reset`** wipes ALL ingested knowledge (docs/vectors/FTS/graph/watermarks +
+  buckets + gaps) via `catalog.reset_knowledge` + `store.reset`, keeping connectors configured —
+  refuses 409 while any sync is active;
   `GET/PATCH /api/settings` — the whole `Config` (llm/embedding/retrieval/chat/**graph**) as a
-  tunable dict; `POST /api/llm/test` probes the provider with a one-token round-trip, accepting
+  tunable dict; `GET /api/settings/defaults` — the same groups built from **freshly-constructed
+  config models** (never the saved config, or every field would read as default forever), so the
+  Settings drawer can mark which fields are still stock without hardcoding the values; `POST /api/llm/test` probes the provider with a one-token round-trip, accepting
   optional unsaved `llm` overrides so the Settings drawer can verify a proxy/model before saving,
   never persisting) + `hooks.py` (HMAC-verified `POST /hooks/{source}` push ingestion). Bearer token via
   `Authorization` header → `_user()`; secret option values masked (`MASKED`) in responses, and a
@@ -379,12 +459,32 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   `/api/learn` (`onLearned` refreshes status/gaps); streaming caret), `Rail` (compact fixed-top /
   independently-scrolling conversations / pinned-bottom systems layout with `min-h-0`; per-row
   **delete** on hover + **Clear all** in the Conversations header → `DELETE /api/sessions[/{id}]`,
-  clear-all confirmed + project-scoped to what's shown), `TopBar`, `Composer`,
+  clear-all confirmed + project-scoped to what's shown; each **Connected systems** row shows a
+  pulsing "syncing…" state and re-opens that job's live log when it has one), `TopBar` (hosts the
+  **`NotificationsMenu`** bell before Settings), `Composer`,
   `EmptyState`, `SettingsDrawer` (account + workspace settings + connector plates/forms; the
   workspace pane exposes provider config incl. LiteLLM proxy URL + api-key env var with a
   **Test connection** button hitting `POST /api/llm/test`, and **Retrieval/Knowledge-graph
   toggles** — hybrid, cross-encoder reranker, graph-expansion, contextual chunking (ingest-time),
-  and LLM triple extraction — each hinted query-time vs ingest-time; a shared `Toggle` primitive),
+  and LLM triple extraction — each hinted query-time vs ingest-time; a shared `Toggle` primitive.
+  **Every workspace group is a collapsible `Group`** (Language model / Retrieval / Knowledge graph /
+  Repositories / Conversations / Embedding), all closed on open, each header badging how many of
+  its fields differ from the shipped defaults — counted over the per-section `*_KEYS` lists, which
+  name only the fields the drawer actually renders so a badge can never point at a knob with no
+  control. Per-field **default markers** (`DefaultNote`, fed by `GET /api/settings/defaults`): a
+  neutral "default" when untouched, gold "default: <value>" when changed, so the drawer answers
+  both "is this stock?" and "what was it before?". `null` and `""` compare equal (an unset optional
+  field is not a customization). The sign-in lock moved from one outer `fieldset` onto each
+  `Group`'s body — **reading** settings is never gated, only editing. A **Danger zone** section
+  (`DangerZone`) holds the global **Reset all learned memory** action: type-to-confirm (`RESET`) →
+  `POST /api/memory/reset`, wording states plainly that connectors/chat/settings are kept),
+  **`NotificationsMenu`** (24h activity bell: `GET /api/notifications`, polled by `App` every 3s
+  while a sync is active and 10s when idle — so a scheduler- or CLI-started sync still surfaces.
+  **Read-state is client-side** in `localStorage.qj_seen_notifications`, keyed `"<job id>:<state>"`
+  so one run notifies twice — when it starts and again when it finishes — instead of a completion
+  being swallowed by a mid-sync glance. The badge counts unseen; unseen rows carry an accent rail +
+  lit background against dimmed viewed rows; closing the menu commits the read-state, so entries
+  stay visibly new *while being read*. Rows with `live` re-open the log viewer),
   `api.ts`
   (typed client + SSE reader), `ui.tsx` primitives. Build: `npm run build` → `frontend/dist`;
   dev: `npm run dev` proxies /api+/hooks to :8787. FastAPI serves the UI per `_ui_dir()`:
@@ -453,12 +553,75 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   `clear_sync_state` (next sync = full pull) — so docs, vectors, FTS and the knowledge graph stay
   mutually consistent (a half-synced or stale-shape source can't leave a corrupted graph). API:
   `POST /api/sync/{name}[?clean=true]` **now starts a job** (was synchronous) → `{job}`;
-  `POST /api/sync/{name}/stop[?cleanup=true]`; `GET /api/syncs`; `GET /api/sync/{name}/logs` (SSE).
+  `POST /api/sync/{name}/stop[?cleanup=true]`; `POST /api/sync/{name}/pause` + `/resume`;
+  `GET /api/syncs`; `GET /api/sync/{name}/logs` (SSE).
+  **Pause/resume + bounded stop latency + stages/% (`sync_control.py`, 2026-07-20):** Python
+  can't kill a worker thread, so cancellation is cooperative — a stop is only seen where code
+  *checks*. Before, that was only between the documents a connector yields, so a connector deep in
+  a non-yielding phase (TFS makes ~11 HTTP calls per team before its first yield; then the
+  graph-drain waits on whole batches of broker calls) could run **10+ minutes** past a stop. Fix: a
+  per-job **`SyncControl`** (built in `_build_control`, wired to the job's `cancel`/`gate` events) is
+  threaded everywhere — `_tracked` (between docs), the connectors' inner loops via
+  `Connector._checkpoint()` (each job gets a fresh connector instance, so `connector._control` is
+  thread-safe; no `sync()` signature change), and the pipeline's triple-drain (one wave per
+  `triple_workers`, checkpoint between waves ⇒ at most that many broker calls in flight at a stop).
+  `control.check()` **raises `SyncStopped`** (caught in `_run` → clean `stopped`) and **blocks while
+  paused**; `control.stage(name, done, total)` reports the phase + optional progress. Target
+  latency ≤20s; the one thing it can't interrupt is a single external call already in flight
+  (bounded by that call's timeout). **Pause** (`pause`/`resume`; `SyncJob.gate` — set=go, clear=hold)
+  holds both the pull and the drain; the same in-memory run continues on resume (no re-pull); stop
+  sets the gate so a paused worker wakes to cancel. **Stages + estimated %**: connectors call
+  `_stage()`. **Accurate %** where a total is knowable up front: `files`/`git` (scanning → reading
+  N/total → dependency map), `azure_devops` (phase + per-team `work items · Team A`, i/teams), `jira`
+  (from the search API's `total`), `octopus` (per-project), `confluence` (per space, via a one-call
+  CQL `totalSize` preflight — `_space_page_count`; unscoped all-spaces pull ⇒ no total ⇒ shimmer).
+  **Phase label only** (UI shows a live shimmer, no fake denominator) where the API gives no cheap
+  count: `github`/`gitlab` list APIs. All of these also `_checkpoint()` between page/section fetches so a stop lands
+  within a page. The remaining connectors (logsearch inventory, web_scrape) rely on the universal
+  between-document check — they finish in seconds / yield per page, so no long non-yielding stretch
+  to instrument. `SyncJob` gains `phase`/`phase_done`/`phase_total` + `percent()` (surfaced in every
+  `summary()`, so `/api/syncs` + `/api/notifications` carry them).
+  **Cleanup jobs** (`start_cleanup(name, source_id)`, `SyncJob.kind` = `sync|cleanup`): the same
+  `_purge` as a clean sync, without the re-pull — documents (cascading graph edges), vectors, FTS,
+  orphan graph nodes and the watermark. It takes `source_id` as an argument rather than looking the
+  config up, because the case that matters most is a source whose config is already gone. The
+  `sources` row is deliberately left alone: a still-configured connector must stay listed with zero
+  documents (like one added but not yet synced), and for a deleted connector `save_config` has
+  already reconciled the row away. Not stoppable — a half-purge is the inconsistency it prevents.
+  **24h activity history** (`recent(hours)`, `GET /api/notifications`): the job map is in-memory
+  and per-process — enough to *watch* a run, not to remember one — so each run is also persisted
+  to the catalog's `sync_events` table (`record_sync_event` on start, upserted on the same id when
+  it ends; `list_sync_events`/`prune_sync_events`, neutral `_SqlCatalog` ⇒ both backends,
+  7-day retention). `recent()` overlays live job state on that history and marks each row `live`;
+  a row left `running` by a process that died is reported as **`interrupted`**, never as a sync
+  that is still going. History reads are best-effort — a catalog that can't serve them degrades to
+  live jobs rather than failing the request. Job ids carry a uuid suffix (`sync-3-4ebb86c1`) so a
+  restarted process can't reuse an id the history already holds.
   CLI `qj sync [--clean]` / `qj resync <name>` and the `sync_source(name, clean=)` agent tool run
-  the same purge synchronously. Web UI: each connector plate has **Sync now** + **Clean re-sync**
-  opening `SyncLogModal` (live log stream, a **Stop** button that asks *"clean up partial data?"*).
+  the same purge synchronously. Web UI: each connector plate has **Sync now** + **Clean re-sync** +
+  **Clean up** (eraser — two-click armed confirm; forgets the source's documents/vectors/graph
+  edges but keeps it configured), all opening `SyncLogModal` (live log stream, a **Stop** button
+  that asks *"clean up partial data?"* — not offered for cleanup jobs). Deleting a connector (trash,
+  also two-click) runs that same cleanup automatically and opens its log. `EditConnectorModal`
+  shows **Name disabled with the reason** — identity: `source_id` = `type:name`, so every doc id,
+  vector, graph node, watermark and webhook URL derives from it, and renaming would orphan the lot.
+  **The log panel is a viewer, not a leash** — it closes at any time (X / backdrop / Esc / "Run in
+  background") and the job keeps running; re-opening re-attaches, and since `subscribe` replays the
+  backlog a reattached viewer sees the whole run, including one started before a page reload. Its
+  `autoStart` prop separates the two entries (press Sync = start then watch; click a running job =
+  attach only). The viewer is owned by `App`, not the settings drawer, so a running sync stays
+  reachable with the drawer closed — from the bell menu or the rail's Connected-systems row. The
+  modal shows a **Pause/Resume** button + a **stage/% progress bar** (determinate when a total is
+  known, an indeterminate shimmer for open-ended pulls), polling `/api/syncs` every 2s while active
+  to keep the % fresh; the rail/plate pills and bell rows show the live % and a "paused" state.
+  **`SyncHistoryModal`** (bell menu → "View full history by connector") groups the 7-day
+  `/api/notifications` window by connector, newest-first, each group's latest/ongoing run shown with
+  its live stage + %, earlier runs collapsed.
   Tests: `tests/test_sync_manager.py` (interruption, clean-start purge, double-start conflict,
-  stop-with-cleanup, backlog replay) + async-sync/clean-resync round-trips in `test_api.py`.
+  stop-with-cleanup, backlog replay, history record/restart-interrupted/degrade, id uniqueness,
+  **pause/resume, stop-while-paused, sub-2s stop inside a non-yielding connector loop, graph-tail
+  pause**), `tests/test_catalog.py` (sync_events upsert/window/prune) + async-sync/clean-resync,
+  pause/resume, and `/api/notifications` round-trips in `test_api.py`.
 
 ## Conventions & gotchas
 
@@ -500,8 +663,10 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
      "shipped" — record it, if worth it, in that doc's short **Shipped** ledger with a pointer to
      where it's now documented. Keep any cross-reference anchors intact (leave a one-line stub if
      a number is referenced elsewhere).
-  3. **Update the trackers** — `docs/plans/STATUS.md` (master table + outstanding list) and the
-     Status column in `docs/plans/README.md`.
+  3. **Update the trackers** — `docs/plans/STATUS.md` (master table + outstanding list), the
+     Status column in `docs/plans/README.md`, **and `docs/PRIORITIES.md`** (the one ordered
+     cross-roadmap backlog): a shipped/dropped item's row is deleted, a re-scoped item's
+     value/effort re-scored, a new item ranked in.
   4. **Delete emptied plans** — when a plan has **nothing outstanding left**, delete the plan file
      entirely (git preserves it) and record it in STATUS.md's **"Shipped & removed"** ledger with
      a pointer to where its substance now lives. Do NOT keep a ✅ tombstone plan around.
@@ -521,7 +686,11 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   remaining holes), `docs/FRONTEND_ROADMAP.md` (F0–F2), `docs/CLOUD_ROADMAP.md` (Y1–Y5),
   `docs/MARKET_ASSESSMENT.md` (Appendix A connector matrix + differentiators), `docs/PITCH_DECK.md`
   (claims must match what actually ships — never let the deck outrun the code), `docs/KNOWLEDGE_GRAPH.md`,
-  and `docs/design/DESIGN_VISION.md`. A claim that's no longer true is corrected, not left to rot.
+  `docs/design/DESIGN_VISION.md`, and **`docs/PRIORITIES.md`** — the single ROI-ordered
+  backlog across ALL roadmaps/plans (rank + value/effort + links only, no design content).
+  **Any change to any roadmap or plan — item added, removed, shipped, or re-scoped — updates
+  `docs/PRIORITIES.md` in the same change**; a row there must always correspond to a live
+  item in its source doc. A claim that's no longer true is corrected, not left to rot.
   Reconcile against the tree, not from memory. Treat any of these drifting out of sync with the
   code as a broken build, exactly like `CLAUDE.md`/`README.md`.
 
@@ -538,11 +707,15 @@ spike, each with a ready-to-paste prompt), `docs/FRONTEND_ROADMAP.md` (F0–F2),
 `docs/TEST_STRATEGY.md` (>90% program, T1–T4), `docs/CLOUD_ROADMAP.md` (Y1–Y5),
 `docs/design/DESIGN_VISION.md` + `orrery-prototype.html` (fog-of-war "Orrery" concept,
 published as a Claude artifact). These are the authoritative roadmap references.
+**`docs/PRIORITIES.md` (2026-07-18)** is the single ROI-ordered backlog ACROSS all of them
+(value/effort matrix + links only; detail stays in the source docs) — kept in lockstep with
+every roadmap/plan change per the house rule above.
 **Execution plans** (each with a ready-to-paste prompt): `docs/plans/` — see `docs/plans/STATUS.md`
 for the live tracker. Live plans: 03 Slack+Teams connectors, 04 coverage fog, **05 evaluate
 retrieval & correlation on a connected org** (the "decide with data" runbook for the a–e stack +
 embedding-change decision; run on an org-connected machine), 06 multi-angle confidence (code
-shipped, verification open). Shipped & removed (graduated into these docs): 01 knowledge-debt
+shipped, verification open), 07 multimodal derive-to-text (vision/audio/video via specialist
+models + deterministic extractors; roadmap #23; not started). Shipped & removed (graduated into these docs): 01 knowledge-debt
 backlog, 02 retrieval quality pack. Finished plans are deleted, not kept — per the house rules
 above, only unbuilt work lives under `docs/plans/`.
 
@@ -744,6 +917,102 @@ Post-phase additions (2026-07-07, all tested — suite: **89 passed**):
   compare run. (Part A, contextual chunking, shipped earlier on 2026-07-13.) Plan 02 is fully
   shipped; its plan file has been removed and its substance graduated here + into the
   `AI_ROADMAP.md` Shipped ledger (see the `docs/plans/STATUS.md` "Shipped & removed" ledger).
+- Prompt caching + stable-prefix discipline (2026-07-18, the S5 fast-half): Anthropic
+  `cache_control` breakpoints in `anthropic_provider._build_kwargs`/`_mark_cache_breakpoints`
+  (system block caches tools+system; moving message breakpoint + ~15-block intermediate
+  markers inside the API's 20-block lookback; `llm.prompt_cache` config gate, ON) and
+  deterministic name-sorted tool specs in `OnboardingAgent` (byte-stable prefix for Anthropic
+  explicit caching, OpenAI-compatible automatic prefix caching, and Ollama/llama.cpp KV
+  reuse). Bonus fix in the same file: Anthropic thinking now sends `{"type": "adaptive"}` —
+  the old `budget_tokens` form 400s on the default model Opus 4.8. Details in the `llm/`
+  architecture bullet; tests `tests/test_prompt_cache.py` (12: breakpoint placement/spacing/
+  cap, thinking-block skip + no-history-mutation, cache-off byte-identical path, sorted
+  specs). Suite: **426 passed**, 10 skipped, pre-existing eval-yaml failure unchanged. Live
+  cache-hit verification (`usage.cache_read_input_tokens` > 0, logged at DEBUG) pending an
+  `ANTHROPIC_API_KEY` — none on this machine.
+- LiteLLM / gpt-oss enhancement pack (2026-07-18, same session): Harmony reasoning round-trip
+  (agent stores `reasoning` on tool-call turns → `reasoning_content` on the wire → stripped on
+  session persist), `llm.reasoning_effort` + `llm.parallel_tool_calls` + `llm.proxy_cache_control`
+  config knobs, `stream_options.include_usage` + `cached_tokens` DEBUG logging (the LiteLLM-side
+  cache-hit verification), strip-and-retry on 400s naming an optional param or an impossible
+  `max_tokens`, Retry-After-aware backoff, and a pooled `httpx.Client`. Full detail in the
+  `llm/` bullet above. New config fields round-trip through `GET/PATCH /api/settings`
+  automatically but have no Settings-drawer controls yet (frontend not rebuilt). Suite:
+  **438 passed**, 10 skipped, pre-existing eval-yaml failure unchanged. Live verification on
+  the AppRiver broker (does gpt-oss loop less with reasoning round-trip? does `cached_tokens`
+  move?) pending the user's next live session with DEBUG logging.
+
+- Non-blocking sync viewer + 24h activity menu (2026-07-20, user-reported): the sync log modal
+  hid its close affordance while a job ran (so watching a sync held the UI hostage) and nothing in
+  the app read `/api/syncs`, so a page reload erased every trace of a running sync even though the
+  server was still happily syncing. Both were frontend-side blindness, not backend gaps. Now: the
+  log panel closes freely and re-attaches on demand (`autoStart` prop; viewer lifted from
+  `SettingsDrawer` to `App`), running syncs are indicated on the rail row + connector plate, and a
+  **`NotificationsMenu`** bell in the `TopBar` shows the last 24h of sync activity with
+  unseen/viewed differentiation. Backed by a new persisted `sync_events` history
+  (`GET /api/notifications`) so the feed outlives a server restart, not just a reload. Suite:
+  **445 passed** (+7), 11 skipped, pre-existing eval-yaml failure unchanged. Verified live in
+  Chrome via Playwright against a scratch workspace: close-while-running, reload-restores-state,
+  badge/unread transitions, re-open-from-menu, and history surviving a restart.
+- Settings drawer: collapsible groups + default markers (2026-07-20, user request): all six
+  workspace groups now collapse like Embedding did (closed by default — the pane was a wall of
+  knobs), each header badges its changed-field count, and every field shows whether it still holds
+  the shipped default. Defaults come from a new `GET /api/settings/defaults` built from fresh
+  config models rather than a hardcoded frontend copy, so they can't drift from `config.py`.
+  `Field`/`Toggle` gained an optional `note` slot; `Field` is now a full-height flex column so a
+  wrapped label can't misalign the inputs in a two-column row. Suite: **446 passed** (+1: the
+  defaults endpoint is asserted to move independently of saved settings). Verified in Chrome:
+  all-collapsed on open, 6 default markers in Retrieval, marker → "default: 0.55" + a
+  "1 changed" header badge after an edit, badge still visible when collapsed.
+
+- Connector cleanup + orphan-proof delete (2026-07-20, user request after asking what renaming a
+  connector would do): a connector's **name is its identity** — `source_id` is `type:name`, which
+  keys doc ids (`sha256(source_id|uri)`), chunk/FTS rows, the `repo:<name>` graph node, the sync
+  watermark, the `/hooks/<name>` URL, live tool names, and (via contextual chunking) the text that
+  gets embedded. Renaming was never wired up (no `name` on `ConnectorUpdate`, no field in the edit
+  modal); it is now **shown disabled with the reason** instead of silently absent. The related hole
+  — deleting a connector left its documents in memory permanently unreachable (nothing could
+  re-sync or purge a source_id with no config) — is closed: **delete purges by default** via a
+  background cleanup job (`keep_memory=true` opts out), and a standalone **Clean up** action
+  forgets a source's knowledge while keeping it configured. Cleanups reuse the whole sync-job
+  surface: live log panel, rail/plate indicators, and the 24h activity feed (`kind` column on
+  `sync_events`, "cleaned up" labels). Caught in live verification: the cleanup job was also
+  dropping the catalog `sources` row, making a still-configured connector vanish from Connected
+  systems — now left alone, with an API test pinning it. Suite: **453 passed** (+7), 11 skipped,
+  pre-existing eval-yaml failure unchanged. Verified in Chrome + over the API: cleanup log
+  ("removed 20 documents, 4 orphan graph nodes"), memory → 0, connector still listed, re-syncable;
+  delete → cleanup job → 0 docs / 0 sources / 0 graph nodes.
+
+- Sync pause/resume, bounded stop latency, stages + % , history-by-connector (2026-07-20, user
+  request; the stop latency was a reported bug — a TFS sync ran 10+ min past a stop). New
+  `sync_control.py` (`SyncControl`/`SyncStopped`) threads one cooperative control through the
+  connector inner loops, the document loop, and the graph-drain, so stop/pause is honored within
+  seconds (target ≤20s; live-measured 0.73s on a files sync, <2s unit-tested inside a non-yielding
+  loop) instead of after the whole phase. Pause holds both the pull and the deferred triple-drain;
+  resume continues the same in-memory run. Connectors report stages + progress via `_stage()`
+  (files/git/jira/ADO/octopus/confluence = accurate %; github/gitlab = phase label + shimmer; the
+  low-volume logsearch/scrape connectors need no instrumentation — the universal between-doc check
+  already bounds their stop latency). Instrumented connectors also `_checkpoint()` between
+  page/section fetches. UI: Pause/Resume button + stage/% progress bar in the log modal, live
+  % on the rail/plate pills and bell rows, and a new `SyncHistoryModal` (7-day history grouped by
+  connector, latest run's live %). Suite: **466 passed**, 11 skipped, pre-existing eval-yaml failure
+  unchanged; connector-level tests assert jira/gitlab/confluence actually honor a cancelling control
+  + report the right stages (confluence: accurate % scoped, shimmer unscoped). Verified live in Chrome: stage
+  progression (scanning → reading N/total → dependency map), climbing %, 0.73s stop, and the
+  history view. **Caveat carried from the pause work:** none of this can pause/stop a sync already
+  running in an OLD server process — it's for syncs started after the restart.
+
+- Global "reset all memory" (2026-07-20, user request — "clean state as if nothing synced, keep
+  connectors configured"). Per-connector cleanup existed but missed the non-connector buckets
+  (taught notes, distilled conversations, webhook pushes) and any orphaned sources. New
+  `catalog.reset_knowledge()` + `store.reset()` (+ `PgVectorStore.reset()`) wipe every document,
+  vector, FTS row, the whole knowledge graph, all sync watermarks, the ingestion-bucket source rows
+  and the gaps backlog — keeping configured connectors (listed at 0 docs, next sync = full pull),
+  users, chat sessions/projects, settings, and the sync-event history. `POST /api/memory/reset`
+  (auth-gated, 409 while any sync/cleanup runs) + a Settings **Danger zone** with a type-`RESET`
+  confirm. Suite: **470 passed** (+4; catalog wipe/keep-gaps, full-stack API reset + refuse-while-
+  syncing, pg parity), 12 skipped, pre-existing eval-yaml failure unchanged. Verified live in Chrome:
+  57 docs → 0, graph 0 nodes/0 edges, connector kept, re-sync repopulated 71 docs as a full pull.
 
 ## Next steps (agreed with user)
 

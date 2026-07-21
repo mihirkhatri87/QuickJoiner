@@ -59,12 +59,34 @@ class ConfluenceConnector(Connector):
         except Exception as exc:
             return ConnectionStatus(False, f"Confluence API error: {exc}")
 
+    def _space_page_count(self, base: str, auth, space: str | None) -> int | None:
+        """Best-effort up-front page count for a space, so the sync can report an accurate
+        %. The content-listing API gives no total, but the CQL search endpoint returns
+        `totalSize` (already used by the live search tool) for one cheap `limit=1` call.
+        Returns None — meaning "no %, show the shimmer" — when the pull isn't scoped to a
+        single space or the count fails; ingestion never depends on it."""
+        if not space:
+            return None
+        try:
+            data = get_json(
+                f"{base}/rest/api/content/search", auth=auth,
+                params={"cql": f'type=page and space="{space}"', "limit": 1},
+            )
+            total = int(data.get("totalSize") or 0)
+            return min(total, MAX_PAGES_PER_SPACE) if total > 0 else None
+        except Exception:
+            return None
+
     def sync(self, state: dict[str, str]) -> Iterator[Document]:
         base, auth = self._base(), self._auth()
         spaces = self.options.get("spaces") or [None]
         for space in spaces:
+            label = f"pages · {space}" if space else "pages"
+            total = self._space_page_count(base, auth, space)  # None ⇒ shimmer, not a bar
+            self._stage(label, 0 if total is not None else None, total)
             start = 0
             while start < MAX_PAGES_PER_SPACE:
+                self._checkpoint()  # stop/pause between page fetches, not just between pages
                 params: dict[str, Any] = {
                     "type": "page",
                     "expand": "body.storage,version",
@@ -77,9 +99,12 @@ class ConfluenceConnector(Connector):
                 results = data.get("results", [])
                 for page in results:
                     yield page_document(base, page)
+                start += len(results)
+                if total is not None:
+                    # Clamp: a space can grow between the preflight count and now.
+                    self._stage(label, min(start, total), total)
                 if len(results) < PAGE_SIZE:
                     break
-                start += len(results)
 
     def tools(self) -> list[AgentTool]:
         base, auth = self._base(), self._auth()

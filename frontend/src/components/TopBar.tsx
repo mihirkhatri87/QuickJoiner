@@ -1,7 +1,8 @@
 import { MessageSquareText, Moon, PanelLeftClose, PanelLeftOpen, Settings, Sun, Waypoints } from "lucide-react";
 import { useState } from "react";
-import type { Status } from "../types";
+import type { Status, SyncJob } from "../types";
 import { isDark, toggleTheme } from "../lib/theme";
+import { NotificationsMenu } from "./NotificationsMenu";
 import { IconButton } from "./ui";
 
 export function TopBar({
@@ -11,6 +12,9 @@ export function TopBar({
   onMenu,
   onSettings,
   onView,
+  onOpenHistory,
+  notifications,
+  onOpenSync,
 }: {
   status: Status | null;
   collapsed: boolean;
@@ -18,6 +22,9 @@ export function TopBar({
   onMenu: () => void;
   onSettings: () => void;
   onView: (view: "chat" | "graph") => void;
+  notifications: SyncJob[];
+  onOpenSync: (source: string, clean: boolean) => void;
+  onOpenHistory: () => void;
 }) {
   const [dark, setDark] = useState(isDark());
   return (
@@ -57,6 +64,7 @@ export function TopBar({
         >
           {dark ? <Sun size={17} /> : <Moon size={17} />}
         </IconButton>
+        <NotificationsMenu items={notifications} onOpenSync={onOpenSync} onOpenHistory={onOpenHistory} />
         <IconButton aria-label="Settings" title="Settings" onClick={onSettings}>
           <Settings size={17} />
         </IconButton>

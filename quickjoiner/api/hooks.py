@@ -38,7 +38,7 @@ def verify_signature(secret: str, body: bytes, headers: dict[str, str]) -> bool:
 def build_hooks_router(ctx) -> APIRouter:
     router = APIRouter()
 
-    @router.post("/hooks/{source_name}")
+    @router.post("/hooks/{source_name}", tags=["Webhooks"], summary="Receive an HMAC-verified push/webhook event from a source and ingest it immediately (PUSH mode).")
     async def receive_hook(source_name: str, request: Request):
         source = next((s for s in ctx.config.sources if s.name == source_name), None)
         if source is None:

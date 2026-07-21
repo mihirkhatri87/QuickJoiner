@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from quickjoiner.llm.base import AgentTool
+from quickjoiner.sync_control import NOOP_CONTROL, SyncControl
 
 
 class Mode(Flag):
@@ -44,6 +45,11 @@ class Connector(ABC):
     type_name: str = "base"
     modes: Mode = Mode.PULL
 
+    # A running sync attaches a live control (sync_manager); until then this no-op default
+    # means `_checkpoint`/`_stage` are safe to call from any connector, sync path, or test.
+    # Each job builds a fresh connector instance, so the per-instance control is thread-safe.
+    _control: SyncControl = NOOP_CONTROL
+
     def __init__(self, name: str, options: dict[str, Any], workspace: Path):
         self.name = name
         self.options = options
@@ -52,6 +58,17 @@ class Connector(ABC):
     @property
     def source_id(self) -> str:
         return f"{self.type_name}:{self.name}"
+
+    def _checkpoint(self) -> None:
+        """Cooperative pause/stop point — call inside long non-yielding loops (paginating
+        an API, walking teams) so a stop/pause is honored within seconds instead of after
+        the whole phase. Raises SyncStopped when cancelled; blocks while paused."""
+        self._control.check()
+
+    def _stage(self, name: str, done: int | None = None, total: int | None = None) -> None:
+        """Report the current phase (+ optional progress for an estimated %) to the UI.
+        Also a cancellation point, so stage transitions honor stop/pause too."""
+        self._control.stage(name, done, total)
 
     @abstractmethod
     def test(self) -> ConnectionStatus:

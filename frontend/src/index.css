@@ -156,6 +156,13 @@ body {
 }
 @keyframes blink { 50% { opacity: 0; } }
 
+/* Indeterminate progress: a segment sweeping across the track for streaming syncs whose
+   total isn't known up front (so there's no % to fill), just to signal liveness. */
+@keyframes indeterminate {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(400%); }
+}
+
 /* ============================================================
    Knowledge graph — motion & emphasis (components/GraphView.tsx).
    A bridge entity (touched by more than one source) gets a slow

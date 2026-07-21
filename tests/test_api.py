@@ -14,6 +14,7 @@ import quickjoiner.app as app_module
 from quickjoiner.api.app import create_app
 from quickjoiner.api.hooks import verify_signature
 from quickjoiner.app import AppContext, build_context
+from quickjoiner.config import RetrievalConfig
 from quickjoiner.llm.base import AgentTool, ChatResult, ToolCall, ToolSpec
 
 from tests.conftest import FakeEmbedder
@@ -158,6 +159,20 @@ def test_settings_graph_and_retrieval_roundtrip(client):
     got = client.get("/api/settings").json()
     assert got["graph"]["extract_triples"] is True
     assert got["retrieval"]["reranker"] == "none"
+
+
+def test_settings_defaults_are_shipped_values_not_current_ones(client):
+    """The Settings drawer marks which fields still sit at their default. The defaults must
+    come from fresh config models — reading back the *saved* config would make every field
+    look default forever, which is exactly the bug this endpoint exists to avoid."""
+    before = client.get("/api/settings/defaults").json()
+    assert before["retrieval"]["min_score"] == RetrievalConfig().min_score
+    assert set(before) == {"llm", "embedding", "retrieval", "chat", "graph", "repos"}
+
+    client.patch("/api/settings", json={"retrieval": {"min_score": 0.81}})
+    after = client.get("/api/settings/defaults").json()
+    assert after["retrieval"]["min_score"] == before["retrieval"]["min_score"]  # unmoved
+    assert client.get("/api/settings").json()["retrieval"]["min_score"] == 0.81  # current did move
 
 
 def test_settings_rejects_bad_retrieval(client):
@@ -362,6 +377,165 @@ def test_clean_resync_purges_then_repopulates(client):
     job = _wait_sync(client, "handbook")
     assert job["state"] == "done" and job["stats"]["added"] == 1  # re-added, not "unchanged"
     assert next(r for r in client.get("/api/sources").json() if r["name"] == "handbook")["documents"] == 1
+
+
+def test_notifications_report_finished_syncs(client):
+    """The activity feed behind the bell menu: empty before anything runs, then one row
+    per run carrying the outcome — read back from the persisted history, so it is still
+    there after a page reload (and, unlike /api/syncs, after a server restart)."""
+    assert client.get("/api/notifications").json() == {"notifications": [], "active": 0}
+
+    client.post("/api/sync/handbook")
+    _wait_sync(client, "handbook")
+
+    body = client.get("/api/notifications").json()
+    assert body["active"] == 0
+    assert len(body["notifications"]) == 1
+    row = body["notifications"][0]
+    assert row["source"] == "handbook" and row["state"] == "done"
+    assert row["stats"]["added"] == 1 and row["started_at"]
+
+    # A second run is its own row, newest first — the feed is history, not a status dict.
+    client.post("/api/sync/handbook")
+    _wait_sync(client, "handbook")
+    rows = client.get("/api/notifications").json()["notifications"]
+    assert len(rows) == 2
+    assert rows[0]["started_at"] >= rows[1]["started_at"]
+    assert len({r["id"] for r in rows}) == 2
+
+
+def test_notifications_window_is_clamped(client):
+    """hours is user input: absurd values must not turn into an unbounded scan."""
+    assert client.get("/api/notifications", params={"hours": 0}).status_code == 200
+    assert client.get("/api/notifications", params={"hours": 100000}).status_code == 200
+
+
+def _wait_job(client, name, timeout=15.0):
+    """Poll until no job (of any kind) is still running for this source."""
+    import time as _t
+
+    deadline = _t.monotonic() + timeout
+    while _t.monotonic() < deadline:
+        jobs = client.get("/api/syncs").json()["syncs"]
+        job = next((s for s in jobs if s["source"] == name), None)
+        if job and job["state"] not in ("running", "stopping"):
+            return job
+        _t.sleep(0.05)
+    raise AssertionError(f"job for {name!r} did not finish in {timeout}s")
+
+
+def test_cleanup_forgets_a_connectors_knowledge_but_keeps_it_configured(client):
+    client.post("/api/sync/handbook")
+    _wait_sync(client, "handbook")
+    assert next(r for r in client.get("/api/sources").json() if r["name"] == "handbook")["documents"] == 1
+
+    job = client.post("/api/connectors/handbook/cleanup").json()["job"]
+    assert job["kind"] == "cleanup"
+    assert _wait_job(client, "handbook")["state"] == "done"
+
+    assert client.get("/api/status").json()["stats"]["documents"] == 0  # knowledge forgotten
+    assert any(c["name"] == "handbook" for c in client.get("/api/connectors").json())  # config kept
+    # …and it stays a listed, connected system with zero documents — like a connector
+    # that has been added but not yet synced. (It vanishing here was a real bug.)
+    row = next((r for r in client.get("/api/sources").json() if r["name"] == "handbook"), None)
+    assert row is not None and row["documents"] == 0 and row["configured"] is True
+    # …and it can be re-synced from scratch, since the watermark went with it.
+    client.post("/api/sync/handbook")
+    assert _wait_sync(client, "handbook")["stats"]["added"] == 1
+
+
+def test_delete_connector_cleans_up_its_knowledge_by_default(client):
+    """A deleted connector's documents are unreachable — nothing can re-sync or purge them
+    — so deletion purges by default rather than stranding them in memory."""
+    client.post("/api/sync/handbook")
+    _wait_sync(client, "handbook")
+    assert client.get("/api/status").json()["stats"]["documents"] == 1
+
+    body = client.delete("/api/connectors/handbook").json()
+    assert body["removed"] == "handbook" and body["job"]["kind"] == "cleanup"
+    assert _wait_job(client, "handbook")["state"] == "done"
+
+    assert client.get("/api/status").json()["stats"]["documents"] == 0
+    assert not any(c["name"] == "handbook" for c in client.get("/api/connectors").json())
+    assert not any(r["name"] == "handbook" for r in client.get("/api/sources").json())
+
+
+def test_delete_connector_can_keep_memory_explicitly(client):
+    """The opt-out: retire the connector, keep what it taught (the pre-2026-07-20 default)."""
+    client.post("/api/sync/handbook")
+    _wait_sync(client, "handbook")
+
+    body = client.delete("/api/connectors/handbook", params={"keep_memory": "true"}).json()
+    assert body["job"] is None
+    assert client.get("/api/status").json()["stats"]["documents"] == 1  # knowledge survives
+    assert not any(c["name"] == "handbook" for c in client.get("/api/connectors").json())
+
+
+def test_delete_connector_refuses_while_a_job_runs(client, monkeypatch):
+    """Purging under a live ingest would race it."""
+    import quickjoiner.sync_manager as sm
+
+    monkeypatch.setattr(sm.SyncManager, "is_running", lambda self, name: True)
+    assert client.delete("/api/connectors/handbook").status_code == 409
+    assert any(c["name"] == "handbook" for c in client.get("/api/connectors").json())  # not removed
+
+
+def test_pause_and_resume_roundtrip(client):
+    """A running sync can be paused and resumed via the API; the state is reflected in the
+    job summary and the activity feed, and it still finishes after resume."""
+    r = client.post("/api/sync/handbook")
+    assert r.status_code == 200
+    # Pause may race the (fast, in-test) sync to completion; both outcomes are valid, but
+    # if we DO catch it running, pause→resume must round-trip.
+    p = client.post("/api/sync/handbook/pause")
+    if p.status_code == 200:
+        assert p.json()["job"]["state"] == "paused"
+        # A paused job blocks a second start and a delete.
+        assert client.post("/api/sync/handbook").status_code == 409
+        assert client.delete("/api/connectors/handbook").status_code == 409
+        assert client.post("/api/sync/handbook/resume").json()["job"]["state"] == "running"
+    else:
+        assert p.status_code == 409  # already finished
+    job = _wait_sync(client, "handbook")
+    assert job["state"] == "done"
+
+
+def test_pause_nothing_running_is_409(client):
+    assert client.post("/api/sync/handbook/pause").status_code == 409
+    assert client.post("/api/sync/handbook/resume").status_code == 409
+
+
+def test_reset_memory_wipes_knowledge_keeps_connectors(client):
+    """Full-stack global reset: ingest, then reset → 0 documents/graph, connectors intact."""
+    client.post("/api/sync/handbook")
+    _wait_sync(client, "handbook")
+    assert client.get("/api/status").json()["stats"]["documents"] >= 1
+
+    r = client.post("/api/memory/reset")
+    assert r.status_code == 200 and r.json()["reset"] is True
+    assert r.json()["removed"]["documents"] >= 1
+
+    st = client.get("/api/status").json()["stats"]
+    assert st["documents"] == 0 and st["chunks"] == 0  # vectors gone too (store.reset)
+    # Connectors remain configured and listed (at 0 docs), so they can be re-synced.
+    names = [c["name"] for c in client.get("/api/connectors").json()]
+    assert "handbook" in names and "ghrepo" in names
+    hb = next(r for r in client.get("/api/sources").json() if r["name"] == "handbook")
+    assert hb["documents"] == 0 and hb["configured"] is True
+    # And search finds nothing now.
+    assert client.get("/api/search", params={"q": "Octopus"}).json() == []
+
+    # Re-sync repopulates from scratch (watermark was cleared).
+    client.post("/api/sync/handbook")
+    assert _wait_sync(client, "handbook")["stats"]["added"] == 1
+
+
+def test_reset_memory_refuses_while_a_sync_runs(client, monkeypatch):
+    import quickjoiner.sync_manager as sm
+
+    monkeypatch.setattr(sm.SyncManager, "status",
+                        lambda self: [{"source": "handbook", "state": "running"}])
+    assert client.post("/api/memory/reset").status_code == 409
 
 
 def test_sync_unknown_source_is_404(client):

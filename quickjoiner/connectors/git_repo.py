@@ -56,6 +56,7 @@ class GitRepoConnector(Connector):
     def sync(self, state: dict[str, str]) -> Iterator[Document]:
         clone_dir = self._clone_dir()
         branch = self.options.get("branch")
+        self._stage("cloning" if not (clone_dir / ".git").exists() else "pulling")
         if (clone_dir / ".git").exists():
             result = self._git("pull", "--ff-only", cwd=clone_dir)
         else:
@@ -69,9 +70,14 @@ class GitRepoConnector(Connector):
             raise RuntimeError(f"git sync failed: {result.stderr.strip()[:500]}")
 
         repo_url = str(self.options.get("url", ""))
-        for path in sorted(clone_dir.rglob("*")):
-            if not path.is_file() or any(part in SKIP_DIRS for part in path.parts):
-                continue
+        self._stage("scanning files")
+        files = [
+            p for p in sorted(clone_dir.rglob("*"))
+            if p.is_file() and not any(part in SKIP_DIRS for part in p.parts)
+        ]
+        total = len(files)
+        for i, path in enumerate(files):
+            self._stage("reading files", i, total)  # checkpoint + progress each file
             doc = read_file_document(path, clone_dir)
             if doc:
                 rel = path.relative_to(clone_dir).as_posix()
@@ -79,6 +85,7 @@ class GitRepoConnector(Connector):
                 doc.title = f"{self.name}/{rel}"
                 yield doc
 
+        self._stage("dependency map", total, total)
         dep_doc = dependency_document(clone_dir, self.name, repo_url)
         if dep_doc:
             yield dep_doc

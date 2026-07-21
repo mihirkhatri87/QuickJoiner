@@ -37,11 +37,35 @@ when memory has nothing relevant.
   actually been learned (your services, repos, environments, past questions). It needs no LLM, so
   it's instant, and it **keeps improving as you connect more systems** — each newly synced source
   adds its real entities to the suggestions automatically.
-- **Sync control** — syncs run as background jobs you can **watch live** (streaming logs) and
-  **stop** at any time; stopping asks whether to clean up the partial pull. Multiple sources sync
+- **Sync control** — syncs run as background jobs you can **watch live** (streaming logs),
+  **pause/resume**, and **stop** at any time; stopping asks whether to clean up the partial pull.
+  The live log shows the **current stage and an estimated %** (e.g. "reading files 40/76 · 53%",
+  or per-team progress for a large TFS pull), and stop/pause take effect within seconds even mid-pull
+  — the pipelines check for it inside their loops, not just between documents. Multiple sources sync
   at once, and a **clean re-sync** (`qj resync`, or the button in the UI) purges a source's
   documents, vectors and graph edges before re-pulling, so the knowledge graph never ends up
-  corrupted or half-populated.
+  corrupted or half-populated. The log panel never traps you: close it and the sync keeps
+  running, with a live indicator on the source (in the sidebar and on its connector card) that
+  re-opens the log. **Reloading the page doesn't lose a sync** — jobs live on the server, so the
+  UI picks them straight back up. The bell menu's **"View full history by connector"** shows every
+  sync over the last 7 days grouped by connector, with the latest run's live %.
+- **Clean up / delete without leftovers** — a connector's **name is its identity**: everything it
+  learns is stored under `type:name`, so the name can't be changed after the fact (the edit view
+  shows it disabled and says why). **Clean up** forgets a source's documents, vectors and graph
+  edges while keeping it connected, and **deleting** a connector runs that cleanup automatically —
+  otherwise its knowledge would linger forever with nothing able to re-sync or remove it. Both run
+  as background jobs with a live log, and both refuse to start while that source is mid-sync. Need
+  the old behaviour? `DELETE /api/connectors/<name>?keep_memory=true` retires the connector and
+  keeps what it taught.
+- **Reset all memory** — Settings has a **Danger zone** with a type-to-confirm "Reset all learned
+  memory" that wipes every ingested document, its vectors, and the whole knowledge graph, and clears
+  each connector's sync watermark — the workspace goes back to as if nothing had ever synced, while
+  your **connectors stay configured** (re-sync any time). Chat history and settings are untouched.
+  (`POST /api/memory/reset`; refuses while a sync is running.)
+- **Activity menu** — the bell in the top bar is the 24-hour view of what the workspace has been
+  doing: syncs running right now and everything that finished, with counts or the error. It badges
+  what you haven't seen yet, keeps unseen entries visually distinct from ones you've already read,
+  and survives both a page reload and a server restart.
 
 ---
 
@@ -127,6 +151,15 @@ qj serve                              # web UI + API on http://127.0.0.1:8787
 flags. To keep multiple orgs, `qj init acme` creates `~/.quickjoiner/acme`; select it later with
 `--workspace` or by setting `QJ_WORKSPACE`.
 
+### API docs & runbooks
+
+`qj serve` exposes a REST API alongside the UI. Interactive, **function-grouped** API docs are at
+**`/docs`** (Swagger UI) and **`/redoc`**, with the raw schema at **`/openapi.json`** — every
+endpoint has a plain-English summary. For a hands-on, end-to-end walkthrough (connect → sync →
+query), import the ready-made **Postman** and **Bruno** collections in [`docs/api/`](docs/api/) —
+all common config (base URL, connector, queries) lives in one variables file. *(Swagger UI loads
+its assets from a CDN, so `/docs` is blank on an air-gapped host; `/openapi.json` always works.)*
+
 ---
 
 ## LLM backends
@@ -138,6 +171,10 @@ Choose one; you can also override per command with `qj ask --provider …`.
 qj init --provider anthropic
 $env:ANTHROPIC_API_KEY = "sk-ant-..."   # or put it in <workspace>/.env
 ```
+Prompt caching is on by default (`llm.prompt_cache`): the system prompt + tool specs and the
+growing conversation are cached server-side, so the 2nd..Nth round of every tool-using answer
+and every follow-up turn read the prompt at ~10% of the input price (and faster). Disable it
+only if a fronting proxy rejects the `cache_control` field.
 
 **Ollama** (fully local, private — no data leaves your machine):
 ```powershell
@@ -155,12 +192,29 @@ $env:LITELLM_API_KEY = "sk-..."         # env var name is configurable (llm.api_
 ```
 The secret is read from the environment at runtime and never written to config.
 
+For reasoning models behind the proxy (gpt-oss and friends) there are dedicated knobs and
+behaviors, all safe on backends that don't support them (a rejecting 400 is stripped and
+retried automatically):
+- the chain of thought that produced a tool call is passed back (`reasoning_content`) until the
+  turn completes — the Harmony-format contract that keeps gpt-oss from re-planning every round;
+- `llm.reasoning_effort` (`low`/`medium`/`high`) — the big cost/latency dial;
+- `llm.parallel_tool_calls: false` forces one tool call per turn if your backend emits garbled
+  parallel calls;
+- streamed responses request usage reporting, and token counts (including the backend's
+  prefix-cache hits, `cached_tokens`) are logged at DEBUG level;
+- `llm.proxy_cache_control` (off by default) forwards an Anthropic-style cache marker for
+  proxies that route to Claude.
+
 The provider is resilient to a flaky gateway: transient `401/429/5xx` responses and network
-blips are retried with bounded exponential backoff (some proxies intermittently reject a valid
-key under load), and tool names are auto-sanitized to the OpenAI-compatible pattern so
+blips are retried with bounded exponential backoff honoring `Retry-After` (some proxies
+intermittently reject a valid key under load), one pooled HTTP connection is reused across a
+whole tool loop, and tool names are auto-sanitized to the OpenAI-compatible pattern so
 connector tools whose names contain spaces work with strict backends like gpt-oss. Live tool
 results are capped (`chat.live_tool_result_max_chars`, default 24000) so a large source — e.g. a
-big Octopus deployment dashboard — can't overflow the model's context window.
+big Octopus deployment dashboard — can't overflow the model's context window. Tool specs are
+sent in a deterministic (name-sorted) order on every provider, so backends with automatic
+prefix caching (OpenAI-compatible proxies, llama.cpp/Ollama KV-cache reuse) get cache hits
+across turns too.
 
 ---
 
@@ -220,14 +274,17 @@ A React app (Vite + TypeScript + Tailwind) with:
 - **Projects and resumable conversations**, with automatic history compression.
 - **Knowledge gaps** — a badge in the rail opens the knowledge-debt backlog (below).
 - **Waypoints** — the interactive knowledge graph view.
-- **⚙ Settings** — sign-in and per-user connector sharing, add/test/sync connectors (or the
+- **⚙ Settings** — sign-in and per-user connector sharing, add/test/sync/clean-up connectors (or the
   conversational `/connect` wizard), and tune workspace settings: LLM provider/model (incl. the
   **LiteLLM proxy URL + API-key env var**, with a **Test connection** button that pings the
   provider before you save), retrieval knobs (**hybrid** dense+sparse, **cross-encoder reranker**,
   **graph-expansion**, **contextual chunking**), **knowledge-graph** LLM triple extraction, chat
   compression, and embeddings. Toggles are labelled query-time (take effect immediately) vs
-  ingest-time (need a re-sync to re-embed). Everything — config and connectors — lives in the
-  workspace's SQLite `catalog.db`, not a YAML file.
+  ingest-time (need a re-sync to re-embed). Settings are grouped into **collapsible sections**
+  that start closed, and each field tells you whether it still holds the **shipped default** —
+  changed fields show what the default was, and a section header counts how many you've changed,
+  so "what have I actually tuned here?" is answerable at a glance. Everything — config and
+  connectors — lives in the workspace's SQLite `catalog.db`, not a YAML file.
 - Composer commands: `/learn <fact>`, `/connect`, `/scrape <url>` (crawl → a cited report with
   mermaid diagrams you can then choose to learn).
 

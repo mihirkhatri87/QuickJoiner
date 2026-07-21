@@ -98,7 +98,10 @@ class GitHubConnector(Connector):
         repo, base, headers = self._repo(), self._base(), self._headers()
         since = state.get("since", "")
 
+        # No cheap up-front count for the GitHub list APIs, so these report a phase label
+        # (the UI shows a live shimmer) rather than a misleading fraction of the page cap.
         for page in range(1, MAX_PAGES + 1):
+            self._stage("pull requests")  # also a stop/pause checkpoint, per page
             prs = get_json(
                 f"{base}/repos/{repo}/pulls",
                 headers=headers,
@@ -114,6 +117,7 @@ class GitHubConnector(Connector):
                 break
 
         for page in range(1, MAX_PAGES + 1):
+            self._stage("issues")
             issues = get_json(
                 f"{base}/repos/{repo}/issues",
                 headers=headers,
@@ -129,6 +133,7 @@ class GitHubConnector(Connector):
             if len(issues) < PER_PAGE:
                 break
 
+        self._stage("CI runs & ownership")
         runs = get_json(
             f"{base}/repos/{repo}/actions/runs",
             headers=headers,

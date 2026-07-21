@@ -14,6 +14,20 @@ from quickjoiner.memory.catalog import Catalog
 from tests.conftest import FakeEmbedder
 
 
+def _wait_idle(client, name, timeout=15.0):
+    """Block until no background job is running for a source (syncs are async)."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        jobs = client.get("/api/syncs").json()["syncs"]
+        job = next((j for j in jobs if j["source"] == name), None)
+        if job is None or job["state"] not in ("running", "stopping"):
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"job for {name!r} still running after {timeout}s")
+
+
 # -- primitives ---------------------------------------------------------------
 
 def test_password_hash_roundtrip():
@@ -92,6 +106,9 @@ def test_open_mode_connector_crud(tmp_path, monkeypatch):
     assert "pull" in rows[0]["modes"]
 
     assert client.post("/api/sync/handbook").status_code == 200
+    # Deleting purges the source's knowledge, so it refuses to race a running ingest.
+    assert client.delete("/api/connectors/handbook").status_code == 409
+    _wait_idle(client, "handbook")
     assert client.delete("/api/connectors/handbook").status_code == 200
     assert client.get("/api/connectors").json() == []
 

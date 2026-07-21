@@ -121,6 +121,11 @@ class PgVectorStore:
         with self._pool.connection() as conn:
             conn.execute("DELETE FROM chunks WHERE source_id = %s", (source_id,))
 
+    def reset(self) -> None:
+        """Drop every vector row — the whole corpus (global memory reset)."""
+        with self._pool.connection() as conn:
+            conn.execute("DELETE FROM chunks")
+
     def search(self, query: str, top_k: int = 8, min_score: float = 0.0) -> list[SearchHit]:
         query = normalize_query(query)
         r = self._retrieval

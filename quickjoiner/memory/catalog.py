@@ -80,6 +80,27 @@ _SCHEMA_STATEMENTS = [
     # see them as "unchanged" and skip them forever, never retrying the graph work.
     """CREATE TABLE IF NOT EXISTS graph_pending (
         doc_id TEXT PRIMARY KEY, source_id TEXT NOT NULL DEFAULT '')""",
+    # One row per sync run (written at start, updated when it ends) so "what has been
+    # happening?" survives a page reload AND a server restart — SyncManager's job map is
+    # in-memory and per-process, which is enough to *watch* a run but not to remember it.
+    # This is what the notification menu reads.
+    """CREATE TABLE IF NOT EXISTS sync_events (
+        id TEXT PRIMARY KEY, source TEXT NOT NULL, state TEXT NOT NULL,
+        clean INTEGER NOT NULL DEFAULT 0, stats_json TEXT NOT NULL DEFAULT '',
+        error TEXT NOT NULL DEFAULT '', started_at TEXT NOT NULL, ended_at TEXT,
+        kind TEXT NOT NULL DEFAULT 'sync')""",
+    "CREATE INDEX IF NOT EXISTS idx_sync_events_started ON sync_events(started_at)",
+]
+
+# Columns added to tables that already exist in the wild. Applied best-effort on every
+# open (an "already exists" error is the expected no-op) — plain ALTER, no IF NOT EXISTS,
+# because SQLite doesn't support that form.
+_MIGRATION_STATEMENTS = [
+    "ALTER TABLE sources ADD COLUMN owner TEXT",
+    "ALTER TABLE sources ADD COLUMN shared INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE sources ADD COLUMN configured INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE sources ADD COLUMN sync_interval_minutes INTEGER",
+    "ALTER TABLE sync_events ADD COLUMN kind TEXT NOT NULL DEFAULT 'sync'",
 ]
 
 
@@ -265,6 +286,37 @@ class _SqlCatalog:
     def clear_sync_state(self, source_id: str) -> None:
         """Forget a source's sync watermark so the next sync is a full pull."""
         self._write("DELETE FROM sync_state WHERE source_id = ?", (source_id,))
+
+    def reset_knowledge(self, include_gaps: bool = True) -> dict[str, int]:
+        """Global memory reset: wipe everything ingested/derived, leaving the workspace as
+        if nothing had ever synced — while KEEPING connector configs, users, chat
+        sessions/projects, settings, and the sync-event history.
+
+        Removes: all documents, the whole knowledge graph (edges, entities, aliases,
+        deferred graph work), and every sync watermark (so the next sync is a full pull).
+        Also drops the ingestion-bucket source rows (taught notes, distilled conversations,
+        webhook pushes — `configured=0`); configured connectors stay listed at 0 documents.
+        The gaps backlog is cleared by default (it references now-deleted near-miss docs).
+        The caller must wipe the vector store separately (`store.reset()`).
+
+        Portable `?`-SQL in the neutral base ⇒ both backends. Returns counts for the UI."""
+        counts = {
+            "documents": self._read_one("SELECT COUNT(*) AS n FROM documents")["n"],
+            "entities": self._read_one("SELECT COUNT(*) AS n FROM entities")["n"],
+            "edges": self._read_one("SELECT COUNT(*) AS n FROM edges")["n"],
+        }
+        self._write("DELETE FROM documents")
+        self._write("DELETE FROM edges")
+        self._write("DELETE FROM entities")
+        self._write("DELETE FROM entity_aliases")
+        self._write("DELETE FROM graph_pending")
+        self._write("DELETE FROM sync_state")
+        # Ingestion buckets exist only because of ingested content — drop them; keep real
+        # connectors so they stay listed (at 0 docs) and re-syncable.
+        self._write("DELETE FROM sources WHERE configured = 0")
+        if include_gaps:
+            self._write("DELETE FROM gaps")
+        return counts
 
     # -- deferred graph work (see graph_pending's comment in the schema) --------
     def mark_graph_pending(self, doc_id: str, source_id: str) -> None:
@@ -785,6 +837,39 @@ class _SqlCatalog:
                 (resolution, _now(), gid),
             )
 
+    # -- sync history (notifications) ----------------------------------------
+    def record_sync_event(self, job_id: str, source: str, state: str, clean: bool,
+                          started_at: str, ended_at: str | None = None,
+                          stats: dict | None = None, error: str | None = None,
+                          kind: str = "sync") -> None:
+        """Upsert one job run (`kind` = sync | cleanup). Called twice per job (start, then
+        end), keyed on the job id so the finished row replaces the running one instead of
+        duplicating it."""
+        self._write(
+            """INSERT INTO sync_events (id, source, state, clean, stats_json, error,
+                                        started_at, ended_at, kind)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET state=excluded.state,
+                   stats_json=excluded.stats_json, error=excluded.error,
+                   ended_at=excluded.ended_at""",
+            (job_id, source, state, 1 if clean else 0,
+             json.dumps(stats) if stats else "", error or "", started_at, ended_at, kind),
+        )
+
+    def list_sync_events(self, since: str, limit: int = 50) -> list[dict]:
+        """Sync runs started at/after `since` (ISO-8601 UTC), newest first."""
+        return self._read_all(
+            "SELECT * FROM sync_events WHERE started_at >= ? "
+            "ORDER BY started_at DESC, id DESC LIMIT ?",
+            (since, int(limit)),
+        )
+
+    def prune_sync_events(self, before: str) -> int:
+        """Drop runs older than `before` — this table is a rolling window, not an audit log."""
+        rows = self._read_all("SELECT id FROM sync_events WHERE started_at < ?", (before,))
+        self._write("DELETE FROM sync_events WHERE started_at < ?", (before,))
+        return len(rows)
+
     # -- sync state -----------------------------------------------------------
     def get_sync_state(self, source_id: str) -> dict[str, str]:
         rows = self._read_all("SELECT key, value FROM sync_state WHERE source_id = ?", (source_id,))
@@ -815,12 +900,7 @@ class Catalog(_SqlCatalog):
 
     def _migrate(self) -> None:
         """Add columns introduced after the first release to pre-existing DBs."""
-        for ddl in (
-            "ALTER TABLE sources ADD COLUMN owner TEXT",
-            "ALTER TABLE sources ADD COLUMN shared INTEGER NOT NULL DEFAULT 1",
-            "ALTER TABLE sources ADD COLUMN configured INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE sources ADD COLUMN sync_interval_minutes INTEGER",
-        ):
+        for ddl in _MIGRATION_STATEMENTS:
             try:
                 self._conn.execute(ddl)
             except sqlite3.OperationalError:

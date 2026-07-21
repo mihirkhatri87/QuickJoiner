@@ -56,18 +56,25 @@ export function Eyebrow({ children, action }: { children: ReactNode; action?: Re
 export function Field({
   label,
   hint,
+  note,
   children,
 }: {
   label: string;
   hint?: ReactNode;
+  /** Right-aligned annotation on the label row (e.g. the default-value marker). */
+  note?: ReactNode;
   children: ReactNode;
 }) {
+  // h-full + mt-auto keeps controls bottom-aligned across a two-column grid row: a label
+  // that wraps to two lines (or carries a note) must not shove its input out of line with
+  // the field beside it.
   return (
-    <label className="mb-3 block">
-      <span className="mb-1.5 block px-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">
+    <label className="mb-3 flex h-full flex-col">
+      <span className="mb-1.5 flex items-baseline gap-2 px-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">
         {label}
+        {note && <span className="ml-auto whitespace-nowrap">{note}</span>}
       </span>
-      {children}
+      <span className="mt-auto block">{children}</span>
       {hint && <span className="mt-1 block px-1 text-[11.5px] leading-snug text-faint">{hint}</span>}
     </label>
   );

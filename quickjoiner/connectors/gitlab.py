@@ -144,8 +144,10 @@ class GitLabConnector(Connector):
         project, headers = self._project(), self._headers()
         since = state.get("since", "")
 
-        for kind, endpoint, to_doc in (
-            ("mrs", "merge_requests", mr_document),
+        # Phase labels only (no cheap total for the GitLab list APIs) — the UI shows a live
+        # shimmer, and each page fetch is a stop/pause checkpoint.
+        for label, endpoint, to_doc in (
+            ("merge requests", "merge_requests", mr_document),
             ("issues", "issues", issue_document),
         ):
             params: dict[str, Any] = {
@@ -154,6 +156,7 @@ class GitLabConnector(Connector):
             if since:
                 params["updated_after"] = since
             for page in range(1, MAX_PAGES + 1):
+                self._stage(label)
                 items = get_json(
                     f"{self._project_api()}/{endpoint}", headers=headers,
                     params={**params, "page": page},
@@ -163,12 +166,14 @@ class GitLabConnector(Connector):
                 if len(items) < PER_PAGE:
                     break
 
+        self._stage("pipelines")
         pipelines = get_json(
             f"{self._project_api()}/pipelines", headers=headers, params={"per_page": PER_PAGE}
         )
         if pipelines:
             yield pipelines_document(project, pipelines, self._web_base())
 
+        self._stage("wiki")
         try:
             pages = get_json(
                 f"{self._project_api()}/wikis", headers=headers, params={"with_content": 1}

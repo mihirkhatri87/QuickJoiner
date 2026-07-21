@@ -131,7 +131,13 @@ class IngestPipeline:
         # network round-trips one document at a time. 1 = fully sequential (default).
         self._triple_workers = max(1, triple_workers)
 
-    def ingest(self, documents: Iterable[Document], source_id: str) -> IngestStats:
+    def ingest(self, documents: Iterable[Document], source_id: str,
+               control: Any = None) -> IngestStats:
+        """`control` (optional) lets a caller pause/stop the deferred graph-extraction
+        phase: any object with `proceed() -> bool` that blocks while paused and returns
+        False once cancelled (see `sync_manager._PauseControl`). None = run to completion,
+        the behaviour for the CLI, scheduler and tests. The document loop itself is gated
+        by whatever iterator is passed in (the sync manager wraps it)."""
         stats = IngestStats()
         pending: list[tuple[str, list, list, list, str, str, str]] = []
         for doc in documents:
@@ -140,7 +146,7 @@ class IngestPipeline:
             except Exception as exc:  # keep syncing the rest of the source
                 stats.errors.append(f"{doc.uri}: {exc}")
         if pending:
-            self._resolve_pending_triples(pending, source_id)
+            self._resolve_pending_triples(pending, source_id, control)
         if stats.chunks:
             ensure_index = getattr(self._store, "ensure_ann_index", None)
             if ensure_index is not None:
@@ -255,12 +261,30 @@ class IngestPipeline:
         self._persist_graph(doc_id, entities, alias_rows, edges, source_id,
                             doc.title, doc.kind)
 
-    def _resolve_pending_triples(self, pending: list, source_id: str) -> None:
-        """Resolve the queued LLM triple-extraction calls, then persist each
-        document's full graph assertions. `triple_workers > 1` runs the (network-
-        bound) extractor calls concurrently; all catalog/embedding work still
-        happens back on this thread as each future completes, so no locking is
-        needed beyond what the catalog already provides."""
+    def _resolve_pending_triples(self, pending: list, source_id: str,
+                                 control: Any = None) -> None:
+        """Resolve the queued LLM triple-extraction calls, then persist each document's
+        full graph assertions. Drained in small waves (one per worker pool) so pause/stop
+        via `control` takes effect promptly — on a big corpus this is the long tail
+        (thousands of broker calls), so it must honor stop within seconds, not run to
+        completion. `control.stage()` before each wave both reports "graph relationships
+        (done/total)" for the UI and raises SyncStopped on cancel; a cancel leaves the
+        undrained docs in `graph_pending`, so they resolve on a later sync/drain — safe and
+        idempotent, never lost work. Wave = `triple_workers`, so at most that many calls
+        are ever in flight when a stop lands."""
+        total = len(pending)
+        wave = max(1, self._triple_workers)
+        done = 0
+        for i in range(0, total, wave):
+            if control is not None:
+                control.stage("graph relationships", done, total)  # checkpoint + progress
+            chunk = pending[i:i + wave]
+            self._drain_pending(chunk, source_id)
+            done += len(chunk)
+        if control is not None:
+            control.stage("graph relationships", done, total)
+
+    def _drain_pending(self, pending: list, source_id: str) -> None:
         if self._triple_workers > 1 and len(pending) > 1:
             with concurrent.futures.ThreadPoolExecutor(max_workers=self._triple_workers) as pool:
                 futures = {

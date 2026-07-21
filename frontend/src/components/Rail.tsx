@@ -1,6 +1,6 @@
 import { ChevronRight, Plus, Radar, Trash2 } from "lucide-react";
 import { useState } from "react";
-import type { ProjectRow, SessionRow, SourceRow, Status } from "../types";
+import type { ProjectRow, SessionRow, SourceRow, Status, SyncJob } from "../types";
 import { Button, cn, Eyebrow, Select } from "./ui";
 
 export function Rail({
@@ -24,6 +24,8 @@ export function Rail({
   onManage,
   gapCount,
   onOpenGaps,
+  syncJobs,
+  onOpenSync,
 }: {
   open: boolean;
   collapsed: boolean; // md+ only; mobile uses `open`
@@ -45,10 +47,16 @@ export function Rail({
   onManage: () => void;
   gapCount: number;
   onOpenGaps: () => void;
+  syncJobs: SyncJob[];
+  onOpenSync: (source: string, clean: boolean) => void;
 }) {
   const [newProj, setNewProj] = useState("");
   const [addingProj, setAddingProj] = useState(false);
   const configured = sources.filter((s) => s.configured);
+  // Newest job per source — a system that is syncing right now says so here, and clicking
+  // it re-opens the live log (the same panel the Sync button opens).
+  const jobBySource = new Map<string, SyncJob>();
+  for (const j of syncJobs) if (!jobBySource.has(j.source)) jobBySource.set(j.source, j);
   const visible = sessions.filter((s) => s.title || s.est_tokens > 0).slice(0, 40);
 
   return (
@@ -229,17 +237,52 @@ export function Rail({
             </p>
           ) : (
             <div className="scroll-thin -mr-1 flex max-h-[148px] flex-col overflow-y-auto pr-1">
-              {configured.map((s) => (
-                <div
-                  key={s.id}
-                  title={`${s.type} · ${s.documents} docs`}
-                  className="flex flex-shrink-0 items-center gap-2.5 rounded-xs px-3 py-1.5 transition hover:bg-fill"
-                >
-                  <span className="h-[7px] w-[7px] flex-shrink-0 rounded-full bg-gold shadow-[0_0_0_3px_var(--gold-soft)]" />
-                  <span className="truncate text-[13px]">{s.name}</span>
-                  <span className="ml-auto flex-shrink-0 font-mono text-[10.5px] tabular-nums text-faint">{s.documents}</span>
-                </div>
-              ))}
+              {configured.map((s) => {
+                const job = jobBySource.get(s.name);
+                const paused = job?.state === "paused";
+                const syncing = job?.state === "running" || job?.state === "stopping" || paused;
+                const watchable = Boolean(job?.live);
+                const Row = watchable ? "button" : "div";
+                return (
+                  <Row
+                    key={s.id}
+                    {...(watchable
+                      ? { onClick: () => onOpenSync(s.name, job!.clean), title: "Open the live sync log" }
+                      : { title: `${s.type} · ${s.documents} docs` })}
+                    className={cn(
+                      "flex w-full flex-shrink-0 items-center gap-2.5 rounded-xs px-3 py-1.5 text-left transition hover:bg-fill",
+                    )}
+                  >
+                    <span
+                      className={cn(
+                        "h-[7px] w-[7px] flex-shrink-0 rounded-full",
+                        paused
+                          ? "bg-gold shadow-[0_0_0_3px_var(--gold-soft)]"
+                          : syncing
+                            ? "animate-pulse bg-accent shadow-[0_0_0_3px_var(--accent-soft)]"
+                            : "bg-gold shadow-[0_0_0_3px_var(--gold-soft)]",
+                      )}
+                    />
+                    <span className="truncate text-[13px]">{s.name}</span>
+                    <span
+                      className={cn(
+                        "ml-auto flex-shrink-0 font-mono text-[10.5px] tabular-nums",
+                        paused ? "text-gold" : syncing ? "text-accent" : "text-faint",
+                      )}
+                    >
+                      {paused
+                        ? "paused"
+                        : syncing
+                          ? job?.percent != null
+                            ? `${job.percent}%`
+                            : job?.kind === "cleanup"
+                              ? "cleaning…"
+                              : "syncing…"
+                          : s.documents}
+                    </span>
+                  </Row>
+                );
+              })}
             </div>
           )}
         </div>

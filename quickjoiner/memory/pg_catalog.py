@@ -8,7 +8,7 @@ extension available (only the vector store uses pgvector; the catalog uses plain
 
 from __future__ import annotations
 
-from quickjoiner.memory.catalog import _SCHEMA_STATEMENTS, _SqlCatalog
+from quickjoiner.memory.catalog import _MIGRATION_STATEMENTS, _SCHEMA_STATEMENTS, _SqlCatalog
 
 
 class PostgresCatalog(_SqlCatalog):
@@ -30,6 +30,15 @@ class PostgresCatalog(_SqlCatalog):
         with self._pool.connection() as conn:
             for stmt in _SCHEMA_STATEMENTS:
                 conn.execute(stmt)
+        # Same late-added columns as the SQLite adapter. Each runs in its own connection:
+        # on Postgres a duplicate-column error aborts the surrounding transaction, so a
+        # shared one would poison the statements after it.
+        for stmt in _MIGRATION_STATEMENTS:
+            try:
+                with self._pool.connection() as conn:
+                    conn.execute(stmt)
+            except Exception:  # noqa: BLE001 — column already exists
+                pass
 
     @staticmethod
     def _pg(sql: str) -> str:

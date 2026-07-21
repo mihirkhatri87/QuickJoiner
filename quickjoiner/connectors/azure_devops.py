@@ -185,17 +185,21 @@ class AzureDevOpsConnector(Connector):
         except Exception as exc:
             return ConnectionStatus(False, f"Azure DevOps API error: {exc}")
 
-    def _teams(self, org_url: str, headers: dict, api: str, verify: bool) -> list[str]:
+    def _teams(self, org_url: str, headers: dict, api: str, verify: bool,
+               control: Any = None) -> list[str]:
         """Team names to ingest. The `teams` option restricts to a named subset;
         otherwise every team in the project is enumerated (paginated). Teams without
         sprints are skipped later, so a project with 100 teams where only a handful use
-        iterations still costs little beyond the one iterations probe per team."""
+        iterations still costs little beyond the one iterations probe per team.
+        `control` (optional) makes the pagination interruptible between pages."""
         configured = self.options.get("teams")
         if configured:
             names = configured if isinstance(configured, list) else str(configured).split(",")
             return [n.strip() for n in names if n and n.strip()]
         teams, skip, project = [], 0, self._project()
         while True:
+            if control is not None:
+                control.check()  # a big org can page teams for a while — stay stoppable
             page = get_json(
                 f"{org_url}/_apis/projects/{project}/teams?{api}",
                 headers=headers, params={"$top": TEAM_PAGE, "$skip": skip}, verify=verify,
@@ -215,6 +219,7 @@ class AzureDevOpsConnector(Connector):
         # cross-source graph (pipeline→builds→repo + branch-aware builds), so a failure
         # later in the long, fragile work-item phase can't cost us the bridge. Wrapped so
         # a build-API hiccup degrades to "no build docs" rather than aborting the sync.
+        self._stage("build pipelines")
         try:
             definitions = get_json(
                 f"{org_url}/{project}/_apis/build/definitions?{api}",
@@ -225,7 +230,9 @@ class AzureDevOpsConnector(Connector):
         except Exception:
             pass
 
+        self._checkpoint()  # honor a stop/pause between the two build calls
         # -- Recent build results (with source branch, via the Build API) ------
+        self._stage("recent builds")
         try:
             builds = get_json(
                 f"{org_url}/{project}/_apis/build/builds?{api}",
@@ -249,7 +256,14 @@ class AzureDevOpsConnector(Connector):
         # interruptible, instead of a long silent, unstoppable enumeration up front.
         seen: set[int] = set()
         total = 0
-        for team in self._teams(org_url, headers, api, verify):
+        # `_teams` may itself paginate for a while before the first team; report the phase
+        # so it never looks hung, and let the enumeration be interrupted between pages.
+        self._stage("work items")
+        teams = list(self._teams(org_url, headers, api, verify, control=self._control))
+        for ti, team in enumerate(teams):
+            # % is estimated over teams (the only up-front denominator TFS gives us — the
+            # true work-item count isn't known until every team's sprints are queried).
+            self._stage(f"work items · {team[:40]}", ti, len(teams))
             tp = quote(team, safe="")
             try:
                 iters = get_json(
@@ -260,6 +274,7 @@ class AzureDevOpsConnector(Connector):
                 continue  # team has no iteration settings, or no access — skip
             team_ids: list[int] = []
             for it in select_recent_iterations(iters, sprints):
+                self._checkpoint()  # each sprint is a separate HTTP call — stop between them
                 try:
                     rels = get_json(
                         f"{org_url}/{project}/{tp}/_apis/work/teamsettings/iterations/{it['id']}/workitems?{api}",
@@ -273,6 +288,7 @@ class AzureDevOpsConnector(Connector):
                         seen.add(tid)
                         team_ids.append(tid)
             for i in range(0, len(team_ids), WORK_ITEM_BATCH):
+                self._checkpoint()  # and between each work-item batch fetch
                 batch = team_ids[i : i + WORK_ITEM_BATCH]
                 items = get_json(
                     f"{org_url}/{project}/_apis/wit/workitems?{api}",

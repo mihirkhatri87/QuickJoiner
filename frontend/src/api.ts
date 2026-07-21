@@ -9,10 +9,12 @@ import type {
   GapsResponse,
   GraphData,
   GraphPathResult,
+  NotificationsResponse,
   ProjectRow,
   ScrapeEvent,
   SessionDetail,
   SessionRow,
+  SettingDefaults,
   Settings,
   SourceRow,
   Status,
@@ -55,6 +57,7 @@ async function req<T>(path: string, opts: RequestInit = {}): Promise<T> {
 export const api = {
   status: () => req<Status>("/api/status"),
   settings: () => req<Settings>("/api/settings"),
+  settingDefaults: () => req<SettingDefaults>("/api/settings/defaults"),
   updateSettings: (body: Record<string, unknown>) =>
     req<Settings>("/api/settings", {
       method: "PATCH",
@@ -105,8 +108,16 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }),
-  deleteConnector: (name: string) =>
-    req<unknown>(`/api/connectors/${encodeURIComponent(name)}`, { method: "DELETE" }),
+  // Deleting purges what the connector taught us: its source_id is `type:name`, so
+  // documents left behind are unreachable — nothing could re-sync or purge them later.
+  // keepMemory retires the connector but keeps its knowledge.
+  deleteConnector: (name: string, keepMemory = false) =>
+    req<{ removed: string; job: SyncJob | null }>(
+      `/api/connectors/${encodeURIComponent(name)}${keepMemory ? "?keep_memory=true" : ""}`,
+      { method: "DELETE" },
+    ),
+  cleanupConnector: (name: string) =>
+    req<{ job: SyncJob }>(`/api/connectors/${encodeURIComponent(name)}/cleanup`, { method: "POST" }),
   testConnector: (name: string) =>
     req<{ ok: boolean; message: string }>(
       `/api/connectors/${encodeURIComponent(name)}/test`,
@@ -118,7 +129,23 @@ export const api = {
     req<{ job: SyncJob }>(`/api/sync/${encodeURIComponent(name)}${clean ? "?clean=true" : ""}`, { method: "POST" }),
   stopSync: (name: string, cleanup = false) =>
     req<{ job: SyncJob }>(`/api/sync/${encodeURIComponent(name)}/stop${cleanup ? "?cleanup=true" : ""}`, { method: "POST" }),
+  // Hold / continue a running sync in place — the same in-memory run, so resume doesn't
+  // re-pull. Pausing covers both the document pull and the deferred graph-extraction tail.
+  pauseSync: (name: string) =>
+    req<{ job: SyncJob }>(`/api/sync/${encodeURIComponent(name)}/pause`, { method: "POST" }),
+  resumeSync: (name: string) =>
+    req<{ job: SyncJob }>(`/api/sync/${encodeURIComponent(name)}/resume`, { method: "POST" }),
   listSyncs: () => req<{ syncs: SyncJob[] }>("/api/syncs"),
+  // Wipe ALL ingested knowledge (documents, vectors, graph, watermarks); keeps connectors
+  // configured. Refuses (409) while any sync runs.
+  resetMemory: () =>
+    req<{ reset: boolean; removed: { documents: number; entities: number; edges: number } }>(
+      "/api/memory/reset",
+      { method: "POST" },
+    ),
+  // Sync activity over a rolling window (running + finished), newest first. Survives a
+  // page reload and a server restart — the backend persists it. Backs the bell menu.
+  notifications: (hours = 24) => req<NotificationsResponse>(`/api/notifications?hours=${hours}`),
   streamSyncLogs: (name: string, onEvent: (e: { type: string; line?: string; job?: SyncJob }) => void) =>
     streamGetSSE(`/api/sync/${encodeURIComponent(name)}/logs`, onEvent),
 

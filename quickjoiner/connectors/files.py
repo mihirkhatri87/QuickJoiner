@@ -96,14 +96,20 @@ class FilesConnector(Connector):
             if doc:
                 yield doc
             return
-        for path in sorted(root.rglob("*")):
-            if not path.is_file():
-                continue
-            if any(part in SKIP_DIRS for part in path.parts):
-                continue
+        # Count the ingestable files up front (a fast local walk) so the file phase can
+        # report an accurate % — a local tree is one of the few sources with a real total.
+        self._stage("scanning files")
+        files = [
+            p for p in sorted(root.rglob("*"))
+            if p.is_file() and not any(part in SKIP_DIRS for part in p.parts)
+        ]
+        total = len(files)
+        for i, path in enumerate(files):
+            self._stage("reading files", i, total)  # checkpoint + progress each file
             doc = self._read_file(path, root)
             if doc:
                 yield doc
+        self._stage("dependency map", total, total)
         dep_doc = dependency_document(root, self.name, root.as_uri())
         if dep_doc:
             yield dep_doc

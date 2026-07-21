@@ -202,6 +202,14 @@ class KnowledgeStore:
             table.delete(f'source_id = "{source_id}"')
         self._fts_write("DELETE FROM chunks_fts WHERE source_id = ?", (source_id,))
 
+    def reset(self) -> None:
+        """Drop every vector + FTS row — the whole corpus. Drops the LanceDB table
+        outright (fast, and it's recreated on the next upsert) rather than a per-row
+        delete, and clears the FTS sidecar. Used by the global memory reset."""
+        if _TABLE in self._db.list_tables().tables:
+            self._db.drop_table(_TABLE)
+        self._fts_write("DELETE FROM chunks_fts")
+
     # -------------------------------------------------------------------- ANN
     def ensure_ann_index(self) -> None:
         """Build the approximate (IVF) vector index once the corpus warrants it.

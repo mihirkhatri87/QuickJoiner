@@ -33,6 +33,106 @@ def test_unknown_connector_type_raises(tmp_path):
         create_connector(SourceConfig(name="x", type="nope"), tmp_path)
 
 
+class _CancelAfter:
+    """A SyncControl stand-in that raises SyncStopped once `check()` has been called n
+    times, and records every stage() for assertions. Proves a connector's inner-loop
+    `_checkpoint()`/`_stage()` are actually wired, not just present in the source."""
+
+    def __init__(self, n):
+        self.n = n
+        self.checks = 0
+        self.stages = []
+
+    def check(self):
+        from quickjoiner.sync_control import SyncStopped
+        self.checks += 1
+        if self.checks >= self.n:
+            raise SyncStopped()
+
+    def stage(self, name, done=None, total=None):
+        self.stages.append((name, done, total))
+        self.check()
+
+
+def test_jira_sync_honors_stop_and_reports_progress(tmp_path, monkeypatch):
+    """Jira paginates behind one HTTP call per page; with the control wired, a stop lands
+    within a page instead of after the whole search, and it reports an accurate % from the
+    API's `total`."""
+    from quickjoiner.sync_control import SyncStopped
+
+    pages = {0: {"issues": [{"key": f"PROJ-{i}", "fields": {"summary": "s"}} for i in range(50)], "total": 500}}
+
+    def fake_get_json(url, **kw):
+        start = kw.get("params", {}).get("startAt", 0)
+        return pages.get(start, {"issues": [{"key": f"PROJ-{start}", "fields": {"summary": "s"}}], "total": 500})
+
+    monkeypatch.setattr("quickjoiner.connectors.jira.get_json", fake_get_json)
+    conn = create_connector(SourceConfig(name="j", type="jira", options={"base_url": "https://x"}), tmp_path)
+    conn._control = _CancelAfter(n=3)  # stop after a few checkpoints
+    with pytest.raises(SyncStopped):
+        list(conn.sync({}))
+    # It stopped early (didn't drain all 500), and reported the "issues" stage with a total.
+    assert any(name == "issues" and total == 500 for name, _done, total in conn._control.stages)
+
+
+def test_confluence_reports_accurate_percent_via_cql_count(tmp_path, monkeypatch):
+    """Confluence's content-listing API gives no total, so the sync preflights the space's
+    page count via the CQL `totalSize` and reports an accurate % from it."""
+    calls = {"search": 0}
+
+    def fake_get_json(url, **kw):
+        if url.endswith("/content/search"):
+            calls["search"] += 1
+            return {"totalSize": 3}  # the preflight count for the space
+        start = kw["params"]["start"]
+        if start == 0:
+            return {"results": [
+                {"id": str(i), "title": f"P{i}", "body": {"storage": {"value": "<p>x</p>"}},
+                 "version": {"when": "2026-07-01T00:00:00Z"}, "_links": {"webui": "/x"}}
+                for i in range(3)
+            ]}
+        return {"results": []}
+
+    monkeypatch.setattr("quickjoiner.connectors.confluence.get_json", fake_get_json)
+    conn = create_connector(
+        SourceConfig(name="c", type="confluence", options={"base_url": "https://x", "spaces": ["ENG"]}),
+        tmp_path,
+    )
+    ctrl = _CancelAfter(n=1000)  # capture stages, never cancel
+    conn._control = ctrl
+    docs = list(conn.sync({}))
+    assert len(docs) == 3 and calls["search"] == 1  # counted once, up front
+    # An accurate total (3) is reported for the ENG space — a real bar, not the shimmer.
+    assert any(name == "pages · ENG" and total == 3 for name, _done, total in ctrl.stages)
+    assert (3, 3) in [(done, total) for _n, done, total in ctrl.stages]  # reached 100%
+
+
+def test_confluence_unscoped_pull_has_no_percent(tmp_path, monkeypatch):
+    """With no space to count, there's no denominator — it reports the phase, no total."""
+    def fake_get_json(url, **kw):
+        return {"results": []}  # no pages; the search endpoint must never be hit
+
+    monkeypatch.setattr("quickjoiner.connectors.confluence.get_json", fake_get_json)
+    conn = create_connector(
+        SourceConfig(name="c", type="confluence", options={"base_url": "https://x"}), tmp_path,
+    )
+    ctrl = _CancelAfter(n=1000)
+    conn._control = ctrl
+    list(conn.sync({}))
+    assert ctrl.stages and all(total is None for _n, _d, total in ctrl.stages)  # shimmer, no %
+
+
+def test_gitlab_sync_reports_phase_labels(tmp_path, monkeypatch):
+    conn = create_connector(SourceConfig(name="g", type="gitlab", options={"project": "grp/app"}), tmp_path)
+    conn._control = _CancelAfter(n=1)  # stop at the very first checkpoint
+    from quickjoiner.sync_control import SyncStopped
+
+    monkeypatch.setattr("quickjoiner.connectors.gitlab.get_json", lambda *a, **k: [])
+    with pytest.raises(SyncStopped):
+        list(conn.sync({}))
+    assert conn._control.stages and conn._control.stages[0][0] == "merge requests"
+
+
 def test_resolve_secret_precedence(monkeypatch):
     monkeypatch.setenv("MY_TOKEN", "from-env-indirect")
     monkeypatch.setenv("FALLBACK_TOKEN", "from-fallback")

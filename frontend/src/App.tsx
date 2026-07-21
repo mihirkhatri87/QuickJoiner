@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, streamChat } from "./api";
-import type { CandidateItem, GapsResponse, ProjectRow, SessionRow, SourceRow, Status } from "./types";
+import type { CandidateItem, GapsResponse, ProjectRow, SessionRow, SourceRow, Status, SyncJob } from "./types";
 import { buildCommands, startConnectFlow, type CommandCtx, type Flow } from "./commands";
 import { ArtifactModal, type Artifact } from "./components/ArtifactModal";
 import { Chat, type Msg } from "./components/Chat";
@@ -10,6 +10,8 @@ import { GapsPanel } from "./components/GapsPanel";
 import { GraphView } from "./components/GraphView";
 import { Rail } from "./components/Rail";
 import { SettingsDrawer } from "./components/SettingsDrawer";
+import { SyncHistoryModal } from "./components/SyncHistoryModal";
+import { SyncLogModal } from "./components/SyncLogModal";
 import { TopBar } from "./components/TopBar";
 
 const uid = () => (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()));
@@ -32,6 +34,13 @@ export default function App() {
   const [learnState, setLearnState] = useState<"idle" | "busy" | "done">("idle");
   const [gaps, setGaps] = useState<GapsResponse>({ open_count: 0, clusters: [] });
   const [gapsOpen, setGapsOpen] = useState(false);
+  const [notifications, setNotifications] = useState<SyncJob[]>([]);
+  // The sync log viewer lives here, not inside the settings drawer, so a running sync
+  // stays reachable (from the bell menu or the rail) with the drawer closed.
+  const [syncView, setSyncView] = useState<
+    { name: string; clean: boolean; autoStart: boolean; kind: "sync" | "cleanup" } | null
+  >(null);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const flowRef = useRef<Flow | null>(null); // active conversational flow (wizard, follow-up questions)
   const [rail, setRail] = useState(false); // mobile off-canvas overlay
   const [collapsed, setCollapsed] = useState(() => localStorage.getItem("qj_rail") === "collapsed");
@@ -77,6 +86,11 @@ export default function App() {
   const loadGaps = useCallback(() => {
     api.gaps().then(setGaps).catch(() => setGaps({ open_count: 0, clusters: [] }));
   }, []);
+  const loadNotifications = useCallback(() => {
+    api.notifications().then((r) => setNotifications(r.notifications)).catch(() => {
+      /* keep the last known feed rather than blanking it on a transient failure */
+    });
+  }, []);
 
   useEffect(() => {
     loadStatus();
@@ -84,7 +98,38 @@ export default function App() {
     loadProjects();
     loadSessions("");
     loadGaps();
-  }, [loadStatus, loadSources, loadProjects, loadSessions, loadGaps]);
+    loadNotifications();
+  }, [loadStatus, loadSources, loadProjects, loadSessions, loadGaps, loadNotifications]);
+
+  const activeSyncs = notifications.filter((n) => n.state === "running" || n.state === "stopping");
+  const activeCount = activeSyncs.length;
+
+  // Poll the activity feed: briskly while something is syncing (so progress and the
+  // finish land promptly), lazily when idle (so a scheduler- or CLI-started sync still
+  // shows up without hammering the API). This is also what restores the picture after a
+  // page reload — the jobs live on the server, so a refresh never loses them.
+  useEffect(() => {
+    const id = setInterval(loadNotifications, activeCount ? 3000 : 10000);
+    return () => clearInterval(id);
+  }, [loadNotifications, activeCount]);
+
+  // When the last running sync finishes, the learned-memory counts and per-source doc
+  // totals have changed — refresh them without making the user hunt for a reload.
+  const prevActive = useRef(0);
+  useEffect(() => {
+    if (prevActive.current > 0 && activeCount === 0) {
+      loadStatus();
+      loadSources();
+    }
+    prevActive.current = activeCount;
+  }, [activeCount, loadStatus, loadSources]);
+
+  const openSync = useCallback(
+    (name: string, clean: boolean, autoStart = false, kind: "sync" | "cleanup" = "sync") => {
+      setSyncView({ name, clean, autoStart, kind });
+    },
+    [],
+  );
 
   const newConversation = () => {
     setMessages([]);
@@ -259,7 +304,9 @@ export default function App() {
   return (
     <div className="flex h-full flex-col">
       <TopBar status={status} collapsed={collapsed} view={view} onMenu={toggleRail}
-              onSettings={() => setDrawer(true)} onView={setView} />
+              onSettings={() => setDrawer(true)} onView={setView}
+              notifications={notifications} onOpenSync={(name, clean) => openSync(name, clean)}
+              onOpenHistory={() => setHistoryOpen(true)} />
       <div className="flex min-h-0 flex-1">
         <Rail
           open={rail}
@@ -299,6 +346,8 @@ export default function App() {
           }}
           gapCount={gaps.open_count}
           onOpenGaps={() => setGapsOpen(true)}
+          syncJobs={notifications}
+          onOpenSync={(name, clean) => openSync(name, clean)}
         />
         <section className="relative flex min-w-0 flex-1 flex-col">
           {view === "graph" ? (
@@ -346,7 +395,32 @@ export default function App() {
           setArtifact(a);
           setLearnState("done"); // repo brief is already ingested by the backend
         }}
+        syncJobs={notifications}
+        onOpenSync={openSync}
       />
+      {historyOpen && (
+        <SyncHistoryModal
+          onClose={() => setHistoryOpen(false)}
+          onOpenSync={(name, clean) => {
+            setHistoryOpen(false);
+            openSync(name, clean);
+          }}
+        />
+      )}
+      {syncView && (
+        <SyncLogModal
+          name={syncView.name}
+          clean={syncView.clean}
+          autoStart={syncView.autoStart}
+          kind={syncView.kind}
+          onClose={() => setSyncView(null)}
+          onJobChange={() => {
+            loadNotifications();
+            loadSources();
+            loadStatus();
+          }}
+        />
+      )}
       <ArtifactModal
         artifact={artifact}
         learnState={learnState}

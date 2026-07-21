@@ -75,6 +75,16 @@ export function EditConnectorModal({
         </div>
 
         <div className="overflow-y-auto px-5 py-4">
+          {/* Name and type are shown, disabled, rather than hidden: the name IS the
+              connector's identity — source_id is `type:name`, and every document id,
+              vector, graph node, watermark and webhook URL is derived from it — so
+              editing it here would orphan everything this connector has learned. */}
+          <Field
+            label="Name"
+            hint="Fixed — this connector's learned documents, vectors, graph nodes and webhook URL are all keyed to it. To use a different name, clean up this connector and add it again."
+          >
+            <TextInput value={c.name} disabled readOnly className="cursor-not-allowed opacity-60" />
+          </Field>
           {fields.length === 0 && (
             <div className="text-[12.5px] text-faint">This connector type has no editable options.</div>
           )}

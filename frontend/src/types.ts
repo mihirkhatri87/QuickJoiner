@@ -4,16 +4,34 @@ export interface Status {
   stats: { sources: number; documents: number; chunks: number };
 }
 
+export type SyncState = "running" | "paused" | "stopping" | "stopped" | "done" | "error" | "interrupted";
+
 export interface SyncJob {
   id: string;
   source: string;
-  state: "running" | "stopping" | "stopped" | "done" | "error";
+  state: SyncState;
+  /** "sync" pulls documents in; "cleanup" purges what a source taught us (no re-pull). */
+  kind: "sync" | "cleanup";
   clean: boolean;
   stats: { added: number; updated: number; skipped: number; chunks: number; errors: number } | null;
   error: string | null;
   started_at: string;
   ended_at: string | null;
+  /** Current stage label (e.g. "work items · Team A"), and an estimated completion % of
+   * that stage when the connector could report a total (null for open-ended streaming). */
+  phase: string;
+  phase_done: number | null;
+  phase_total: number | null;
+  percent: number | null;
   log_lines: number;
+  /** Only on /api/notifications rows: true when this process still owns the running job
+   * (so its live log can be streamed); false for history read back from the catalog. */
+  live?: boolean;
+}
+
+export interface NotificationsResponse {
+  notifications: SyncJob[];
+  active: number;
 }
 
 export interface LLMSettings {
@@ -48,6 +66,11 @@ export interface Settings {
   repos: { auto_agents_md: boolean };
   embedding_reindex_required: boolean;
 }
+
+/** The shipped defaults (GET /api/settings/defaults), same groups as Settings minus the
+ * per-workspace bits. Built server-side from fresh config models, so the drawer can mark
+ * which fields are still untouched without hardcoding — and drifting from — the values. */
+export type SettingDefaults = Pick<Settings, "llm" | "embedding" | "retrieval" | "chat" | "graph" | "repos">;
 
 export interface AuthStatus {
   enabled: boolean;

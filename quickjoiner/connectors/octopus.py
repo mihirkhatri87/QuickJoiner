@@ -194,8 +194,10 @@ class OctopusConnector(Connector):
 
         # The project list itself is always fully paginated (cheap; needed for the
         # dashboard's id->name map regardless) — this is the fix for the 100-cap.
+        self._stage("projects")
         projects = list(self._paged("projects"))
-        for project in projects:
+        for i, project in enumerate(projects):
+            self._stage("releases", i, len(projects))  # checkpoint + progress per project
             yield project_document(server, project)
             if changed is not None and project["Id"] not in changed:
                 continue  # unchanged since last sync — skip the per-project releases call
@@ -209,6 +211,7 @@ class OctopusConnector(Connector):
 
         # The dashboard is a single call and reflects current deploy state, so it is
         # always refreshed (this is what carries the service->deploys->environment edges).
+        self._stage("deployment dashboard")
         dashboard = get_json(f"{self._api()}/dashboard", headers=headers)
         items = dashboard.get("Items", [])
         if items:

@@ -120,16 +120,22 @@ class JiraConnector(Connector):
         base, auth = self._base(), self._auth()
         jql = self._jql(state)
         start = 0
+        self._stage("issues")
         while start < MAX_ISSUES:
+            self._checkpoint()  # stop/pause between page fetches
             data = get_json(
                 f"{base}/rest/api/2/search",
                 auth=auth,
                 params={"jql": jql, "startAt": start, "maxResults": PAGE_SIZE, "fields": FIELDS},
             )
             issues = data.get("issues", [])
+            # Jira's search returns the matching total, so this % is accurate (capped at
+            # MAX_ISSUES, the ceiling we actually ingest).
+            total = min(data.get("total", 0) or 0, MAX_ISSUES)
             for issue in issues:
                 yield issue_document(base, issue)
             start += len(issues)
+            self._stage("issues", min(start, total), total)
             if start >= data.get("total", 0) or not issues:
                 break
 
