@@ -937,6 +937,13 @@ valid) — never a crash.
   reproduces the *shape*, and the worked-example gate runs against the real workspace at
   implementation time. If the live ids differ, only the gate transcript is affected, not
   the design.
+- **Same-type only** (measured 2026-07-20, after this plan shipped): resolution buckets
+  candidates by type (`EntityResolver._bucket` → `entities_by_type`), so §1.D can only ever
+  merge a `repo` with a `repo`. On the live workspace that leaves the same real-world thing
+  split across `service:` / `repo:` / `pipeline:` nodes — 158 exact name matches, 18
+  multi-source entities. Out of scope here and NOT a defect in this plan; tracked as
+  **AI_ROADMAP #24 cross-source identity bridge (`same_as`)**. Relevant when running §2.7's
+  live check: a NONE result there may be this boundary rather than adjudicator weakness.
 - **Adjudicator efficacy**: §1.D assumes title/kind context is enough signal for the
   configured model (gemma4:cloud) to say "Webroot Connector" == "AppRiver.Connector.Web".
   If the live check still returns NONE, the next escalation is including the mention

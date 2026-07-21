@@ -20,6 +20,7 @@ and its substance graduates into the architecture/strategy docs (CLAUDE.md house
 | 04 | [Coverage fog + remediation](04-coverage-fog.md) | ⬜ | ~4–5d | gaps data (shipped) | The dark map on the real GraphView + one-click fixes; stands up the FE test harness |
 | 05 | [Eval on connected org](05-eval-on-connected-org.md) | ⏸ | runbook | — | The "decide fine-tuning with data" matrix on a real corpus |
 | 06 | [Multi-angle, confidence-scored answers](06-multi-angle-confidence-scored-answers.md) | ◐ | ~7–9d | — | Ambiguity detection + clarifying questions, deterministic confidence scoring, a candidate-answer traversal UI — code shipped 2026-07-17; live check + related work open (see STATUS.md) |
+| 07 | [Multimodal derive-to-text](07-multimodal-media.md) | ⬜ | ~9–12d | — | Vision/audio/video → cited text via specialist models (gemma vision, whisper) + deterministic extractors (draw.io/SVG, ffmpeg, phash); ingest + live `analyze_media` tool + upload UI; provider-conditional capabilities (litellm/ollama/anthropic) |
 
 **Shipped & removed** (substance graduated — see the STATUS.md ledger): **01** Knowledge-debt
 backlog (2026-07-13), **02** Retrieval quality pack (2026-07-17). Suggested order for the rest:

@@ -63,6 +63,32 @@ How each works is documented in `CLAUDE.md` — the source of truth for current 
     live graph literally contains `#{azureusername}` placeholders today). Same conservative
     direction rules; per-environment variable scoping can carry the environment entity as
     detail. Extension of the same mechanism: Terraform state/vars, k8s ConfigMaps.
+24. **Cross-source identity bridge (`same_as`)** — *original*. Entities are keyed
+    `type:name` and entity resolution only ever considers **same-type** candidates
+    (`EntityResolver._bucket` → `entities_by_type`), so the same real-world thing becomes two
+    or three nodes that can never merge: Octopus asserts `service:connector --deploys-->
+    environment`, ADO asserts `pipeline:… --builds--> repo:connector`, deps/code assert
+    `repo:connector`. Measured on the live AppRiver workspace (2026-07-20): **158 service
+    names normalize-match a repo/project name exactly** (305 pipeline↔repo, 147
+    service↔pipeline), yet only **18 entities** have evidence from more than one source —
+    14,172 edges that are really four disjoint islands. This is the machinery behind
+    `graph_expand`, `graph_path` and every multi-hop cross-source answer, i.e. the evidence
+    graph we sell as the differentiator, so it mostly cannot cross sources today. Emit a
+    deterministic `same_as` edge on exact normalized-name match across `service`/`repo`/
+    `project`/`pipeline`, evidence = the two asserting documents; traverse it in
+    `graph_expand`/`graph_path` (and count a bridged hop honestly in `score_chain`).
+    **Deliberately not cross-type *merging***: both nodes survive, a wrong bridge is one row
+    to delete rather than an unpicked merge, and the type distinction (a service is not its
+    repo) stays real. Fuzzy/alias-based bridging is a follow-up only if exact match proves
+    insufficient.
+25. **Drain stale deferred graph work** — *adopt*. `graph_pending` rows are only retried when
+    a later sync **re-yields that document** (`pipeline.py:158`). For connectors that ingest a
+    moving window this never happens: the live workspace has **1,331 TFS documents** queued
+    for LLM triple extraction whose work items have aged out of the per-team recent-sprint
+    slice, so their relationships are permanently unmined. Add a pending-drain pass (a job on
+    the `SyncManager` surface, so it streams logs + lands in the activity feed) that re-reads
+    those documents' stored chunks and resolves their triples without a connector round-trip.
+    Cheap, and it converts already-paid-for ingest into graph edges.
 21. **Relation signatures (ontology-lite domain/range validation)** — *adapt*. A signature
     table over the existing triple vocab (`deploys: service|project → environment`,
     `owns: team|person → repo|service|project`, …) enforced in `parse_triples` alongside the
@@ -100,6 +126,16 @@ How each works is documented in `CLAUDE.md` — the source of truth for current 
     threshold with conformal prediction over calibration sets → statistically guaranteed
     refusal error rates ("≤5% false-grounding at 90% coverage"). #3's calibrate flow +
     X1's self-mined packs provide the calibration data. A sentence no competitor says.
+23. **Multimodal derive-to-text (vision/audio/video)** — *adapt*. Modality specialists
+    (a vision model, whisper-class ASR) convert diagrams, screenshots, and recorded
+    meetings into cited, provenance-stamped, confidence-discounted TEXT at ingest time and
+    via a live `analyze_media` tool — the answering LLM never becomes multimodal, the
+    grounding gate is untouched, and deterministic rungs run first (draw.io/SVG XML
+    extraction with zero LLM calls, ffprobe metadata, phash frame dedupe, silence trim,
+    sha-keyed derive-once cache). Provider-conditional capabilities (litellm vision+ASR on
+    one proxy; ollama vision-native, ASR external/local; anthropic vision-native, ASR
+    external). Full design: `docs/plans/07-multimodal-media.md`. Unlocks the knowledge
+    class no text pipeline reaches: architecture diagrams and unwritten meetings.
 
 ### Tier 4 — the ragless track
 15. **Cost/quality router** — *adapt*. Per query choose hybrid RAG / graph-first /
@@ -151,10 +187,17 @@ before/after bench table, exactly as no quality work merges without `--compare`.
 - **S4 — Reranker right-sizing** — *adopt*. Auto-tune `rerank_candidates` depth from
   measured marginal gain (S1 × eval); evaluate smaller/quantized CE models; consider
   early-exit when fused-head order is already stable.
-- **S5 — Prompt-cache-aware context assembly** — *adapt*. Deterministic, stable ordering of
-  the system prompt + tool specs + stable corpus digest so provider prompt-caching actually
-  hits across turns and sessions; measure cost delta via S1 token counts. (The narrow,
-  cheap precursor to #16.)
+- **S5 — Prompt-cache-aware context assembly** — *adapt; partially shipped 2026-07-18*.
+  SHIPPED (documented in CLAUDE.md `llm/` bullet): explicit Anthropic `cache_control`
+  breakpoints (system block caches tools+system; moving message breakpoint + intermediate
+  markers inside the 20-block lookback; `llm.prompt_cache` ON by default) and deterministic
+  name-sorted tool specs in the agent — the byte-stable prefix that also feeds automatic
+  prefix caching on OpenAI-compatible backends and Ollama/llama.cpp KV reuse. REMAINING:
+  (a) measure the actual cost delta via S1 token counts once `qj bench` exists (incl. live
+  `cache_read_input_tokens` verification — needs an Anthropic key); (b) a stable corpus
+  digest / stable `extra_system` framing so caching survives session-summary refreshes;
+  (c) keep volatile content (per-request scores, timestamps) after the last breakpoint as
+  new prompt sections are added. (The narrow, cheap precursor to #16.)
 
 ## 4. Original research track (X-track)
 
@@ -273,6 +316,26 @@ Scan log: *(dated one-liners appended here by each scan)*
   when the API implies it. User intake from the same session: orgs hold real values in
   deployment tooling (Octopus vars, AWS CFTs) → CFT slice shipped as references-only;
   **#22 Octopus variable-set extraction** accepted into Tier 1 as the placeholder resolver.
+- 2026-07-18 — user-driven intake: "can gemma's vision + whisper's audio derive context from
+  other data types?" evaluated → **#23 multimodal derive-to-text** (Tier 3) accepted with the
+  derive-to-text constraint (specialists at ingest/tool time, never a multimodal answering
+  model); full plan authored as `docs/plans/07-multimodal-media.md`. Rejected in the same
+  session: gemma-3-27b or whisper as *answering*-model replacements for gpt-oss-120b (vision
+  model = weaker tool discipline; whisper = not a chat model at all).
+
+- 2026-07-20 — **live-graph diagnosis** (user: "I've configured Confluence, Octopus, TFS and a
+  repo but don't see many connected things"). Measured against the real AppRiver workspace
+  rather than reasoned about: 14,172 edges / 3,580 entities across all four sources, but only
+  **18 entities with evidence from more than one source** — the graph is four islands. Root
+  cause: entities are keyed `type:name` and resolution buckets candidates by type, so the same
+  thing is `service:connector` + `repo:connector` + a `pipeline:*` that builds it; 158 exact
+  service↔repo name matches sit unmerged. → **#24 cross-source identity bridge (`same_as`)**
+  accepted (Tier 1; chosen over cross-type *merging*, which would destroy a real distinction
+  and be hard to unpick). Second finding: **1,331 TFS docs stuck in `graph_pending`** because
+  deferred triple work is only retried when a sync re-yields the document, and ADO ingests a
+  moving sprint window → **#25 drain stale deferred graph work** accepted (Tier 1). Third,
+  frontend: the graph view's per-entity edge budget resolves to 5 edges/node at this scale
+  (~2.8% of edges shown), which reads as an empty graph → density-budget item added to FE F0.
 
 **Intake rejections** (don't re-propose without new evidence; mirrors the research archive):
 - **Full formal ontology** (OWL/RDF class hierarchies, reasoners, triple stores, interop

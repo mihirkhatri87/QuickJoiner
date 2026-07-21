@@ -37,6 +37,13 @@ Debt, named:
   the canvas must never blank the app again (learned that live).
 - **CI**: typecheck + lint (eslint@ts, prettier) + vitest + Playwright smoke on PR; build
   artifact uploaded.
+- **GraphView density budget**: `/api/graph?limit=400` divides its budget evenly across
+  distinct source entities, so a big graph renders as stubs — on the live AppRiver workspace
+  (1,571 source entities) that is a **5-edge cap per node, ~2.8% of 14,172 edges**, which
+  reads as "nothing is connected" on a graph that is in fact dense. Make the budget adaptive
+  (raise the default; scale the per-entity cap with viewport/zoom), say what was elided
+  ("showing 400 of 14,172 edges") rather than silently truncating, and lead with focus:
+  entity search returns a full neighbourhood, so make that the primary entry to the view.
 
 ## Phase F1 — Product hardening (with R3 "Team product")
 

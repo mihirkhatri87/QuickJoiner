@@ -17,6 +17,7 @@ Legend: ✅ complete · ◐ partial (code done, verification/related-work open) 
 | 04 | [Coverage fog + remediation](04-coverage-fog.md) | ⬜ | Entire plan incl. **Phase 0 frontend test harness** (Vitest/RTL/MSW — still zero FE tests). No `coverage.py`, `/api/coverage`, `frontend/src/fog.ts`, GraphView fog layer. Its data dependency (gaps) shipped. |
 | 05 | [Eval on connected org](05-eval-on-connected-org.md) | ⏸ | Runbook not yet executed on a real org — the deferred "decide fine-tuning with data" step. Needs an org-connected machine + 30–50 authored cases + the C0–C4 config matrix. `qj eval --calibrate/--compare` are now the measurement tools for it. |
 | 06 | [Multi-angle, confidence-scored answers](06-multi-angle-confidence-scored-answers.md) | ◐ | Code shipped (all four phases A→D→B→C, 2026-07-17). Open: **§2.7 / AC #7 live check** — `resolve_entity('webroot connector')` merging fires at ingest time, pending the next clean Connector + Confluence re-sync; **§4 related work** — repo-graph refresh (`repo-graph-refresh-pending`), connect Nautical↔Stevedore directly. When these close, graduate the substance and delete the plan. |
+| 07 | [Multimodal derive-to-text (vision/audio/video)](07-multimodal-media.md) | ⬜ | Entire plan (phases A–E). No `quickjoiner/media/` package, no `media` config section, no `analyze_media` tool, no `/api/upload`, no composer attach. Roadmap item #23. |
 
 ## Shipped & removed (graduated into the architecture/strategy docs)
 
@@ -36,6 +37,8 @@ the current-behavior source of truth.
 3. **Plan 05** — Run the retrieval/correlation eval matrix on a connected org; unblocks the
    deferred embedding/fine-tuning decision.
 4. **Plan 06 §2.7 + §4** — the live merge check and related-work items above.
+5. **Plan 07** — multimodal derive-to-text. Phases A+B alone deliver the conversational
+   "summarize this recording" story; D unlocks diagram/audio knowledge at sync time.
 
 Also outstanding (pre-existing): `docs/evals/multi-hop-crosssource.yaml` is referenced by a test
 and the docs but the `docs/evals/` directory does not exist — `test_multi_hop_eval_set_file_loads`

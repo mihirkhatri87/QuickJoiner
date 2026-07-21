@@ -46,6 +46,28 @@ Workstreams (each is a PR-able epic):
    blue/green on ECS; image scanning (ECR + Inspector).
 7. **DR/backup**: PITR on RDS, S3 versioning, weekly restore drill in CI (restore → run
    grounding smoke suite against the restored copy — *backups that answer questions*).
+8. **Knowledge scopes — the personal-layer union** (intake 2026-07-18; also PRD W9.3).
+   Today ingested knowledge is one communal memory (documented in CLAUDE.md's auth bullet) —
+   right for single-user/open mode, wrong at 5–200 users: a user's `/learn` notes and private
+   scrapes pollute the org graph (entities, edges, corroboration counts, autocomplete),
+   wrong personal "facts" become citable org truth, and personal notes are readable by all.
+   Model: **query-time row-level visibility over ONE store** (never per-user forks) — user U
+   retrieves the union of {ownerless commons, owned-by-U, shared} sources; the scope key is
+   the existing `documents.source_id → sources.owner/shared` chain, so no doc-schema change.
+   Work: (a) native source-visibility predicate in `store.search` (LanceDB where / pgvector
+   WHERE / FTS sidecar, both hybrid legs, over-fetch so the grounding gate can't be starved
+   into false refusals); (b) graph reads filtered by evidence-doc visibility
+   (`graph_neighbors`/`graph_path[_candidates]`/`graph_expand`, plan-06 `edge_corroboration`
+   counts visible evidence only); (c) **ingest-time merge guard** — personal evidence may
+   attach to org entities but must never *trigger* a merge of them (a wrong merge rewrites
+   canonical ids globally — the one pollution filtering can't undo); (d) aliases, suggester,
+   and gaps scoped the same way; (e) `/learn` gains ownership (owner=user, private by
+   default, `--share` to teach the commons — the connector flags exactly); (f) **promotion
+   flow**: personal → org via review, a metadata flip, not a copy — the onboarding flywheel;
+   plus a discounted `personal-note` evidence class so personal-vs-org contradictions
+   surface with both citations (invariant I2), never silently averaged. Open-mode/single-user
+   behavior stays byte-identical (everything is commons). **Must land before multi-user GA**
+   — retrofitting visibility onto a polluted graph is a cleanup migration.
 
 SLOs: API P95 < 400 ms (non-LLM), chat first token < 3 s, sync lag < interval + 5 min,
 99.9% availability. Cost envelope (100 users): ~2×Fargate 1vCPU + db.r6g.large Multi-AZ +

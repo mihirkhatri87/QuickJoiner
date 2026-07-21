@@ -175,6 +175,8 @@ ACs are Given/When/Then; tests name real files for shipped stories.
 - **W9.1** OIDC/SSO login; SCIM provisioning. AC/tests per cloud roadmap Y1–Y2.
 - **W9.2** Tenant isolation with per-tenant encryption keys; audit log of every answer with its evidence set (compliance replay).
   AC: audit record = question, answer hash, evidence doc ids, model, timestamps; export to SIEM. Tests: audit completeness test on chat path.
+- **W9.3** Knowledge scopes — personal-layer union (intake 2026-07-18; design in `CLOUD_ROADMAP.md` Y1 workstream 8). A user's `/learn` notes and private-source docs are visible only to them; retrieval/graph/suggest/gaps read the union of commons + own + shared via query-time source-visibility filtering; personal evidence never triggers org-entity merges; personal facts promote to org knowledge via review (metadata flip).
+  AC: with auth on, user A's private note is never retrieved/cited/suggested for user B; graph paths and corroboration counts differ per user accordingly; promotion makes it commons; open mode byte-identical to today. Tests: per-user retrieval + graph filtering units, merge-guard unit, promotion round-trip, open-mode regression.
 
 ### W10 — UX North Star ("Orrery", see `design/`)
 - **W10.1** Coverage fog-of-war layer on the Knowledge view (learned = lit, gaps = dark, refusal heat).

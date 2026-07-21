@@ -64,6 +64,15 @@ Key defended choices:
 - **One neutral message format; providers convert at the wire.** Anthropic and Ollama are
   adapters; extended thinking, tool loops, and streaming live above them. Adding a
   provider is a wire-format exercise, not a rewrite.
+- **The prompt prefix is treated as cacheable state.** Tool specs are name-sorted (byte-
+  stable across requests/processes) and the Anthropic adapter places `cache_control`
+  breakpoints (system block = tools+system; a moving breakpoint on the conversation tail,
+  spaced inside the API's 20-block lookback), so rounds 2..N of a tool loop and follow-up
+  turns re-read the prefix at ~0.1× input price. The same stable ordering feeds automatic
+  prefix caching on OpenAI-compatible backends and local KV-cache reuse. `llm.prompt_cache`
+  gates the explicit markers (ON). Both sides are observable at DEBUG: Anthropic
+  `cache_read_input_tokens`, OpenAI-compatible `prompt_tokens_details.cached_tokens`.
+  Cost-delta measurement is pending S1 (`qj bench`).
 - **Evals in the repo.** Retrieval metrics (recall@k, MRR, grounded-recall, refusal
   accuracy) are deterministic and LLM-free, so quality is CI-checkable — the control
   system for every enhancement below (nothing merges without an eval gate).
