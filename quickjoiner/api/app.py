@@ -131,6 +131,7 @@ class ConnectorRequest(BaseModel):
 
 
 class ConnectorUpdate(BaseModel):
+    name: str | None = None  # rename — only allowed before the first sync (0 documents)
     options: dict | None = None
     shared: bool | None = None
     sync_interval_minutes: int | None = None
@@ -305,7 +306,7 @@ def create_app(workspace: Path) -> FastAPI:
         ctx.catalog.save_config(ctx.config)  # persists settings + this source (configured=1)
         return {**_connector_row(source, user), "test": test_result}
 
-    @api.patch("/api/connectors/{name}", tags=["Connectors"], summary="Update a connector's options, sharing, or sync schedule. Secrets sent back as the mask are preserved; a field cleared to empty is removed.")
+    @api.patch("/api/connectors/{name}", tags=["Connectors"], summary="Update a connector's options, sharing, or sync schedule. Can also RENAME it, but only before its first sync (0 documents) — the name is the identity that keys all ingested data. Secrets sent back as the mask are preserved; a field cleared to empty is removed.")
     def update_connector(
         name: str, req: ConnectorUpdate, authorization: str | None = Header(default=None)
     ):
@@ -314,6 +315,26 @@ def create_app(workspace: Path) -> FastAPI:
         source = _find_source(name, user)
         if not can_manage(source, user, auth.enabled):
             raise HTTPException(status_code=403, detail="Only the owner can change this connector")
+        # Rename — safe ONLY before the first sync, because the name keys the source_id and
+        # thus every document / vector / graph node / watermark / webhook URL. With 0
+        # documents nothing is keyed to it yet, so it's just a config move.
+        if req.name is not None and req.name.strip() != source.name:
+            new_name = req.name.strip()
+            if not new_name:
+                raise HTTPException(status_code=400, detail="Name cannot be empty")
+            if any(s.name == new_name for s in ctx.config.sources):
+                raise HTTPException(status_code=409, detail=f"Name {new_name!r} is already taken")
+            old_id = f"{source.type}:{source.name}"
+            doc_count = len(ctx.catalog.documents_for_source(old_id))
+            if doc_count > 0:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Renaming is only allowed before the first sync — this connector has "
+                           f"{doc_count} learned document(s). Clean it up first, then rename.")
+            if syncs.is_running(source.name):
+                raise HTTPException(status_code=409, detail="A sync is running — stop it before renaming")
+            ctx.catalog.clear_sync_state(old_id)  # drop the now-orphan watermark (0 docs ⇒ nothing else)
+            source.name = new_name  # save_config below writes the new sources row + drops the old one
         if req.shared is not None:
             source.shared = req.shared
         if req.clear_sync_interval:

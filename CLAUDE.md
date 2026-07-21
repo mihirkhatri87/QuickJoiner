@@ -607,8 +607,12 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   edges but keeps it configured), all opening `SyncLogModal` (live log stream, a **Stop** button
   that asks *"clean up partial data?"* — not offered for cleanup jobs). Deleting a connector (trash,
   also two-click) runs that same cleanup automatically and opens its log. `EditConnectorModal`
-  shows **Name disabled with the reason** — identity: `source_id` = `type:name`, so every doc id,
-  vector, graph node, watermark and webhook URL derives from it, and renaming would orphan the lot.
+  makes **Name editable only before the first sync** (0 documents), otherwise disabled with the
+  reason — identity: `source_id` = `type:name`, so every doc id, vector, graph node, watermark and
+  webhook URL derives from it; with nothing ingested yet a rename is just a config move (PATCH
+  `{name}`, guarded server-side on doc-count == 0 + no running job + name uniqueness; `save_config`
+  reconciles the `sources` row and the old watermark is cleared), but after the first sync it would
+  orphan the lot.
   **The log panel is a viewer, not a leash** — it closes at any time (X / backdrop / Esc / "Run in
   background") and the job keeps running; re-opening re-attaches, and since `subscribe` replays the
   backlog a reattached viewer sees the whole run, including one started before a page reload. Its
@@ -1044,6 +1048,16 @@ Post-phase additions (2026-07-07, all tested — suite: **89 passed**):
   mutual-exclusion guard added both ways. Suite: **473 passed** (+3), verified live in Chrome (log
   modal + bell + no re-prompt on reopen). **New house rule added** (Conventions): any API change
   must keep Swagger tags/summaries, the Postman + Bruno runbooks, and README/CLAUDE in sync.
+
+- Rename a connector before its first sync (2026-07-20, user request). The name keys everything a
+  connector ingests (`source_id = type:name`), so it was always fixed — but with **0 documents**
+  nothing is keyed to it yet, so a rename is safe and just a config move. `PATCH /api/connectors/
+  {name}` now accepts `{name}`, guarded on doc-count == 0 + no running job + uniqueness (409
+  otherwise); it clears the orphan watermark and `save_config` swaps the `sources` row.
+  `EditConnectorModal` makes the Name field editable when `documents == 0`, disabled with the
+  reason after. Tests: rename-before-sync / rejected-after-sync / name-taken in `test_api.py`.
+  Verified live in Chrome (Fresh 0-doc editable + renamed via UI; Synced 23-doc locked). Follows
+  the new API-docs house rule: Swagger summary + Postman/Bruno runbooks updated in the same change.
 
 ## Next steps (agreed with user)
 

@@ -1,0 +1,27 @@
+meta {
+  name: Rename connector (before first sync)
+  type: http
+  seq: 4
+}
+
+patch {
+  url: {{baseUrl}}/api/connectors/{{connectorName}}
+  body: json
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "name": "{{connectorName}}-renamed"
+  }
+}
+
+docs {
+  Rename a connector — allowed ONLY before its first sync (0 documents), because the name keys
+  every document / vector / graph node / watermark it would ingest. Returns 409 once it has
+  learned anything (clean it up first), or if the new name is taken. Also patches options /
+  sharing / schedule via the same endpoint.
+}

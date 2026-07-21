@@ -50,8 +50,9 @@ when memory has nothing relevant.
   UI picks them straight back up. The bell menu's **"View full history by connector"** shows every
   sync over the last 7 days grouped by connector, with the latest run's live %.
 - **Clean up / delete without leftovers** — a connector's **name is its identity**: everything it
-  learns is stored under `type:name`, so the name can't be changed after the fact (the edit view
-  shows it disabled and says why). **Clean up** forgets a source's documents, vectors and graph
+  learns is stored under `type:name`, so it can only be renamed **before its first sync** (while it
+  has 0 documents and nothing is keyed to it yet); the edit view lets you change the name then, and
+  locks it with the reason afterwards. **Clean up** forgets a source's documents, vectors and graph
   edges while keeping it connected, and **deleting** a connector runs that cleanup automatically —
   otherwise its knowledge would linger forever with nothing able to re-sync or remove it. Both run
   as background jobs with a live log, and both refuse to start while that source is mid-sync. Need

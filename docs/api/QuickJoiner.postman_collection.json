@@ -101,6 +101,16 @@
         {
           "name": "Test the connector",
           "request": { "method": "POST", "url": "{{baseUrl}}/api/connectors/{{connectorName}}/test" }
+        },
+        {
+          "name": "Rename connector (before first sync)",
+          "description": "Rename — allowed ONLY before the first sync (0 documents), since the name keys every document/vector/graph node/watermark it would ingest. 409 once it has learned anything (clean it up first) or if the new name is taken. Same endpoint patches options/sharing/schedule.",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"name\": \"{{connectorName}}-renamed\"\n}" },
+            "url": "{{baseUrl}}/api/connectors/{{connectorName}}"
+          }
         }
       ]
     },

@@ -550,6 +550,31 @@ def test_sync_unknown_source_is_404(client):
     assert client.post("/api/sync/nope").status_code == 404
 
 
+def test_rename_connector_before_first_sync(client):
+    """A connector with 0 documents can be renamed (nothing is keyed to the old name yet);
+    it stays listed under the new name and is gone under the old one."""
+    r = client.patch("/api/connectors/handbook", json={"name": "playbook"})
+    assert r.status_code == 200 and r.json()["name"] == "playbook"
+    names = [c["name"] for c in client.get("/api/connectors").json()]
+    assert "playbook" in names and "handbook" not in names
+    # And it syncs fine under the new name.
+    client.post("/api/sync/playbook")
+    assert _wait_sync(client, "playbook")["stats"]["added"] == 1
+
+
+def test_rename_connector_rejected_after_sync(client):
+    """Once it has learned documents, the name keys them — renaming is refused."""
+    client.post("/api/sync/handbook")
+    _wait_sync(client, "handbook")
+    r = client.patch("/api/connectors/handbook", json={"name": "playbook"})
+    assert r.status_code == 409 and "before the first sync" in r.json()["detail"]
+    assert any(c["name"] == "handbook" for c in client.get("/api/connectors").json())  # unchanged
+
+
+def test_rename_connector_to_taken_name_conflicts(client):
+    assert client.patch("/api/connectors/handbook", json={"name": "ghrepo"}).status_code == 409
+
+
 def test_patch_connector_edits_options_schedule_and_merges(client):
     """The edit-connector modal saves via PATCH options: update fields, keep a secret
     sent back as its mask, preserve untouched fields, set the schedule, and remove a

@@ -31,8 +31,14 @@ export function EditConnectorModal({
   });
   const [share, setShare] = useState(c.shared);
   const [sync, setSync] = useState(c.sync_interval_minutes ? String(c.sync_interval_minutes) : "");
+  const [name, setName] = useState(c.name);
   const [msg, setMsg] = useState("");
   const [saving, setSaving] = useState(false);
+
+  // The name keys everything a connector ingests, so it's only editable before the first
+  // sync — i.e. while it has 0 learned documents. After that, clean up to rename.
+  const canRename = c.documents === 0;
+  const rename = canRename && name.trim() && name.trim() !== c.name;
 
   const save = async () => {
     // Send every field: the API keeps a secret sent back as its mask (•••), deletes a
@@ -47,6 +53,7 @@ export function EditConnectorModal({
     try {
       await api.patchConnector(c.name, {
         options,
+        ...(rename ? { name: name.trim() } : {}),
         ...(canShare ? { shared: share } : {}),
         ...(sync ? { sync_interval_minutes: Number(sync) } : { clear_sync_interval: true }),
       });
@@ -75,15 +82,23 @@ export function EditConnectorModal({
         </div>
 
         <div className="overflow-y-auto px-5 py-4">
-          {/* Name and type are shown, disabled, rather than hidden: the name IS the
-              connector's identity — source_id is `type:name`, and every document id,
-              vector, graph node, watermark and webhook URL is derived from it — so
-              editing it here would orphan everything this connector has learned. */}
+          {/* The name IS the connector's identity — source_id is `type:name`, and every
+              document id, vector, graph node, watermark and webhook URL is derived from it.
+              So it's only editable before the first sync (0 documents), when nothing is
+              keyed to it yet; after that, renaming would orphan everything it learned. */}
           <Field
             label="Name"
-            hint="Fixed — this connector's learned documents, vectors, graph nodes and webhook URL are all keyed to it. To use a different name, clean up this connector and add it again."
+            hint={
+              canRename
+                ? "Editable only until the first sync — the name keys everything this connector ingests."
+                : "Fixed — this connector's learned documents, vectors, graph nodes and webhook URL are all keyed to it. Clean it up first to free the name for a rename."
+            }
           >
-            <TextInput value={c.name} disabled readOnly className="cursor-not-allowed opacity-60" />
+            {canRename ? (
+              <TextInput value={name} onChange={(e) => setName(e.target.value)} placeholder={c.name} />
+            ) : (
+              <TextInput value={c.name} disabled readOnly className="cursor-not-allowed opacity-60" />
+            )}
           </Field>
           {fields.length === 0 && (
             <div className="text-[12.5px] text-faint">This connector type has no editable options.</div>
