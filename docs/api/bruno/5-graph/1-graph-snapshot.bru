@@ -1,0 +1,14 @@
+meta {
+  name: Graph snapshot
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{baseUrl}}/api/graph?limit=200
+}
+
+docs {
+  Nodes + edges for the whole graph (capped, fairly sampled across sources). Add `?entity=<id>`
+  for one entity's neighborhood with per-edge evidence.
+}

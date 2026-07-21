@@ -1,0 +1,224 @@
+{
+  "info": {
+    "name": "QuickJoiner API — connected flow",
+    "_postman_id": "qj-connected-flow-0001",
+    "description": "An end-to-end runbook for driving QuickJoiner over its HTTP API: check health, (optionally) sign in, connect a source, sync it, watch progress, then query the learned memory and graph. Requests are chained — test scripts capture the bearer token, connector name, and a session id into collection variables, so you can run the whole folder top-to-bottom with the Collection Runner.\n\nSet the `baseUrl` variable (default http://localhost:8787). Auth is OPTIONAL: skip the Authentication folder to run in open mode; run it once to turn auth on and capture a token for the rest.\n\nStreaming note: /api/chat, /api/scrape and /api/sync/{name}/logs return Server-Sent Events (text/event-stream). Postman shows the raw stream; read `data:` lines until a `done` event.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:8787", "type": "string" },
+    { "key": "token", "value": "", "type": "string" },
+    { "key": "username", "value": "admin", "type": "string" },
+    { "key": "password", "value": "change-me", "type": "string" },
+    { "key": "connectorName", "value": "handbook", "type": "string" },
+    { "key": "connectorType", "value": "files", "type": "string" },
+    { "key": "connectorPath", "value": "/absolute/path/to/a/docs/folder", "type": "string" },
+    { "key": "askQuestion", "value": "How do we deploy and roll back?", "type": "string" },
+    { "key": "searchQuery", "value": "how do we deploy", "type": "string" },
+    { "key": "suggestPrefix", "value": "where", "type": "string" },
+    { "key": "entityA", "value": "repo:connector", "type": "string" },
+    { "key": "entityB", "value": "service:stevedore", "type": "string" },
+    { "key": "sessionId", "value": "", "type": "string" }
+  ],
+  "auth": {
+    "type": "bearer",
+    "bearer": [{ "key": "token", "value": "{{token}}", "type": "string" }]
+  },
+  "item": [
+    {
+      "name": "0 · Status",
+      "item": [
+        {
+          "name": "Health",
+          "request": { "method": "GET", "url": "{{baseUrl}}/health" }
+        },
+        {
+          "name": "Workspace status",
+          "event": [{ "listen": "test", "script": { "exec": [
+            "pm.test('reachable', () => pm.response.code === 200);",
+            "const s = pm.response.json();",
+            "console.log('org:', s.org, '| model:', s.llm.model, '| docs:', s.stats.documents);"
+          ], "type": "text/javascript" } }],
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/status" }
+        }
+      ]
+    },
+    {
+      "name": "1 · Authentication (optional)",
+      "description": "Run ONCE to turn auth on + capture a token. Skip entirely to stay in open mode.",
+      "item": [
+        {
+          "name": "Auth status",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/auth/status" }
+        },
+        {
+          "name": "Create first user (turns auth ON)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"username\": \"{{username}}\",\n  \"password\": \"{{password}}\"\n}" },
+            "url": "{{baseUrl}}/api/auth/users"
+          }
+        },
+        {
+          "name": "Login → capture token",
+          "event": [{ "listen": "test", "script": { "exec": [
+            "pm.test('logged in', () => pm.response.code === 200);",
+            "const t = pm.response.json().token;",
+            "if (t) { pm.collectionVariables.set('token', t); console.log('token captured'); }"
+          ], "type": "text/javascript" } }],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"username\": \"{{username}}\",\n  \"password\": \"{{password}}\"\n}" },
+            "url": "{{baseUrl}}/api/auth/login"
+          }
+        }
+      ]
+    },
+    {
+      "name": "2 · Connect a source",
+      "item": [
+        {
+          "name": "List connector types",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/connectors/types" }
+        },
+        {
+          "name": "Create a 'files' connector",
+          "description": "Point `connectorPath` at a real folder first. Swap type/options for git/github/jira/etc. — see the connector types response for each type's fields.",
+          "event": [{ "listen": "test", "script": { "exec": [
+            "pm.test('created', () => pm.response.code === 200);",
+            "const c = pm.response.json();",
+            "if (c.name) pm.collectionVariables.set('connectorName', c.name);"
+          ], "type": "text/javascript" } }],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"name\": \"{{connectorName}}\",\n  \"type\": \"{{connectorType}}\",\n  \"options\": { \"path\": \"{{connectorPath}}\" },\n  \"shared\": true\n}" },
+            "url": "{{baseUrl}}/api/connectors"
+          }
+        },
+        {
+          "name": "Test the connector",
+          "request": { "method": "POST", "url": "{{baseUrl}}/api/connectors/{{connectorName}}/test" }
+        }
+      ]
+    },
+    {
+      "name": "3 · Sync & watch",
+      "item": [
+        {
+          "name": "Start sync",
+          "request": { "method": "POST", "url": "{{baseUrl}}/api/sync/{{connectorName}}" }
+        },
+        {
+          "name": "Poll sync jobs (re-send until done)",
+          "description": "Re-send until the job for your connector reads done/error/stopped. Shows current stage + percent while running. In the Collection Runner add an iteration delay, or use the logs SSE stream instead.",
+          "event": [{ "listen": "test", "script": { "exec": [
+            "const name = pm.collectionVariables.get('connectorName');",
+            "const job = pm.response.json().syncs.find(s => s.source === name);",
+            "if (job) console.log(`state=${job.state} phase=${job.phase||''} percent=${job.percent==null?'-':job.percent}`);",
+            "pm.test('has a job for the connector', () => !!job);"
+          ], "type": "text/javascript" } }],
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/syncs" }
+        },
+        {
+          "name": "Pause sync",
+          "request": { "method": "POST", "url": "{{baseUrl}}/api/sync/{{connectorName}}/pause" }
+        },
+        {
+          "name": "Resume sync",
+          "request": { "method": "POST", "url": "{{baseUrl}}/api/sync/{{connectorName}}/resume" }
+        },
+        {
+          "name": "Stop sync (keep partial)",
+          "request": { "method": "POST", "url": "{{baseUrl}}/api/sync/{{connectorName}}/stop" }
+        },
+        {
+          "name": "Stream live logs (SSE)",
+          "description": "Server-Sent Events. Postman renders the raw stream — read `data:` lines until `done`.",
+          "request": { "method": "GET", "header": [{ "key": "Accept", "value": "text/event-stream" }], "url": "{{baseUrl}}/api/sync/{{connectorName}}/logs" }
+        },
+        {
+          "name": "Activity feed (24h history)",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/notifications?hours=24" }
+        }
+      ]
+    },
+    {
+      "name": "4 · Query the memory",
+      "item": [
+        {
+          "name": "Search (keyword + semantic)",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/search?q={{searchQuery}}&top_k=8" }
+        },
+        {
+          "name": "Ask a grounded question (SSE)",
+          "description": "Streams SSE events: thinking / delta / tool_call / candidates / answer / done. `project` and `session_id` are optional; if a session id comes back on the stream, capture it for the next call.",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "Accept", "value": "text/event-stream" }],
+            "body": { "mode": "raw", "raw": "{\n  \"message\": \"{{askQuestion}}\",\n  \"session_id\": \"{{sessionId}}\"\n}" },
+            "url": "{{baseUrl}}/api/chat"
+          }
+        },
+        {
+          "name": "Teach a fact",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"fact\": \"Deployments run through Octopus on Fridays.\"\n}" },
+            "url": "{{baseUrl}}/api/learn"
+          }
+        },
+        {
+          "name": "Autocomplete suggestions",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/suggest?q={{suggestPrefix}}&limit=6" }
+        }
+      ]
+    },
+    {
+      "name": "5 · Explore the graph & gaps",
+      "item": [
+        {
+          "name": "Graph snapshot",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/graph?limit=200" }
+        },
+        {
+          "name": "Entity search",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/graph/search?q={{entityA}}&limit=8" }
+        },
+        {
+          "name": "Path between two entities",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/graph/path?a={{entityA}}&b={{entityB}}&max_hops=4" }
+        },
+        {
+          "name": "Cross-source bridges",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/graph/bridges?limit=20" }
+        },
+        {
+          "name": "Knowledge gaps",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/gaps" }
+        }
+      ]
+    },
+    {
+      "name": "6 · Lifecycle & cleanup",
+      "item": [
+        {
+          "name": "Clean up one connector (keep config)",
+          "request": { "method": "POST", "url": "{{baseUrl}}/api/connectors/{{connectorName}}/cleanup" }
+        },
+        {
+          "name": "Delete connector (purges its data)",
+          "request": { "method": "DELETE", "url": "{{baseUrl}}/api/connectors/{{connectorName}}" }
+        },
+        {
+          "name": "Reset ALL memory (keep connectors)",
+          "description": "DANGER — wipes every ingested document, vector and graph edge across the whole workspace. Refuses (409) while any sync runs.",
+          "request": { "method": "POST", "url": "{{baseUrl}}/api/memory/reset" }
+        }
+      ]
+    }
+  ]
+}

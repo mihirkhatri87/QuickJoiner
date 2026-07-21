@@ -1,0 +1,21 @@
+auth {
+  mode: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}
+
+docs {
+  # QuickJoiner API — connected flow (Bruno)
+
+  An end-to-end runbook for driving QuickJoiner over HTTP: health → (optional) sign in →
+  connect a source → sync & watch → query memory & graph → clean up.
+
+  Select the **Local** environment and set `baseUrl` (default http://localhost:8787).
+  Auth is OPTIONAL — skip folder `1-auth` to run in open mode; run it once to turn auth on,
+  and the login request captures the bearer token into the environment for every later call.
+
+  Streaming: `/api/chat`, `/api/scrape`, `/api/sync/{name}/logs` return Server-Sent Events —
+  read `data:` lines until a `done` event. Everything else is JSON.
+}

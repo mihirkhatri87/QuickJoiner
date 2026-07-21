@@ -1,0 +1,21 @@
+meta {
+  name: Poll sync jobs
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{baseUrl}}/api/syncs
+}
+
+script:post-response {
+  const name = bru.getEnvVar("connectorName");
+  const job = (res.body.syncs || []).find(s => s.source === name);
+  if (job) console.log(`state=${job.state} phase=${job.phase || ""} percent=${job.percent == null ? "-" : job.percent}`);
+  else console.log("no job yet for", name);
+}
+
+docs {
+  Live state of every sync job, with current stage + estimated %. Re-send until your
+  connector's job reads done / error / stopped.
+}

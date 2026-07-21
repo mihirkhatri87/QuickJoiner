@@ -1,0 +1,14 @@
+meta {
+  name: Activity feed (history)
+  type: http
+  seq: 7
+}
+
+get {
+  url: {{baseUrl}}/api/notifications?hours=24
+}
+
+docs {
+  Sync activity over the last N hours — running jobs plus finished runs from persisted history.
+  Survives a server restart.
+}

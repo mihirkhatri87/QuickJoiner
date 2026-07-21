@@ -1,0 +1,28 @@
+meta {
+  name: Ask (grounded, SSE)
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/api/chat
+  body: json
+}
+
+headers {
+  Content-Type: application/json
+  Accept: text/event-stream
+}
+
+body:json {
+  {
+    "message": "{{askQuestion}}",
+    "session_id": "{{sessionId}}"
+  }
+}
+
+docs {
+  Ask a grounded, cited question (uses the `askQuestion` variable). Streams Server-Sent Events:
+  thinking / delta / tool_call / candidates / answer / done. Answers only from learned memory,
+  or says it hasn't learned that yet. `session_id` and `project` are optional.
+}

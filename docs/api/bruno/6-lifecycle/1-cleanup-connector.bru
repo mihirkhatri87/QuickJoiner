@@ -1,0 +1,14 @@
+meta {
+  name: Clean up connector (keep config)
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/api/connectors/{{connectorName}}/cleanup
+}
+
+docs {
+  Forget everything this connector taught the system (documents, vectors, graph edges) while
+  KEEPING its config. Runs as a background job — watch it like a sync.
+}

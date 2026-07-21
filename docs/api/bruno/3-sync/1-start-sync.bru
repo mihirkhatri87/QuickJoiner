@@ -1,0 +1,14 @@
+meta {
+  name: Start sync
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/api/sync/{{connectorName}}
+}
+
+docs {
+  Start a background sync. Returns immediately with the job. Add `?clean=true` for a
+  from-scratch re-pull (purges the source first). Watch it with "Poll sync jobs" or "Stream logs".
+}

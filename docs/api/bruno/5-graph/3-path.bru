@@ -1,0 +1,14 @@
+meta {
+  name: Path between entities
+  type: http
+  seq: 3
+}
+
+get {
+  url: {{baseUrl}}/api/graph/path?a={{entityA}}&b={{entityB}}&max_hops=4
+}
+
+docs {
+  Evidence-cited relationship chain between `entityA` and `entityB` (alias-resolved). Surfaces
+  materially different chains with per-chain confidence when they exist. 404 on unknown entity.
+}

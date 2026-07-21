@@ -1,0 +1,13 @@
+meta {
+  name: Test connector
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/api/connectors/{{connectorName}}/test
+}
+
+docs {
+  Check the connector's credentials / reachability without ingesting anything.
+}

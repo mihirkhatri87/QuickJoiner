@@ -1,0 +1,14 @@
+meta {
+  name: List connector types
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{baseUrl}}/api/connectors/types
+}
+
+docs {
+  The catalog of connector types and each type's configurable fields (which are required,
+  which are secrets). Use this to fill `options` for the connector you create next.
+}

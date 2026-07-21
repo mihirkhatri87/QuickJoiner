@@ -1,0 +1,14 @@
+meta {
+  name: Autocomplete suggestions
+  type: http
+  seq: 4
+}
+
+get {
+  url: {{baseUrl}}/api/suggest?q={{suggestPrefix}}&limit=6
+}
+
+docs {
+  Deterministic question suggestions computed live from the knowledge graph. Uses the
+  `suggestPrefix` variable.
+}

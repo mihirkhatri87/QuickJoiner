@@ -1,0 +1,34 @@
+meta {
+  name: Login (captures token)
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/api/auth/login
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "username": "{{username}}",
+    "password": "{{password}}"
+  }
+}
+
+script:post-response {
+  if (res.body && res.body.token) {
+    bru.setEnvVar("token", res.body.token);
+    console.log("token captured into the environment");
+  }
+}
+
+docs {
+  Sign in and capture the bearer token into the `token` environment variable, so every later
+  request authenticates automatically (the collection sends `Authorization: Bearer {{token}}`).
+}

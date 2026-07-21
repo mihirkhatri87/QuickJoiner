@@ -1,0 +1,20 @@
+meta {
+  name: Workspace status
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{baseUrl}}/api/status
+  auth: none
+}
+
+script:post-response {
+  const s = res.body;
+  console.log(`org=${s.org} model=${s.llm.model} docs=${s.stats.documents} sources=${s.stats.sources}`);
+}
+
+docs {
+  Org name, active LLM model, and learned-memory counts. A quick way to confirm how much
+  has been ingested so far.
+}

@@ -1,0 +1,14 @@
+meta {
+  name: Auth status
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{baseUrl}}/api/auth/status
+  auth: none
+}
+
+docs {
+  Is sign-in enabled, and who does the current token identify? `enabled:false` = open mode.
+}

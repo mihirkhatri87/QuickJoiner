@@ -1,0 +1,14 @@
+meta {
+  name: Search memory
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{baseUrl}}/api/search?q={{searchQuery}}&top_k=8
+}
+
+docs {
+  Hybrid keyword + semantic search over learned memory. Returns scored hits with source URIs —
+  the retrieval layer beneath the agent, with no LLM call. Uses the `searchQuery` variable.
+}

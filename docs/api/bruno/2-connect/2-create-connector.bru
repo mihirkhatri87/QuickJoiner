@@ -1,0 +1,31 @@
+meta {
+  name: Create connector
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/api/connectors
+  body: json
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "name": "{{connectorName}}",
+    "type": "{{connectorType}}",
+    "options": { "path": "{{connectorPath}}" },
+    "shared": true
+  }
+}
+
+docs {
+  Create the source defined by the `connectorName`/`connectorType`/`connectorPath` variables.
+  The default `options` suit a `files` connector; for git/github/jira/etc. replace `options`
+  with that type's fields (from List connector types). Secrets support env indirection, e.g.
+  `"token": "env:GITHUB_TOKEN"`. The connector is tested before saving (add `"skip_test": true`
+  to save anyway).
+}

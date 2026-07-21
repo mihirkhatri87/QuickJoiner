@@ -1,0 +1,24 @@
+meta {
+  name: Teach a fact
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/api/learn
+  body: json
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "fact": "Deployments run through Octopus on Fridays."
+  }
+}
+
+docs {
+  Teach the system a fact / ingest a free-text note directly into memory (no LLM round-trip).
+}

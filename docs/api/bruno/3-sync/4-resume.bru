@@ -1,0 +1,13 @@
+meta {
+  name: Resume sync
+  type: http
+  seq: 4
+}
+
+post {
+  url: {{baseUrl}}/api/sync/{{connectorName}}/resume
+}
+
+docs {
+  Resume a paused sync.
+}

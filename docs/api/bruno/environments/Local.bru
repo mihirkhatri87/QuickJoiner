@@ -1,0 +1,36 @@
+vars {
+  ~baseUrl: http://localhost:8787
+  ~username: admin
+  ~password: change-me
+  ~connectorName: handbook
+  ~connectorType: files
+  ~connectorPath: /absolute/path/to/a/docs/folder
+  ~askQuestion: How do we deploy and roll back?
+  ~searchQuery: how do we deploy
+  ~suggestPrefix: where
+  ~entityA: repo:connector
+  ~entityB: service:stevedore
+  ~token:
+  ~sessionId:
+}
+
+vars:secret [
+  token,
+  password
+]
+
+docs {
+  # Single place for all common configuration
+
+  Everything the runbook needs is here — edit these, not the individual requests:
+
+  - **baseUrl** — where QuickJoiner is serving (default http://localhost:8787).
+  - **username / password** — only used by folder `1-auth` (skip it for open mode).
+  - **connectorName / connectorType / connectorPath** — the source `2-connect` creates.
+    Swap type/path for git/github/jira/etc. (see `GET /api/connectors/types` for each type's fields).
+  - **askQuestion / searchQuery / suggestPrefix** — the queries used in folder `4-query`.
+  - **entityA / entityB** — the two graph nodes for the path request in `5-graph`.
+
+  **token** and **sessionId** are filled in automatically at runtime (login captures the token;
+  the chat stream can surface a session id) — leave them blank.
+}

@@ -1,0 +1,14 @@
+meta {
+  name: Stop sync
+  type: http
+  seq: 5
+}
+
+post {
+  url: {{baseUrl}}/api/sync/{{connectorName}}/stop
+}
+
+docs {
+  Stop a running sync (keeps whatever was already ingested). Add `?cleanup=true` to also purge
+  the partial pull. Takes effect within seconds, even mid-pull.
+}

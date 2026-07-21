@@ -1,0 +1,14 @@
+meta {
+  name: Pause sync
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/api/sync/{{connectorName}}/pause
+}
+
+docs {
+  Hold a running sync in place (both the pull and the graph-extraction tail). Resume continues
+  the same run — nothing re-pulls.
+}

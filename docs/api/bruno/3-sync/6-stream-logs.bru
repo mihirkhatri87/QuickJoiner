@@ -1,0 +1,18 @@
+meta {
+  name: Stream live logs (SSE)
+  type: http
+  seq: 6
+}
+
+get {
+  url: {{baseUrl}}/api/sync/{{connectorName}}/logs
+}
+
+headers {
+  Accept: text/event-stream
+}
+
+docs {
+  Server-Sent Events stream of the sync's live log lines (replays the backlog first), ending
+  with a `done` event. Read `data:` lines as they arrive.
+}

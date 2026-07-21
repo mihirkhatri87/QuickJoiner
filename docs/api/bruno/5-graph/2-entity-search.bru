@@ -1,0 +1,14 @@
+meta {
+  name: Entity search
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{baseUrl}}/api/graph/search?q={{entityA}}&limit=8
+}
+
+docs {
+  Entity autocomplete over the graph (name/alias substring, ranked by connectivity). Handy for
+  discovering the exact entity ids to use in the Path request.
+}

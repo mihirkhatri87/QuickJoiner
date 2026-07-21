@@ -1,0 +1,15 @@
+meta {
+  name: Reset ALL memory (keep connectors)
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/api/memory/reset
+}
+
+docs {
+  DANGER — wipes every ingested document, vector and graph edge across the whole workspace, and
+  clears each connector's sync watermark. Keeps connectors configured, users, chat, and settings.
+  Refuses (409) while any sync is running.
+}

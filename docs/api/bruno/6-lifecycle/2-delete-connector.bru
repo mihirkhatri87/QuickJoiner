@@ -1,0 +1,14 @@
+meta {
+  name: Delete connector
+  type: http
+  seq: 2
+}
+
+delete {
+  url: {{baseUrl}}/api/connectors/{{connectorName}}
+}
+
+docs {
+  Delete the connector. By default this also purges its learned data (a deleted connector's data
+  is otherwise unreachable). Add `?keep_memory=true` to retire it but keep what it taught.
+}
