@@ -28,7 +28,12 @@ class OnboardingAgent:
         score_ledger: dict[str, float] | None = None,
     ):
         self._provider = provider
-        self._tools = {t.spec.name: t for t in tools}
+        # Sorted by name so the tool-spec list is byte-stable across requests and
+        # processes — prompt caching (explicit Anthropic cache_control, automatic
+        # prefix caching on OpenAI-compatible backends, llama.cpp KV-cache reuse)
+        # is a prefix match over tools -> system -> messages, and a reordered tool
+        # list silently invalidates all of it.
+        self._tools = {t.spec.name: t for t in sorted(tools, key=lambda t: t.spec.name)}
         self._system = system
         # Cap a single live tool result before feeding it back to the model, so an
         # unbounded connector tool (e.g. the whole Octopus dashboard) can't overflow
@@ -69,6 +74,12 @@ class OnboardingAgent:
                 # Signed thinking blocks must ride along so the provider can echo
                 # them back on the next round of this tool-use turn.
                 assistant["thinking_blocks"] = result.thinking_blocks
+            if result.thinking:
+                # Harmony-format reasoning models (gpt-oss) want the chain of thought
+                # that produced a tool call passed back until the turn completes; the
+                # LiteLLM provider re-emits it as reasoning_content on tool-call turns.
+                # Live-turn plumbing only — sessions strip it on persist.
+                assistant["reasoning"] = result.thinking
             messages.append(assistant)
             for call in result.tool_calls:
                 if on_event:

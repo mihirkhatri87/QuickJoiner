@@ -15,7 +15,9 @@ from quickjoiner.llm import litellm_provider
 from quickjoiner.llm.litellm_provider import (
     LiteLLMProvider,
     _parse_arguments,
+    _retry_delay,
     _sse_json,
+    _strip_rejected,
     _tool_calls_from_acc,
     accumulate_delta,
 )
@@ -276,3 +278,189 @@ def test_non_retriable_status_raises_immediately(monkeypatch):
     except httpx.HTTPStatusError as exc:
         assert exc.response.status_code == 400
     assert attempts["n"] == 1  # 400 is a real client error — no retry
+
+
+# --------------------------------------------------------------- reasoning round-trip
+
+def test_to_wire_roundtrips_reasoning_on_tool_call_turns_only():
+    messages = [
+        {"role": "user", "content": "q"},
+        {
+            "role": "assistant", "content": "", "reasoning": "plan: call echo",
+            "tool_calls": [ToolCall(id="c1", name="echo", input={})],
+        },
+        {"role": "tool", "tool_call_id": "c1", "name": "echo", "content": "out"},
+        # A finished turn's reasoning is NOT sent back (Harmony drops prior-turn CoT).
+        {"role": "assistant", "content": "final", "reasoning": "leftover"},
+    ]
+    wire = LiteLLMProvider._to_wire(messages, None)
+    assert wire[1]["reasoning_content"] == "plan: call echo"
+    assert "reasoning_content" not in wire[3]
+
+
+def test_agent_attaches_reasoning_to_tool_call_history():
+    from quickjoiner.agent.agent import OnboardingAgent
+    from quickjoiner.llm.base import ChatResult
+    from tests.test_agent_loop import ScriptedProvider, _echo_tool
+
+    provider = ScriptedProvider([
+        ChatResult(text="", thinking="plan: echo it",
+                   tool_calls=[ToolCall(id="c1", name="echo", input={})]),
+        ChatResult(text="done"),
+    ])
+    agent = OnboardingAgent(provider, [_echo_tool()], system="s")
+    _, history = agent.ask("q")
+    tool_turn = [m for m in history if m["role"] == "assistant" and m.get("tool_calls")][0]
+    assert tool_turn["reasoning"] == "plan: echo it"
+    # The final (no-tool-call) assistant message never carries reasoning.
+    assert "reasoning" not in history[-1]
+
+
+def test_sessions_strip_reasoning_on_persist():
+    from quickjoiner.sessions import messages_to_json
+
+    raw = messages_to_json([
+        {"role": "assistant", "content": "", "reasoning": "cot",
+         "tool_calls": [ToolCall(id="c1", name="echo", input={})]},
+    ])
+    assert "reasoning" not in json.loads(raw)[0]
+    assert "cot" not in raw
+
+
+# --------------------------------------------------------------- payload knobs
+
+def test_reasoning_effort_and_parallel_tool_calls_in_payload():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    prov = LiteLLMProvider(
+        _cfg(reasoning_effort="high", parallel_tool_calls=False),
+        transport=httpx.MockTransport(handler),
+    )
+    tools = [ToolSpec(name="echo", description="d", input_schema={"type": "object"})]
+    prov.chat([{"role": "user", "content": "hi"}], tools=tools)
+    assert captured["body"]["reasoning_effort"] == "high"
+    assert captured["body"]["parallel_tool_calls"] is False
+
+
+def test_knobs_omitted_by_default():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    prov = LiteLLMProvider(_cfg(), transport=httpx.MockTransport(handler))
+    tools = [ToolSpec(name="echo", description="d", input_schema={"type": "object"})]
+    prov.chat([{"role": "user", "content": "hi"}], tools=tools)
+    body = captured["body"]
+    assert "reasoning_effort" not in body
+    assert "parallel_tool_calls" not in body
+    assert "stream_options" not in body  # non-streaming request
+
+
+def test_proxy_cache_control_marks_system_as_content_parts():
+    wire = LiteLLMProvider._to_wire([{"role": "user", "content": "q"}], "SYS", cache_system=True)
+    assert wire[0] == {
+        "role": "system",
+        "content": [{"type": "text", "text": "SYS", "cache_control": {"type": "ephemeral"}}],
+    }
+    # Off by default: plain string, byte-identical to before.
+    assert LiteLLMProvider._to_wire([], "SYS")[0] == {"role": "system", "content": "SYS"}
+
+
+# --------------------------------------------------------------- streaming usage
+
+def test_stream_requests_usage_and_parses_final_usage_chunk():
+    chunks = [
+        {"choices": [{"delta": {"content": "Hi"}}]},
+        {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+        # include_usage final chunk: empty choices, usage only — must not crash.
+        {"choices": [], "usage": {"prompt_tokens": 900, "completion_tokens": 5,
+                                  "prompt_tokens_details": {"cached_tokens": 800}}},
+    ]
+    body = "".join(f"data: {json.dumps(c)}\n\n" for c in chunks) + "data: [DONE]\n\n"
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, content=body.encode(), headers={"content-type": "text/event-stream"})
+
+    prov = LiteLLMProvider(_cfg(), transport=httpx.MockTransport(handler))
+    result = prov.chat([{"role": "user", "content": "hi"}], on_stream=lambda k, d: None)
+    assert captured["body"]["stream_options"] == {"include_usage": True}
+    assert result.text == "Hi" and result.stop_reason == "stop"
+
+
+# --------------------------------------------------------------- strip-and-retry on 400
+
+def test_strip_rejected_removes_named_optional_params():
+    payload = {"model": "m", "messages": [], "max_tokens": 100,
+               "stream_options": {"include_usage": True}, "reasoning_effort": "high"}
+    assert _strip_rejected(payload, "unknown parameter: stream_options") == "stream_options"
+    assert "stream_options" not in payload
+    assert _strip_rejected(payload, "max_tokens must be at least 1, got -86016") == "max_tokens"
+    assert "max_tokens" not in payload
+    assert _strip_rejected(payload, "some unrelated validation error") is None
+    assert payload["reasoning_effort"] == "high"  # untouched — not named by the error
+
+
+def test_strip_rejected_removes_message_level_reasoning_and_cache_parts():
+    payload = {
+        "model": "m",
+        "messages": [
+            {"role": "system", "content": [
+                {"type": "text", "text": "SYS", "cache_control": {"type": "ephemeral"}}]},
+            {"role": "assistant", "content": None, "reasoning_content": "cot"},
+        ],
+    }
+    assert _strip_rejected(payload, "reasoning_content is not permitted") == "reasoning_content"
+    assert "reasoning_content" not in payload["messages"][1]
+    assert _strip_rejected(payload, "extra field cache_control") == "cache_control"
+    assert payload["messages"][0]["content"] == "SYS"  # flattened back to a string
+
+
+def test_400_naming_optional_param_is_stripped_and_retried(monkeypatch):
+    monkeypatch.setattr(litellm_provider.time, "sleep", lambda *_: None)
+    bodies = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        if len(bodies) == 1:
+            return httpx.Response(400, json={"error": "unsupported parameter: reasoning_effort"})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    prov = LiteLLMProvider(_cfg(reasoning_effort="high"), transport=httpx.MockTransport(handler))
+    result = prov.chat([{"role": "user", "content": "hi"}])
+    assert result.text == "ok"
+    assert "reasoning_effort" in bodies[0] and "reasoning_effort" not in bodies[1]
+
+
+# --------------------------------------------------------------- Retry-After
+
+def test_retry_delay_honors_retry_after_within_cap():
+    assert _retry_delay(0) == 0.5
+    assert _retry_delay(1) == 1.0
+    assert _retry_delay(0, "7") == 7.0            # server's ask wins when larger
+    assert _retry_delay(4, "1") == 8.0            # backoff wins when larger
+    assert _retry_delay(0, "9999") == 30.0        # capped
+    assert _retry_delay(0, "Wed, 21 Oct") == 0.5  # HTTP-date form ignored
+
+
+def test_retry_after_header_used_on_429(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(litellm_provider.time, "sleep", lambda s: sleeps.append(s))
+    statuses = [429, 200]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        code = statuses.pop(0)
+        if code != 200:
+            return httpx.Response(code, json={"error": "slow down"}, headers={"retry-after": "3"})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    prov = LiteLLMProvider(_cfg(), transport=httpx.MockTransport(handler))
+    assert prov.chat([{"role": "user", "content": "hi"}]).text == "ok"
+    assert sleeps == [3.0]

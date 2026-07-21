@@ -79,6 +79,9 @@ def messages_to_json(messages: list[Message]) -> str:
     out = []
     for m in messages:
         entry = dict(m)
+        # Live-turn plumbing for gpt-oss reasoning round-trip — never persisted
+        # (it would bloat stored sessions and is useless outside the turn it served).
+        entry.pop("reasoning", None)
         if m.get("tool_calls"):
             entry["tool_calls"] = [
                 {"id": tc.id, "name": tc.name, "input": tc.input} for tc in m["tool_calls"]

@@ -31,10 +31,29 @@ class LLMConfig(BaseModel):
     base_url: str = "http://localhost:11434"
     max_tokens: int = 8192
     thinking: bool = False  # extended thinking (Anthropic) / think mode (Ollama reasoning models)
-    thinking_budget: int = 4096  # max thinking tokens (Anthropic)
+    thinking_budget: int = 4096  # extra max_tokens headroom for thinking (Anthropic)
+    # Anthropic prompt caching (cache_control breakpoints). One breakpoint on the system
+    # prompt caches tools+system together; a moving breakpoint on the conversation tail
+    # makes rounds 2..N of every tool loop and every follow-up turn read the prefix at
+    # ~0.1x input price. Writes cost 1.25x, so break-even is 2 requests — guaranteed
+    # whenever a tool fires. Harmless when the prefix is under the model's cacheable
+    # minimum (it silently doesn't cache); off only if a fronting proxy rejects the field.
+    prompt_cache: bool = True
     # litellm only: name of the env var holding the proxy's bearer key (never store the
     # secret itself). Empty/unset var -> no Authorization header (keyless local proxies).
     api_key_env: str = "LITELLM_API_KEY"
+    # litellm only: reasoning-effort hint for OpenAI-compatible reasoning models
+    # (gpt-oss & co.): "low" | "medium" | "high". None -> not sent (backend default,
+    # usually medium). The big cost/latency dial on a large reasoning model; a backend
+    # that rejects the param is handled by the provider's strip-and-retry on 400.
+    reasoning_effort: str | None = None
+    # litellm only: OpenAI parallel_tool_calls. False forces at most one tool call per
+    # turn (Harmony-family models like gpt-oss are happiest that way); None -> not sent.
+    parallel_tool_calls: bool | None = None
+    # litellm only: attach an Anthropic-style cache_control marker to the system message
+    # (as a content-part extra LiteLLM forwards when the proxy routes to Claude). Off by
+    # default — a strict non-LiteLLM backend may reject it (also strip-and-retried).
+    proxy_cache_control: bool = False
 
     def resolved_model(self) -> str:
         return self.model or DEFAULT_MODELS.get(self.provider, "claude-opus-4-8")
