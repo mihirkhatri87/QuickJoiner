@@ -45,6 +45,12 @@ How each works is documented in `CLAUDE.md` — the source of truth for current 
   Remaining upgrade folded into #10.
 - **#3 Threshold calibration per workspace** — `qj eval --calibrate/--apply/--compare` (2026-07-17).
 - **#4 Query expansion with org aliases** — `memory/expansion.py` (2026-07-17).
+- **#24 Cross-source identity bridge (`same_as`)** — `ingest/bridges.py` +
+  `catalog.refresh_same_as_bridges` (2026-07-21). Deterministic cross-type name/alias
+  bridges (incl. the connectors' declared "also known as" field); traversed by
+  `graph_path`/`graph_expand`; scored as its own lowest-tier `name-bridge` confidence
+  class. Deliberately a bridge, not a merge. Fuzzy identity remains with the plan-06
+  adjudicator.
 
 ### Tier 1 — highest leverage, low risk
 2. **AST-aware code chunking** (tree-sitter) — *adopt*. Functions/classes as chunk units
@@ -63,24 +69,6 @@ How each works is documented in `CLAUDE.md` — the source of truth for current 
     live graph literally contains `#{azureusername}` placeholders today). Same conservative
     direction rules; per-environment variable scoping can carry the environment entity as
     detail. Extension of the same mechanism: Terraform state/vars, k8s ConfigMaps.
-24. **Cross-source identity bridge (`same_as`)** — *original*. Entities are keyed
-    `type:name` and entity resolution only ever considers **same-type** candidates
-    (`EntityResolver._bucket` → `entities_by_type`), so the same real-world thing becomes two
-    or three nodes that can never merge: Octopus asserts `service:connector --deploys-->
-    environment`, ADO asserts `pipeline:… --builds--> repo:connector`, deps/code assert
-    `repo:connector`. Measured on the live AppRiver workspace (2026-07-20): **158 service
-    names normalize-match a repo/project name exactly** (305 pipeline↔repo, 147
-    service↔pipeline), yet only **18 entities** have evidence from more than one source —
-    14,172 edges that are really four disjoint islands. This is the machinery behind
-    `graph_expand`, `graph_path` and every multi-hop cross-source answer, i.e. the evidence
-    graph we sell as the differentiator, so it mostly cannot cross sources today. Emit a
-    deterministic `same_as` edge on exact normalized-name match across `service`/`repo`/
-    `project`/`pipeline`, evidence = the two asserting documents; traverse it in
-    `graph_expand`/`graph_path` (and count a bridged hop honestly in `score_chain`).
-    **Deliberately not cross-type *merging***: both nodes survive, a wrong bridge is one row
-    to delete rather than an unpicked merge, and the type distinction (a service is not its
-    repo) stays real. Fuzzy/alias-based bridging is a follow-up only if exact match proves
-    insufficient.
 25. **Drain stale deferred graph work** — *adopt*. `graph_pending` rows are only retried when
     a later sync **re-yields that document** (`pipeline.py:158`). For connectors that ingest a
     moving window this never happens: the live workspace has **1,331 TFS documents** queued
@@ -98,6 +86,52 @@ How each works is documented in `CLAUDE.md` — the source of truth for current 
     lower-confidence signal for plan-06 scoring. Pure function, tiny effort, no schema change.
     This is the full extent of "ontology" we adopt eagerly — see the §5.2 intake-rejection
     note for what we deliberately do NOT build.
+26. **ADO/TFS work-item hierarchy + link graph** — *adopt*. Today the Azure DevOps sync
+    ingests each recent-sprint work item as a **flat** document (`azure_devops.py:21-38` —
+    title/state/assignee/area/iteration/description only) with **no `$expand=relations`**, so:
+    (a) the parent **Features/Epics** are lost — they carry no sprint iteration, so the
+    `/iterations/{id}/workitems` pull (`:279`) never even returns them, and the code discards
+    the `rel`/`source` of the relations it does get (`:285-289`); (b) every **work-item link**
+    is lost — parent/child, Related, Predecessor/Successor, and the **development links** to
+    PRs/commits/branches; (c) the pipeline's ticket-key regex matches Jira `PROJ-123` keys, not
+    ADO `#id`, so ADO items get **no graph edges at all** — an asymmetry with the Jira connector,
+    which asserts `ticket → part_of → project/epic`. So we hold ~sprint-scoped leaf stories with
+    zero fabric between them or up to the features/epics they served. Fix, connector-local +
+    deterministic:
+    - fetch work items with `$expand=relations`;
+    - walk **up** the hierarchy and ingest parent Features/Epics as their own documents (even
+      though they sit outside the sprint window) so epic/feature context is in memory, not just
+      leaf stories;
+    - emit edges: `story --part_of--> feature`, `feature --part_of--> epic`,
+      `story --references--> repo|pull_request|branch` (development links — strengthens the
+      existing GitLab↔TFS build-map bridge), `story --related_to--> story`;
+    - store the extra fields (parent id, story points, priority, acceptance criteria).
+
+    **Incremental update / dedup — the load-bearing half (how already-synced stories gain the
+    new edges without re-embedding).** The pipeline dedups on the document's *content* hash
+    (`pipeline.py:170-176`): an unchanged story is `skipped` and its `_sync_graph` never re-runs,
+    so shipping the extraction alone would leave every already-ingested story **edgeless** until
+    its text next changes. Split the two concerns: keep `content_hash` gating chunk/embed
+    (unchanged), and add a **graph-assertion signature** per document (hash of the computed
+    entities+edges + an extractor-version stamp) so a doc whose *content* is unchanged but whose
+    *graph output* differs re-runs only `_persist_graph` — cheap, no embedding, and
+    `replace_doc_edges` is already idempotent per evidence doc. Then, on the first re-sync after
+    this ships, every in-window story is re-yielded *with* relations, its content hash matches,
+    its graph signature doesn't → **edges backfill with zero re-embedding**. Stories aged out of
+    the recent-sprint window are re-hydrated by the **#25 drain pass** (re-reads stored chunks, no
+    connector round-trip) rather than re-pulled — this item and #25 compose. Parent Feature/Epic
+    docs are added once; their child `part_of` edges are re-asserted from each child's evidence
+    doc every sync, so the hierarchy self-heals if a child moves. The extractor-version stamp is
+    the general mechanism for *any* future connector whose graph extraction improves: bump it and
+    the derived layer rebuilds on the next sync/drain without a re-embed. Optional refinement
+    (ties to the ingest-vs-live-query balance): **skeleton-ingest + live-hydrate** — ingest only
+    the cheap hierarchy skeleton (ids + parent links + titles) for correlation/graph and leave
+    full per-field detail to the live `ado_query_work_items` tool, indexing the fabric without
+    pulling every field of every item.
+
+    Gate: connector unit tests (relations→edges, up-hierarchy walk, graph-signature backfill
+    without re-embed), no `qj eval --compare` regression. Closes the Jira/ADO asymmetry and turns
+    the sprint snapshot into a genuine feature→epic→story→PR fabric.
 
 ### Tier 2 — strong, moderate effort
 6. **Query decomposition / multi-query** — *adopt*. LLM splits compound questions;
@@ -198,6 +232,56 @@ before/after bench table, exactly as no quality work merges without `--compare`.
   digest / stable `extra_system` framing so caching survives session-summary refreshes;
   (c) keep volatile content (per-request scores, timestamps) after the last breakpoint as
   new prompt sections are added. (The narrow, cheap precursor to #16.)
+- **S6 — GPU-accelerated, resource-aware parallel ingestion** — *adopt*. Make a large sync /
+  full re-embed use the machine it runs on. Scope is honest: the only ingest stage that is
+  local *compute* (not network pull or disk I/O) is **embedding** (`memory/embedder.py`
+  `FastEmbedEmbedder`, ONNX), with the ANN index build and the reranker as secondary compute
+  users; connector pull is network-bound and the LLM triple drain is network/Ollama-bound, so
+  neither is a GPU target here (if the LLM is *local* Ollama it already uses the GPU itself, and
+  then embedding contends with it for VRAM — deferred, see (4)). Small-org syncs are dominated
+  by connector API paging, so this pays off at scale, on re-syncs, and on re-embeds — not on
+  every sync. Four parts, phased:
+  1. **Cross-document batch embedding + a machine profiler (CPU-first, no GPU, biggest ROI).**
+     `store.upsert_document` embeds one document's chunks at a time today (`store.py:147`); ONNX
+     — CPU *or* GPU — is far more efficient on large batches and GPUs starve on small ones.
+     Accumulate chunks across documents into one embed call, and add a startup **profiler**
+     (`os.cpu_count()`, RAM, and — via `onnxruntime.get_available_providers()` /
+     `nvidia-smi`/NVML — GPU presence + VRAM) that emits an auto-tuned plan
+     `{execution_provider, embed_batch_size, embed_workers, triple_workers}`, logged like the
+     rest of the sync machinery. This establishes the batched-ingest integrity model (below) and
+     speeds the default CPU path on its own.
+  2. **GPU execution provider** behind an opt-in `[gpu]` extra (`fastembed-gpu` /
+     `onnxruntime-gpu`, `CUDAExecutionProvider`), selected by the profiler. Runtime provider-probe
+     with **graceful CPU fallback** — `fastembed-gpu` installed ≠ CUDA/cuDNN DLLs loadable, so a
+     mismatched CUDA must silently degrade to CPU, never crash a sync. CUDA/cuDNN version-matching
+     on Windows is the real cost/risk of this whole item; the default install stays pure-CPU.
+  3. **Re-calibrate the grounding gate on GPU vectors.** GPU float math ≠ CPU bit-for-bit; bge
+     vectors are near-identical but this is exactly the "embedding change ⇒ re-check `min_score`"
+     rule (I1). Gate on `qj eval --compare` (zero grounded-recall loss, same bar as S2) and
+     `qj eval --calibrate` before declaring done.
+  4. *(Later, only if local Ollama)* VRAM-aware scheduling between embedding and a co-resident
+     local LLM, so the two don't thrash the same GPU.
+
+  **Integrity under batched/parallel ingest (the hard half — must not break pause/resume/stop).**
+  Today's crash-safety rests on a document-serial invariant: per doc, vectors are written
+  (`store.upsert_document`) *before* the content hash (`catalog.upsert_document`, the "done"
+  marker), with `SyncControl.check()` between docs. Any batching/parallelism must preserve it:
+  - **store-before-catalog per document, never reordered for speed** — a hash written before its
+    vectors land means a kill loses those vectors but marks the doc "done", so it is silently
+    missing until its text next changes.
+  - **checkpoints land at batch boundaries**; a `SyncStopped` mid-batch commits only the
+    fully-written docs, the rest stay un-hashed and re-ingest next run — safe because hash dedupe
+    is idempotent.
+  - the deferred **`graph_pending` drain** already survives interruption correctly — keep that seam.
+  - useful parallelism given the GIL is a *staged pipeline* (chunk = Python/GIL → embed = native,
+    releases GIL → upsert = I/O), not threaded pure-Python chunking; batching beats threading here.
+    This is the ingest-side complement to **S3**'s "embed batches pipelined with upserts."
+
+  Gate: **S1** (`qj bench` sync throughput — docs/min, embed batch rate — before/after) **and**
+  the eval `--compare`/`--calibrate` recalibration above. Local-first by construction (it uses the
+  user's own hardware); nothing leaves the machine. Feasibility note: the engineering weight is in
+  the batched-ingest integrity model + the profiler/auto-tune + CUDA packaging, not in the GPU call
+  itself.
 
 ## 4. Original research track (X-track)
 
