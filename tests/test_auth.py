@@ -89,9 +89,48 @@ def _bearer(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
+def test_rbac_roles_gate_http_writes(tmp_path, monkeypatch):
+    """RBAC at the HTTP layer (plan 08 stage 3): roles gate writes; reads stay open;
+    anonymous under enabled auth is 401 (not 403); admins administer users/roles."""
+    client = _client(tmp_path, monkeypatch)
+    # First user is always an admin and turns auth on.
+    assert client.post("/api/auth/users", json={"username": "root", "password": "pw44"}).json()["role"] == "admin"
+    ah = _bearer(client.post("/api/auth/login", json={"username": "root", "password": "pw44"}).json()["token"])
+    assert client.get("/api/auth/status", headers=ah).json()["role"] == "admin"
+
+    # Admin creates a viewer and an editor.
+    assert client.post("/api/auth/users", json={"username": "vic", "password": "pw55", "role": "viewer"},
+                       headers=ah).json()["role"] == "viewer"
+    client.post("/api/auth/users", json={"username": "ed", "password": "pw66", "role": "editor"}, headers=ah)
+    vic = _bearer(client.post("/api/auth/login", json={"username": "vic", "password": "pw55"}).json()["token"])
+    ed = _bearer(client.post("/api/auth/login", json={"username": "ed", "password": "pw66"}).json()["token"])
+
+    # Viewer: reads ok; every write forbidden (403); can't administer users.
+    assert client.get("/api/status", headers=vic).status_code == 200
+    assert client.post("/api/learn", json={"fact": "x"}, headers=vic).status_code == 403
+    assert client.post("/api/memory/reset", headers=vic).status_code == 403
+    assert client.patch("/api/settings", json={"org": "z"}, headers=vic).status_code == 403
+    assert client.get("/api/auth/users", headers=vic).status_code == 403
+
+    # Editor: everyday writes ok; but no reset / settings / user-admin.
+    assert client.post("/api/learn", json={"fact": "the sky is blue"}, headers=ed).status_code == 200
+    assert client.post("/api/memory/reset", headers=ed).status_code == 403
+    assert client.patch("/api/settings", json={"org": "z"}, headers=ed).status_code == 403
+
+    # Admin: user administration + role change persists.
+    users = {u["username"]: u["role"] for u in client.get("/api/auth/users", headers=ah).json()}
+    assert users == {"root": "admin", "vic": "viewer", "ed": "editor"}
+    assert client.patch("/api/auth/users/vic", json={"role": "editor"}, headers=ah).status_code == 200
+    vic2 = client.post("/api/auth/login", json={"username": "vic", "password": "pw55"}).json()["token"]
+    assert client.get("/api/auth/status", headers=_bearer(vic2)).json()["role"] == "editor"
+
+    # Anonymous under enabled auth is 401 (unauthenticated), not 403.
+    assert client.post("/api/learn", json={"fact": "y"}).status_code == 401
+
+
 def test_open_mode_connector_crud(tmp_path, monkeypatch):
     client = _client(tmp_path, monkeypatch)
-    assert client.get("/api/auth/status").json() == {"enabled": False, "user": None}
+    assert client.get("/api/auth/status").json() == {"enabled": False, "user": None, "role": "admin"}
 
     docs = tmp_path / "docs"
     resp = client.post("/api/connectors", json={
@@ -101,7 +140,7 @@ def test_open_mode_connector_crud(tmp_path, monkeypatch):
     row = resp.json()
     assert row["shared"] is True and row["owner"] is None and row["test"]["ok"]
 
-    rows = client.get("/api/connectors").json()
+    rows = [r for r in client.get("/api/connectors").json() if r["name"] != "quickjoiner"]
     assert [r["name"] for r in rows] == ["handbook"]
     assert "pull" in rows[0]["modes"]
 
@@ -110,7 +149,7 @@ def test_open_mode_connector_crud(tmp_path, monkeypatch):
     assert client.delete("/api/connectors/handbook").status_code == 409
     _wait_idle(client, "handbook")
     assert client.delete("/api/connectors/handbook").status_code == 200
-    assert client.get("/api/connectors").json() == []
+    assert [r["name"] for r in client.get("/api/connectors").json() if r["name"] != "quickjoiner"] == []
 
 
 def test_auth_enables_private_connectors_and_sharing(tmp_path, monkeypatch):
@@ -130,8 +169,10 @@ def test_auth_enables_private_connectors_and_sharing(tmp_path, monkeypatch):
 
     # Second user needs a signed-in creator now.
     assert client.post("/api/auth/users", json={"username": "raj", "password": "pw55"}).status_code == 401
+    # raj is an editor so he can sync a shared connector below (a viewer — the default second
+    # role — could see it but not run a sync; RBAC gates that, verified in test_rbac_roles).
     assert client.post(
-        "/api/auth/users", json={"username": "raj", "password": "pw55"},
+        "/api/auth/users", json={"username": "raj", "password": "pw55", "role": "editor"},
         headers=_bearer(meena["token"]),
     ).status_code == 200
     raj = client.post("/api/auth/login", json={"username": "raj", "password": "pw55"}).json()
@@ -144,8 +185,9 @@ def test_auth_enables_private_connectors_and_sharing(tmp_path, monkeypatch):
     assert resp.status_code == 200
     assert resp.json()["owner"] == "meena" and resp.json()["shared"] is False
 
-    # Raj can't see, sync, or remove it.
-    assert client.get("/api/connectors", headers=_bearer(raj["token"])).json() == []
+    # Raj can't see, sync, or remove it. (The commons control connector is always visible.)
+    assert [r["name"] for r in client.get("/api/connectors", headers=_bearer(raj["token"])).json()
+            if r["name"] != "quickjoiner"] == []
     assert client.post("/api/sync/meena-notes", headers=_bearer(raj["token"])).status_code == 404
     assert client.delete("/api/connectors/meena-notes", headers=_bearer(raj["token"])).status_code == 404
     # And can't squat the name.
@@ -157,7 +199,8 @@ def test_auth_enables_private_connectors_and_sharing(tmp_path, monkeypatch):
     resp = client.patch("/api/connectors/meena-notes", json={"shared": True},
                         headers=_bearer(meena["token"]))
     assert resp.status_code == 200 and resp.json()["shared"] is True
-    rows = client.get("/api/connectors", headers=_bearer(raj["token"])).json()
+    rows = [r for r in client.get("/api/connectors", headers=_bearer(raj["token"])).json()
+            if r["name"] != "quickjoiner"]
     assert [r["name"] for r in rows] == ["meena-notes"]
     assert rows[0]["can_manage"] is False
     assert client.post("/api/sync/meena-notes", headers=_bearer(raj["token"])).status_code == 200

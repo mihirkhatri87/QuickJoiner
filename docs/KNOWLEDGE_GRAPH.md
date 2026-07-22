@@ -104,6 +104,18 @@ Notes:
    already extracts durable facts; extend the prompt to also propose
    `(src, rel, dst)` triples, stored with `evidence_doc_id` = the
    conversation doc. Keyless mode skips this — graph stays deterministic-only.
+5. **Cross-source identity bridges** (shipped 2026-07-21, `ingest/bridges.py`):
+   a derived `same_as` layer recomputed after every ingest batch
+   (`catalog.refresh_same_as_bridges`). Bridges entities of DIFFERENT types
+   (`service`/`repo`/`project`/`pipeline`) whose names — or declared aliases,
+   incl. the git/files connectors' **"also known as"** option — match after
+   normalization, with guards (≥5 alnum chars, all-generic names skipped,
+   groups >6 skipped). **Honesty:** a bridge carries an EMPTY `evidence_doc_id`
+   (no document asserts the identity), is excluded from corroboration and from
+   gc's keeps-alive rule, and scores as its own lowest-tier `name-bridge`
+   confidence class — so a chain crossing one is capped low and flagged.
+   `graph_path` traverses bridges natively; `graph_expand` extends its seed
+   entities across them but only ever returns real, citable documents.
 
 ## Query surface
 

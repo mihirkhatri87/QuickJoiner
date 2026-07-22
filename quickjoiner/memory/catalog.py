@@ -101,6 +101,9 @@ _MIGRATION_STATEMENTS = [
     "ALTER TABLE sources ADD COLUMN configured INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE sources ADD COLUMN sync_interval_minutes INTEGER",
     "ALTER TABLE sync_events ADD COLUMN kind TEXT NOT NULL DEFAULT 'sync'",
+    # RBAC (docs/plans/08): a user's role gates which parts of the API they may use.
+    # Existing single-user workspaces get 'admin' so nobody is locked out by the upgrade.
+    "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'admin'",
 ]
 
 
@@ -219,6 +222,34 @@ class _SqlCatalog:
                                              config_json=excluded.config_json""",
             (source_id, name, type_, json.dumps(options or {}), _now()),
         )
+        self._declare_aka_aliases(source_id, options)
+
+    def _declare_aka_aliases(self, source_id: str, options: dict | None) -> None:
+        """Persist a connector's declared "also known as" names (the `aka` option,
+        comma-separated string or list) as aliases on its source entity — feeding
+        `resolve_entity`, alias query expansion, autocomplete, AND the same_as identity
+        bridges (a declared alias is exactly the identity claim name-matching can't
+        discover: repo "Stevedore" aka "appriver.provisioning"). Runs at every sync
+        start via upsert_source, so edits apply on the next sync. Best-effort — an
+        alias failure must never break registering the source."""
+        raw = (options or {}).get("aka")
+        if not raw:
+            return
+        try:
+            from quickjoiner.ingest.pipeline import source_entity
+
+            akas = raw if isinstance(raw, list) else str(raw).split(",")
+            akas = [a.strip() for a in akas if a and a.strip()]
+            if not akas:
+                return
+            eid, ename, kind = source_entity(source_id)
+            # The entity may not exist until the first document lands — create it now so
+            # the aliases resolve immediately (gc keeps it once real edges cite it).
+            self.upsert_entity(eid, ename, kind, source_id)
+            for alias in akas:
+                self.add_entity_alias(alias, eid)
+        except Exception:  # noqa: BLE001
+            pass
 
     def list_sources(self) -> list[dict]:
         return self._read_all(
@@ -274,14 +305,48 @@ class _SqlCatalog:
         """Drop entities that participate in no edge — dangling graph nodes left behind
         after a purge/resync — and their aliases, keeping the graph's invariant that
         every node is part of at least one (cited) relationship. Returns count removed.
-        A node that a re-sync re-asserts with an edge simply comes back."""
+        A node that a re-sync re-asserts with an edge simply comes back.
+
+        `same_as` bridges are NOT evidence of existence (they are name-equality
+        inferences with no citing document — see ingest/bridges.py), so they neither
+        keep a node alive here nor survive their endpoints: dangling bridges are swept
+        after the orphans go."""
         orphan_ids = [r["id"] for r in self._read_all(
             "SELECT id FROM entities WHERE id NOT IN "
-            "(SELECT src FROM edges UNION SELECT dst FROM edges)")]
+            "(SELECT src FROM edges WHERE rel <> 'same_as' "
+            " UNION SELECT dst FROM edges WHERE rel <> 'same_as')")]
         for eid in orphan_ids:
             self._write("DELETE FROM entity_aliases WHERE entity_id = ?", (eid,))
             self._write("DELETE FROM entities WHERE id = ?", (eid,))
+        if orphan_ids:
+            self._write(
+                "DELETE FROM edges WHERE rel = 'same_as' AND ("
+                "src NOT IN (SELECT id FROM entities) OR "
+                "dst NOT IN (SELECT id FROM entities))")
         return len(orphan_ids)
+
+    def refresh_same_as_bridges(self) -> int:
+        """Recompute the deterministic cross-source identity bridges (ingest/bridges.py)
+        from the current entities table + their aliases (incl. the connectors' declared
+        "also known as" names). Full replace — the bridge layer is derived, so
+        recomputing after each ingest batch keeps it consistent with whatever entities
+        exist now (bridges to deleted entities simply don't come back). Returns the
+        number of bridges now in place."""
+        from quickjoiner.ingest.bridges import compute_same_as_bridges
+
+        entities = self._read_all("SELECT id, name, type FROM entities")
+        alias_rows = self._read_all("SELECT entity_id, alias FROM entity_aliases")
+        bridges = compute_same_as_bridges(
+            entities, [(r["entity_id"], r["alias"]) for r in alias_rows])
+        self._write("DELETE FROM edges WHERE rel = 'same_as'")
+        for src, rel, dst, detail in bridges:
+            self._write(
+                "INSERT INTO edges (src, rel, dst, evidence_doc_id, detail) "
+                "VALUES (?, ?, ?, '', ?) "
+                "ON CONFLICT (src, rel, dst, evidence_doc_id) DO NOTHING",
+                (src, rel, dst, detail),
+            )
+        return len(bridges)
 
     def clear_sync_state(self, source_id: str) -> None:
         """Forget a source's sync watermark so the next sync is a full pull."""
@@ -408,17 +473,20 @@ class _SqlCatalog:
         return len(rows)
 
     # -- users & auth tokens --------------------------------------------------
-    def create_user(self, username: str, password_hash: str) -> None:
+    def create_user(self, username: str, password_hash: str, role: str = "viewer") -> None:
         self._write(
-            "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
-            (username, password_hash, _now()),
+            "INSERT INTO users (username, password_hash, created_at, role) VALUES (?, ?, ?, ?)",
+            (username, password_hash, _now(), role),
         )
 
     def get_user(self, username: str) -> dict | None:
         return self._read_one("SELECT * FROM users WHERE username = ?", (username,))
 
+    def set_user_role(self, username: str, role: str) -> None:
+        self._write("UPDATE users SET role = ? WHERE username = ?", (role, username))
+
     def list_users(self) -> list[dict]:
-        return self._read_all("SELECT username, created_at FROM users ORDER BY username")
+        return self._read_all("SELECT username, created_at, role FROM users ORDER BY username")
 
     def count_users(self) -> int:
         row = self._read_one("SELECT COUNT(*) AS n FROM users")
@@ -783,6 +851,20 @@ class _SqlCatalog:
         ]
         if not seed_entities:
             return []
+        # Cross the deterministic identity bridges (ingest/bridges.py): a seed doc that
+        # evidences `service:connector` should also expand through `repo:connector`.
+        # Only the seed SET grows — the bridges themselves carry no evidence doc, so the
+        # `evidence_doc_id <> ''` filter below still guarantees every returned row is a
+        # real, citable document; the bridge is never itself presented as evidence.
+        sph = ",".join("?" for _ in seed_entities)
+        partners = [
+            r["e"] for r in self._read_all(
+                f"SELECT dst AS e FROM edges WHERE rel = 'same_as' AND src IN ({sph}) "
+                f"UNION SELECT src AS e FROM edges WHERE rel = 'same_as' AND dst IN ({sph})",
+                (*seed_entities, *seed_entities),
+            )
+        ]
+        seed_entities = list(dict.fromkeys([*seed_entities, *partners]))
         eph = ",".join("?" for _ in seed_entities)
         rows = self._read_all(
             f"""SELECT g.rel, g.evidence_doc_id AS doc_id, g.detail,
@@ -865,10 +947,23 @@ class _SqlCatalog:
         )
 
     def prune_sync_events(self, before: str) -> int:
-        """Drop runs older than `before` — this table is a rolling window, not an audit log."""
-        rows = self._read_all("SELECT id FROM sync_events WHERE started_at < ?", (before,))
-        self._write("DELETE FROM sync_events WHERE started_at < ?", (before,))
+        """Drop *finished* runs older than `before` — this table is a rolling window, not an
+        audit log. Unfinished rows (ended_at IS NULL) are never pruned: a deliberately-paused
+        sync must survive the laptop being closed for longer than the retention window so it
+        can still be resumed on the next startup (see `list_unfinished_syncs`)."""
+        rows = self._read_all(
+            "SELECT id FROM sync_events WHERE started_at < ? AND ended_at IS NOT NULL", (before,))
+        self._write(
+            "DELETE FROM sync_events WHERE started_at < ? AND ended_at IS NOT NULL", (before,))
         return len(rows)
+
+    def list_unfinished_syncs(self) -> list[dict]:
+        """Every sync run with no end recorded (`ended_at IS NULL`) — the rows a process left
+        behind when it exited. A `paused` one was a deliberate hold and is resumable after a
+        restart; a `running`/`stopping` one died mid-flight and is finalized as interrupted.
+        Drives `SyncManager.revive_paused`."""
+        return self._read_all(
+            "SELECT * FROM sync_events WHERE ended_at IS NULL ORDER BY started_at")
 
     # -- sync state -----------------------------------------------------------
     def get_sync_state(self, source_id: str) -> dict[str, str]:

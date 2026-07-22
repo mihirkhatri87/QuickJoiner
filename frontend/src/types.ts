@@ -4,7 +4,7 @@ export interface Status {
   stats: { sources: number; documents: number; chunks: number };
 }
 
-export type SyncState = "running" | "paused" | "stopping" | "stopped" | "done" | "error" | "interrupted";
+export type SyncState = "running" | "paused" | "retrying" | "stopping" | "stopped" | "done" | "error" | "interrupted";
 
 export interface SyncJob {
   id: string;
@@ -76,6 +76,13 @@ export type SettingDefaults = Pick<Settings, "llm" | "embedding" | "retrieval" |
 export interface AuthStatus {
   enabled: boolean;
   user: string | null;
+  role: string; // admin | editor | viewer (admin in open mode)
+}
+
+export interface UserRow {
+  username: string;
+  created_at: string;
+  role: string;
 }
 
 export interface SourceRow {
@@ -109,6 +116,9 @@ export interface ConnectorField {
   placeholder: string;
   help: string;
   list: boolean;
+  /** Editable only before the connector's first sync (0 documents) — same rule as the
+   * connector name. Enforced server-side; the edit form renders it disabled after. */
+  lock_after_sync?: boolean;
 }
 export interface ConnectorType {
   type: string;

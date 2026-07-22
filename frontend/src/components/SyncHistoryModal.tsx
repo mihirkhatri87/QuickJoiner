@@ -7,6 +7,7 @@ import { cn } from "./ui";
 const TONE: Record<string, { dot: string; label: string }> = {
   running: { dot: "bg-accent animate-pulse", label: "syncing" },
   paused: { dot: "bg-gold", label: "paused" },
+  retrying: { dot: "bg-gold animate-pulse", label: "retrying" },
   stopping: { dot: "bg-accent animate-pulse", label: "stopping" },
   done: { dot: "bg-gold", label: "completed" },
   error: { dot: "bg-danger", label: "failed" },
@@ -23,7 +24,8 @@ function ago(iso: string | null): string {
   return `${Math.floor(s / 86400)}d ago`;
 }
 
-const isLive = (n: SyncJob) => n.state === "running" || n.state === "paused" || n.state === "stopping";
+const isLive = (n: SyncJob) =>
+  n.state === "running" || n.state === "paused" || n.state === "retrying" || n.state === "stopping";
 
 function runLine(n: SyncJob): string {
   if (isLive(n)) return n.phase ? `${n.phase}${n.percent != null ? ` · ${n.percent}%` : ""}` : "in progress";

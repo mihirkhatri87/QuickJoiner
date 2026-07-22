@@ -147,6 +147,16 @@ class IngestPipeline:
                 stats.errors.append(f"{doc.uri}: {exc}")
         if pending:
             self._resolve_pending_triples(pending, source_id, control)
+        if stats.added or stats.updated:
+            # Recompute the derived cross-source identity bridges (ingest/bridges.py) now
+            # that this batch's entities are in — cheap (O(entities)), idempotent, and
+            # best-effort: the bridge layer is an enrichment, never worth failing a sync.
+            refresh = getattr(self._catalog, "refresh_same_as_bridges", None)
+            if refresh is not None:
+                try:
+                    refresh()
+                except Exception:  # noqa: BLE001
+                    pass
         if stats.chunks:
             ensure_index = getattr(self._store, "ensure_ann_index", None)
             if ensure_index is not None:

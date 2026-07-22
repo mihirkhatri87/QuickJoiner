@@ -33,6 +33,7 @@ def _load_builtin_connectors() -> None:
         gitlab,
         jira,
         octopus,
+        self_connector,
     )
     from quickjoiner.connectors.browser import scraper  # noqa: F401
     from quickjoiner.connectors.logsearch import (  # noqa: F401

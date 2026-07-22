@@ -575,6 +575,28 @@ def test_rename_connector_to_taken_name_conflicts(client):
     assert client.patch("/api/connectors/handbook", json={"name": "ghrepo"}).status_code == 409
 
 
+def test_aka_editable_before_first_sync_locked_after(client):
+    """`aka` (lock_after_sync in FORM_SPECS) follows the connector-name rule: free to set
+    while 0 documents, 409 once anything has been ingested — an alias removal could not be
+    applied consistently after the fact."""
+    r = client.patch("/api/connectors/handbook", json={"options": {"aka": "playbook, the-handbook"}})
+    assert r.status_code == 200 and r.json()["options"]["aka"] == "playbook, the-handbook"
+
+    client.post("/api/sync/handbook")
+    _wait_sync(client, "handbook")
+
+    # Changing it after the sync is refused…
+    r = client.patch("/api/connectors/handbook", json={"options": {"aka": "different"}})
+    assert r.status_code == 409 and "before the first sync" in r.json()["detail"]
+    # …but the edit form re-sending the UNCHANGED value (it submits every field, possibly
+    # re-formatted as a list) must still save fine.
+    assert client.patch("/api/connectors/handbook",
+                        json={"options": {"aka": ["the-handbook", "playbook"]}}).status_code == 200
+    # And the declared alias actually resolved to the source entity during the sync.
+    hits = client.get("/api/graph/search", params={"q": "playbook"}).json()
+    assert any(h["id"] == "repo:handbook" for h in hits)
+
+
 def test_patch_connector_edits_options_schedule_and_merges(client):
     """The edit-connector modal saves via PATCH options: update fields, keep a secret
     sent back as its mask, preserve untouched fields, set the schedule, and remove a
@@ -604,7 +626,7 @@ def test_patch_connector_edits_options_schedule_and_merges(client):
 # -- SSE chat ----------------------------------------------------------------
 
 def test_chat_streams_tool_calls_and_answer(client, monkeypatch):
-    def fake_build_agent(self, provider_override=None, model_override=None, extra_system=None, sources=None):
+    def fake_build_agent(self, provider_override=None, model_override=None, extra_system=None, sources=None, user=None, role=None):
         from quickjoiner.agent.agent import OnboardingAgent
 
         provider = ScriptedProvider(
@@ -637,7 +659,7 @@ def test_chat_forwards_candidates_event(client, monkeypatch):
         "1. Weekly cadence | confidence=0.80 | sources: EchoDoc\n```"
     )
 
-    def fake_build_agent(self, provider_override=None, model_override=None, extra_system=None, sources=None):
+    def fake_build_agent(self, provider_override=None, model_override=None, extra_system=None, sources=None, user=None, role=None):
         from quickjoiner.agent.agent import OnboardingAgent
 
         provider = ScriptedProvider([
@@ -665,7 +687,7 @@ def test_chat_forwards_candidates_event(client, monkeypatch):
 def test_chat_reuses_session_history(client, monkeypatch):
     providers: list[ScriptedProvider] = []
 
-    def fake_build_agent(self, provider_override=None, model_override=None, extra_system=None, sources=None):
+    def fake_build_agent(self, provider_override=None, model_override=None, extra_system=None, sources=None, user=None, role=None):
         from quickjoiner.agent.agent import OnboardingAgent
 
         provider = ScriptedProvider([ChatResult(text=f"answer {len(providers)}")])
@@ -692,7 +714,7 @@ def test_chat_provider_failure_becomes_error_event(client, monkeypatch):
 
 
 def test_chat_session_persists_across_app_restarts(api_workspace, monkeypatch):
-    def fake_build_agent(self, provider_override=None, model_override=None, extra_system=None, sources=None):
+    def fake_build_agent(self, provider_override=None, model_override=None, extra_system=None, sources=None, user=None, role=None):
         from quickjoiner.agent.agent import OnboardingAgent
 
         return OnboardingAgent(ScriptedProvider([ChatResult(text="persisted answer")]), [], system="sys")
@@ -717,7 +739,7 @@ def test_projects_and_sessions_endpoints(client, monkeypatch):
     ).json()
     assert project["id"] == "payments-ramp-up"
 
-    def fake_build_agent(self, provider_override=None, model_override=None, extra_system=None, sources=None):
+    def fake_build_agent(self, provider_override=None, model_override=None, extra_system=None, sources=None, user=None, role=None):
         from quickjoiner.agent.agent import OnboardingAgent
 
         fake_build_agent.last_system = extra_system
@@ -736,7 +758,7 @@ def test_projects_and_sessions_endpoints(client, monkeypatch):
 
 
 def test_delete_sessions_endpoints(client, monkeypatch):
-    def fake_build_agent(self, provider_override=None, model_override=None, extra_system=None, sources=None):
+    def fake_build_agent(self, provider_override=None, model_override=None, extra_system=None, sources=None, user=None, role=None):
         from quickjoiner.agent.agent import OnboardingAgent
 
         return OnboardingAgent(ScriptedProvider([ChatResult(text="ok")]), [], system="sys")

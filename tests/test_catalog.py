@@ -58,7 +58,8 @@ def test_sync_events_upsert_list_and_prune(catalog):
     )
     catalog.record_sync_event("sync-2-def", "tickets", "error", True, "2026-07-20T11:00:00+00:00",
                               ended_at="2026-07-20T11:00:30+00:00", error="401 from the broker")
-    catalog.record_sync_event("sync-0-old", "handbook", "done", False, "2026-07-01T09:00:00+00:00")
+    catalog.record_sync_event("sync-0-old", "handbook", "done", False, "2026-07-01T09:00:00+00:00",
+                              ended_at="2026-07-01T09:05:00+00:00")
 
     recent = catalog.list_sync_events("2026-07-20T00:00:00+00:00")
     assert [r["id"] for r in recent] == ["sync-2-def", "sync-1-abc"]  # newest first
@@ -75,3 +76,20 @@ def test_sync_events_upsert_list_and_prune(catalog):
 
     assert catalog.prune_sync_events("2026-07-20T00:00:00+00:00") == 1  # only the July 1 run
     assert len(catalog.list_sync_events("2000-01-01T00:00:00+00:00")) == 2
+
+
+def test_prune_never_drops_an_unfinished_paused_run(catalog):
+    """A deliberately-paused sync (ended_at IS NULL) must survive the retention window so it
+    can be resumed after a restart, however long the laptop was closed. list_unfinished_syncs
+    is what revive_paused reads to find it."""
+    catalog.record_sync_event("sync-paused-old", "handbook", "paused", False,
+                              "2020-01-01T00:00:00+00:00")  # no ended_at => unfinished
+    catalog.record_sync_event("sync-done-old", "tickets", "done", False,
+                              "2020-01-01T00:00:00+00:00", ended_at="2020-01-01T00:05:00+00:00")
+
+    pruned = catalog.prune_sync_events("2026-07-20T00:00:00+00:00")
+    assert pruned == 1  # the finished old run went; the paused one stayed
+
+    unfinished = catalog.list_unfinished_syncs()
+    assert [r["id"] for r in unfinished] == ["sync-paused-old"]
+    assert unfinished[0]["state"] == "paused"

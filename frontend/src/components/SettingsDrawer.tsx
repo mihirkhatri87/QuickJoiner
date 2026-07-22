@@ -14,7 +14,7 @@ import {
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { api, token } from "../api";
-import type { AuthStatus, ConnectorRow, ConnectorType, SettingDefaults, Settings, SyncJob } from "../types";
+import type { AuthStatus, ConnectorRow, ConnectorType, SettingDefaults, Settings, SyncJob, UserRow } from "../types";
 import { EditConnectorModal } from "./EditConnectorModal";
 import { Button, cn, Field, IconButton, schedLabel, Select, SYNC_OPTIONS, TextInput } from "./ui";
 
@@ -49,7 +49,7 @@ export function SettingsDrawer({
   /** Opens the shared sync log viewer (owned by App, so it outlives this drawer). */
   onOpenSync: (source: string, clean: boolean, autoStart?: boolean, kind?: "sync" | "cleanup") => void;
 }) {
-  const [auth, setAuth] = useState<AuthStatus>({ enabled: false, user: null });
+  const [auth, setAuth] = useState<AuthStatus>({ enabled: false, user: null, role: "viewer" });
   const [status, setStatus] = useState("");
   const [statusOk, setStatusOk] = useState(true);
 
@@ -57,7 +57,7 @@ export function SettingsDrawer({
     try {
       setAuth(await api.authStatus());
     } catch {
-      setAuth({ enabled: false, user: null });
+      setAuth({ enabled: false, user: null, role: "viewer" });
     }
   };
   useEffect(() => {
@@ -121,10 +121,12 @@ export function SettingsDrawer({
                         syncJobs={syncJobs} onOpenSync={onOpenSync} />
           </Section>
 
-          <Section title="Danger zone">
-            <DangerZone open={open} locked={auth.enabled && !auth.user} onFlash={flash}
-                        onChanged={onChanged} onOpenSync={onOpenSync} />
-          </Section>
+          {auth.role === "admin" && (
+            <Section title="Danger zone">
+              <DangerZone open={open} locked={auth.enabled && !auth.user} onFlash={flash}
+                          onChanged={onChanged} onOpenSync={onOpenSync} />
+            </Section>
+          )}
         </div>
       </aside>
     </>
@@ -377,12 +379,12 @@ function Account({
       onFlash(String((e as Error).message), false);
     }
   };
-  const createUser = async (u: string, p: string, thenLogin: boolean) => {
+  const createUser = async (u: string, p: string, thenLogin: boolean, role?: string) => {
     try {
-      await api.createUser(u, p);
+      await api.createUser(u, p, role);
       if (thenLogin) await login(u, p);
       else {
-        onFlash(`User ${u} created`);
+        onFlash(`User ${u} created${role ? ` (${role})` : ""}`);
         onChanged();
       }
     } catch (e) {
@@ -422,7 +424,12 @@ function Account({
           {auth.user[0]}
         </span>
         <div>
-          <div className="text-[14px] font-semibold">{auth.user}</div>
+          <div className="text-[14px] font-semibold">
+            {auth.user}
+            <span className="ml-2 rounded-full bg-accent-soft px-2 py-0.5 align-middle text-[10px] font-semibold uppercase tracking-wide text-accent">
+              {auth.role}
+            </span>
+          </div>
           <div className="text-[12px] text-muted">Signed in</div>
         </div>
         <Button
@@ -437,15 +444,99 @@ function Account({
           Sign out
         </Button>
       </div>
-      <details className="mt-3">
-        <summary className="cursor-pointer text-[11.5px] font-semibold uppercase tracking-[0.08em] text-muted">
-          Add a user
-        </summary>
-        <div className="mt-3">
-          <CredForm label="Create user" onSubmit={(u, p) => createUser(u, p, false)} />
-        </div>
-      </details>
+      {auth.role === "admin" && <PeopleAccess onFlash={onFlash} />}
     </div>
+  );
+}
+
+/* ---------- People & access (admin only, plan 08 RBAC) ---------- */
+const ROLES = ["admin", "editor", "viewer"];
+
+function PeopleAccess({ onFlash }: { onFlash: (m: string, ok?: boolean) => void }) {
+  const [users, setUsers] = useState<UserRow[]>([]);
+  const [nu, setNu] = useState("");
+  const [np, setNp] = useState("");
+  const [nr, setNr] = useState("viewer");
+
+  const load = async () => {
+    try {
+      setUsers(await api.listUsers());
+    } catch {
+      /* non-admins can't list; the panel isn't rendered for them anyway */
+    }
+  };
+  useEffect(() => {
+    void load();
+  }, []);
+
+  const changeRole = async (username: string, role: string) => {
+    try {
+      await api.setUserRole(username, role);
+      onFlash(`${username} is now ${role}`);
+      void load();
+    } catch (e) {
+      onFlash(String((e as Error).message), false);
+    }
+  };
+  const add = async () => {
+    if (!nu.trim() || np.length < 4) {
+      onFlash("Username required and password ≥ 4 chars", false);
+      return;
+    }
+    try {
+      await api.createUser(nu.trim(), np, nr);
+      onFlash(`User ${nu.trim()} created (${nr})`);
+      setNu("");
+      setNp("");
+      void load();
+    } catch (e) {
+      onFlash(String((e as Error).message), false);
+    }
+  };
+
+  return (
+    <details className="mt-3" open>
+      <summary className="cursor-pointer text-[11.5px] font-semibold uppercase tracking-[0.08em] text-muted">
+        People &amp; access
+      </summary>
+      <p className="mt-2 text-[11.5px] leading-relaxed text-muted">
+        Roles gate what each person can do: <b className="text-ink">admin</b> everything incl. settings,
+        memory reset and user management; <b className="text-ink">editor</b> connects sources, syncs and
+        teaches; <b className="text-ink">viewer</b> reads and asks only.
+      </p>
+      <div className="mt-3 space-y-1.5">
+        {users.map((u) => (
+          <div key={u.username} className="flex items-center gap-2 rounded-lg bg-fill2 px-3 py-2">
+            <span className="text-[13px] font-medium">{u.username}</span>
+            <Select className="ml-auto w-28" value={u.role} onChange={(e) => changeRole(u.username, e.target.value)}>
+              {ROLES.map((r) => (
+                <option key={r} value={r}>
+                  {r}
+                </option>
+              ))}
+            </Select>
+          </div>
+        ))}
+      </div>
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <TextInput className="w-32" placeholder="username" value={nu} onChange={(e) => setNu(e.target.value)} />
+        <TextInput
+          className="w-32"
+          type="password"
+          placeholder="password"
+          value={np}
+          onChange={(e) => setNp(e.target.value)}
+        />
+        <Select className="w-24" value={nr} onChange={(e) => setNr(e.target.value)}>
+          {ROLES.map((r) => (
+            <option key={r} value={r}>
+              {r}
+            </option>
+          ))}
+        </Select>
+        <Button onClick={add}>Add user</Button>
+      </div>
+    </details>
   );
 }
 
@@ -814,11 +905,15 @@ function Connectors({
           QuickJoiner learns from them.
         </p>
       ) : (
-        rows.map((c) => (
-          <ConnectorPlate key={c.name} c={c} types={types} auth={auth} reload={() => { load(); onChanged(); }}
-                          onOpenArtifact={onOpenArtifact}
-                          job={syncJobs.find((j) => j.source === c.name)} onOpenSync={onOpenSync} />
-        ))
+        rows.map((c) =>
+          c.type === "quickjoiner" ? (
+            <ControlPlate key={c.name} />
+          ) : (
+            <ConnectorPlate key={c.name} c={c} types={types} auth={auth} reload={() => { load(); onChanged(); }}
+                            onOpenArtifact={onOpenArtifact}
+                            job={syncJobs.find((j) => j.source === c.name)} onOpenSync={onOpenSync} />
+          ),
+        )
       )}
       {auth.enabled && !auth.user ? (
         <p className="mt-2 text-[12.5px] text-muted">Sign in above to add or manage connectors.</p>
@@ -836,6 +931,33 @@ function Crumb({ onClick, children }: { onClick: () => void; children: React.Rea
     <button onClick={onClick} className="mb-3.5 inline-flex items-center gap-1.5 rounded-full bg-fill px-3 py-1.5 text-[11.5px] font-medium text-muted transition hover:bg-fill2 hover:text-ink">
       <ChevronLeft size={12} /> {children}
     </button>
+  );
+}
+
+/** The permanent QuickJoiner control connector (plan 08): shown as a plate, but it holds no
+ * data and can't be synced/edited/deleted — its capability is the `/qj` natural-language
+ * control of QuickJoiner's own API, gated by your role. */
+function ControlPlate() {
+  return (
+    <div className="mb-2.5 rounded-xl border border-line/60 bg-fill/60 p-3.5">
+      <div className="flex items-center gap-2">
+        <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-accent-soft text-accent">
+          <Gear size={15} />
+        </span>
+        <div className="min-w-0">
+          <div className="flex items-center gap-2 text-[13.5px] font-semibold">
+            QuickJoiner control
+            <Lock size={11} className="text-muted" />
+          </div>
+          <div className="text-[11.5px] text-muted">Permanent · not ingested</div>
+        </div>
+      </div>
+      <p className="mt-2 text-[11.5px] leading-relaxed text-muted">
+        Control QuickJoiner in plain language from chat with{" "}
+        <code className="font-mono text-[10.5px] text-gold">/qj</code> — connect sources, sync,
+        teach, tune settings, manage access. What you can do follows your role.
+      </p>
+    </div>
   );
 }
 
@@ -863,7 +985,8 @@ function ConnectorPlate({
   const [armedWipe, setArmedWipe] = useState(false);
   const [editing, setEditing] = useState(false);
   const paused = job?.state === "paused";
-  const syncing = job?.state === "running" || job?.state === "stopping" || paused;
+  const retrying = job?.state === "retrying";
+  const syncing = job?.state === "running" || job?.state === "stopping" || paused || retrying;
   const ctype = types.find((t) => t.type === c.type);
   const label = ctype?.label ?? c.type;
   const isRepo = c.type === "git" || c.type === "files";
@@ -898,17 +1021,24 @@ function ConnectorPlate({
             title="Open the live sync log"
             className={cn(
               "flex flex-shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 font-mono text-[9px] uppercase tracking-[0.12em] transition hover:brightness-110",
-              paused ? "bg-gold-soft text-gold" : "bg-accent-soft text-accent",
+              paused || retrying ? "bg-gold-soft text-gold" : "bg-accent-soft text-accent",
             )}
           >
-            <span className={cn("h-[6px] w-[6px] rounded-full", paused ? "bg-gold" : "animate-pulse bg-accent")} />
+            <span
+              className={cn(
+                "h-[6px] w-[6px] rounded-full",
+                paused ? "bg-gold" : retrying ? "animate-pulse bg-gold" : "animate-pulse bg-accent",
+              )}
+            />
             {paused
               ? "paused"
-              : job?.state === "stopping"
-                ? "stopping"
-                : job?.kind === "cleanup"
-                  ? "cleaning"
-                  : "syncing"}
+              : retrying
+                ? "retrying"
+                : job?.state === "stopping"
+                  ? "stopping"
+                  : job?.kind === "cleanup"
+                    ? "cleaning"
+                    : "syncing"}
           </button>
         )}
         <span

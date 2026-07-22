@@ -19,9 +19,14 @@ from quickjoiner.connectors.registry import CONNECTOR_TYPES, _load_builtin_conne
 
 def _f(key: str, label: str, *, required: bool = False, secret: bool = False,
        env: str | None = None, placeholder: str = "", help: str = "",
-       list_: bool = False) -> dict:
+       list_: bool = False, lock_after_sync: bool = False) -> dict:
+    # lock_after_sync: editable only while the connector has 0 learned documents (same
+    # rule as the connector name) — for identity-shaping fields whose edits could not be
+    # applied consistently to already-ingested data. Enforced server-side in the PATCH
+    # endpoint and rendered disabled (with the reason) in the edit form.
     return {"key": key, "label": label, "required": required, "secret": secret,
-            "env": env, "placeholder": placeholder, "help": help, "list": list_}
+            "env": env, "placeholder": placeholder, "help": help, "list": list_,
+            "lock_after_sync": lock_after_sync}
 
 
 FORM_SPECS: dict[str, dict] = {
@@ -31,6 +36,11 @@ FORM_SPECS: dict[str, dict] = {
         "suggests": ["Give me a quick onboarding overview.", "What are the main systems in this org?"],
         "fields": [
             _f("path", "Folder or file path", required=True, placeholder="D:\\docs\\team-wiki"),
+            _f("aka", "Also known as", list_=True, lock_after_sync=True,
+               placeholder="provisioning, stevedore-svc",
+               help="Other names this system goes by (comma-separated) — powers alias search "
+                    "and links it to same-named services/pipelines in the knowledge graph. "
+                    "Editable only until the first sync."),
         ],
     },
     "git": {
@@ -44,6 +54,11 @@ FORM_SPECS: dict[str, dict] = {
             _f("token", "Access token", secret=True, env="GIT_TOKEN",
                help="GitLab tokens need the oauth2: prefix, e.g. oauth2:glpat-…"),
             _f("branch", "Branch", placeholder="main"),
+            _f("aka", "Also known as", list_=True, lock_after_sync=True,
+               placeholder="appriver.provisioning, stevedore",
+               help="Other names this repo goes by (comma-separated) — powers alias search "
+                    "and links it to same-named services/pipelines in the knowledge graph. "
+                    "Editable only until the first sync."),
         ],
     },
     "github": {
@@ -200,6 +215,22 @@ FORM_SPECS: dict[str, dict] = {
         ],
     },
 }
+
+# "Also known as" applies to EVERY connected system, not just repos: declare the other
+# names it goes by (comma-separated). It always powers alias search / query expansion /
+# autocomplete for that source, and drives the `same_as` identity bridges wherever the
+# source maps to a bridgeable entity (code repos, services, pipelines, projects). Same
+# editability rule as the connector name (lock_after_sync). Appended here to every type so
+# it's universal and consistent — git/files above already carry a tailored copy, which the
+# guard preserves.
+for _spec in FORM_SPECS.values():
+    if not any(f["key"] == "aka" for f in _spec["fields"]):
+        _spec["fields"].append(_f(
+            "aka", "Also known as", list_=True, lock_after_sync=True,
+            placeholder="other-name, legacy-name",
+            help="Other names this system goes by (comma-separated) — powers alias search "
+                 "and links it to same-named entities in the knowledge graph. Editable only "
+                 "until the first sync."))
 
 _MODE_LETTERS = [
     (Mode.PULL, "pull"), (Mode.PUSH, "hooks"), (Mode.LIVE, "live"),

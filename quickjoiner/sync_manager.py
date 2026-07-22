@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator
 
+from quickjoiner.connectors.util import is_transient_network_error
 from quickjoiner.sync_control import SyncControl, SyncStopped
 
 _MAX_LOG_LINES = 500
@@ -36,6 +37,16 @@ _HEARTBEAT_SECONDS = 20  # "still syncing…" cadence while a connector is mid-p
 _DONE = object()  # sentinel pushed to subscribers when a job ends
 _HISTORY_RETENTION_DAYS = 7  # rolling window kept in sync_events (UI asks for 24h of it)
 RESET_SOURCE = "all memory"  # sentinel "source" name for the workspace-wide memory-reset job
+
+# Self-healing auto-retry on a transient NETWORK failure mid-sync. A raised exception kills
+# the connector's generator (a Python generator can't resume past a raise), so "resume" means
+# re-invoking connector.sync(state) from the un-advanced watermark — idempotent hash-dedupe
+# skips the already-ingested docs. Backoff doubles from 20s and we keep retrying for up to an
+# hour after the first network failure; after the budget is spent the job parks in a real
+# paused state (thread blocked on the gate) until a manual Resume (which restarts the budget)
+# or Stop. Only network-classified errors retry — auth/config/code errors fail immediately.
+_RETRY_INITIAL_BACKOFF = 20.0  # seconds; first wait after a network failure (then 40, 80, …)
+_RETRY_MAX_WINDOW = 3600.0  # keep auto-retrying for up to this long after the first failure
 
 
 def _now() -> str:
@@ -53,10 +64,13 @@ class SyncJob:
     id: str
     source_name: str
     source_id: str
-    state: str = "running"  # running | paused | stopping | stopped | done | error
+    state: str = "running"  # running | paused | retrying | stopping | stopped | done | error
     kind: str = "sync"  # sync | cleanup (a purge with no re-pull)
     clean: bool = False
     cleanup_on_stop: bool = False
+    # A paused sync reconstructed after a process restart (see revive_paused): no live worker
+    # holds it, so resume must re-spawn from the watermark rather than releasing a gate.
+    cold: bool = False
     logs: list[str] = field(default_factory=list)
     stats: dict[str, Any] | None = None
     error: str | None = None
@@ -123,13 +137,15 @@ class SyncManager:
             return [j.summary() for j in self._jobs.values()]
 
         live = {j.id: j for j in self._jobs.values()}
+        seen: set[str] = set()
         out: list[dict[str, Any]] = []
         for r in rows:
+            seen.add(r["id"])
             job = live.get(r["id"])
             if job is not None:
                 out.append({**job.summary(), "live": True})
                 continue
-            stale = r["state"] in ("running", "paused", "stopping")
+            stale = r["state"] in ("running", "paused", "stopping", "retrying")
             out.append({
                 "id": r["id"], "source": r["source"],
                 "state": "interrupted" if stale else r["state"],
@@ -140,7 +156,13 @@ class SyncManager:
                 "started_at": r["started_at"], "ended_at": r["ended_at"],
                 "log_lines": 0, "live": False,
             })
-        return out
+        # An in-flight job whose start predates the window (e.g. a sync paused before the
+        # laptop was closed for days, then revived on restart) won't be in `rows` — surface it
+        # anyway so the UI never loses a resumable/active job to the retention horizon.
+        extra = [j.summary() | {"live": True} for j in self._jobs.values()
+                 if j.id not in seen and j.state in ("running", "paused", "stopping", "retrying")]
+        extra.sort(key=lambda s: s["started_at"], reverse=True)
+        return extra + out
 
     def _record(self, job: SyncJob) -> None:
         """Persist the job's current state to the 24h history. Best-effort: the history
@@ -154,15 +176,55 @@ class SyncManager:
             pass
 
     def is_running(self, source_name: str) -> bool:
-        """True when a job owns this source — including a paused one. Guards double-start
-        and delete/cleanup: a paused sync still holds the source, it's just not moving."""
+        """True when a job owns this source — including a paused or auto-retrying one. Guards
+        double-start and delete/cleanup: a paused/retrying sync still holds the source, it's
+        just not moving."""
         j = self._jobs.get(source_name)
-        return bool(j and j.state in ("running", "paused", "stopping"))
+        return bool(j and j.state in ("running", "paused", "stopping", "retrying"))
 
     def active_sources(self) -> list[str]:
-        """Every source with a job currently in flight (running/paused/stopping)."""
+        """Every source with a job currently in flight (running/paused/stopping/retrying)."""
         return sorted(j.source_name for j in self._jobs.values()
-                      if j.state in ("running", "paused", "stopping"))
+                      if j.state in ("running", "paused", "stopping", "retrying"))
+
+    def revive_paused(self) -> int:
+        """Reconstruct deliberately-paused syncs left by a previous process, so pause→resume
+        survives the worker being killed / the laptop being closed in between. Call once at
+        startup.
+
+        A killed process loses the in-memory generator, so a revived pause can't literally
+        continue — instead it is re-attached as a **cold** paused job that, on Resume, re-runs
+        the connector from the un-advanced watermark (idempotent dedupe skips already-ingested
+        docs). It does NOT auto-resume: the pause was deliberate, so it waits for the user.
+        Every other unfinished row (a run that died mid-flight, or a paused one whose config is
+        gone) is finalized as `interrupted` so it becomes terminal history and isn't re-examined
+        on the next startup. Best-effort — a failure here must never block server startup."""
+        try:
+            rows = self.ctx.catalog.list_unfinished_syncs()
+        except Exception:  # noqa: BLE001
+            return 0
+        revived = 0
+        with self._lock:
+            for r in rows:
+                name, kind = r["source"], (r.get("kind") or "sync")
+                source = next((s for s in self.ctx.config.sources if s.name == name), None)
+                if r["state"] == "paused" and kind == "sync" and source is not None \
+                        and name not in self._jobs:
+                    job = SyncJob(id=r["id"], source_name=name,
+                                  source_id=f"{source.type}:{source.name}", state="paused",
+                                  kind=kind, cold=True, started_at=r["started_at"])
+                    job.gate.clear()  # held until the user resumes
+                    job.phase = "paused before shutdown — resume to continue"
+                    self._jobs[name] = job
+                    revived += 1
+                else:
+                    try:  # close the dangling row so it stops showing as unfinished
+                        self.ctx.catalog.record_sync_event(
+                            r["id"], name, "interrupted", bool(r["clean"]),
+                            r["started_at"], _now(), None, r["error"] or None, kind)
+                    except Exception:  # noqa: BLE001
+                        pass
+        return revived
 
     # -- control --------------------------------------------------------------
     def start(self, source_name: str, clean: bool = False) -> SyncJob:
@@ -279,20 +341,67 @@ class SyncManager:
         job = self._jobs.get(source_name)
         if job is None or job.state != "paused":
             raise RuntimeError(f"No paused sync to resume for {source_name!r}")
+        if job.cold:
+            return self._resume_cold(job)  # revived after a restart — re-spawn a worker
         job.state = "running"
         job.gate.set()  # wakes the worker blocked in _wait_if_paused
         self._log(job, "▶ resume requested")
         self._record(job)
         return job
 
+    def _resume_cold(self, job: SyncJob) -> SyncJob:
+        """Resume a sync that was paused in an earlier process (the laptop was closed / the
+        server restarted between pause and resume). No live worker holds it, so this re-runs
+        the connector from the un-advanced watermark on a fresh thread — idempotent hash-dedupe
+        skips the docs the earlier run already committed. It's the same re-pull model as the
+        network auto-retry; `clean=False` so an original clean sync (whose purge already ran
+        before it paused) never re-purges."""
+        with self._lock:
+            if not job.cold:  # a concurrent resume already re-spawned the worker
+                raise RuntimeError(f"A sync is already resuming for {job.source_name!r}")
+            source = next((s for s in self.ctx.config.sources if s.name == job.source_name), None)
+            if source is None:
+                job.state, job.error, job.ended_at = "error", "source no longer configured", _now()
+                self._record(job)
+                self._jobs.pop(job.source_name, None)
+                raise RuntimeError(f"{job.source_name!r} is no longer configured")
+            from quickjoiner.connectors.registry import create_connector
+
+            connector = create_connector(source, self.ctx.workspace)
+            job.source_id = connector.source_id
+            job.cold = False
+            job.clean = False
+            job.cancel = threading.Event()
+            job.gate = _set_event()
+            job.state = "running"
+            job.phase, job.phase_done, job.phase_total = "", None, None
+        self._record(job)
+        self._log(job, "▶ resuming after restart — re-running from the last checkpoint "
+                       "(already-ingested items are skipped)")
+        threading.Thread(target=self._run, args=(job, source, connector), daemon=True).start()
+        return job
+
     def stop(self, source_name: str, cleanup: bool = False) -> SyncJob:
         job = self._jobs.get(source_name)
-        if job is None or job.state not in ("running", "paused", "stopping"):
+        if job is None or job.state not in ("running", "paused", "stopping", "retrying"):
             raise RuntimeError(f"No running sync for {source_name!r}")
+        if job.cold:
+            # A revived pause has no worker to signal — finalize it here (there is no partial
+            # in-memory pull; `cleanup` still purges what the earlier run had committed).
+            job.cancel.set()
+            job.state = "stopped"
+            if cleanup:
+                self._purge(job)
+            job.ended_at = _now()
+            self._log(job, "⏹ paused sync discarded"
+                      + (" — cleaned up its partial data." if cleanup else "."))
+            self._record(job)
+            self._close(job)
+            return job
         job.cleanup_on_stop = cleanup
         job.state = "stopping"
         job.cancel.set()
-        job.gate.set()  # a paused worker must wake to observe the cancel
+        job.gate.set()  # a paused/retrying worker must wake to observe the cancel
         self._log(job, "⏹ stop requested" + (" — will clean up partial data" if cleanup else ""))
         return job
 
@@ -318,7 +427,7 @@ class SyncManager:
             with job.lock:
                 for line in job.logs:  # replay backlog so a late viewer sees the whole run
                     q.put_nowait(line)
-                if job.state in ("running", "paused", "stopping"):
+                if job.state in ("running", "paused", "stopping", "retrying"):
                     job.subscribers.append(q)
                 else:
                     q.put_nowait(_DONE)
@@ -363,34 +472,121 @@ class SyncManager:
                 self._log(job, f"  · {job.ingested}: {getattr(doc, 'title', '')[:72]}")
             yield doc
 
+    def _progress_line(self, job: SyncJob) -> str:
+        """A truthful 'where are we now' for the heartbeat. Once the document pull finishes and
+        the pipeline moves into the graph-relationships drain (or any other non-yielding phase),
+        `job.ingested` stops changing — so leading with the doc count alone reads as "stuck on
+        the same document". When the connector/pipeline is reporting a phase (`job.phase`, e.g.
+        `graph relationships 56/3091` or `work items · Team A`), surface *that* + its progress,
+        which is what's actually advancing; fall back to the running doc count only when no phase
+        is being reported."""
+        if job.phase:
+            pct = job.percent()
+            prog = f" {job.phase_done}/{job.phase_total}" if job.phase_total else ""
+            pctstr = f" · {pct}%" if pct is not None else ""
+            return f"{job.ingested} documents · {job.phase}{prog}{pctstr}"
+        return f"still syncing — {job.ingested} documents so far"
+
     def _heartbeat(self, job: SyncJob, stop: threading.Event) -> None:
-        """Emit a 'still syncing' line on a timer so long connector-internal phases
-        (e.g. walking many empty teams before the first document) don't look hung.
-        Stays quiet-but-honest while paused rather than claiming progress."""
+        """Emit a progress line on a timer so long connector-internal phases (walking many empty
+        teams before the first document, or draining thousands of graph relationships after the
+        pull) don't look hung — and report what's *actually* moving (see `_progress_line`), not a
+        frozen doc count. Stays quiet-but-honest while paused rather than claiming progress."""
         start = time.monotonic()
         while not stop.wait(_HEARTBEAT_SECONDS):
+            if job.state == "retrying":
+                continue  # the auto-retry loop logs its own "retrying in Ns" countdown
             if not job.gate.is_set():
                 self._log(job, f"⏸ paused — {job.ingested} documents ingested, waiting to resume")
             else:
                 elapsed = int(time.monotonic() - start)
-                self._log(job, f"⏳ still syncing — {job.ingested} documents so far ({elapsed}s)")
+                self._log(job, f"⏳ {self._progress_line(job)} ({elapsed}s)")
+
+    def _pull_with_auto_retry(self, job: SyncJob, connector: Any, control: SyncControl):
+        """Run one pull+ingest, auto-retrying on a transient NETWORK failure.
+
+        A raised exception kills the connector's generator (generators can't resume past a
+        raise), so a retry re-invokes `connector.sync(state)` from the un-advanced watermark;
+        idempotent hash-dedupe skips the docs already committed by the failed attempt. Backoff
+        doubles from 20s and we keep retrying for up to an hour after the first failure. Once
+        that budget is spent the job parks in a real paused state (`_enter_network_hold`) until
+        a manual Resume — which restarts the whole budget — or Stop. Only network-classified
+        errors retry; SyncStopped (manual stop) and any non-network error propagate at once."""
+        backoff = _RETRY_INITIAL_BACKOFF
+        window_start: float | None = None  # monotonic time of the first failure in this budget
+        while True:
+            if job.cancel.is_set():
+                raise SyncStopped()
+            state = {} if job.clean else self.ctx.catalog.get_sync_state(job.source_id)
+            self._log(job, f"▶ syncing {job.source_name!r}…")
+            try:
+                stats = self.ctx.pipeline.ingest(
+                    self._tracked(job, control, connector.sync(state)), job.source_id, control=control,
+                )
+                return stats
+            except SyncStopped:
+                raise  # manual stop — not a network failure
+            except Exception as exc:  # noqa: BLE001
+                if not is_transient_network_error(exc):
+                    raise  # auth/config/code error — fails identically however long we wait
+                now = time.monotonic()
+                if window_start is None:
+                    window_start = now
+                elapsed = now - window_start
+                if elapsed >= _RETRY_MAX_WINDOW:
+                    self._enter_network_hold(job, exc)  # blocks until manual resume or stop
+                    if job.cancel.is_set():
+                        raise SyncStopped()
+                    window_start, backoff = None, _RETRY_INITIAL_BACKOFF  # resume = fresh budget
+                    continue
+                wait = min(backoff, _RETRY_MAX_WINDOW - elapsed)
+                job.state = "retrying"
+                job.phase, job.phase_done, job.phase_total = "auto-retry after network error", None, None
+                self._log(job, f"⚠ network error during sync: {exc}")
+                self._log(job, f"⏸ auto-paused — retrying in {int(wait)}s "
+                               f"(network down {int(elapsed)}s of a {int(_RETRY_MAX_WINDOW / 60)}min budget)")
+                self._record(job)
+                if job.cancel.wait(timeout=wait):  # a manual Stop interrupts the backoff at once
+                    raise SyncStopped()
+                backoff *= 2
+                job.state = "running"
+                self._record(job)
+                continue
+
+    def _enter_network_hold(self, job: SyncJob, exc: Exception) -> None:
+        """The 1-hour auto-retry budget is spent and the network still hasn't recovered: park
+        the job in a genuine paused state (thread blocked on the gate) with clear logs, rather
+        than failing it. `resume()` (state=='paused') wakes it to retry with a fresh budget;
+        `stop()` sets the gate + cancel so it wakes to abandon the run."""
+        job.state = "paused"
+        job.gate.clear()
+        job.phase, job.phase_done, job.phase_total = "network unavailable", None, None
+        self._log(job, f"✗ network still unavailable after auto-retrying for "
+                       f"{int(_RETRY_MAX_WINDOW / 60)} minutes: {exc}")
+        self._log(job, "⏸ sync paused — the network hasn't recovered. Resume to retry from where "
+                       "it left off, or Stop to abandon this run.")
+        self._record(job)
+        # A Stop racing the clear above sets cancel+gate; re-check so we never block on a gate
+        # that has already been released for cancellation.
+        if not job.cancel.is_set():
+            job.gate.wait()  # released by resume() (retry) or stop() (abandon)
+        if not job.cancel.is_set():
+            self._log(job, "▶ resume requested — restarting the sync and the retry budget")
 
     def _run(self, job: SyncJob, source: Any, connector: Any) -> None:
         hb_stop = threading.Event()
         threading.Thread(target=self._heartbeat, args=(job, hb_stop), daemon=True).start()
         try:
             self.ctx.catalog.upsert_source(job.source_id, source.name, source.type, source.options)
+            control = self._build_control(job)
+            connector._control = control  # inner loops (e.g. TFS teams/sprints) honor stop/pause
             if job.clean:
                 self._log(job, "🧹 clean sync — purging existing data first…")
                 self._purge(job)
-            self._log(job, f"▶ syncing {job.source_name!r}…")
-            state = {} if job.clean else self.ctx.catalog.get_sync_state(job.source_id)
+            # Timestamp the watermark from before the FIRST attempt so a run that spanned an
+            # outage + retries can't miss items created while the network was down.
             started = _now()
-            control = self._build_control(job)
-            connector._control = control  # inner loops (e.g. TFS teams/sprints) honor stop/pause
-            stats = self.ctx.pipeline.ingest(
-                self._tracked(job, control, connector.sync(state)), job.source_id, control=control,
-            )
+            stats = self._pull_with_auto_retry(job, connector, control)
 
             # A stop that arrived exactly as the pull finished (no SyncStopped raised) is
             # still a stop — the watermark must not advance on a partial run.

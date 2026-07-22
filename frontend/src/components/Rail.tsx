@@ -240,7 +240,8 @@ export function Rail({
               {configured.map((s) => {
                 const job = jobBySource.get(s.name);
                 const paused = job?.state === "paused";
-                const syncing = job?.state === "running" || job?.state === "stopping" || paused;
+                const retrying = job?.state === "retrying";
+                const syncing = job?.state === "running" || job?.state === "stopping" || paused || retrying;
                 const watchable = Boolean(job?.live);
                 const Row = watchable ? "button" : "div";
                 return (
@@ -272,13 +273,15 @@ export function Rail({
                     >
                       {paused
                         ? "paused"
-                        : syncing
-                          ? job?.percent != null
-                            ? `${job.percent}%`
-                            : job?.kind === "cleanup"
-                              ? "cleaning…"
-                              : "syncing…"
-                          : s.documents}
+                        : retrying
+                          ? "retrying…"
+                          : syncing
+                            ? job?.percent != null
+                              ? `${job.percent}%`
+                              : job?.kind === "cleanup"
+                                ? "cleaning…"
+                                : "syncing…"
+                            : s.documents}
                     </span>
                   </Row>
                 );

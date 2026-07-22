@@ -22,6 +22,8 @@ body:json {
 }
 
 docs {
-  Creates a user. The FIRST user turns authentication ON for the whole workspace — everything
-  is open until then. Run once, then use Login.
+  Creates a user. The FIRST user turns authentication ON for the whole workspace AND is always
+  an admin — everything is open until then. Run once, then use Login. After the first user,
+  only an admin may add users, and may set a role: add "role": "admin" | "editor" | "viewer"
+  to the body (default viewer). See "Set user role" to change a role later.
 }

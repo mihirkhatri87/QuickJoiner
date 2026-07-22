@@ -101,7 +101,9 @@ export default function App() {
     loadNotifications();
   }, [loadStatus, loadSources, loadProjects, loadSessions, loadGaps, loadNotifications]);
 
-  const activeSyncs = notifications.filter((n) => n.state === "running" || n.state === "stopping");
+  const activeSyncs = notifications.filter(
+    (n) => n.state === "running" || n.state === "stopping" || n.state === "retrying",
+  );
   const activeCount = activeSyncs.length;
 
   // Poll the activity feed: briskly while something is syncing (so progress and the
@@ -218,16 +220,32 @@ export default function App() {
     if (!text || busy) return;
     setInput("");
 
-    // Stage 1: an active conversational flow gets first claim on the input.
-    const flow = flowRef.current;
-    if (flow && (await flow.handle(text))) return;
+    // /qj <natural language>: control QuickJoiner in plain language. Strip the prefix and
+    // send the rest straight to the agent (which has the qj_api control tools) — bypassing
+    // the flow/command stages. This replaces the old /connect and /learn commands.
+    const qj = text.match(/^\/qj\b\s*([\s\S]*)$/i);
+    const effective = qj ? qj[1].trim() : text;
+    if (qj && !effective) {
+      ctx.say(
+        "Type `/qj` then what you want — I control QuickJoiner through its own API. " +
+          "e.g. `/qj connect a git repo for https://…`, `/qj teach: deploys happen on Fridays`, " +
+          "`/qj sync the handbook connector`, or `/qj what can you change?`",
+      );
+      return;
+    }
 
-    // Stage 2: deterministic slash commands from the registry.
-    for (const cmd of commands) {
-      const m = text.match(cmd.match);
-      if (m) {
-        await cmd.run(m, text);
-        return;
+    if (!qj) {
+      // Stage 1: an active conversational flow gets first claim on the input.
+      const flow = flowRef.current;
+      if (flow && (await flow.handle(text))) return;
+
+      // Stage 2: deterministic slash commands from the registry.
+      for (const cmd of commands) {
+        const m = text.match(cmd.match);
+        if (m) {
+          await cmd.run(m, text);
+          return;
+        }
       }
     }
 
@@ -235,14 +253,14 @@ export default function App() {
     const agentId = uid();
     setMessages((m) => [
       ...m,
-      { id: uid(), role: "user", text, ts: now() },
+      { id: uid(), role: "user", text: effective, ts: now() },
       { id: agentId, role: "agent", streaming: true, ts: now() },
     ]);
     setBusy(true);
     const patch = (fn: (m: Msg) => Msg) =>
       setMessages((list) => list.map((x) => (x.id === agentId ? fn(x) : x)));
     try {
-      await streamChat({ message: text, session_id: sessionId, project: currentProject || null }, (e) => {
+      await streamChat({ message: effective, session_id: sessionId, project: currentProject || null }, (e) => {
         if (e.type === "thinking") patch((m) => ({ ...m, thinking: (m.thinking || "") + e.data }));
         else if (e.type === "tool_call") patch((m) => ({ ...m, tools: [...(m.tools || []), e.data] }));
         else if (e.type === "delta") patch((m) => ({ ...m, streamText: (m.streamText || "") + e.data }));
@@ -439,7 +457,7 @@ export default function App() {
         onTeach={() => {
           setGapsOpen(false);
           setView("chat");
-          setInput("/learn ");
+          setInput("/qj teach: ");
         }}
         onDismiss={async (cluster) => {
           try {

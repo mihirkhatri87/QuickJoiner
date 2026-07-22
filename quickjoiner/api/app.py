@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import contextvars
+import hmac
 import json
 import os
 import queue
+import secrets
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,6 +33,15 @@ from quickjoiner.config import (
 
 STATIC_DIR = Path(__file__).parent / "static"  # legacy vanilla UI (fallback)
 
+# In-process control dispatch (plan 08): the control tools (agent/control.py) call the API
+# in-process as the acting user. A request carrying the per-process secret header sets this
+# contextvar in the internal-user middleware; `_user` honours it. Network requests never set it
+# (they don't know the secret), so it's not a bypass surface. Set within one request's task, so
+# the middleware value is visible to that request's handler and reset afterwards.
+_internal_user_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "qj_internal_user", default=None
+)
+
 
 def _ui_dir() -> Path:
     """Where the web UI lives. Priority: QJ_UI_DIR env -> built React app
@@ -44,6 +56,26 @@ def _ui_dir() -> Path:
 
 _SENTINEL = object()
 MASKED = "•••"
+
+
+def _locked_option_keys(type_: str) -> set[str]:
+    """Option keys marked lock_after_sync in the connector catalog (FORM_SPECS) —
+    identity-shaping fields that follow the connector-name rule: editable only while
+    the connector has 0 learned documents."""
+    from quickjoiner.connectors.specs import FORM_SPECS
+
+    return {f["key"] for f in FORM_SPECS.get(type_, {}).get("fields", [])
+            if f.get("lock_after_sync")}
+
+
+def _norm_opt(value) -> tuple:
+    """Comparable form of an option value that may arrive as a list or a comma string
+    ('a, b' == ['a','b'] == 'a,b'); None/'' both mean unset."""
+    if value is None:
+        return ()
+    items = value if isinstance(value, list) else str(value).split(",")
+    return tuple(sorted(s.strip().lower() for s in items if s and s.strip()))
+
 
 # --- OpenAPI / Swagger metadata (grouping + top-level description) ------------
 _API_DESCRIPTION = """
@@ -101,6 +133,11 @@ class ProjectRequest(BaseModel):
 class CredentialsRequest(BaseModel):
     username: str
     password: str
+    role: str | None = None  # create_user only; ignored on login. First user is always admin.
+
+
+class RoleUpdate(BaseModel):
+    role: str  # admin | editor | viewer
 
 
 class LearnRequest(BaseModel):
@@ -170,27 +207,76 @@ def _mask_options(type_: str, options: dict) -> dict:
     }
 
 
-def create_app(workspace: Path) -> FastAPI:
+def _ensure_control_connector(ctx: AppContext, name: str, type_: str) -> None:
+    """Seed the permanent control connector as a source if absent (plan 08). Ownerless (commons)
+    so everyone sees the plate; it yields no documents, so it never enters memory or the graph.
+    Delete/rename/sync of it are refused by the endpoint guards."""
+    if any(s.name == name for s in ctx.config.sources):
+        return
+    source = SourceConfig(name=name, type=type_, options={}, owner=None, shared=True)
+    ctx.config.sources.append(source)
+    try:
+        ctx.catalog.write_source(source)
+    except Exception:  # noqa: BLE001 — the in-memory source is enough; persistence is best-effort
+        pass
+
+
+def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = True) -> FastAPI:
+    """Build the FastAPI app. `ctx` lets a caller (e.g. the CLI's control tools) reuse an
+    existing AppContext instead of building a second one over the same workspace — the app is
+    stashed on `ctx.app` for in-process control dispatch. `revive=False` skips re-attaching
+    paused syncs (wanted only when actually serving, not when a `qj ask` lazily builds an app)."""
+    from quickjoiner.connectors.self_connector import CONTROL_NAME, CONTROL_TYPE
+
     from quickjoiner.sessions import SessionManager
 
     from quickjoiner.suggest import QuestionSuggester
     from quickjoiner.sync_manager import SyncManager, _DONE
 
-    ctx: AppContext = build_context(workspace)
+    if ctx is None:
+        ctx = build_context(workspace)
     api = FastAPI(
         title="QuickJoiner API",
         version="0.1.0",
         description=_API_DESCRIPTION,
         openapi_tags=_OPENAPI_TAGS,
     )
+    # Wire the app + a per-process internal-dispatch secret onto the ctx so the control tools
+    # can call this same app in-process, as the acting user (plan 08).
+    ctx.app = api
+    if not ctx.internal_secret:
+        ctx.internal_secret = secrets.token_urlsafe(32)
+    _internal_secret = ctx.internal_secret
+
+    @api.middleware("http")
+    async def _internal_user_mw(request, call_next):
+        u = request.headers.get("x-qj-internal-user")
+        a = request.headers.get("x-qj-internal-auth")
+        trusted = bool(u and a and hmac.compare_digest(a, _internal_secret))
+        token = _internal_user_var.set(u if trusted else None)
+        try:
+            return await call_next(request)
+        finally:
+            _internal_user_var.reset(token)
+
+    _ensure_control_connector(ctx, CONTROL_NAME, CONTROL_TYPE)
     manager = SessionManager(ctx)
     auth = Auth(ctx.catalog)
     suggester = QuestionSuggester(ctx.catalog)
     syncs = SyncManager(ctx)
+    # Re-attach any syncs that were paused when a previous process exited (laptop closed /
+    # server restarted), so the user can resume them — they re-pull from the watermark.
+    if revive:
+        syncs.revive_paused()
     api.include_router(build_hooks_router(ctx))
 
     def _user(authorization: str | None) -> str | None:
-        """Bearer token -> username; None in open mode or when signed out."""
+        """Acting username. An in-process control call injects the user via the trusted
+        internal-secret header (honoured only in-process); otherwise resolve the bearer token.
+        None in open mode or when signed out."""
+        internal = _internal_user_var.get()
+        if internal is not None:
+            return internal
         if authorization and authorization.lower().startswith("bearer "):
             return auth.resolve(authorization[7:].strip())
         return None
@@ -198,6 +284,28 @@ def create_app(workspace: Path) -> FastAPI:
     def _require_user(user: str | None) -> None:
         if auth.enabled and user is None:
             raise HTTPException(status_code=401, detail="Sign in to manage connectors")
+
+    def _guard_not_control(name: str, action: str = "changed") -> None:
+        """Refuse delete/rename/sync of the permanent control connector (plan 08)."""
+        from quickjoiner.connectors.self_connector import is_control_source
+
+        if is_control_source(name=name):
+            raise HTTPException(
+                status_code=409,
+                detail=f"The QuickJoiner control connector is permanent and cannot be {action}.")
+
+    def _require(cap: str, user: str | None) -> None:
+        """RBAC capability gate at the HTTP layer — defense in depth alongside the control
+        tool's own check (plan 08). Open mode (no users) => everyone is admin, so this is a
+        no-op until auth is turned on. Placed AFTER existence/visibility checks so a private
+        resource still 404s (never leaks) rather than 403-ing for a user who can't see it."""
+        from quickjoiner import rbac
+
+        role = auth.role_of(user)
+        if cap not in rbac.capabilities_for(role):
+            raise HTTPException(
+                status_code=403,
+                detail=f"Your role '{role}' lacks the '{cap}' capability. An admin can grant it.")
 
     def _find_source(name: str, user: str | None) -> SourceConfig:
         source = next((s for s in ctx.config.sources if s.name == name), None)
@@ -229,19 +337,42 @@ def create_app(workspace: Path) -> FastAPI:
         }
 
     # -- auth -----------------------------------------------------------------
-    @api.get("/api/auth/status", tags=["Authentication"], summary="Whether sign-in is enabled and who (if anyone) the bearer token identifies.")
+    @api.get("/api/auth/status", tags=["Authentication"], summary="Whether sign-in is enabled and who (if anyone) the bearer token identifies, plus that user's RBAC role.")
     def auth_status(authorization: str | None = Header(default=None)):
-        return {"enabled": auth.enabled, "user": _user(authorization)}
+        user = _user(authorization)
+        return {"enabled": auth.enabled, "user": user, "role": auth.role_of(user)}
 
-    @api.post("/api/auth/users", tags=["Authentication"], summary="Create a user. The FIRST user turns authentication ON for the workspace (open mode until then).")
+    @api.post("/api/auth/users", tags=["Authentication"], summary="Create a user. The FIRST user turns authentication ON and is always an admin; afterwards only an admin may add users (and assign a role: admin|editor|viewer, default viewer).")
     def create_user(req: CredentialsRequest, authorization: str | None = Header(default=None)):
-        # Bootstrap: anyone may create the FIRST user; after that, sign-in required.
-        _require_user(_user(authorization))
+        # Bootstrap: anyone may create the FIRST user (open mode). After that, sign-in required
+        # AND the creator must be an admin (users:admin) to add more users.
+        user = _user(authorization)
+        _require_user(user)
+        if auth.enabled:
+            _require("users:admin", user)
         try:
-            auth.create_user(req.username, req.password)
+            role = auth.create_user(req.username, req.password, req.role)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
-        return {"username": req.username.strip()}
+        return {"username": req.username.strip(), "role": role}
+
+    @api.get("/api/auth/users", tags=["Authentication"], summary="List all users and their RBAC roles (admin only).")
+    def list_users(authorization: str | None = Header(default=None)):
+        user = _user(authorization)
+        _require_user(user)
+        _require("users:admin", user)
+        return auth.catalog.list_users()
+
+    @api.patch("/api/auth/users/{username}", tags=["Authentication"], summary="Set a user's RBAC role: admin | editor | viewer (admin only).")
+    def set_user_role(username: str, req: RoleUpdate, authorization: str | None = Header(default=None)):
+        user = _user(authorization)
+        _require_user(user)
+        _require("users:admin", user)
+        try:
+            auth.set_role(username, req.role)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"username": username, "role": req.role}
 
     @api.post("/api/auth/login", tags=["Authentication"], summary="Sign in with username/password; returns a bearer token to send as `Authorization: Bearer <token>`.")
     def login(req: CredentialsRequest):
@@ -281,6 +412,7 @@ def create_app(workspace: Path) -> FastAPI:
 
         user = _user(authorization)
         _require_user(user)
+        _require("connectors:write", user)
         existing = next((s for s in ctx.config.sources if s.name == req.name), None)
         if existing is not None and not can_manage(existing, user, auth.enabled):
             raise HTTPException(status_code=409, detail=f"Name {req.name!r} is already taken")
@@ -312,7 +444,9 @@ def create_app(workspace: Path) -> FastAPI:
     ):
         user = _user(authorization)
         _require_user(user)
+        _guard_not_control(name, "changed")
         source = _find_source(name, user)
+        _require("connectors:write", user)
         if not can_manage(source, user, auth.enabled):
             raise HTTPException(status_code=403, detail="Only the owner can change this connector")
         # Rename — safe ONLY before the first sync, because the name keys the source_id and
@@ -342,6 +476,20 @@ def create_app(workspace: Path) -> FastAPI:
         elif req.sync_interval_minutes is not None:
             source.sync_interval_minutes = req.sync_interval_minutes
         if req.options is not None:
+            # Identity-shaping fields (FORM_SPECS lock_after_sync, e.g. `aka`) follow the
+            # same rule as the connector name: editable only before the first sync. After
+            # it, edits could not be applied consistently (removing an alias would not
+            # un-declare it from the graph) — clean up first, then change them.
+            locked_keys = _locked_option_keys(source.type)
+            if locked_keys:
+                changed = [k for k in locked_keys
+                           if k in req.options and req.options[k] != MASKED
+                           and _norm_opt(req.options.get(k)) != _norm_opt(source.options.get(k))]
+                if changed and ctx.catalog.documents_for_source(f"{source.type}:{source.name}"):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"{', '.join(sorted(changed))} can only be changed before the "
+                               f"first sync — clean up this connector first, then edit it.")
             merged = dict(source.options)
             for k, v in req.options.items():
                 if v == MASKED:
@@ -360,7 +508,9 @@ def create_app(workspace: Path) -> FastAPI:
         background job (streams to the same log/notification surface as a sync)."""
         user = _user(authorization)
         _require_user(user)
+        _guard_not_control(name, "cleaned up")
         source = _find_source(name, user)
+        _require("sync:run", user)
         if not can_manage(source, user, auth.enabled):
             raise HTTPException(status_code=403, detail="Only the owner can clean up this connector")
         try:
@@ -381,7 +531,9 @@ def create_app(workspace: Path) -> FastAPI:
         for deliberately retiring a source while keeping what it taught."""
         user = _user(authorization)
         _require_user(user)
+        _guard_not_control(name, "deleted")
         source = _find_source(name, user)
+        _require("connectors:delete", user)
         if not can_manage(source, user, auth.enabled):
             raise HTTPException(status_code=403, detail="Only the owner can remove this connector")
         source_id = f"{source.type}:{source.name}"
@@ -405,6 +557,7 @@ def create_app(workspace: Path) -> FastAPI:
 
         user = _user(authorization)
         source = _find_source(name, user)
+        _require("connectors:write", user)
         result = create_connector(source, ctx.workspace).test()
         return {"ok": result.ok, "message": result.message}
 
@@ -466,7 +619,9 @@ def create_app(workspace: Path) -> FastAPI:
 
     @api.patch("/api/settings", tags=["Settings"], summary="Update workspace settings. Validated against the config models; persisted to the workspace.")
     def update_settings(req: SettingsUpdate, authorization: str | None = Header(default=None)):
-        _require_user(_user(authorization))
+        user = _user(authorization)
+        _require_user(user)
+        _require("settings:write", user)
         c = ctx.config
         try:
             if req.org is not None:
@@ -493,7 +648,9 @@ def create_app(workspace: Path) -> FastAPI:
         """Probe the configured LLM provider with a one-token round-trip. Accepts
         optional `llm` overrides so the settings form can test UNSAVED values (proxy
         URL, model, api-key env var) before persisting. Never saves."""
-        _require_user(_user(authorization))
+        user = _user(authorization)
+        _require_user(user)
+        _require("settings:write", user)
         from quickjoiner.llm import create_provider
 
         try:
@@ -543,7 +700,10 @@ def create_app(workspace: Path) -> FastAPI:
         """Start a background sync job (returns immediately). `clean=true` purges the
         source's documents/vectors/graph first for a from-scratch, non-corrupted resync.
         Multiple different sources can sync at once; watch progress on the logs stream."""
-        _find_source(source_name, _user(authorization))  # visibility + existence gate
+        _guard_not_control(source_name, "synced (it has nothing to ingest)")
+        user = _user(authorization)
+        _find_source(source_name, user)  # visibility + existence gate
+        _require("sync:run", user)
         try:
             job = syncs.start(source_name, clean=clean)
         except RuntimeError as exc:  # already running
@@ -555,7 +715,9 @@ def create_app(workspace: Path) -> FastAPI:
                   authorization: str | None = Header(default=None)):
         """Stop a running sync. `cleanup=true` also purges whatever the interrupted run
         ingested, leaving the source (and the knowledge graph) clean rather than partial."""
-        _find_source(source_name, _user(authorization))
+        user = _user(authorization)
+        _find_source(source_name, user)
+        _require("sync:run", user)
         try:
             job = syncs.stop(source_name, cleanup=cleanup)
         except RuntimeError as exc:
@@ -566,7 +728,9 @@ def create_app(workspace: Path) -> FastAPI:
     def pause_sync(source_name: str, authorization: str | None = Header(default=None)):
         """Hold a running sync in place (after the current document / between graph
         batches). Committed work stays; resume continues the same in-memory run."""
-        _find_source(source_name, _user(authorization))
+        user = _user(authorization)
+        _find_source(source_name, user)
+        _require("sync:run", user)
         try:
             job = syncs.pause(source_name)
         except RuntimeError as exc:
@@ -576,7 +740,9 @@ def create_app(workspace: Path) -> FastAPI:
     @api.post("/api/sync/{source_name}/resume", tags=["Sync & ingestion"], summary="Resume a paused sync.")
     def resume_sync(source_name: str, authorization: str | None = Header(default=None)):
         """Resume a paused sync."""
-        _find_source(source_name, _user(authorization))
+        user = _user(authorization)
+        _find_source(source_name, user)
+        _require("sync:run", user)
         try:
             job = syncs.resume(source_name)
         except RuntimeError as exc:
@@ -597,7 +763,9 @@ def create_app(workspace: Path) -> FastAPI:
         `{job}`, source `"all memory"`) so it streams logs and lands in the activity feed —
         watch it via `GET /api/sync/all%20memory/logs` or `/api/notifications`. Refuses
         (409) while any sync/cleanup job is active, since it clears every source at once."""
-        _require_user(_user(authorization))
+        user = _user(authorization)
+        _require_user(user)
+        _require("memory:reset", user)
         try:
             job = syncs.start_reset()  # runs as a background job → logs, notifications, history
         except RuntimeError as exc:  # a sync/cleanup is in flight
@@ -611,7 +779,7 @@ def create_app(workspace: Path) -> FastAPI:
         notification menu; read-state is tracked client-side."""
         _user(authorization)
         items = syncs.recent(hours=max(1, min(hours, 24 * 7)))
-        active = sum(1 for i in items if i["state"] in ("running", "stopping"))
+        active = sum(1 for i in items if i["state"] in ("running", "stopping", "retrying"))
         return {"notifications": items, "active": active}
 
     @api.get("/api/sync/{source_name}/logs", tags=["Sync & ingestion"], summary="Server-Sent Events stream of a sync's live log lines (replays the backlog first), ending with a terminal `done` event.")
@@ -649,7 +817,9 @@ def create_app(workspace: Path) -> FastAPI:
         `remember` tool and `qj learn "<text>"`, no LLM round-trip needed."""
         from quickjoiner.agent.tools import teach_fact
 
-        _require_user(_user(authorization))
+        user = _user(authorization)
+        _require_user(user)
+        _require("memory:write", user)
         fact = req.fact.strip()
         if not fact:
             raise HTTPException(status_code=400, detail="Nothing to learn: empty fact")
@@ -674,7 +844,9 @@ def create_app(workspace: Path) -> FastAPI:
     @api.post("/api/gaps/resolve", tags=["Knowledge gaps"], summary="Mark one or more gap clusters resolved or dismissed.")
     def resolve_gaps(req: GapsResolveRequest, authorization: str | None = Header(default=None)):
         """Mark gaps resolved (after connecting a source, teaching, or dismissing)."""
-        _require_user(_user(authorization))
+        user = _user(authorization)
+        _require_user(user)
+        _require("gaps:write", user)
         ctx.catalog.resolve_gaps(req.gap_ids, req.resolution or "dismissed")
         return {"resolved": len(req.gap_ids)}
 
@@ -694,7 +866,9 @@ def create_app(workspace: Path) -> FastAPI:
         from quickjoiner.agent.scrape_report import build_report, save_report
         from quickjoiner.connectors.registry import create_connector
 
-        _require_user(_user(authorization))
+        user = _user(authorization)
+        _require_user(user)
+        _require("scrape:run", user)
         url = req.url.strip()
         if not url.startswith(("http://", "https://")):
             raise HTTPException(status_code=400, detail="Provide an http(s):// URL to scrape")
@@ -846,9 +1020,11 @@ def create_app(workspace: Path) -> FastAPI:
         return [{"name": f.stem, "path": str(f)} for f in files]
 
     @api.post("/api/briefs/{brief_type}", tags=["Briefs & repo docs"], summary="Generate a cited onboarding brief (architecture / week1 / roadmap / quick-wins) from memory.")
-    def make_brief(brief_type: str, provider: str | None = None, model: str | None = None):
+    def make_brief(brief_type: str, provider: str | None = None, model: str | None = None,
+                   authorization: str | None = Header(default=None)):
         from quickjoiner.agent.briefs import generate_brief
 
+        _require("briefs:write", _user(authorization))
         try:
             markdown, path = generate_brief(
                 ctx, brief_type, provider_override=provider, model_override=model
@@ -860,9 +1036,11 @@ def create_app(workspace: Path) -> FastAPI:
         return {"brief": markdown, "path": str(path) if path else None, "generated": path is not None}
 
     @api.post("/api/repos/{source_name}/agents-md", tags=["Briefs & repo docs"], summary="Generate a principal-engineer architecture brief (AGENTS.md) for a git/files repo from its real code structure + docs.")
-    def make_agents_md(source_name: str, provider: str | None = None, model: str | None = None):
+    def make_agents_md(source_name: str, provider: str | None = None, model: str | None = None,
+                       authorization: str | None = Header(default=None)):
         from quickjoiner.agent.repo_docs import generate_agents_md
 
+        _require("briefs:write", _user(authorization))
         try:
             markdown, path = generate_agents_md(
                 ctx, source_name, provider_override=provider, model_override=model
@@ -878,7 +1056,8 @@ def create_app(workspace: Path) -> FastAPI:
         return ctx.catalog.list_projects()
 
     @api.post("/api/projects", tags=["Sessions & projects"], summary="Create a conversation project.")
-    def create_project(req: ProjectRequest):
+    def create_project(req: ProjectRequest, authorization: str | None = Header(default=None)):
+        _require("sessions:write", _user(authorization))
         return manager.create_project(req.name, req.description)
 
     @api.get("/api/sessions", tags=["Sessions & projects"], summary="List persisted chat sessions (optionally filtered by project).")
@@ -900,7 +1079,8 @@ def create_app(workspace: Path) -> FastAPI:
         return session
 
     @api.post("/api/sessions/{session_id}/distill", tags=["Sessions & projects"], summary="Extract durable facts from a conversation into searchable memory.")
-    def distill_session(session_id: str):
+    def distill_session(session_id: str, authorization: str | None = Header(default=None)):
+        _require("sessions:write", _user(authorization))
         try:
             facts = manager.distill(session_id, provider=ctx.build_provider())
         except ValueError as exc:
@@ -910,15 +1090,17 @@ def create_app(workspace: Path) -> FastAPI:
         return {"session": session_id, "facts_learned": facts}
 
     @api.delete("/api/sessions/{session_id}", tags=["Sessions & projects"], summary="Delete one chat session.")
-    def delete_session(session_id: str):
+    def delete_session(session_id: str, authorization: str | None = Header(default=None)):
+        _require("sessions:write", _user(authorization))
         if not ctx.catalog.get_session(session_id):
             raise HTTPException(status_code=404, detail=f"No session {session_id!r}")
         ctx.catalog.delete_session(session_id)
         return {"deleted": session_id}
 
     @api.delete("/api/sessions", tags=["Sessions & projects"], summary="Delete all chat sessions, optionally scoped to a project.")
-    def delete_sessions(project: str | None = None):
+    def delete_sessions(project: str | None = None, authorization: str | None = Header(default=None)):
         """Delete all conversations, optionally scoped to a project."""
+        _require("sessions:write", _user(authorization))
         project_row = manager.resolve_project(project)
         if project and not project_row:
             raise HTTPException(status_code=404, detail=f"No project {project!r}")
@@ -943,7 +1125,7 @@ def create_app(workspace: Path) -> FastAPI:
                 # Live connector tools are scoped to sources this user may see.
                 agent = ctx.build_agent(
                     req.provider, req.model, extra_system=manager.system_context(session),
-                    sources=ctx.visible_sources(user),
+                    sources=ctx.visible_sources(user), user=user,
                 )
                 answer, new_history = agent.ask(
                     req.message,

@@ -32,7 +32,7 @@ export function Composer({
   // Debounced fetch of completions as the user types a natural-language question.
   useEffect(() => {
     const q = value.trim();
-    // Skip slash-commands (/learn, /scrape, /connect) and near-empty input.
+    // Skip slash-commands (/qj, /scrape) and near-empty input.
     if (justAccepted.current || q.length < 2 || q.startsWith("/")) {
       setSuggestions([]);
       setOpen(false);
@@ -178,9 +178,8 @@ export function Composer({
       <p className="mx-auto mt-3 max-w-[1100px] text-center text-[11.5px] text-faint">
         Answers are grounded in learned memory and <b className="font-semibold text-gold">cite their sources</b> — or
         say what hasn't been learned yet. Commands:{" "}
-        <code className="font-mono text-[10.5px] text-gold">/learn &lt;fact&gt;</code>,{" "}
-        <code className="font-mono text-[10.5px] text-gold">/scrape &lt;url&gt;</code>,{" "}
-        <code className="font-mono text-[10.5px] text-gold">/connect</code>.
+        <code className="font-mono text-[10.5px] text-gold">/qj &lt;control QuickJoiner in words&gt;</code>,{" "}
+        <code className="font-mono text-[10.5px] text-gold">/scrape &lt;url&gt;</code>.
       </p>
     </div>
   );

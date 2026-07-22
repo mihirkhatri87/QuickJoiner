@@ -1,0 +1,21 @@
+meta {
+  name: List users & roles (admin)
+  type: http
+  seq: 4
+}
+
+get {
+  url: {{baseUrl}}/api/auth/users
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}
+
+docs {
+  Lists every user and their RBAC role (admin | editor | viewer). Admin only (403 otherwise;
+  401 if not signed in). Roles gate the whole API: viewers read/ask, editors also connect/sync/
+  teach, admins additionally manage settings, reset memory, and administer users.
+}

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import socket
 import time
 from typing import Any
 
@@ -40,6 +41,33 @@ def resolve_secret(options: dict[str, Any], key: str, env_var: str | None = None
 _RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 _MAX_ATTEMPTS = 4
 _BACKOFF_BASE = 1.0  # seconds; exponential: 1, 2, 4
+
+# Winsock error codes that mean "the network, not the request, is the problem":
+# 10060 timed-out, 10054 reset, 10061 refused, 10064 host-down, 10065 unreachable,
+# 11001/11002 DNS lookup failed. (WinError 10060 is the blip that killed the 3.3h TFS sync.)
+_NETWORK_WINERRORS = frozenset({10050, 10051, 10054, 10060, 10061, 10064, 10065, 11001, 11002})
+# POSIX errnos for the same conditions (ECONNRESET/ETIMEDOUT/ECONNREFUSED/ENETUNREACH/EHOSTUNREACH).
+_NETWORK_ERRNOS = frozenset({101, 104, 110, 111, 113})
+
+
+def is_transient_network_error(exc: BaseException) -> bool:
+    """True when `exc` is a *transient network* failure worth waiting out and retrying —
+    as opposed to a request/auth/config error that would fail identically no matter how
+    long we wait. This is the classifier the sync manager uses to decide whether a sync
+    that died mid-pull should enter auto-retry (network) or fail immediately (everything
+    else). Covers httpx transport errors, a persisted 429/5xx (`HTTPStatusError` after the
+    HTTP layer's own retries were exhausted), and raw socket/OS-level connection failures
+    (incl. Windows `WinError 10060` timeouts) from connectors that don't route through
+    `get_json`/`post_json`."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in _RETRY_STATUSES
+    if isinstance(exc, (httpx.TransportError, socket.timeout, socket.gaierror,
+                        ConnectionError, TimeoutError)):
+        return True
+    if isinstance(exc, OSError):
+        return (getattr(exc, "winerror", None) in _NETWORK_WINERRORS
+                or getattr(exc, "errno", None) in _NETWORK_ERRNOS)
+    return False
 
 
 def _request_with_retry(method: str, url: str, **kwargs: Any) -> Any:

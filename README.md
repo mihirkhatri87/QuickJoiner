@@ -33,6 +33,14 @@ when memory has nothing relevant.
   **server-computed confidence** (evidence shape + corroboration — informal meeting notes score
   below a real architecture doc), and asking for "options" renders a ranked candidate carousel
   with shared citations.
+- **Cross-source identity bridges** — the same real-world thing often appears under different
+  entity types per system (the `connector` git repo, the `Connector` Octopus service, the pipeline
+  that builds it). QuickJoiner links them with deterministic `same_as` bridges — from exact name
+  matches and from every connector's **"also known as"** field (comma-separated aliases you declare
+  at setup on any connected system, e.g. the Stevedore repo aka `appriver.provisioning`; like the
+  connector name, it locks after the first sync) — so multi-hop questions can cross systems
+  ("which environment is this repo's code deployed to?"). Bridges are honestly labeled as
+  name-equality inferences, scored low-confidence, and never affect the answer/refuse decision.
 - **Question autocomplete** — as you type, the composer suggests real questions drawn from what's
   actually been learned (your services, repos, environments, past questions). It needs no LLM, so
   it's instant, and it **keeps improving as you connect more systems** — each newly synced source
@@ -44,7 +52,17 @@ when memory has nothing relevant.
   — the pipelines check for it inside their loops, not just between documents. Multiple sources sync
   at once, and a **clean re-sync** (`qj resync`, or the button in the UI) purges a source's
   documents, vectors and graph edges before re-pulling, so the knowledge graph never ends up
-  corrupted or half-populated. The log panel never traps you: close it and the sync keeps
+  corrupted or half-populated. **A network drop won't lose a sync** — if the connection fails
+  mid-ingest, the job doesn't error out: it auto-pauses and **retries itself on a growing delay
+  (20s, 40s, 80s… for up to an hour)**, picking up from where it left off (already-ingested data
+  is never re-fetched wastefully). If the network still hasn't recovered after an hour it stays
+  paused with a clear message — hit **Resume** once you're back online, or **Stop** to abandon the
+  run. (Auth or configuration errors still fail fast — retrying those would be pointless.)
+  **A paused sync survives a restart** — pause a sync, close your laptop, and it's still there
+  (paused) when you reopen; hit **Resume** and it picks up from the last checkpoint. (Because a
+  killed process can't literally continue an in-progress pull, resuming re-runs the connector from
+  where it last committed — already-ingested data is skipped, so nothing is duplicated or lost.)
+  The log panel never traps you: close it and the sync keeps
   running, with a live indicator on the source (in the sidebar and on its connector card) that
   re-opens the log. **Reloading the page doesn't lose a sync** — jobs live on the server, so the
   UI picks them straight back up. The bell menu's **"View full history by connector"** shows every
@@ -223,7 +241,7 @@ across turns too.
 
 ## Connect org systems
 
-Register a source from the CLI (or use the **/connect** wizard in the web UI):
+Register a source from the CLI (or just say **`/qj connect a <type> …`** in the web UI):
 
 ```powershell
 qj connect git --name platform --option url=https://github.com/acme/platform.git --option token=env:GIT_TOKEN
@@ -277,8 +295,8 @@ A React app (Vite + TypeScript + Tailwind) with:
 - **Projects and resumable conversations**, with automatic history compression.
 - **Knowledge gaps** — a badge in the rail opens the knowledge-debt backlog (below).
 - **Waypoints** — the interactive knowledge graph view.
-- **⚙ Settings** — sign-in and per-user connector sharing, add/test/sync/clean-up connectors (or the
-  conversational `/connect` wizard), and tune workspace settings: LLM provider/model (incl. the
+- **⚙ Settings** — sign-in, roles & access (below), per-user connector sharing, add/test/sync/clean-up
+  connectors, and tune workspace settings: LLM provider/model (incl. the
   **LiteLLM proxy URL + API-key env var**, with a **Test connection** button that pings the
   provider before you save), retrieval knobs (**hybrid** dense+sparse, **cross-encoder reranker**,
   **graph-expansion**, **contextual chunking**), **knowledge-graph** LLM triple extraction, chat
@@ -288,8 +306,28 @@ A React app (Vite + TypeScript + Tailwind) with:
   changed fields show what the default was, and a section header counts how many you've changed,
   so "what have I actually tuned here?" is answerable at a glance. Everything — config and
   connectors — lives in the workspace's SQLite `catalog.db`, not a YAML file.
-- Composer commands: `/learn <fact>`, `/connect`, `/scrape <url>` (crawl → a cited report with
-  mermaid diagrams you can then choose to learn).
+- Composer commands: **`/qj <plain language>`** — control QuickJoiner through its own API in
+  words (connect a source, sync, teach a fact, tune settings, manage access); and `/scrape <url>`
+  (crawl → a cited report with mermaid diagrams you can then choose to learn). `/qj` replaces the
+  old `/connect` and `/learn` commands — just say what you want (e.g. `/qj connect a git repo for
+  https://…`, `/qj teach: deploys happen on Fridays`, `/qj make the handbook connector sync
+  hourly`). It asks what it needs (a git connector's URL, etc.), confirms before any change, and
+  can only do what your **role** allows.
+
+**Roles & access (RBAC).** A workspace is open (everyone is effectively an admin) until you
+create the first user — who is always an **admin**. From then on, every user has a role:
+
+| Role | Can |
+|------|-----|
+| **viewer** | read and ask questions only |
+| **editor** | + connect sources, sync, teach facts, resolve gaps, generate briefs, scrape |
+| **admin** | + change settings, reset memory, and manage users/roles |
+
+Roles gate **both** the `/qj` chat control and the HTTP API (a viewer's write returns `403`;
+destructive actions like memory reset need an explicit confirmation on top). Admins manage people
+in **Settings → Account → People & access** (`GET/PATCH /api/auth/users`), or from chat
+(`/qj make alice an editor`). QuickJoiner also ships a permanent **control connector** plate — it
+holds no data and can't be deleted; it's just the surface for `/qj`.
 
 The prebuilt UI is served automatically. To develop it:
 `cd frontend && npm install && npm run dev` (proxies to `qj serve` on :8787); `npm run build`

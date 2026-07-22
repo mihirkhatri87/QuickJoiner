@@ -18,6 +18,7 @@
     { "key": "suggestPrefix", "value": "where", "type": "string" },
     { "key": "entityA", "value": "repo:connector", "type": "string" },
     { "key": "entityB", "value": "service:stevedore", "type": "string" },
+    { "key": "targetUser", "value": "teammate", "type": "string" },
     { "key": "sessionId", "value": "", "type": "string" }
   ],
   "auth": {
@@ -72,6 +73,24 @@
             "header": [{ "key": "Content-Type", "value": "application/json" }],
             "body": { "mode": "raw", "raw": "{\n  \"username\": \"{{username}}\",\n  \"password\": \"{{password}}\"\n}" },
             "url": "{{baseUrl}}/api/auth/login"
+          }
+        },
+        {
+          "name": "List users & roles (admin)",
+          "request": {
+            "method": "GET",
+            "description": "Every user + RBAC role (admin | editor | viewer). Admin only.",
+            "url": "{{baseUrl}}/api/auth/users"
+          }
+        },
+        {
+          "name": "Set user role (admin)",
+          "request": {
+            "method": "PATCH",
+            "description": "Set {{targetUser}}'s role to admin | editor | viewer. Admin only. Roles gate the whole API: viewers read/ask, editors also connect/sync/teach, admins additionally manage settings, reset memory, and administer users.",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"role\": \"editor\"\n}" },
+            "url": "{{baseUrl}}/api/auth/users/{{targetUser}}"
           }
         }
       ]

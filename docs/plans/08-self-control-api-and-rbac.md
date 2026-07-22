@@ -1,6 +1,23 @@
 # Plan 08 — Natural-language self-control (`/qj`) + RBAC
 
-**Status:** in progress (backend foundation first). **Owner:** —. **Created:** 2026-07-21.
+**Status:** ◐ code complete (stages 1–5 shipped 2026-07-21); only **live browser verification**
+of the `/qj` + admin-UI flows remains. **Created:** 2026-07-21.
+
+**Progress:** ✅ Stage 1 (RBAC foundation — `rbac.py`, `role` column, `Auth` roles,
+`tests/test_rbac.py`) · ✅ Stage 2 (`agent/control.py` `qj_api`/`qj_api_reference`, in-process
+dispatch, control connector + guards, `tests/test_control_tools.py`) · ✅ Stage 3 (HTTP `_require`
+on all mutating routes, `GET/PATCH /api/auth/users`, role in create-user + auth-status, Postman +
+Bruno runbooks, `test_rbac_roles_gate_http_writes`) · ✅ Stage 4 (frontend `/qj` replacing
+`/connect`+`/learn`, People & access admin UI, control plate, role-gated affordances; typecheck +
+build green) · ✅ Stage 5 (CLAUDE.md + README.md + runbooks graduated; trackers updated) ·
+✅ **Live verification** (2026-07-21): curl against a running server confirmed the full RBAC
+flow (open-mode admin, first-user→admin, viewer writes → 403, admin lists roles, control-connector
+delete → 409); headless Playwright confirmed the UI (admin sees **People & access** + the locked
+**QuickJoiner control** plate + **Danger zone**; a viewer sees none of those but keeps the control
+plate; `/qj` shows the help note and the composer commands now read `/qj`, `/scrape`). Only
+environment-gated remainder: the full `/qj`→agent→`qj_api` round-trip needs a live LLM (the same
+standing "Anthropic live path untested" gap; `qj_api` mechanics are unit-tested). **Ready to
+graduate/delete** — substance now lives in CLAUDE.md.
 
 Give a user full control of QuickJoiner from chat, in plain language, through QuickJoiner's
 own API — gated by a real role/permission system so this is safe at 100+ users. The API

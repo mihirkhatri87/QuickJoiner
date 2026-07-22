@@ -19,6 +19,7 @@ import type {
   SourceRow,
   Status,
   SyncJob,
+  UserRow,
 } from "./types";
 
 const TOKEN_KEY = "qj_token";
@@ -79,11 +80,19 @@ export const api = {
       body: JSON.stringify({ username, password }),
     }),
   logout: () => req<unknown>("/api/auth/logout", { method: "POST" }),
-  createUser: (username: string, password: string) =>
-    req<unknown>("/api/auth/users", {
+  createUser: (username: string, password: string, role?: string) =>
+    req<{ username: string; role: string }>("/api/auth/users", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username, password }),
+      body: JSON.stringify({ username, password, role: role ?? null }),
+    }),
+  // People & access (admin only). listUsers/setUserRole 403 for non-admins.
+  listUsers: () => req<UserRow[]>("/api/auth/users"),
+  setUserRole: (username: string, role: string) =>
+    req<{ username: string; role: string }>(`/api/auth/users/${encodeURIComponent(username)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ role }),
     }),
 
   learn: (fact: string, topic?: string) =>

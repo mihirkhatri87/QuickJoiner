@@ -25,7 +25,8 @@ You should only ever edit variables — never the individual requests.
 | Variable | Meaning |
 |----------|---------|
 | `baseUrl` | Where QuickJoiner is serving. Default `http://localhost:8787`. |
-| `username`, `password` | Only used by the auth folder. Skip that folder to stay in open mode. |
+| `username`, `password` | Only used by the auth folder. Skip that folder to stay in open mode. The first user is always an **admin**. |
+| `targetUser` | The user whose role the "Set user role" request changes (admin-only RBAC: admin / editor / viewer). |
 | `connectorName`, `connectorType`, `connectorPath` | The source the "connect" folder creates. Defaults create a `files` connector — set `connectorPath` to a real folder, or change `connectorType`/options for git/github/jira/etc. |
 | `askQuestion`, `searchQuery`, `suggestPrefix` | The queries used in the "query" folder. |
 | `entityA`, `entityB` | The two graph nodes for the path request. |

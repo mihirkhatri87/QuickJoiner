@@ -7,8 +7,11 @@ import threading
 import time
 import types
 
+import httpx
 import pytest
 
+import quickjoiner.sync_manager as sm
+from quickjoiner.connectors.util import is_transient_network_error
 from quickjoiner.ingest.pipeline import IngestStats
 from quickjoiner.sync_manager import SyncJob, SyncManager, _DONE
 
@@ -34,6 +37,9 @@ class FakeCatalog:
     def list_sync_events(self, since, limit=50):
         rows = [r for r in self.events.values() if r["started_at"] >= since]
         return sorted(rows, key=lambda r: (r["started_at"], r["id"]), reverse=True)[:limit]
+
+    def list_unfinished_syncs(self):
+        return [r for r in self.events.values() if not r["ended_at"]]
 
     def prune_sync_events(self, before):
         self.calls.append("prune_sync_events")
@@ -490,6 +496,211 @@ def test_recent_survives_a_catalog_without_history(monkeypatch):
     mgr.start("demo")
     _wait(mgr, "demo", {"done"})
     assert [r["source"] for r in mgr.recent()] == ["demo"]
+
+
+# --------------------------------------------------------------- network auto-retry
+
+class FlakyConnector:
+    """Fails the first `fail_times` sync() invocations with a (by default) network error,
+    then yields its documents. A raised exception kills the generator, so each retry is a
+    fresh sync() call — exactly what the manager's auto-retry does."""
+
+    source_id = "files:demo"
+    _control = None
+
+    def __init__(self, docs, fail_times=1, exc=None):
+        self._docs = docs
+        self._fail_times = fail_times
+        self._exc = exc if exc is not None else httpx.ConnectError("network down")
+        self.calls = 0
+
+    def sync(self, state):
+        self.calls += 1
+        if self.calls <= self._fail_times:
+            raise self._exc
+        for d in self._docs:
+            yield d
+
+
+def test_classifier_separates_network_from_request_errors():
+    assert is_transient_network_error(httpx.ConnectError("x"))
+    assert is_transient_network_error(httpx.ReadTimeout("x"))
+    assert is_transient_network_error(TimeoutError())
+    assert is_transient_network_error(OSError(110, "timed out"))  # ETIMEDOUT
+    req = httpx.Request("GET", "http://x")
+    assert is_transient_network_error(
+        httpx.HTTPStatusError("503", request=req, response=httpx.Response(503, request=req)))
+    # NOT transient: a request/auth/config error fails identically however long we wait.
+    assert not is_transient_network_error(
+        httpx.HTTPStatusError("404", request=req, response=httpx.Response(404, request=req)))
+    assert not is_transient_network_error(ValueError("bad config"))
+    assert not is_transient_network_error(OSError(2, "no such file"))
+
+
+def test_network_error_auto_retries_then_recovers(monkeypatch):
+    """A transient network failure mid-pull must NOT fail the sync: it auto-pauses, waits the
+    backoff, then re-runs the connector from the un-advanced watermark and completes."""
+    monkeypatch.setattr(sm, "_RETRY_INITIAL_BACKOFF", 0.05)
+    ctx = _ctx([_source()])
+    conn = FlakyConnector([_Doc("d1"), _Doc("d2")], fail_times=1)
+    monkeypatch.setattr("quickjoiner.connectors.registry.create_connector", lambda s, ws: conn)
+    mgr = SyncManager(ctx)
+    mgr.start("demo")
+    job = _wait(mgr, "demo", {"done", "error"})
+    assert job.state == "done" and job.stats["added"] == 2
+    assert conn.calls == 2  # failed once, retried once, succeeded
+    assert any("network error" in ln for ln in job.logs)
+    assert any("retrying in" in ln for ln in job.logs)
+    assert "set_sync_state" in ctx.catalog.calls  # watermark advanced only after success
+
+
+def test_non_network_error_fails_immediately_without_retrying(monkeypatch):
+    """An auth/config/code error must fail fast — retrying for an hour would be pointless."""
+    monkeypatch.setattr(sm, "_RETRY_INITIAL_BACKOFF", 0.05)
+    ctx = _ctx([_source()])
+    conn = FlakyConnector([_Doc("d1")], fail_times=99, exc=ValueError("bad token"))
+    monkeypatch.setattr("quickjoiner.connectors.registry.create_connector", lambda s, ws: conn)
+    mgr = SyncManager(ctx)
+    mgr.start("demo")
+    job = _wait(mgr, "demo", {"done", "error"})
+    assert job.state == "error" and "bad token" in (job.error or "")
+    assert conn.calls == 1  # no retry
+    assert not any("retrying" in ln for ln in job.logs)
+    assert "set_sync_state" not in ctx.catalog.calls  # a failed run never advances the watermark
+
+
+def test_retry_budget_exhausts_into_a_resumable_pause(monkeypatch):
+    """Once the 1h budget is spent the job parks in a real paused state (not error); a manual
+    Resume restarts the budget and, when the network is back, the sync completes."""
+    monkeypatch.setattr(sm, "_RETRY_INITIAL_BACKOFF", 0.05)
+    monkeypatch.setattr(sm, "_RETRY_MAX_WINDOW", 0.0)  # first failure immediately exhausts it
+    ctx = _ctx([_source()])
+    conn = FlakyConnector([_Doc("d1")], fail_times=1)
+    monkeypatch.setattr("quickjoiner.connectors.registry.create_connector", lambda s, ws: conn)
+    mgr = SyncManager(ctx)
+    mgr.start("demo")
+    job = _wait(mgr, "demo", {"paused"})  # network never recovered within the budget
+    assert any("network still unavailable" in ln for ln in job.logs)
+    assert mgr.is_running("demo")  # a network-held job still owns the source
+    mgr.resume("demo")  # network is back — retry from where it left off
+    job = _wait(mgr, "demo", {"done"})
+    assert job.state == "done" and job.stats["added"] == 1
+
+
+def test_stop_during_a_network_hold_abandons_cleanly(monkeypatch):
+    monkeypatch.setattr(sm, "_RETRY_MAX_WINDOW", 0.0)
+    ctx = _ctx([_source()])
+    conn = FlakyConnector([_Doc("d1")], fail_times=99)  # never recovers
+    monkeypatch.setattr("quickjoiner.connectors.registry.create_connector", lambda s, ws: conn)
+    mgr = SyncManager(ctx)
+    mgr.start("demo")
+    _wait(mgr, "demo", {"paused"})
+    mgr.stop("demo")
+    job = _wait(mgr, "demo", {"stopped"})
+    assert job.state == "stopped"
+    assert "set_sync_state" not in ctx.catalog.calls
+
+
+def test_stop_interrupts_the_backoff_wait(monkeypatch):
+    """A manual Stop during the countdown must cancel it at once, not wait out the backoff."""
+    monkeypatch.setattr(sm, "_RETRY_INITIAL_BACKOFF", 30.0)  # long enough to observe the state
+    ctx = _ctx([_source()])
+    conn = FlakyConnector([_Doc("d1")], fail_times=99)
+    monkeypatch.setattr("quickjoiner.connectors.registry.create_connector", lambda s, ws: conn)
+    mgr = SyncManager(ctx)
+    mgr.start("demo")
+    _wait(mgr, "demo", {"retrying"})
+    t0 = time.monotonic()
+    mgr.stop("demo")
+    job = _wait(mgr, "demo", {"stopped"}, timeout=5.0)
+    assert job.state == "stopped" and time.monotonic() - t0 < 2.0  # nowhere near the 30s backoff
+
+
+# ------------------------------------------------ heartbeat honesty
+
+def test_heartbeat_reports_the_active_phase_not_a_frozen_doc_count():
+    """The reported bug: once the pull finishes and the graph-relationships drain starts,
+    `job.ingested` stops moving, so the old heartbeat kept logging 'still syncing — N documents'
+    with the same N — reading as stuck on the last document. The line must instead surface the
+    phase that is actually advancing."""
+    mgr = SyncManager(_ctx([]))
+    job = SyncJob(id="x", source_name="tfs", source_id="azure_devops:tfs")
+    job.ingested = 10988
+    # During the pull, before any phase is reported: the doc count is the live signal.
+    assert mgr._progress_line(job) == "still syncing — 10988 documents so far"
+    # Pull done, draining graph relationships: lead with the phase + its real progress/%.
+    job.phase, job.phase_done, job.phase_total = "graph relationships", 56, 3091
+    line = mgr._progress_line(job)
+    assert "graph relationships 56/3091" in line and "2%" in line
+    assert "10988 documents" in line  # still honest about the pull total, just not leading
+
+
+# ------------------------------------------------ durable pause across a restart
+
+def _seed_paused(ctx, name="demo", jid="sync-old-1"):
+    """A row a previous process left behind: paused, never ended (ended_at IS NULL)."""
+    ctx.catalog.record_sync_event(jid, name, "paused", False, "2020-01-01T00:00:00+00:00")
+    return jid
+
+
+def test_revive_reconstructs_a_paused_sync_as_cold():
+    """A deliberately-paused sync must survive the process dying: on startup it's re-attached
+    as a cold paused job that still owns the source and can be resumed."""
+    ctx = _ctx([_source()])
+    jid = _seed_paused(ctx)
+    mgr = SyncManager(ctx)
+    assert mgr.revive_paused() == 1
+    job = mgr.job_for("demo")
+    assert job is not None and job.state == "paused" and job.cold and job.id == jid
+    assert mgr.is_running("demo")  # holds the source until resumed or discarded
+    # Surfaces in the feed even though its start predates the 24h retention window.
+    assert any(r["source"] == "demo" and r["state"] == "paused" for r in mgr.recent())
+
+
+def test_cold_resume_repulls_from_watermark_and_completes(monkeypatch):
+    ctx = _ctx([_source()])
+    _seed_paused(ctx)
+    conn = FakeConnector([_Doc("d1"), _Doc("d2")])
+    monkeypatch.setattr("quickjoiner.connectors.registry.create_connector", lambda s, ws: conn)
+    mgr = SyncManager(ctx)
+    mgr.revive_paused()
+    mgr.resume("demo")  # no live worker existed — resume must re-spawn one
+    job = _wait(mgr, "demo", {"done"})
+    assert job.state == "done" and job.stats["added"] == 2
+    assert "set_sync_state" in ctx.catalog.calls  # completed → watermark advanced
+
+
+def test_cold_stop_discards_without_hanging():
+    """Stopping a revived pause has no worker to signal — it must finalize directly, not
+    wedge in 'stopping' forever."""
+    ctx = _ctx([_source()])
+    _seed_paused(ctx)
+    mgr = SyncManager(ctx)
+    mgr.revive_paused()
+    job = mgr.stop("demo")
+    assert job.state == "stopped" and not mgr.is_running("demo")
+
+
+def test_revive_finalizes_a_dead_running_row_as_interrupted():
+    """A run that died mid-flight (state 'running', not paused) is not resumable — it's closed
+    out as interrupted so it stops showing as unfinished on later startups."""
+    ctx = _ctx([_source()])
+    ctx.catalog.record_sync_event("sync-dead-1", "demo", "running", False,
+                                  "2020-01-01T00:00:00+00:00")
+    mgr = SyncManager(ctx)
+    assert mgr.revive_paused() == 0
+    assert mgr.job_for("demo") is None  # not revived
+    row = ctx.catalog.events["sync-dead-1"]
+    assert row["state"] == "interrupted" and row["ended_at"]  # finalized
+
+
+def test_revive_finalizes_a_paused_row_whose_config_is_gone():
+    """A pause is only resumable while its connector still exists; otherwise it's interrupted."""
+    ctx = _ctx([])  # no configured sources
+    _seed_paused(ctx, name="gone", jid="sync-gone-1")
+    mgr = SyncManager(ctx)
+    assert mgr.revive_paused() == 0
+    assert ctx.catalog.events["sync-gone-1"]["state"] == "interrupted"
 
 
 def test_subscribe_replays_backlog_and_signals_done(monkeypatch):

@@ -40,6 +40,7 @@ function ago(iso: string | null): string {
 const TONE: Record<string, { dot: string; label: string }> = {
   running: { dot: "bg-accent animate-pulse", label: "syncing" },
   paused: { dot: "bg-gold", label: "paused" },
+  retrying: { dot: "bg-gold animate-pulse", label: "retrying" },
   stopping: { dot: "bg-accent animate-pulse", label: "stopping" },
   done: { dot: "bg-gold", label: "completed" },
   error: { dot: "bg-danger", label: "failed" },
@@ -68,6 +69,7 @@ function detail(n: SyncJob): string {
   const reset = n.kind === "reset";
   // A live run leads with its stage + %, so the menu answers "how far along?" at a glance.
   const stage = n.phase ? `${n.phase}${n.percent != null ? ` · ${n.percent}%` : ""}` : "";
+  if (n.state === "retrying") return stage ? `network error · ${stage}` : "network error · retrying";
   if (n.state === "paused") return stage ? `paused · ${stage}` : `paused · started ${ago(n.started_at)}`;
   if (n.state === "running" || n.state === "stopping") {
     if (stage) return stage;
@@ -105,7 +107,9 @@ export function NotificationsMenu({
   const ref = useRef<HTMLDivElement>(null);
 
   const unread = useMemo(() => items.filter((n) => !seen.has(notifKey(n))).length, [items, seen]);
-  const active = items.filter((n) => n.state === "running" || n.state === "stopping");
+  const active = items.filter(
+    (n) => n.state === "running" || n.state === "stopping" || n.state === "retrying",
+  );
   const lastDone = items.find((n) => n.state === "done");
 
   // Closing commits the read-state — while the menu is open the new rows stay highlighted

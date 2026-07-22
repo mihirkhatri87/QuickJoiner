@@ -1,0 +1,30 @@
+meta {
+  name: Set user role (admin)
+  type: http
+  seq: 5
+}
+
+patch {
+  url: {{baseUrl}}/api/auth/users/{{targetUser}}
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "role": "editor"
+  }
+}
+
+docs {
+  Sets a user's RBAC role to admin | editor | viewer. Admin only. `targetUser` is an
+  environment variable — set it to the username you're promoting/demoting.
+}

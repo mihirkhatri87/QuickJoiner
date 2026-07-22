@@ -64,7 +64,13 @@ class Auth:
     def enabled(self) -> bool:
         return self.catalog.count_users() > 0
 
-    def create_user(self, username: str, password: str) -> None:
+    def create_user(self, username: str, password: str, role: str | None = None) -> str:
+        """Create a user and return their assigned role. The FIRST user is always an admin
+        (they turn auth on and must be able to administer it); later users default to the
+        least-privileged role unless an explicit valid role is given. Returns the role so
+        callers can report/echo it."""
+        from quickjoiner.rbac import DEFAULT_ROLE, ROLES
+
         username = username.strip()
         if not username or not username.replace("-", "").replace("_", "").isalnum():
             raise ValueError("Usernames use letters, numbers, '-' and '_' only")
@@ -72,7 +78,38 @@ class Auth:
             raise ValueError("Password must be at least 4 characters")
         if self.catalog.get_user(username):
             raise ValueError(f"User {username!r} already exists")
-        self.catalog.create_user(username, hash_password(password))
+        first_user = not self.enabled
+        if first_user:
+            role = "admin"
+        elif role is None:
+            role = DEFAULT_ROLE
+        elif role not in ROLES:
+            raise ValueError(f"Unknown role {role!r} (choose from {', '.join(ROLES)})")
+        self.catalog.create_user(username, hash_password(password), role)
+        return role
+
+    def set_role(self, username: str, role: str) -> None:
+        from quickjoiner.rbac import ROLES
+
+        if role not in ROLES:
+            raise ValueError(f"Unknown role {role!r} (choose from {', '.join(ROLES)})")
+        if not self.catalog.get_user(username):
+            raise ValueError(f"No such user {username!r}")
+        self.catalog.set_user_role(username, role)
+
+    def get_role(self, username: str) -> str | None:
+        user = self.catalog.get_user(username)
+        return user.get("role") if user else None
+
+    def role_of(self, user: str | None) -> str:
+        """The effective role for access decisions. Open mode (no users) => admin for all,
+        preserving pre-auth behaviour; an authenticated user gets their stored role; an
+        unknown/anonymous user under enabled auth gets the least privilege."""
+        from quickjoiner.rbac import DEFAULT_ROLE, OPEN_MODE_ROLE
+
+        if not self.enabled:
+            return OPEN_MODE_ROLE
+        return self.get_role(user) or DEFAULT_ROLE if user else DEFAULT_ROLE
 
     def login(self, username: str, password: str) -> str:
         """Verify credentials and issue a bearer token."""

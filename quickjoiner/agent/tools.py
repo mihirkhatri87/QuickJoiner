@@ -151,6 +151,10 @@ def build_builtin_tools(
     _NEIGHBORS_SAMPLE_PER_REL = 8
 
     def _evidence_class(r) -> str:
+        if r["rel"] == "same_as":
+            # Identity bridges (ingest/bridges.py) carry no evidence doc — they are
+            # name-equality inferences and score as their own lowest-tier class.
+            return "name-bridge"
         return classify_evidence(r["evidence_title"] or "", r["evidence_uri"] or "",
                                  r["evidence_kind"] or "")
 
@@ -163,10 +167,14 @@ def build_builtin_tools(
         src = r["src_name"] or r["src"]
         dst = r["dst_name"] or r["dst"]
         detail = f" ({r['detail']})" if r["detail"] else ""
-        evidence = r["evidence_title"] or r["evidence_uri"] or r["evidence_doc_id"]
+        # Bridges have no evidence doc; their self-describing detail is the whole story.
+        evidence = (r["evidence_title"] or r["evidence_uri"] or r["evidence_doc_id"]
+                    or "none — name-equality inference")
         suffix = ""
         if flag_weak and _evidence_class(r) == "meeting-notes":
             suffix = " (low-confidence: meeting-notes evidence)"
+        elif flag_weak and _evidence_class(r) == "name-bridge":
+            suffix = " (low-confidence: same-name identity bridge, no document asserts it)"
         return f"- {src} --{r['rel']}--> {dst}{detail} [evidence: {evidence}]{suffix}"
 
     def graph_neighbors(entity: str) -> str:

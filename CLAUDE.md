@@ -180,6 +180,30 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   hits (via shared entities) and `search_memory` appends them as a "RELATED via knowledge graph"
   section — the multi-hop / cross-source channel. It runs ONLY when there are already grounded hits,
   so it never turns a refusal into an answer (grounding gate untouched).
+  **Cross-source identity bridges (`same_as`, 2026-07-21, roadmap #24):** entities are keyed
+  `type:name` and resolution merges same-type only, so `service:connector` / `repo:connector` / the
+  pipeline that builds it were disjoint islands (measured pre-reset: 158 exact service↔repo name
+  matches, 18 multi-source entities in 3,580). `ingest/bridges.py::compute_same_as_bridges` (pure)
+  emits deterministic cross-type `same_as` edges between `service`/`repo`/`project`/`pipeline`
+  entities whose names — or aliases, incl. **every connector's `aka` option** ("also known as",
+  on all 13 types via a guarded append after `FORM_SPECS`; persisted by `upsert_source` →
+  `_declare_aka_aliases` as entity aliases so they also feed `resolve_entity`/expansion/suggest for
+  any source, and drive bridges wherever the source maps to a bridgeable entity) — match after
+  normalization. `aka` follows the
+  **connector-name editability rule**: settable at creation, locked once the connector has learned
+  documents (a later alias *removal* could not be un-declared consistently) — generic
+  `lock_after_sync` flag in `FORM_SPECS`, enforced in the PATCH endpoint (409 on a changed value,
+  unchanged round-trips fine via `_norm_opt` list/string normalization) and rendered
+  disabled-with-reason in `EditConnectorModal`. Guards: ≥5 alnum chars,
+  all-generic names skipped (`_GENERIC_TOKENS`), groups >6 members skipped, cross-type only.
+  **Honesty:** a bridge is an inference — empty `evidence_doc_id` (never citable, corroboration 0),
+  self-describing `detail`, its own lowest-tier `name-bridge` confidence class (0.30 in
+  `confidence._BASE`; min-rule caps any chain crossing one), excluded from `gc_orphan_entities`'
+  keeps-alive rule (dangling bridges swept). `catalog.refresh_same_as_bridges()` is a full derived-
+  layer recompute, called best-effort by `pipeline.ingest` after any batch with adds/updates;
+  `graph_path` traverses bridges natively, `graph_expand` extends its seed entities across them but
+  still returns only real cited documents. A bridge, deliberately NOT a merge: one row to delete if
+  wrong. Tests: `tests/test_bridges.py`.
   **Alias query expansion** (`memory/expansion.py`, `expand_query(catalog, query)`,
   `retrieval.alias_expansion`, on): the query-side twin of ingest-time aliasing (`connectors/deps.py`).
   Slides 1–4-token windows over the normalized query, resolves each against the knowledge graph
@@ -363,7 +387,25 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   list_connector_types / add_connector / sync_source — same service functions as the UI
   slash commands; prompt requires explicit user confirmation before add_connector, secrets
   via env: indirection only, scrape only user-given URLs, failed connection tests are not
-  saved; wired in `AppContext.build_agent`), tool-call loop (`agent.py`, max 10 rounds —
+  saved; wired in `AppContext.build_agent`),
+  **self-control tools = `/qj` natural-language control of QuickJoiner's OWN API** (`control.py`,
+  plan 08, 2026-07-21): `qj_api(method, path, body, confirm)` dispatches against the real API
+  **in-process** (Starlette `TestClient` over the same FastAPI app + `AppContext` — no network, no
+  duplicated handlers) and `qj_api_reference(area)` lists the endpoints the caller may use (role-
+  filtered) plus the connector field schema (so "create a git connector" is one discovery call).
+  Three gates before anything runs: RBAC capability (`rbac.py`) → connector scope
+  (`visible`/`can_manage`) → danger-confirm (`memory:reset`/`connectors:delete` need typed
+  `confirm=true` on top of the prompt's conversational confirmation for any mutation). SSE
+  endpoints are refused. The acting user is injected into the in-process request via a
+  per-process secret header (`_internal_user` middleware in `api/app.py` sets a contextvar
+  `_user` honours; a network client can't forge it). Wired in `build_agent(user, role)` (role
+  derived via `role_of`). The **permanent control connector** (`connectors/self_connector.py`,
+  type `quickjoiner`) is seeded as a commons singleton that yields no documents (never ingested,
+  never in the graph) and is un-deletable/un-renamable/un-syncable (409 guards) — it's the plate
+  that surfaces this capability. Tests: `tests/test_control_tools.py` (gating, danger-confirm,
+  scope, role-filtered reference, seeded+undeletable connector, route-coverage lockstep). Old
+  `/connect` + `/learn` slash commands are retired in favour of `/qj`. Also: tool-call loop
+  (`agent.py`, max 10 rounds —
   **each live tool result is capped to `chat.live_tool_result_max_chars` (default 24000) before
   re-entering the model context**, so an unbounded connector tool like the full Octopus dashboard
   can't overflow the window and make the provider reject the follow-up turn; on hitting the round
@@ -402,11 +444,26 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   cp1252 Windows console (the save+ingest already completed before the render — this stops the
   cosmetic exit-1 crash it caused for `qj agents-md`/`qj brief`).
 - `quickjoiner/auth.py` — opt-in local auth. `Auth` over the catalog: PBKDF2 password hashing,
-  bearer tokens (sha256-hashed at rest in `auth_tokens`), `users` table. **Open mode until the
-  first user exists** (no login, everything shared = pre-auth behavior). Sharing model on
-  `SourceConfig` (`owner`, `shared`): ownerless = commons; owned = owner-only unless `shared`.
-  `visible()` / `can_manage()` are the gate. Ingested *knowledge* stays one communal memory;
-  sharing governs who sees/manages a **connector's config + credentials** and gets its live tools.
+  bearer tokens (sha256-hashed at rest in `auth_tokens`), `users` table (with a **`role`
+  column**). **Open mode until the first user exists** (no login, everything shared = pre-auth
+  behavior). Sharing model on `SourceConfig` (`owner`, `shared`): ownerless = commons; owned =
+  owner-only unless `shared`. `visible()` / `can_manage()` are the gate. Ingested *knowledge*
+  stays one communal memory; sharing governs who sees/manages a **connector's config +
+  credentials** and gets its live tools.
+  **RBAC (plan 08, 2026-07-21):** `Auth` gained `create_user(role)` (**first user is always
+  admin**; later users default `viewer`), `set_role`, `get_role`, and `role_of(user)` (open mode
+  ⇒ admin for all; enabled auth ⇒ the stored role, anonymous/unknown ⇒ least privilege). The
+  role → capability model lives in **`quickjoiner/rbac.py`** (pure, dependency-free): roles
+  **admin / editor / viewer**, a capability taxonomy derived from the OpenAPI tag groups
+  (`connectors:write`, `sync:run`, `memory:reset`, `settings:write`, `users:admin`, …), and a
+  `(method, path) → capability + connector-scope` map (`required_capability`, `can`) covering
+  every `/api` route — a **route-coverage lockstep test** asserts none is unmapped. `connectors:
+  delete`/`memory:reset` are the danger tier. Enforced in **two** places: the control tool
+  (`agent/control.py`, the chat path) and the HTTP layer (`_require(cap, user)` on every mutating
+  route, placed after existence/visibility checks so a private resource still 404s rather than
+  leaking via 403 — open mode is a no-op since everyone is admin). Connector-specific ops also
+  require the source be visible/manageable (reuses `visible`/`can_manage`). Tests:
+  `tests/test_rbac.py` (model + lockstep), role gating in `tests/test_auth.py`.
   (PLANNED, not built: per-user **knowledge scopes** — query-time union of commons + own +
   shared over the one store, with an ingest-time entity-merge guard and a promotion flow;
   intake 2026-07-18 → `CLOUD_ROADMAP.md` Y1 workstream 8 / PRD W9.3. Must precede multi-user GA.)
@@ -585,6 +642,51 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   between-document check — they finish in seconds / yield per page, so no long non-yielding stretch
   to instrument. `SyncJob` gains `phase`/`phase_done`/`phase_total` + `percent()` (surfaced in every
   `summary()`, so `/api/syncs` + `/api/notifications` carry them).
+  **Self-healing network auto-retry (`_pull_with_auto_retry`/`_enter_network_hold`, state
+  `retrying`, 2026-07-21):** a sync that dies mid-pull on a **transient network** failure no
+  longer fails the run — it auto-pauses and retries itself. A raised exception kills the
+  connector's generator (a Python generator can't resume past a raise), so a retry re-invokes
+  `connector.sync(state)` from the **un-advanced watermark**; idempotent hash-dedupe skips the docs
+  the failed attempt already committed (full-refresh connectors re-walk but re-embed nothing
+  unchanged). Backoff **doubles from 20s** (`_RETRY_INITIAL_BACKOFF`) and it keeps retrying for up
+  to **1 hour** (`_RETRY_MAX_WINDOW`) after the first failure; each wait is `job.cancel.wait()`, so a
+  manual **Stop cancels the countdown at once**. Once the budget is spent the job parks in a
+  genuine **paused** state (`_enter_network_hold` — thread blocked on `SyncJob.gate`, watermark
+  never advanced) with clear logs; a manual **Resume restarts the whole budget** and re-attempts,
+  **Stop** abandons it. Classification is `connectors.util.is_transient_network_error` — httpx
+  transport errors, a persisted 429/5xx (`HTTPStatusError` after the HTTP layer's own 4-attempt
+  retry in `_request_with_retry` was exhausted), and raw socket/OS failures incl. Windows
+  `WinError 10060`. Only network errors retry: **auth/config/code errors (e.g. a 401 or a
+  `ValueError`) fail immediately** as before, since they'd fail identically however long we wait.
+  This composes with the existing per-call HTTP retry (that smooths sub-~7s blips; this rides out a
+  sustained outage). The `retrying` state joins `running`/`paused`/`stopping` everywhere a job is
+  counted "in flight" (`is_running`/`active_sources`/`recent`/`subscribe`/`stop`) and is rendered
+  in the rail pill, connector plate, bell menu, history and log modal (gold "retrying…", Stop stays
+  available). Tests: `tests/test_sync_manager.py` (classifier split, retry-then-recover, non-network
+  fail-fast, budget→resumable-pause, stop-during-hold, stop-interrupts-backoff). Caveat: like all
+  the cooperative control, this only governs syncs started **after** the current process — a run in
+  an old server process isn't affected (a *paused* run is the exception — it's durable, see next).
+  **Durable pause across a restart (`revive_paused`/`_resume_cold`, `SyncJob.cold`, 2026-07-21):**
+  pause→resume now survives the worker being killed / the laptop being closed in between. The
+  durable record is the existing `sync_events` row — a paused job persists as `state="paused",
+  ended_at IS NULL` (written by `pause`/`_enter_network_hold` via `_record`), and
+  `prune_sync_events` was hardened to **never drop an unfinished row** so a days-long pause outlives
+  the 7-day retention window. At API startup `app.py` calls `syncs.revive_paused()`, which reads
+  `catalog.list_unfinished_syncs()` and, for each `paused` sync whose connector is still configured,
+  re-attaches a **cold** `SyncJob` (state `paused`, no worker thread) that owns the source; every
+  other unfinished row (a run that died mid-flight, or a paused one whose config is gone) is
+  finalized as `interrupted` so it stops re-appearing. A killed process loses the in-memory
+  generator, so a cold job can't literally continue — `resume()` detects `cold` and calls
+  `_resume_cold`, which spawns a fresh worker that re-runs `connector.sync(state)` from the
+  un-advanced watermark (`clean=False` ⇒ never re-purges; idempotent dedupe skips already-ingested
+  docs) — the same re-pull model as the network auto-retry. It does **not** auto-resume: the pause
+  was deliberate, so it waits for the user. `stop()` on a cold job finalizes it directly (no worker
+  to signal, so it can't wedge in `stopping`). `recent()` also unions in-memory active/paused jobs
+  that predate the feed window, so a long-dormant revived pause still surfaces in the UI. A cold job
+  presents as an ordinary `paused` job, so the rail/plate/bell/log-modal render it and its
+  Resume/Stop with no UI change. Tests: `tests/test_sync_manager.py` (revive-as-cold, cold-resume
+  re-pulls + completes, cold-stop finalizes, dead-running→interrupted, config-gone→interrupted) +
+  `tests/test_catalog.py` (prune keeps unfinished, `list_unfinished_syncs`).
   **Cleanup jobs** (`start_cleanup(name, source_id)`, `SyncJob.kind` = `sync|cleanup`): the same
   `_purge` as a clean sync, without the re-pull — documents (cascading graph edges), vectors, FTS,
   orphan graph nodes and the watermark. It takes `source_id` as an argument rather than looking the
@@ -675,6 +777,15 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
      (per the rule above).
   Verify the schema still builds (`app.openapi()`), and that request bodies/params in the runbooks
   match the models — a runbook that 4xxs against the real API is worse than none.
+- **Every API change is a UI+API change until proven otherwise.** Whenever an endpoint, request/
+  response shape, or API-served catalog (e.g. `FORM_SPECS` → `/api/connectors/types`) changes,
+  **scan the frontend for every consumer** (`frontend/src/api.ts` is the map; then the components
+  and flows that call it — forms, wizard, modals, rail, bell) and scope the UI work into the SAME
+  change: render the new capability, handle the new error/status codes, respect new constraints
+  (disabled states with the reason, not silent absence). Then **verify in the browser** (Playwright
+  against a scratch workspace) — "the UI is data-driven so it'll just appear" is a hypothesis, not
+  a verification; it also misses that the *running server process* must be restarted to serve
+  changed server-side data. A backend change whose UI half is unverified is an incomplete change.
 - **Plans and roadmaps are forward-looking; graduate finished work OUT of them.** `docs/plans/`
   and the roadmaps embedded in the strategy docs describe work that is **not yet done**. The
   moment a slice ships (or is deliberately dropped), in the **same change**:
@@ -1058,6 +1169,78 @@ Post-phase additions (2026-07-07, all tested — suite: **89 passed**):
   reason after. Tests: rename-before-sync / rejected-after-sync / name-taken in `test_api.py`.
   Verified live in Chrome (Fresh 0-doc editable + renamed via UI; Synced 23-doc locked). Follows
   the new API-docs house rule: Swagger summary + Postman/Bruno runbooks updated in the same change.
+
+- Cross-source identity bridges shipped (2026-07-21, priorities item — roadmap #24 graduated):
+  see the `memory/` bullet above for the full design. Includes the user-requested **`aka`
+  ("also known as") connector option** on git/files (FORM_SPECS-driven, appears in the web
+  forms automatically; comma-separated) — a declared alias is the identity claim name-matching
+  can't discover (repo "Stevedore" aka "appriver.provisioning"). Suite: **489 passed** (+13
+  in `tests/test_bridges.py`: pure guards, alias bridging, aka end-to-end via `upsert_source`,
+  graph_path/graph_expand crossing, gc sweep, confidence cap), 12 skipped, pre-existing
+  eval-yaml failure unchanged. Follow-ups same day (user): `aka` now carries the generic
+  `lock_after_sync` FORM_SPECS flag — same editability rule as the connector name (settable at
+  creation, 409 + disabled-with-reason after the first sync; unchanged values round-trip via
+  `_norm_opt`) — and the UI was **browser-verified** this time (create form shows the field;
+  editable at 0 docs; locked with hint at 23 docs). The initial miss ("data-driven, it'll just
+  appear" — asserted, unverified, and the user's running server needed a restart to serve the new
+  FORM_SPECS) prompted the new **UI+API scoping house rule** in Conventions. Follow-up: `aka` was
+  initially only on git/files (the "repos" the user named); when the user hit a **Confluence**
+  connector without it, extended to **all 13 connector types** — "also known as" is meaningful for
+  any connected system (alias search/expansion for every source; bridges where the source is a
+  bridgeable entity). Browser-verified on the Confluence edit modal specifically. NOTE (honest): the live before/after demo was not possible —
+  the user's workspace had been **memory-reset** and not yet re-synced (0 entities; the earlier
+  158-match measurement was pre-reset). Bridges compute automatically as re-syncs land, via the
+  pipeline hook. AI_ROADMAP #24 moved to Shipped; PRIORITIES renumbered; KNOWLEDGE_GRAPH.md §5.
+- Self-healing sync on network failure (2026-07-21, user request): before, a network error
+  mid-ingest (past the HTTP layer's 4-attempt retry) failed the whole sync with no recovery, and
+  a manual pause/resume couldn't rescue it — the failure had already killed the worker thread and
+  the connector's generator (a generator can't resume past a raise). Now a **transient network**
+  failure auto-pauses the job into a new `retrying` state, waits an **exponential backoff (20s →
+  40s → 80s …)**, and re-runs `connector.sync(state)` from the un-advanced watermark (idempotent
+  dedupe skips already-committed docs) for **up to 1 hour**; after that it parks in a resumable
+  **paused** state with clear logs (manual Resume restarts the budget, Stop abandons). Only
+  network-classified errors retry (`connectors.util.is_transient_network_error`); auth/config/code
+  errors fail immediately as before. Wired through the whole job surface + UI (`retrying` pill,
+  Stop stays live). See the `sync_manager` architecture bullet for the full design. Suite:
+  **496 passed** (+7: 6 new sync-manager tests + the classifier test), 12 skipped, pre-existing
+  eval-yaml failure unchanged. Frontend rebuilt (typecheck clean). Answered in the same session:
+  *before* this change, a manual pause/resume after a network failure did **not** continue the sync
+  and could not — the job was already terminally `error` with its thread gone; it was abandoned
+  cleanly (watermark not advanced, committed docs intact), not corruptly.
+- Heartbeat honesty during the graph drain (2026-07-21, user-reported): once a connector's
+  document pull finished and the pipeline moved into the deferred graph-relationships drain,
+  `job.ingested` stopped changing, so the 20s heartbeat kept logging `still syncing — N documents
+  so far` with a frozen N — reading as "stuck repeating the last document" even though the drain
+  (`graph relationships 56/3091`) was advancing (that progress fed the top bar but never the log
+  stream). Fix: `SyncManager._progress_line` — when a phase is being reported (`job.phase`/
+  `phase_done`/`phase_total`), the heartbeat leads with that phase + its progress/% (e.g.
+  `10988 documents · graph relationships 56/3091 · 2%`), falling back to the doc count only when no
+  phase is set. Pure + unit-tested (`test_heartbeat_reports_the_active_phase_not_a_frozen_doc_count`).
+- Durable pause across a restart (2026-07-21, user request): a sync that was **paused** now
+  survives the worker being killed / the laptop being closed between pause and resume. The paused
+  `sync_events` row is the durable record (prune hardened to never drop an unfinished row); at API
+  startup `SyncManager.revive_paused()` re-attaches each still-configured paused sync as a **cold**
+  job that owns the source, and Resume re-runs the connector from the watermark (idempotent dedupe
+  skips what's done — the same re-pull model as the network auto-retry, since a killed process
+  loses the in-memory generator either way). Deliberately does not auto-resume; runs that died
+  mid-flight are finalized `interrupted` (unchanged). No frontend change — a cold job presents as an
+  ordinary `paused` job. See the `sync_manager` architecture bullet for the design. Suite: **502
+  passed** (+6: revive/cold-resume/cold-stop/interrupted-finalize + catalog prune-keeps-unfinished),
+  12 skipped, pre-existing eval-yaml failure unchanged.
+- Natural-language self-control (`/qj`) + RBAC (2026-07-21, user request; **plan 08**): full
+  control of QuickJoiner from chat via its OWN API, gated by a real role system so it's safe at
+  100+ users. **Generic dispatch** — `qj_api`/`qj_api_reference` (`agent/control.py`) call the API
+  in-process and are the single choke point for permissions; the API is a **permanent, non-ingested
+  control connector** (type `quickjoiner`) that can't be deleted. **RBAC** (`rbac.py`, `role` column
+  on `users`): admin / editor / viewer with capability + connector scoping, enforced BOTH in the
+  control tool and at the HTTP layer (`_require`). New endpoints `GET /api/auth/users` +
+  `PATCH /api/auth/users/{username}` (admin), `role` added to `POST /api/auth/users` and
+  `GET /api/auth/status`. Frontend: `/connect` + `/learn` replaced by `/qj <plain language>`; a
+  **People & access** admin panel (list users + role dropdowns + add-user-with-role), the control
+  connector shown as a locked plate, and role-gated affordances (viewers/editors don't see the
+  memory-reset danger zone or admin controls). Full design + the staged build: `docs/plans/08-…md`.
+  Suite: **530 passed**, 12 skipped, pre-existing eval-yaml failure unchanged; frontend typecheck +
+  build green. OPEN: live browser (Playwright) verification of the `/qj` + admin UI flows.
 
 ## Next steps (agreed with user)
 

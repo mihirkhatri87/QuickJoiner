@@ -60,7 +60,17 @@ def classify_evidence(title: str, uri: str, kind: str) -> str:
 # strongest claim; a deliberately authored architecture doc close behind; ordinary
 # prose in the middle; an informal meeting-notes/journal page weakest — real, but
 # never authoritative on its own (the "Jan 6, 2026" lesson).
-_BASE = {"dependency-map": 0.60, "authored-doc": 0.55, "generic": 0.45, "meeting-notes": 0.25}
+_BASE = {
+    "dependency-map": 0.60,
+    "authored-doc": 0.55,
+    "generic": 0.45,
+    # A `same_as` identity bridge (ingest/bridges.py): deterministic, but inferred purely
+    # from name equality — no document asserts it. Above meeting-notes (it can't be
+    # wrong about *what was said*, only about identity) yet below all document-backed
+    # classes; with zero corroboration possible, chains crossing a bridge cap here.
+    "name-bridge": 0.30,
+    "meeting-notes": 0.25,
+}
 
 
 def score_edge(evidence_class: str, doc_corroboration: int, source_corroboration: int) -> float:

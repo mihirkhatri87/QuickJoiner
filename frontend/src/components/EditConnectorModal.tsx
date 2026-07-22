@@ -104,10 +104,13 @@ export function EditConnectorModal({
             <div className="text-[12.5px] text-faint">This connector type has no editable options.</div>
           )}
           {fields.map((f) => {
+            // Identity-shaping fields (lock_after_sync, e.g. "also known as") follow the
+            // same rule as the name: editable only before the first sync.
+            const locked = Boolean(f.lock_after_sync) && !canRename;
             const hints = [
-              f.help,
+              locked ? "Fixed after the first sync — clean up this connector to change it." : f.help,
               f.secret ? "Leave unchanged to keep the stored secret." : "",
-              f.list ? "Several values? Separate with commas." : "",
+              !locked && f.list ? "Several values? Separate with commas." : "",
             ].filter(Boolean);
             return (
               <Field key={f.key} label={`${f.label}${f.required ? " *" : ""}`} hint={hints.join(" — ")}>
@@ -115,6 +118,9 @@ export function EditConnectorModal({
                   type={f.secret ? "password" : "text"}
                   placeholder={f.placeholder}
                   value={vals[f.key] ?? ""}
+                  disabled={locked}
+                  readOnly={locked}
+                  className={locked ? "cursor-not-allowed opacity-60" : undefined}
                   onChange={(e) => setVals((p) => ({ ...p, [f.key]: e.target.value }))}
                 />
               </Field>

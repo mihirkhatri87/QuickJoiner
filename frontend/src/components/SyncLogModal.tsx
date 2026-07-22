@@ -88,7 +88,12 @@ export function SyncLogModal({
   // The SSE stream only carries log lines + a terminal `done`, so poll the live job while
   // it's active to keep the phase/% fresh. Stops polling once the job leaves an active
   // state (the `done` event already set the final job).
-  const activeState = job === null || job.state === "running" || job.state === "paused" || job.state === "stopping";
+  const activeState =
+    job === null ||
+    job.state === "running" ||
+    job.state === "paused" ||
+    job.state === "retrying" ||
+    job.state === "stopping";
   useEffect(() => {
     if (!activeState) return;
     let stop = false;
@@ -117,8 +122,14 @@ export function SyncLogModal({
   }, [onClose]);
 
   const paused = job?.state === "paused";
-  // "active" = the job still owns the source (incl. paused); drives the footer controls.
-  const active = !job || job.state === "running" || job.state === "paused" || job.state === "stopping";
+  const retrying = job?.state === "retrying";
+  // "active" = the job still owns the source (incl. paused/retrying); drives the footer controls.
+  const active =
+    !job ||
+    job.state === "running" ||
+    job.state === "paused" ||
+    job.state === "retrying" ||
+    job.state === "stopping";
   const jobKind = job?.kind ?? kind;
   // Cleanup and reset are short, all-or-nothing purges — neither is pausable or stoppable.
   const isPurge = jobKind === "cleanup" || jobKind === "reset";
@@ -148,11 +159,13 @@ export function SyncLogModal({
 
   const dot = paused
     ? "bg-gold"
-    : active
-      ? "bg-accent animate-pulse"
-      : job?.state === "error"
-        ? "bg-danger"
-        : "bg-gold";
+    : retrying
+      ? "bg-gold animate-pulse"
+      : active
+        ? "bg-accent animate-pulse"
+        : job?.state === "error"
+          ? "bg-danger"
+          : "bg-gold";
 
   return (
     <div
@@ -192,7 +205,7 @@ export function SyncLogModal({
           <div className="border-b border-fill2 px-5 py-2.5">
             <div className="flex items-baseline justify-between gap-3">
               <span className="truncate text-[12px] text-muted">
-                {paused ? "Paused" : "Stage"}
+                {paused ? "Paused" : retrying ? "Retrying" : "Stage"}
                 {job?.phase ? <span className="text-ink"> · {job.phase}</span> : null}
                 {job?.phase_total ? (
                   <span className="ml-1 font-mono text-[11px] text-faint">

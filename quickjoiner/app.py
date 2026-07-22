@@ -23,6 +23,11 @@ class AppContext:
     catalog: CatalogBackend
     store: StoreBackend
     pipeline: IngestPipeline
+    # Set by api.app.create_app: the FastAPI app + a per-process secret the control tools
+    # (agent/control.py) use to dispatch API calls in-process as the acting user. None until
+    # an app is built (the CLI builds one lazily around this same ctx on first control call).
+    app: object | None = None
+    internal_secret: str = ""
 
     def build_provider(self, provider_override: str | None = None, model_override: str | None = None):
         llm = self.config.llm.model_copy()
@@ -40,7 +45,10 @@ class AppContext:
         model_override: str | None = None,
         extra_system: str | None = None,
         sources: list | None = None,
+        user: str | None = None,
+        role: str | None = None,
     ) -> OnboardingAgent:
+        from quickjoiner.agent.control import build_control_tools
         from quickjoiner.agent.ops import build_ops_tools
 
         provider = self.build_provider(provider_override, model_override)
@@ -54,6 +62,9 @@ class AppContext:
         )
         tools.extend(build_ops_tools(self))
         tools.extend(self.connector_tools(sources))
+        # Self-control tools (plan 08): full API control from chat, gated by the acting user's
+        # RBAC role (derived from role_of when not given). Scoped, confirmed, and permission-checked.
+        tools.extend(build_control_tools(self, user, role))
         system = SYSTEM_PROMPT + (f"\n\n{extra_system}" if extra_system else "")
         return OnboardingAgent(
             provider, tools, system,

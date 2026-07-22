@@ -223,36 +223,16 @@ export async function startConnectFlow(ctx: CommandCtx, preselectType?: string):
 /* ------------------------------------------------------------- registry */
 
 export function buildCommands(ctx: CommandCtx): Command[] {
+  // /connect and /learn were retired in favour of `/qj <natural language>` (plan 08): the agent
+  // now creates connectors and teaches facts through QuickJoiner's own API, so "connect a git
+  // repo" or "teach: deploys are on Fridays" work in plain language, RBAC-gated. /scrape stays
+  // (it's a distinct streaming crawl+synthesis flow, not an API mutation). The wizard machine is
+  // still reachable from the knowledge-gap "Connect <type>" CTA via startConnectFlow.
   return [
-    {
-      name: "connect",
-      match: /^\/connect\b/i,
-      run: async (_m, raw) => {
-        ctx.pushUser(raw);
-        await startConnectFlow(ctx);
-      },
-    },
     {
       name: "scrape",
       match: /^\/scrape\s+(\S+)/i,
       run: (m, raw) => runScrape(ctx, m[1], raw),
-    },
-    {
-      name: "learn",
-      match: /^\/learn\s+(.+)$/is,
-      run: async (m, raw) => {
-        ctx.pushUser(raw);
-        ctx.setBusy(true);
-        try {
-          const r = await api.learn(m[1].trim());
-          ctx.say(`Saved as a taught note — ${r.result}`);
-        } catch (e) {
-          ctx.sayError("Could not learn: " + String(e));
-        } finally {
-          ctx.setBusy(false);
-          ctx.refresh();
-        }
-      },
     },
   ];
 }
