@@ -28,7 +28,9 @@ You should only ever edit variables — never the individual requests.
 | `username`, `password` | Only used by the auth folder. Skip that folder to stay in open mode. The first user is always an **admin**. |
 | `targetUser` | The user whose role the "Set user role" request changes (admin-only RBAC: admin / editor / viewer). |
 | `connectorName`, `connectorType`, `connectorPath` | The source the "connect" folder creates. Defaults create a `files` connector — set `connectorPath` to a real folder, or change `connectorType`/options for git/github/jira/etc. |
+| `uploadPath` | An absolute file path on the server host for the "Ingest a server file path" request (Word/PowerPoint/Excel/PDF/Markdown/…). The multipart "Upload a document" request instead points its `files` part at a local file. |
 | `askQuestion`, `searchQuery`, `suggestPrefix` | The queries used in the "query" folder. |
+| `attachmentId` | **Captured automatically** by "Attach a file to a question" (per-question context files, not memory) — used by the download request. Leave blank. |
 | `entityA`, `entityB` | The two graph nodes for the path request. |
 | `token`, `sessionId` | **Filled in automatically** — login captures the token; leave blank. |
 
@@ -50,6 +52,10 @@ login request stores the bearer token so every later request sends `Authorizatio
 2. **1 · Auth** *(optional)* — create user + login (captures the token).
 3. **2 · Connect** — list types, create the connector, test it.
 4. **3 · Sync** — start the sync, then poll `GET /api/syncs` (shows stage + %), or stream the logs.
-5. **4 · Query** — search, ask a grounded question (SSE), teach a fact, autocomplete.
+   This folder also holds **Upload a document** (multipart) and **Ingest a server file path** — drop
+   Word/PowerPoint/Excel/PDF/Markdown/… into memory via the rolling Uploads connector.
+5. **4 · Query** — search, ask a grounded question (SSE), teach a fact, autocomplete, and attach a
+   file to a question (per-question context — extracted to text, injected into the turn, NOT memory;
+   auto-deleted after the retention window) + download it.
 6. **5 · Graph** — snapshot, entity search, path between two entities, bridges, gaps.
 7. **6 · Lifecycle** — clean up one connector, delete a connector, or reset all memory.

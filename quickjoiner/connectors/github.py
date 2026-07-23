@@ -8,7 +8,7 @@ from typing import Any, Iterator
 
 from quickjoiner.connectors.base import ConnectionStatus, Connector, Document, Mode
 from quickjoiner.connectors.registry import register
-from quickjoiner.connectors.util import get_json, resolve_secret
+from quickjoiner.connectors.util import get_json, prefetch_pages, resolve_secret
 from quickjoiner.llm.base import AgentTool, ToolSpec
 
 MAX_PAGES = 4
@@ -100,37 +100,41 @@ class GitHubConnector(Connector):
 
         # No cheap up-front count for the GitHub list APIs, so these report a phase label
         # (the UI shows a live shimmer) rather than a misleading fraction of the page cap.
-        for page in range(1, MAX_PAGES + 1):
-            self._stage("pull requests")  # also a stop/pause checkpoint, per page
-            prs = get_json(
-                f"{base}/repos/{repo}/pulls",
-                headers=headers,
-                params={"state": "all", "sort": "updated", "direction": "desc",
-                        "per_page": PER_PAGE, "page": page},
-            )
+        # Each list prefetches the next page while the current one is parsed+embedded.
+        def _fetch(endpoint):
+            def fetch(page):
+                page = page or 1
+                items = get_json(
+                    f"{base}/repos/{repo}/{endpoint}", headers=headers,
+                    params={"state": "all", "sort": "updated", "direction": "desc",
+                            "per_page": PER_PAGE, "page": page},
+                )
+                more = len(items) == PER_PAGE and page < MAX_PAGES
+                return items, (page + 1 if more else None)
+            return fetch
+
+        self._stage("pull requests")
+        stop = False
+        for prs in prefetch_pages(_fetch("pulls"), 1, self._checkpoint):
+            self._stage("pull requests")
             for pr in prs:
                 if since and pr.get("updated_at", "") < since:
-                    prs = []
+                    stop = True
                     break
                 yield pr_document(repo, pr)
-            if len(prs) < PER_PAGE:
+            if stop:
                 break
 
-        for page in range(1, MAX_PAGES + 1):
+        self._stage("issues")
+        stop = False
+        for issues in prefetch_pages(_fetch("issues"), 1, self._checkpoint):
             self._stage("issues")
-            issues = get_json(
-                f"{base}/repos/{repo}/issues",
-                headers=headers,
-                params={"state": "all", "sort": "updated", "direction": "desc",
-                        "per_page": PER_PAGE, "page": page},
-            )
-            real_issues = [i for i in issues if "pull_request" not in i]
-            for issue in real_issues:
+            for issue in (i for i in issues if "pull_request" not in i):
                 if since and issue.get("updated_at", "") < since:
-                    issues = []
+                    stop = True
                     break
                 yield issue_document(repo, issue)
-            if len(issues) < PER_PAGE:
+            if stop:
                 break
 
         self._stage("CI runs & ownership")

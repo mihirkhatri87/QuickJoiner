@@ -12,7 +12,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -123,6 +123,9 @@ class ChatRequest(BaseModel):
     project: str | None = None  # project id or name; groups sessions + scopes memory
     provider: str | None = None
     model: str | None = None
+    # Per-question context files (from POST /api/chat/attachments). Their text is injected into
+    # THIS turn only and their metadata is stamped on the user message — NOT ingested into memory.
+    attachment_ids: list[str] = []
 
 
 class ProjectRequest(BaseModel):
@@ -143,6 +146,10 @@ class RoleUpdate(BaseModel):
 class LearnRequest(BaseModel):
     fact: str
     topic: str | None = None
+
+
+class UploadLocalRequest(BaseModel):
+    path: str  # a file path on the server, ingested into the rolling uploads connector
 
 
 class ScrapeRequest(BaseModel):
@@ -221,6 +228,23 @@ def _ensure_control_connector(ctx: AppContext, name: str, type_: str) -> None:
         pass
 
 
+def _ensure_uploads_connector(ctx: AppContext) -> None:
+    """Seed the permanent rolling Uploads connector if absent. Ownerless (commons) so everyone
+    sees the drop-box plate; unlike the control connector it DOES ingest documents (from the
+    upload endpoints and its own folder scan) and is syncable/cleanable — only delete/rename are
+    refused by the endpoint guards, so it stays a single, continuously-growing source."""
+    from quickjoiner.connectors.uploads import UPLOADS_NAME, UPLOADS_TYPE
+
+    if any(s.name == UPLOADS_NAME for s in ctx.config.sources):
+        return
+    source = SourceConfig(name=UPLOADS_NAME, type=UPLOADS_TYPE, options={}, owner=None, shared=True)
+    ctx.config.sources.append(source)
+    try:
+        ctx.catalog.write_source(source)
+    except Exception:  # noqa: BLE001 — the in-memory source is enough; persistence is best-effort
+        pass
+
+
 def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = True) -> FastAPI:
     """Build the FastAPI app. `ctx` lets a caller (e.g. the CLI's control tools) reuse an
     existing AppContext instead of building a second one over the same workspace — the app is
@@ -260,6 +284,7 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
             _internal_user_var.reset(token)
 
     _ensure_control_connector(ctx, CONTROL_NAME, CONTROL_TYPE)
+    _ensure_uploads_connector(ctx)
     manager = SessionManager(ctx)
     auth = Auth(ctx.catalog)
     suggester = QuestionSuggester(ctx.catalog)
@@ -293,6 +318,17 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
             raise HTTPException(
                 status_code=409,
                 detail=f"The QuickJoiner control connector is permanent and cannot be {action}.")
+
+    def _guard_not_uploads(name: str, action: str = "changed") -> None:
+        """Refuse delete/rename of the permanent rolling Uploads connector (it stays a single,
+        continuously-growing source). Sync and clean-up ARE allowed, unlike the control connector."""
+        from quickjoiner.connectors.uploads import is_uploads_source
+
+        if is_uploads_source(name=name):
+            raise HTTPException(
+                status_code=409,
+                detail=f"The Uploads connector is permanent and cannot be {action}. "
+                       "Drag files onto the chat or POST /api/uploads to add documents to it.")
 
     def _require(cap: str, user: str | None) -> None:
         """RBAC capability gate at the HTTP layer — defense in depth alongside the control
@@ -413,6 +449,13 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
         user = _user(authorization)
         _require_user(user)
         _require("connectors:write", user)
+        from quickjoiner.connectors.uploads import is_uploads_source
+
+        if is_uploads_source(name=req.name, type_=req.type):
+            raise HTTPException(
+                status_code=409,
+                detail="The Uploads connector is a permanent singleton — it already exists. Drag "
+                       "files onto the chat or POST /api/uploads to add documents.")
         existing = next((s for s in ctx.config.sources if s.name == req.name), None)
         if existing is not None and not can_manage(existing, user, auth.enabled):
             raise HTTPException(status_code=409, detail=f"Name {req.name!r} is already taken")
@@ -453,6 +496,7 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
         # thus every document / vector / graph node / watermark / webhook URL. With 0
         # documents nothing is keyed to it yet, so it's just a config move.
         if req.name is not None and req.name.strip() != source.name:
+            _guard_not_uploads(name, "renamed")
             new_name = req.name.strip()
             if not new_name:
                 raise HTTPException(status_code=400, detail="Name cannot be empty")
@@ -532,6 +576,7 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
         user = _user(authorization)
         _require_user(user)
         _guard_not_control(name, "deleted")
+        _guard_not_uploads(name, "deleted")
         source = _find_source(name, user)
         _require("connectors:delete", user)
         if not can_manage(source, user, auth.enabled):
@@ -825,6 +870,65 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
             raise HTTPException(status_code=400, detail="Nothing to learn: empty fact")
         return {"result": teach_fact(ctx.catalog, ctx.pipeline, fact, req.topic)}
 
+    def _ingest_upload_path(path: Path) -> dict:
+        """Ingest one file that already lives in the uploads folder into the rolling uploads
+        source. Uses the SAME reader (and thus the same doc uri/id) a folder sync would, so a
+        later `sync uploads` is idempotent. Returns a per-file result row."""
+        from quickjoiner.connectors.files import read_file_document
+        from quickjoiner.connectors.uploads import UPLOADS_NAME, UPLOADS_SOURCE_ID, UPLOADS_TYPE, uploads_dir
+
+        ctx.catalog.upsert_source(UPLOADS_SOURCE_ID, UPLOADS_NAME, UPLOADS_TYPE)
+        doc = read_file_document(path, uploads_dir(ctx.workspace))
+        if doc is None:
+            return {"file": path.name, "ingested": False,
+                    "reason": "unsupported type, empty, or no extractable text (image-only?)"}
+        stats = ctx.pipeline.ingest([doc], UPLOADS_SOURCE_ID)
+        return {"file": path.name, "title": doc.title, "ingested": True, "result": stats.summary()}
+
+    @api.post("/api/uploads", tags=["Sync & ingestion"], summary="Upload one or more documents (Word, PowerPoint, Excel, PDF, Markdown, text, JSON, HTML, code) straight into memory via the rolling Uploads connector. Text is extracted at ingest.")
+    async def upload_documents(
+        files: list[UploadFile] = File(...), authorization: str | None = Header(default=None)
+    ):
+        """Off-hand document uploads (chat drag-drop, /qj, API): each file is saved into the
+        managed `<workspace>/uploads/` folder and ingested into the single rolling uploads
+        source, so it becomes cited memory immediately and persists for future re-syncs."""
+        from quickjoiner.connectors.uploads import save_upload
+
+        user = _user(authorization)
+        _require_user(user)
+        _require("memory:write", user)
+        if not files:
+            raise HTTPException(status_code=400, detail="No files uploaded")
+        results = []
+        for f in files:
+            data = await f.read()
+            if not data:
+                results.append({"file": f.filename or "?", "ingested": False, "reason": "empty file"})
+                continue
+            path = save_upload(ctx.workspace, f.filename or "upload", data)
+            results.append(_ingest_upload_path(path))
+        return {"uploaded": results, "ingested": sum(1 for r in results if r.get("ingested"))}
+
+    @api.post("/api/uploads/local", tags=["Sync & ingestion"], summary="Ingest a document from a server-side file path into the rolling Uploads connector (the /qj-friendly path — the file is copied into the uploads folder).")
+    def upload_local(req: UploadLocalRequest, authorization: str | None = Header(default=None)):
+        """Ingest a file the server can already read (a local path) into the rolling uploads
+        source — the JSON path the `/qj` control tool uses, since it can't carry binary. The file
+        is copied into the managed uploads folder so it becomes part of the rolling source."""
+        from quickjoiner.connectors.uploads import save_upload
+
+        user = _user(authorization)
+        _require_user(user)
+        _require("memory:write", user)
+        src = Path(req.path.strip().strip('"'))
+        if not src.is_file():
+            raise HTTPException(status_code=400, detail=f"Not a readable file: {src}")
+        try:
+            data = src.read_bytes()
+        except OSError as exc:
+            raise HTTPException(status_code=400, detail=f"Could not read {src}: {exc}")
+        path = save_upload(ctx.workspace, src.name, data)
+        return _ingest_upload_path(path)
+
     @api.get("/api/gaps", tags=["Knowledge gaps"], summary="Clusters of questions the system could not answer (the knowledge-debt backlog), with suggested connectors/actions to close them.")
     def list_gaps(authorization: str | None = Header(default=None)):
         """The knowledge-debt backlog: open refusals clustered by topic, each with
@@ -1072,10 +1176,16 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
         session = ctx.catalog.get_session(session_id)
         if not session:
             raise HTTPException(status_code=404, detail=f"No session {session_id!r}")
-        session["messages"] = [
-            {k: v for k, v in m.items() if k in ("role", "content")}
-            for m in json.loads(session.pop("messages_json"))
-        ]
+        from quickjoiner import chat_attachments
+
+        out_messages = []
+        for m in json.loads(session.pop("messages_json")):
+            entry = {k: v for k, v in m.items() if k in ("role", "content")}
+            if m.get("attachments"):
+                # Resolve each attachment's CURRENT state (deleted or downloadable) at read time.
+                entry["attachments"] = chat_attachments.resolve_message_attachments(ctx, m["attachments"])
+            out_messages.append(entry)
+        session["messages"] = out_messages
         return session
 
     @api.post("/api/sessions/{session_id}/distill", tags=["Sessions & projects"], summary="Extract durable facts from a conversation into searchable memory.")
@@ -1107,6 +1217,54 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
         deleted = ctx.catalog.delete_sessions(project_row["id"] if project_row else None)
         return {"deleted": deleted}
 
+    @api.post("/api/chat/attachments", tags=["Ask & search"], summary="Upload file(s) as per-question context for a chat message (extracted to text, injected into that turn only). NOT ingested into memory or the Uploads connector; auto-deleted after the retention window.")
+    async def upload_chat_attachments(
+        files: list[UploadFile] = File(...), authorization: str | None = Header(default=None)
+    ):
+        """Attach documents to a question. Each file's text is extracted and stored as
+        short-lived context (see `chat.context_retention_days`) — separate from learned memory.
+        Returns metadata (id/filename/size/…) to send back as `attachment_ids` on POST /api/chat."""
+        from quickjoiner import chat_attachments
+
+        user = _user(authorization)
+        _require_user(user)
+        _require("chat:use", user)
+        if not files:
+            raise HTTPException(status_code=400, detail="No files uploaded")
+        out = []
+        for f in files:
+            data = await f.read()
+            if not data:
+                continue
+            out.append(chat_attachments.store_attachment(
+                ctx, f.filename or "attachment", data, f.content_type or ""))
+        if not out:
+            raise HTTPException(status_code=400, detail="No non-empty files uploaded")
+        return {"attachments": out}
+
+    @api.get("/api/chat/attachments/{att_id}/download", tags=["Ask & search"], summary="Download a chat context file. Returns 410 Gone once it has been auto-deleted by the retention sweep.")
+    def download_chat_attachment(att_id: str, authorization: str | None = Header(default=None)):
+        """Serve the original attached file. 404 if unknown; 410 Gone once the retention sweep
+        has deleted the bytes (the chat history still shows the name + when it went)."""
+        from fastapi.responses import FileResponse
+
+        from quickjoiner import chat_attachments
+
+        user = _user(authorization)
+        _require_user(user)
+        _require("chat:use", user)
+        row = ctx.catalog.get_context_attachment(att_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="No such attachment")
+        path = chat_attachments.attachment_original_path(ctx, att_id)
+        if path is None:
+            raise HTTPException(
+                status_code=410,
+                detail=f"This file was deleted on {row.get('deleted_at') or 'expiry'} "
+                       f"({ctx.config.chat.context_retention_days}-day retention).")
+        return FileResponse(path, filename=row["filename"],
+                            media_type=row.get("content_type") or "application/octet-stream")
+
     @api.post("/api/chat", tags=["Ask & search"], summary="Ask a grounded, cited question. Streams Server-Sent Events: thinking / delta / tool_call / candidates / answer / done. Answers only from learned memory, or says it hasn't learned that yet.")
     def chat(req: ChatRequest, authorization: str | None = Header(default=None)):
         """SSE stream: {type: thinking|delta|tool_call|candidates|answer|error|done, data: ...}
@@ -1118,20 +1276,32 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
 
         def worker():
             try:
+                from quickjoiner import chat_attachments
+
                 session = manager.open_session(req.session_id, req.project)
                 history = manager.history(session)
+                # Per-question attachments (context for THIS turn only, never memory): their text
+                # rides the system prompt, their metadata is stamped on the user message.
+                att_block, att_meta = chat_attachments.build_context_block(ctx, req.attachment_ids)
+                extra = "\n\n".join(s for s in (manager.system_context(session), att_block) if s)
                 # Built inside the worker so provider setup errors (e.g. missing
                 # ANTHROPIC_API_KEY) surface as SSE error events, not a 500.
                 # Live connector tools are scoped to sources this user may see.
                 agent = ctx.build_agent(
-                    req.provider, req.model, extra_system=manager.system_context(session),
+                    req.provider, req.model, extra_system=extra or None,
                     sources=ctx.visible_sources(user), user=user,
                 )
+                turn_index = len(history)
                 answer, new_history = agent.ask(
                     req.message,
                     history,
                     on_event=lambda etype, detail: events.put({"type": etype, "data": detail}),
                 )
+                # Stamp the attachment metadata onto this turn's user message so reloaded
+                # history renders the chips beneath the question, and bind them to the session.
+                if att_meta and turn_index < len(new_history) and new_history[turn_index].get("role") == "user":
+                    new_history[turn_index]["attachments"] = att_meta
+                    ctx.catalog.link_context_attachments(req.attachment_ids, session["id"])
                 manager.record_turn(session["id"], new_history)
                 manager.maybe_compress(session["id"])
                 events.put({"type": "answer", "data": answer, "session_id": session["id"]})

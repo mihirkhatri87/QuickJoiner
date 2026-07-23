@@ -102,6 +102,11 @@ def build_control_tools(ctx, user: str | None, role: str | None) -> list[AgentTo
             return (f"{method} {path} is a streaming endpoint and can't be called this way. "
                     "For chat, just answer normally; for a scrape use the /scrape flow; for sync "
                     "logs, tell the user to open the sync's log in the UI.")
+        if path.split("?", 1)[0] == "/api/uploads":
+            return ("POST /api/uploads takes an uploaded file (multipart) and can't be called this "
+                    "way. If the user gave a readable server file path, call POST /api/uploads/local "
+                    'with {"path": "<path>"} to ingest it into the rolling Uploads connector; '
+                    "otherwise tell them to drag the file onto the chat or use the attach button.")
         if rbac.is_danger(rc.capability) and not confirm:
             return (f"CONFIRM REQUIRED: {method} {path} is destructive ({rc.capability}). State "
                     "exactly what will happen, get the user's explicit yes, THEN re-call with "

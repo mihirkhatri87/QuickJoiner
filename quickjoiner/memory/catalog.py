@@ -90,6 +90,15 @@ _SCHEMA_STATEMENTS = [
         error TEXT NOT NULL DEFAULT '', started_at TEXT NOT NULL, ended_at TEXT,
         kind TEXT NOT NULL DEFAULT 'sync')""",
     "CREATE INDEX IF NOT EXISTS idx_sync_events_started ON sync_events(started_at)",
+    # Per-question chat file attachments (context for one question). Deliberately NOT in the
+    # documents/vector memory — these never enter the Uploads connector or the knowledge graph.
+    # A row outlives its files: cleanup sets deleted_at (7-day retention) and removes the bytes,
+    # but the row stays so history can still show the filename + when it was deleted.
+    """CREATE TABLE IF NOT EXISTS context_attachments (
+        id TEXT PRIMARY KEY, session_id TEXT, filename TEXT NOT NULL,
+        content_type TEXT NOT NULL DEFAULT '', size_bytes INTEGER NOT NULL DEFAULT 0,
+        char_count INTEGER NOT NULL DEFAULT 0, uploaded_at TEXT NOT NULL, deleted_at TEXT)""",
+    "CREATE INDEX IF NOT EXISTS idx_context_attachments_uploaded ON context_attachments(uploaded_at)",
 ]
 
 # Columns added to tables that already exist in the wild. Applied best-effort on every
@@ -471,6 +480,48 @@ class _SqlCatalog:
             rows = self._read_all("SELECT id FROM chat_sessions", ())
             self._write("DELETE FROM chat_sessions", ())
         return len(rows)
+
+    # -- per-question chat attachments (context files, NOT memory) -------------
+    def add_context_attachment(self, att_id: str, filename: str, content_type: str,
+                               size_bytes: int, char_count: int, uploaded_at: str,
+                               session_id: str | None = None) -> None:
+        self._write(
+            "INSERT INTO context_attachments (id, session_id, filename, content_type, "
+            "size_bytes, char_count, uploaded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (att_id, session_id, filename, content_type, size_bytes, char_count, uploaded_at),
+        )
+
+    def get_context_attachment(self, att_id: str) -> dict | None:
+        return self._read_one("SELECT * FROM context_attachments WHERE id = ?", (att_id,))
+
+    def get_context_attachments(self, ids: list[str]) -> list[dict]:
+        """The rows for a set of attachment ids (order not guaranteed). Used to resolve the
+        CURRENT state (deleted_at) of attachments referenced by a stored chat message."""
+        if not ids:
+            return []
+        ph = ",".join("?" for _ in ids)
+        return self._read_all(f"SELECT * FROM context_attachments WHERE id IN ({ph})", tuple(ids))
+
+    def link_context_attachments(self, ids: list[str], session_id: str) -> None:
+        """Bind attachments to the session they were first used in (they may be uploaded
+        before the session exists). Only sets a still-null session_id — never reassigns."""
+        for att_id in ids:
+            self._write(
+                "UPDATE context_attachments SET session_id = ? WHERE id = ? AND session_id IS NULL",
+                (session_id, att_id),
+            )
+
+    def list_expired_context_attachments(self, cutoff: str) -> list[dict]:
+        """Live (not-yet-deleted) attachments uploaded before `cutoff` — the scheduler's
+        7-day sweep list."""
+        return self._read_all(
+            "SELECT * FROM context_attachments WHERE deleted_at IS NULL AND uploaded_at < ?",
+            (cutoff,),
+        )
+
+    def mark_context_attachment_deleted(self, att_id: str, deleted_at: str) -> None:
+        self._write(
+            "UPDATE context_attachments SET deleted_at = ? WHERE id = ?", (deleted_at, att_id))
 
     # -- users & auth tokens --------------------------------------------------
     def create_user(self, username: str, password_hash: str, role: str = "viewer") -> None:

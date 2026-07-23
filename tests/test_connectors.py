@@ -77,11 +77,12 @@ def test_jira_sync_honors_stop_and_reports_progress(tmp_path, monkeypatch):
 
 def test_confluence_reports_accurate_percent_via_cql_count(tmp_path, monkeypatch):
     """Confluence's content-listing API gives no total, so the sync preflights the space's
-    page count via the CQL `totalSize` and reports an accurate % from it."""
+    page count via the CQL `/rest/api/search` endpoint's `totalSize` (the content-listing
+    `/rest/api/content` pull does not carry a total) and reports an accurate % from it."""
     calls = {"search": 0}
 
     def fake_get_json(url, **kw):
-        if url.endswith("/content/search"):
+        if url.endswith("/rest/api/search"):
             calls["search"] += 1
             return {"totalSize": 3}  # the preflight count for the space
         start = kw["params"]["start"]

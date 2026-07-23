@@ -1,19 +1,34 @@
-import { ArrowUp, Sparkles } from "lucide-react";
+import { ArrowUp, Paperclip, Sparkles, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { api } from "../api";
+
+// Extensions the rolling Uploads connector can ingest (mirrors ingest/extract.py). Used only
+// to hint the file picker + validate a drop; the server is the source of truth.
+const UPLOAD_ACCEPT =
+  ".pdf,.docx,.pptx,.xlsx,.md,.markdown,.txt,.text,.rst,.log,.json,.jsonl,.csv,.tsv,.html,.htm," +
+  ".xml,.yaml,.yml,.toml,.ini,.cfg,.py,.js,.ts,.tsx,.jsx,.java,.cs,.go,.rb,.php,.rs,.c,.h,.cpp,.sql,.sh,.ps1";
 
 export function Composer({
   value,
   onChange,
   onSend,
   disabled,
+  pending,
+  onAttachFiles,
+  onRemovePending,
 }: {
   value: string;
   onChange: (v: string) => void;
   onSend: () => void;
   disabled: boolean;
+  // Per-question context files staged for the next question (filenames only); they upload on send.
+  pending?: string[];
+  onAttachFiles?: (files: File[]) => void;
+  onRemovePending?: (idx: number) => void;
 }) {
   const ref = useRef<HTMLTextAreaElement>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [dragOver, setDragOver] = useState(false);
   const [suggestions, setSuggestions] = useState<string[]>([]);
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(-1);
@@ -54,6 +69,12 @@ export function Composer({
     }, 120);
     return () => clearTimeout(t);
   }, [value]);
+
+  const pickFiles = (list: FileList | null) => {
+    if (!list || !onAttachFiles) return;
+    const files = Array.from(list);
+    if (files.length) onAttachFiles(files);
+  };
 
   const accept = (s: string) => {
     justAccepted.current = true;
@@ -114,8 +135,73 @@ export function Composer({
             close();
             onSend();
           }}
-          className="flex items-end gap-2.5 rounded-[26px] bg-panel p-3 pl-5 shadow-panel backdrop-blur-xl transition-shadow focus-within:shadow-[0_0_0_1.5px_color-mix(in_srgb,var(--accent)_55%,transparent),0_24px_60px_-28px_rgba(0,0,0,.65)]"
+          onDragOver={(e) => {
+            if (!onAttachFiles) return;
+            e.preventDefault();
+            setDragOver(true);
+          }}
+          onDragLeave={(e) => {
+            if (e.currentTarget.contains(e.relatedTarget as Node)) return;
+            setDragOver(false);
+          }}
+          onDrop={(e) => {
+            if (!onAttachFiles) return;
+            e.preventDefault();
+            setDragOver(false);
+            pickFiles(e.dataTransfer.files);
+          }}
+          className={
+            "flex flex-col gap-1.5 rounded-[26px] bg-panel p-3 pl-3 shadow-panel backdrop-blur-xl transition-shadow focus-within:shadow-[0_0_0_1.5px_color-mix(in_srgb,var(--accent)_55%,transparent),0_24px_60px_-28px_rgba(0,0,0,.65)] " +
+            (dragOver ? "shadow-[0_0_0_2px_var(--accent)]" : "")
+          }
         >
+          {/* Staged per-question context files — upload on send, shown beneath the question after. */}
+          {pending && pending.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 px-1.5 pt-0.5">
+              {pending.map((name, i) => (
+                <span
+                  key={`${name}-${i}`}
+                  className="inline-flex max-w-[240px] items-center gap-1.5 rounded-full bg-fill2 py-1 pl-2.5 pr-1.5 text-[12px] text-muted"
+                >
+                  <Paperclip size={12} className="flex-shrink-0" />
+                  <span className="truncate">{name}</span>
+                  <button
+                    type="button"
+                    aria-label={`Remove ${name}`}
+                    onClick={() => onRemovePending?.(i)}
+                    className="flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-full text-faint transition hover:bg-fill hover:text-ink"
+                  >
+                    <X size={12} />
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+          <div className="flex items-end gap-2.5">
+          {onAttachFiles && (
+            <>
+              <input
+                ref={fileRef}
+                type="file"
+                multiple
+                accept={UPLOAD_ACCEPT}
+                className="hidden"
+                onChange={(e) => {
+                  pickFiles(e.target.files);
+                  e.target.value = ""; // allow re-selecting the same file
+                }}
+              />
+              <button
+                type="button"
+                aria-label="Attach files as context"
+                title="Attach files as context for your question (Word, PowerPoint, Excel, PDF, Markdown, …). Kept for this conversation only, not added to memory."
+                onClick={() => fileRef.current?.click()}
+                className="flex h-11 w-11 flex-shrink-0 items-center justify-center rounded-full text-muted transition hover:bg-fill2 hover:text-ink"
+              >
+                <Paperclip size={19} strokeWidth={2} />
+              </button>
+            </>
+          )}
           <textarea
             ref={ref}
             rows={1}
@@ -173,6 +259,7 @@ export function Composer({
           >
             <ArrowUp size={19} strokeWidth={2.2} />
           </button>
+          </div>
         </form>
       </div>
       <p className="mx-auto mt-3 max-w-[1100px] text-center text-[11.5px] text-faint">

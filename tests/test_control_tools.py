@@ -45,6 +45,17 @@ def test_unknown_endpoint_denied(env):
     assert qj("GET", "/api/does-not-exist").startswith("DENIED")
 
 
+def test_multipart_upload_endpoint_is_not_dispatchable_via_qj_api(env):
+    """POST /api/uploads is multipart; qj_api can only send JSON, so it must refuse and point
+    the model at the JSON local-path variant instead of failing cryptically (feature: uploads)."""
+    ctx, _ = env
+    qj = _tools(ctx, "editor")["qj_api"]
+    out = qj("POST", "/api/uploads", {})
+    assert "multipart" in out and "/api/uploads/local" in out
+    # The JSON local-path variant IS dispatchable (a missing file 400s, proving it got through).
+    assert "HTTP 400" in qj("POST", "/api/uploads/local", {"path": "/no/such/file.pdf"})
+
+
 def test_editor_cannot_reset_or_change_settings(env):
     ctx, _ = env
     qj = _tools(ctx, "editor")["qj_api"]

@@ -223,7 +223,22 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   rel, dst)` — distinct evidence docs + distinct sources per exact edge (the
   `(src,rel,dst,evidence_doc_id)` PK already stores one row per corroborating doc);
   `entity_evidence(entity_id, limit)` — evidence titles/kinds for adjudication context.
-- `quickjoiner/ingest/` — `pipeline.py` (**normalize → sha256 dedupe → chunk → embed → upsert;
+- `quickjoiner/ingest/` — `extract.py` (**the single text-extraction choke point**, 2026-07-22):
+  `extract_text(bytes, filename) -> str` turns any supported file into plain text — Word (`.docx`),
+  PowerPoint (`.pptx`), Excel (`.xlsx`) and PDF (`.pdf`) via lazy office/PDF parsers
+  (python-docx/python-pptx/openpyxl/pypdf), plus Markdown/text/JSON/CSV/code decoded directly and
+  HTML stripped to text (keeping `<img alt>` captions). Every ingestion surface funnels through it:
+  the `files`/`git` connectors, the rolling `uploads` connector, and the upload endpoints. Defensive
+  — a missing parser or corrupt/encrypted/image-only file raises `ExtractionError` (caller skips that
+  one file, never fails a sync); size caps bound work. **Vision seam (text-first today, multimodal
+  tomorrow):** an optional `ImageHandler = Callable[[bytes,str],str]` threads through `extract_text`
+  and the office/PDF/HTML extractors, which already enumerate embedded images and call it — None
+  today ⇒ pure text, images skipped honestly; the planned vision layer (`docs/plans/07-…`,
+  AI_ROADMAP #23) supplies a handler built from a vision provider to describe diagrams/scanned pages
+  into text with **no extractor changes**. `TEXT_EXTENSIONS`/`DOC_EXTENSIONS`/`CODE_EXTENSIONS`/
+  `NAMED_TEXT_FILES` live here now (`files.py` re-exports them). Tests: `tests/test_extract.py`
+  (per-format, HTML alt-text, corrupt→error, inert-vs-invoked vision seam).
+  `pipeline.py` (**normalize → sha256 dedupe → chunk → embed → upsert;
   idempotent**; optionally injected a `triple_extractor`), `chunkers.py` (markdown/code/prose aware;
   large markdown sections carry their heading onto every sub-chunk), `normalize.py` (NFKC + typographic
   folding: curly quotes/dashes/NBSP/zero-width/CRLF → plain ASCII, applied to doc text before
@@ -301,6 +316,37 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   lives here (files.py re-exports). Tests: `tests/test_deps.py` incl. an end-to-end "loose
   alias query correlates consumer+provider repos" case. The structural entity/edge graph
   layer on top is **designed, not built**: `docs/KNOWLEDGE_GRAPH.md`.
+  **Parallel file reading** (`files.read_documents_parallel`, 2026-07-22): both `files` and `git`
+  read their file trees on a bounded `ThreadPoolExecutor` (disk `stat`/`read_text` release the
+  GIL ⇒ real I/O parallelism) instead of one file at a time — the file-phase bottleneck on a large
+  repo, and the whole cost of a re-sync (unchanged files are still read to hash them). Yields
+  **in submission order** (stable progress/URIs), keeps a bounded read-ahead window (memory-safe on
+  huge trees) that also **overlaps reading with the downstream embed**, and preserves pause/stop +
+  `%` via the per-file `stage` callback — reads are side-effect-free, so a `SyncStopped` unwinds
+  cleanly and nothing commits until the pipeline ingests (idempotent). Worker count auto-scales to
+  the machine (`read_workers()`), `QJ_READ_WORKERS` overrides (1 ⇒ the old sequential path). This
+  is the connector-side slice of AI_ROADMAP **S6**. Tests: `tests/test_parallel_read.py`
+  (order-preserving under out-of-order completion, None-skip, stop-honored, env override).
+  `files.read_file_document` now routes **office/PDF** files (`.docx/.pptx/.xlsx/.pdf`) through
+  `ingest.extract` (roomier `MAX_DOC_BYTES` cap) alongside the text/code/markdown it already read,
+  so the `files`/`git` connectors ingest Word/PowerPoint/Excel/PDF too (a file we can't parse is
+  skipped, not fatal).
+  `uploads.py` — **the rolling Uploads connector** (2026-07-22): one permanent, continuously-growing
+  document drop-box instead of a connector-per-file. Everything a user adds ad-hoc — a chat
+  drag-drop, a `/qj` "ingest this file", the `POST /api/uploads[/local]` endpoints — lands in one
+  managed folder `<workspace>/uploads/` and ingests into a single source (`uploads:uploads`),
+  accepting anything `ingest.extract` understands. A seeded singleton like the control connector
+  (`_ensure_uploads_connector`, ownerless commons): auto-created, **un-deletable / un-renamable /
+  never user-duplicated** (409 guards `_guard_not_uploads` + a create-type block), but — unlike the
+  control connector — it DOES produce documents and IS syncable + cleanable. It subclasses
+  `FilesConnector` with `_target()` → the managed folder, so a re-sync re-scans and picks up
+  new/changed files idempotently (hash dedupe). `save_upload(workspace, filename, data)` writes an
+  upload under a safe, path-traversal-proof, collision-aware name (identical bytes ⇒ same path/
+  idempotent; different content sharing a name ⇒ short content-hash suffix). Because the endpoints
+  read the saved file with the SAME `read_file_document`, an upload and a later folder sync produce
+  the same doc uri/id — no duplicates. `is_uploads_source()` is what the API guards check. Tests:
+  `tests/test_uploads.py` (folder read, save collisions/traversal, seeded+permanent, endpoint
+  ingest + idempotent re-sync, unreadable-file reporting).
   `azure_devops.py` works against **both** cloud (`dev.azure.com/{organization}`) and **on-prem
   Azure DevOps Server / TFS**: set `server_url` (host up to `/tfs`) + `collection` instead of
   `organization` and the base URL becomes `{server_url}/{collection}`; code search drops the
@@ -497,6 +543,13 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   `{job}`; refuses 409 while any sync is active (and syncs refuse while a reset runs). The logs SSE
   endpoint was relaxed to serve manager-only jobs (reset, or a just-deleted connector's cleanup) —
   auth-gated, not requiring a configured source;
+  **`POST /api/uploads`** (multipart, `memory:write`) — off-hand document uploads (chat drag-drop /
+  attach button / API): each file is `save_upload`-ed into `<workspace>/uploads/` and ingested into
+  the rolling uploads source via `ingest.extract`, so it's cited memory immediately; returns a
+  per-file result (title/ingested/reason). **`POST /api/uploads/local`** (`{path}` JSON,
+  `memory:write`) — the `/qj`-friendly variant: ingests a server-readable file path (copied into the
+  uploads folder first). The multipart `/api/uploads` is refused by the `qj_api` control tool (it
+  can only send JSON) with a hint to use `/api/uploads/local` or the attach button;
   `GET/PATCH /api/settings` — the whole `Config` (llm/embedding/retrieval/chat/**graph**) as a
   tunable dict; `GET /api/settings/defaults` — the same groups built from **freshly-constructed
   config models** (never the saved config, or every field would read as default forever), so the
@@ -522,7 +575,15 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   **delete** on hover + **Clear all** in the Conversations header → `DELETE /api/sessions[/{id}]`,
   clear-all confirmed + project-scoped to what's shown; each **Connected systems** row shows a
   pulsing "syncing…" state and re-opens that job's live log when it has one), `TopBar` (hosts the
-  **`NotificationsMenu`** bell before Settings), `Composer`,
+  **`NotificationsMenu`** bell before Settings), `Composer` (also a **per-question attachment
+  drop-zone**: a paperclip attach button + drag-and-drop **stage** files as context for the NEXT
+  question — `App.pendingFiles` shows removable chips; on send they upload via
+  `api.uploadChatAttachments` → `POST /api/chat/attachments` (ephemeral context, NOT memory) and
+  their metadata stamps the user message. This is deliberately NOT the Uploads connector —
+  attaching in chat never ingests into learned memory; that stays an explicit `/qj`/API action.
+  `Chat.AttachmentChips` renders each attachment beneath its question: a download button, or —
+  once the 7-day retention sweep deleted it — a struck-through name + warning icon + a
+  when-deleted tooltip),
   `EmptyState`, `SettingsDrawer` (account + workspace settings + connector plates/forms; the
   workspace pane exposes provider config incl. LiteLLM proxy URL + api-key env var with a
   **Test connection** button hitting `POST /api/llm/test`, and **Retrieval/Knowledge-graph
@@ -600,7 +661,19 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   `qj eval SET --compare old.json`): per-metric delta table over `COMPARE_METRICS`
   (`false_refusal_rate` is lower-is-better), **exits non-zero** if any watched metric regressed by
   more than `COMPARE_TOLERANCE` (0.02) — the CI merge gate for any retrieval change.
-- `quickjoiner/scheduler.py` — APScheduler periodic syncs for sources with `sync_interval_minutes`.
+- `quickjoiner/scheduler.py` — APScheduler periodic syncs for sources with `sync_interval_minutes`,
+  PLUS a standing `context-attachment-cleanup` sweep (every 6h + once at startup) that expires
+  per-question chat attachments past `chat.context_retention_days`. Now **always** returns a running
+  scheduler (the cleanup must run even with no interval-synced sources).
+- `quickjoiner/chat_attachments.py` — per-question chat file attachments: **context for one
+  question, NOT learned memory** (never embedded/indexed/graphed, and never folded into the Uploads
+  connector unless the user explicitly asks). `store_attachment` extracts text (via `ingest/extract`)
+  to `<workspace>/context/<id>/`, `build_context_block` injects it into a chat turn's system prompt
+  (cited as `[file: <name>]`), `resolve_message_attachments` overlays a stored message's attachments
+  with their current deleted/downloadable state, and `cleanup_expired` (the scheduler sweep) removes
+  the bytes after the retention window while keeping the catalog row (`deleted_at`) so history still
+  shows the name + deletion time. Catalog table `context_attachments`. See the chat-attachments
+  status entry for the endpoints + UI.
 - `quickjoiner/sync_manager.py` — **startable / stoppable / live-logged sync jobs** (`SyncManager`).
   Each sync runs on its own daemon thread, so **multiple different sources sync concurrently**
   (a second job for the *same* source is refused). Interruption without touching `pipeline.ingest`:
@@ -636,6 +709,12 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   N/total → dependency map), `azure_devops` (phase + per-team `work items · Team A`, i/teams), `jira`
   (from the search API's `total`), `octopus` (per-project), `confluence` (per space, via a one-call
   CQL `totalSize` preflight — `_space_page_count`; unscoped all-spaces pull ⇒ no total ⇒ shimmer).
+  **Confluence batch prefetch** (2026-07-22): `sync` prefetches the NEXT page batch on a worker
+  thread (`_fetch_page_batch`, `ThreadPoolExecutor(max_workers=1)`) while the pipeline parses+embeds
+  the current one, so the heavy `body.storage` network round-trip overlaps the downstream work
+  instead of being a serial gap between batches; `next_start` is always derived from the actual
+  result count (never guessed), so pagination stays correct and `_checkpoint()` still lands between
+  batches. Tests: the existing confluence paging/percent tests in `tests/test_connectors.py` cover it.
   **Phase label only** (UI shows a live shimmer, no fake denominator) where the API gives no cheap
   count: `github`/`gitlab` list APIs. All of these also `_checkpoint()` between page/section fetches so a stop lands
   within a page. The remaining connectors (logsearch inventory, web_scrape) rely on the universal
@@ -1241,6 +1320,75 @@ Post-phase additions (2026-07-07, all tested — suite: **89 passed**):
   memory-reset danger zone or admin controls). Full design + the staged build: `docs/plans/08-…md`.
   Suite: **530 passed**, 12 skipped, pre-existing eval-yaml failure unchanged; frontend typecheck +
   build green. OPEN: live browser (Playwright) verification of the `/qj` + admin UI flows.
+  (Verified live 2026-07-21 via curl + headless Playwright — see `docs/plans/08-…md`.)
+- Parallel ingestion reads (2026-07-22, user request — "file reading is going very slowly"; then
+  "apply it to the other paginated connectors too"): the connector-side slice of AI_ROADMAP **S6**.
+  Two reusable primitives + per-connector wiring:
+  - **`files.read_documents_parallel(items, fn, stage, workers)`** — bounded, in-order,
+    memory-safe parallel map for slow per-item I/O (GIL-releasing disk/httpx). `files`/`git` use
+    it to read their file trees concurrently (the dominant cost of a large repo, and effectively
+    the *whole* cost of a re-sync — unchanged files are still read to hash them); **Octopus** uses
+    it to fetch every project's releases **concurrently** (was 100s of serial per-project round-
+    trips on a big space). `read_workers()` auto-scales, `QJ_READ_WORKERS` overrides (1 ⇒ old path).
+  - **`connectors/util.prefetch_pages(fetch, cursor0, checkpoint)`** — 1-page-ahead prefetch for
+    sequential paginated APIs: fetches the NEXT page on a worker thread while the caller
+    parses+embeds the current one, so the network round-trip overlaps downstream work.
+    `fetch(cursor) -> (items, next_cursor)`; `next_cursor=None` ends it. Wired into **jira**
+    (startAt offset pages), **github** + **gitlab** (page-number MR/PR/issue lists), **azure_devops**
+    (per-team work-item id-batches), and **confluence** (its own inline variant — `_fetch_page_batch`).
+  Both are side-effect-free (nothing commits until the pipeline ingests, idempotently) and honor
+  cooperative pause/stop + `%` via the connector's `_checkpoint`/`_stage` — integrity and stop
+  latency unchanged, only the fetching parallelizes. Suite: **539 passed** (+9,
+  `tests/test_parallel_read.py`), 12 skipped, pre-existing eval-yaml failure unchanged. Per-connector
+  detail in the connectors architecture bullets above.
+- Document ingestion (Word/PowerPoint/Excel/PDF/…) + rolling Uploads connector (2026-07-22, user
+  request): ingest office/PDF documents into learned memory. **Core:** `ingest/extract.py` is the single text-extraction choke
+  point (docx/pptx/xlsx/pdf parsers + text/markdown/json/html decode with HTML alt-text), funnelled
+  to by the `files`/`git` connectors (which now read office/PDF too), the rolling uploads connector,
+  and the upload endpoints. **Rolling connector:** `connectors/uploads.py` — one permanent
+  singleton drop-box (`<workspace>/uploads/`, source `uploads:uploads`) that accumulates any file
+  type instead of a connector-per-file; syncable/cleanable but un-deletable/un-renamable/
+  un-duplicable. **UI (2026-07-23):** rendered by a dedicated locked `UploadsPlate` in
+  `SettingsDrawer` (like `ControlPlate`) — friendly "Uploaded documents" name + lock + blurb, Sync
+  and Clean-up actions only, **no delete / rename / share** (the earlier version reused the generic
+  `ConnectorPlate` and wrongly showed a trash button + raw `uploads` slug for a permanent source);
+  the Rail also labels the reserved `uploads`/`quickjoiner` singletons in friendly form.
+  **Surfaces (explicit "learn this permanently"):** `POST /api/uploads` (multipart)
+  and `POST /api/uploads/local` (`{path}` JSON, the `/qj` path — the multipart route is refused by
+  `qj_api` with a hint). NB (2026-07-23): the **chat composer's attach button was later repurposed**
+  to per-question *context* attachments (see the chat-attachments entry below), so drag-drop in chat
+  no longer feeds this connector — memory ingestion via uploads is now only the explicit `/qj`/API
+  path, per the user's "don't inject unless asked". Text
+  extracted at ingest; **images are NOT read yet** — an `ImageHandler` seam threads through the
+  extractors (embedded images already enumerated + handed to it), so the **vision roadmap item
+  (`docs/plans/07-multimodal-derive-to-text.md`, AI_ROADMAP #23) plugs in with no extractor
+  changes** — the two features are deliberately linked. New deps: python-docx/openpyxl/pypdf +
+  python-multipart (python-pptx already present). Suite: **559 passed** (+20: `tests/test_extract.py`
+  ×9, `tests/test_uploads.py` ×10, control-tool multipart guard ×1; auth tests updated to exclude
+  the new singleton), 12 skipped, pre-existing eval-yaml failure unchanged; frontend typecheck +
+  build green.
+- Per-question chat file attachments — "ask about this file" (2026-07-23, user request): a distinct,
+  ephemeral flow, kept **separate from the Uploads connector and learned memory**. `chat_attachments.py`
+  (new): a file attached to a chat message is extracted to text (via `ingest/extract`) and stored under
+  `<workspace>/context/<id>/` (original + `text.txt`) with a `context_attachments` catalog row — never
+  embedded, indexed, graphed, or citable as memory. **Chat integration:** `ChatRequest.attachment_ids`;
+  `build_context_block` injects the files' text into the turn's system prompt (capped by
+  `chat.attachment_context_max_chars`, instructing the agent to use/cite them as `[file: <name>]` and
+  NOT to save them unless asked), `agent.ask`'s user turn gets the attachment metadata stamped on it,
+  and the attachments bind to the session. **Endpoints:** `POST /api/chat/attachments` (multipart,
+  `chat:use`) and `GET /api/chat/attachments/{id}/download` (`chat:use`, **410 Gone** once expired).
+  `GET /api/sessions/{id}` resolves each message's attachments to their CURRENT state (deleted or
+  downloadable) at read time. **Retention:** `scheduler.py` now ALWAYS runs (a standing
+  `context-attachment-cleanup` sweep every 6h + once at startup) — `chat_attachments.cleanup_expired`
+  deletes the bytes of attachments older than `chat.context_retention_days` (default 7) but KEEPS the
+  row (marked `deleted_at`) so history still shows the filename + when it went. **Frontend:** the
+  Composer attach button/drag-drop now STAGE per-question files (removable chips) that upload on send;
+  `Chat.AttachmentChips` renders them beneath the question — a download button, or a struck-through
+  name + warning icon + when-deleted tooltip once swept. Config: `ChatConfig.attachment_context_max_chars`,
+  `context_retention_days`. Suite: **566 passed** (+7 `tests/test_chat_attachments.py`; scheduler test
+  updated to assert the always-on cleanup job), 12 skipped, pre-existing eval-yaml failure unchanged.
+  Browser-verified via Playwright (stage chip → send → attachment renders under the question with a
+  download link; Uploads connector stays 0 docs) + live uvicorn (upload/download/410/isolation).
 
 ## Next steps (agreed with user)
 

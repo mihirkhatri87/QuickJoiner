@@ -1,7 +1,7 @@
-import { Check, CircleAlert, Download, Loader2, Quote, ScrollText, ThumbsDown, ThumbsUp, X } from "lucide-react";
+import { Check, CircleAlert, Download, Loader2, Paperclip, Quote, ScrollText, ThumbsDown, ThumbsUp, TriangleAlert, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { api } from "../api";
-import type { CandidateItem } from "../types";
+import type { CandidateItem, ChatAttachment } from "../types";
 import type { Artifact } from "./ArtifactModal";
 import { CandidateCarousel, type CandidateCard } from "./CandidateCarousel";
 import { CiteBook, renderInline, renderMarkdown } from "./markdown";
@@ -18,6 +18,7 @@ export interface Msg {
   streamText?: string; // live delta accumulation before the final answer arrives
   thinking?: string;
   tools?: string[];
+  attachments?: ChatAttachment[]; // per-question context files shown beneath the question
   ts?: string;
 }
 
@@ -46,6 +47,50 @@ function downloadMarkdown(text: string) {
   a.download = answerFilename(text);
   a.click();
   URL.revokeObjectURL(a.href);
+}
+
+function fmtDeleted(deletedAt?: string | null): string {
+  if (!deletedAt || deletedAt === "gone") return "This file was removed and can no longer be downloaded.";
+  const d = new Date(deletedAt);
+  const when = isNaN(d.getTime())
+    ? deletedAt
+    : d.toLocaleString(undefined, { year: "numeric", month: "short", day: "numeric" });
+  return `Deleted on ${when} (7-day retention) — can no longer be downloaded.`;
+}
+
+/** Per-question context files shown beneath a question: a download button, or — once the
+ * retention sweep deleted the file — a struck-through name with a warning icon + when-tooltip. */
+function AttachmentChips({ attachments }: { attachments: ChatAttachment[] }) {
+  const [err, setErr] = useState<string | null>(null);
+  return (
+    <div className="mt-1.5 flex flex-col items-end gap-1">
+      {attachments.map((a) =>
+        a.deleted_at ? (
+          <span
+            key={a.id}
+            title={fmtDeleted(a.deleted_at)}
+            className="inline-flex max-w-full items-center gap-1.5 rounded-full bg-fill px-3 py-1 text-[12px] text-faint"
+          >
+            <TriangleAlert size={13} className="flex-shrink-0 text-gold" />
+            <span className="truncate line-through decoration-faint/60">{a.filename}</span>
+          </span>
+        ) : (
+          <button
+            key={a.id}
+            type="button"
+            title={`Download ${a.filename}`}
+            onClick={() => api.downloadChatAttachment(a.id, a.filename).catch((e) => setErr(String(e?.message || e)))}
+            className="inline-flex max-w-full items-center gap-1.5 rounded-full bg-fill2 px-3 py-1 text-[12px] text-muted transition hover:text-ink"
+          >
+            <Paperclip size={13} className="flex-shrink-0" />
+            <span className="truncate">{a.filename}</span>
+            <Download size={12} className="flex-shrink-0 opacity-60" />
+          </button>
+        ),
+      )}
+      {err && <span className="text-[11px] text-danger">{err}</span>}
+    </div>
+  );
 }
 
 function IconButton({
@@ -295,6 +340,8 @@ function Message({
           <div className="whitespace-pre-wrap rounded-lg rounded-br-xs bg-raised px-4 py-3 text-[14.5px] leading-relaxed shadow-soft">
             {m.text}
           </div>
+          {/* Attachments render directly under the question so they read as part of it. */}
+          {m.attachments && m.attachments.length > 0 && <AttachmentChips attachments={m.attachments} />}
           {m.ts && <div className="mt-1.5 pr-1 text-right font-mono text-[10px] tabular-nums text-faint">{m.ts}</div>}
         </div>
       </div>

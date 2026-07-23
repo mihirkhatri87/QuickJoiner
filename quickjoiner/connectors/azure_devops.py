@@ -8,7 +8,7 @@ from urllib.parse import quote
 
 from quickjoiner.connectors.base import ConnectionStatus, Connector, Document, Mode
 from quickjoiner.connectors.registry import register
-from quickjoiner.connectors.util import as_bool as _as_bool, get_json, post_json, resolve_secret
+from quickjoiner.connectors.util import as_bool as _as_bool, get_json, post_json, prefetch_pages, resolve_secret
 from quickjoiner.llm.base import AgentTool, ToolSpec
 
 DEFAULT_API_VERSION = "7.0"
@@ -287,18 +287,25 @@ class AzureDevOpsConnector(Connector):
                     if tid and tid not in seen:
                         seen.add(tid)
                         team_ids.append(tid)
-            for i in range(0, len(team_ids), WORK_ITEM_BATCH):
-                self._checkpoint()  # and between each work-item batch fetch
-                batch = team_ids[i : i + WORK_ITEM_BATCH]
-                items = get_json(
-                    f"{org_url}/{project}/_apis/wit/workitems?{api}",
-                    headers=headers,
-                    params={"ids": ",".join(map(str, batch))},
-                    verify=verify,
-                ).get("value", [])
-                for item in items:
-                    yield work_item_document(org_url, item)
-                    total += 1
+            # Fetch this team's work items in id-batches, prefetching the NEXT batch while the
+            # current one is parsed+embedded — the batch fetches were a serial per-team gap.
+            batches = [team_ids[i : i + WORK_ITEM_BATCH]
+                       for i in range(0, len(team_ids), WORK_ITEM_BATCH)]
+            if batches:
+                def fetch_batch(idx, batches=batches):
+                    idx = idx or 0
+                    items = get_json(
+                        f"{org_url}/{project}/_apis/wit/workitems?{api}",
+                        headers=headers,
+                        params={"ids": ",".join(map(str, batches[idx]))},
+                        verify=verify,
+                    ).get("value", [])
+                    return items, (idx + 1 if idx + 1 < len(batches) else None)
+
+                for items in prefetch_pages(fetch_batch, 0, self._checkpoint):
+                    for item in items:
+                        yield work_item_document(org_url, item)
+                        total += 1
             if total >= MAX_WORK_ITEMS:
                 break
 

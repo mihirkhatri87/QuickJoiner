@@ -34,12 +34,28 @@ def _sync_job(ctx: AppContext, source_name: str) -> None:
         log.exception("scheduled sync failed for %s", source_name)
 
 
-def start_scheduler(ctx: AppContext) -> BackgroundScheduler | None:
-    jobs = [s for s in ctx.config.sources if s.sync_interval_minutes]
-    if not jobs:
-        return None
+CONTEXT_CLEANUP_INTERVAL_HOURS = 6
+
+
+def _context_cleanup_job(ctx: AppContext) -> None:
+    """Delete per-question chat attachments past their retention window (chat.context_retention_days).
+    Files are removed; the catalog rows stay (marked deleted) so history keeps the name + date."""
+    try:
+        from quickjoiner import chat_attachments
+
+        n = chat_attachments.cleanup_expired(ctx)
+        if n:
+            log.info("context-attachment cleanup: deleted %d expired file(s)", n)
+    except Exception:
+        log.exception("context-attachment cleanup failed")
+
+
+def start_scheduler(ctx: AppContext) -> BackgroundScheduler:
+    """Always returns a running scheduler: it registers periodic syncs for sources with a
+    `sync_interval_minutes`, AND a standing sweep that deletes expired chat context files —
+    the latter must run even in a workspace with no interval-synced sources."""
     scheduler = BackgroundScheduler()
-    for source in jobs:
+    for source in (s for s in ctx.config.sources if s.sync_interval_minutes):
         scheduler.add_job(
             _sync_job,
             "interval",
@@ -49,5 +65,10 @@ def start_scheduler(ctx: AppContext) -> BackgroundScheduler | None:
             max_instances=1,
             coalesce=True,
         )
+    scheduler.add_job(
+        _context_cleanup_job, "interval", hours=CONTEXT_CLEANUP_INTERVAL_HOURS,
+        args=[ctx], id="context-attachment-cleanup", max_instances=1, coalesce=True,
+    )
+    _context_cleanup_job(ctx)  # sweep once at startup (catches files that expired while down)
     scheduler.start()
     return scheduler

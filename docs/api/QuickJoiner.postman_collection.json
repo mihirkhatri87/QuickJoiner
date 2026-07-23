@@ -13,13 +13,15 @@
     { "key": "connectorName", "value": "handbook", "type": "string" },
     { "key": "connectorType", "value": "files", "type": "string" },
     { "key": "connectorPath", "value": "/absolute/path/to/a/docs/folder", "type": "string" },
+    { "key": "uploadPath", "value": "/absolute/path/to/a/document.pdf", "type": "string" },
     { "key": "askQuestion", "value": "How do we deploy and roll back?", "type": "string" },
     { "key": "searchQuery", "value": "how do we deploy", "type": "string" },
     { "key": "suggestPrefix", "value": "where", "type": "string" },
     { "key": "entityA", "value": "repo:connector", "type": "string" },
     { "key": "entityB", "value": "service:stevedore", "type": "string" },
     { "key": "targetUser", "value": "teammate", "type": "string" },
-    { "key": "sessionId", "value": "", "type": "string" }
+    { "key": "sessionId", "value": "", "type": "string" },
+    { "key": "attachmentId", "value": "", "type": "string" }
   ],
   "auth": {
     "type": "bearer",
@@ -171,6 +173,25 @@
         {
           "name": "Activity feed (24h history)",
           "request": { "method": "GET", "url": "{{baseUrl}}/api/notifications?hours=24" }
+        },
+        {
+          "name": "Upload a document (Word/PPT/Excel/PDF/…)",
+          "description": "multipart/form-data — pick one or more files under the `files` key. Each is extracted and ingested into the rolling Uploads connector. Do not set Content-Type by hand; Postman adds the multipart boundary.",
+          "request": {
+            "method": "POST",
+            "body": { "mode": "formdata", "formdata": [{ "key": "files", "type": "file", "src": [] }] },
+            "url": "{{baseUrl}}/api/uploads"
+          }
+        },
+        {
+          "name": "Ingest a server file path (JSON)",
+          "description": "The /qj-friendly variant: ingest a file the server can read (copied into the uploads folder). Set `uploadPath` to an absolute path on the server host.",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"path\": \"{{uploadPath}}\"\n}" },
+            "url": "{{baseUrl}}/api/uploads/local"
+          }
         }
       ]
     },
@@ -199,6 +220,23 @@
             "body": { "mode": "raw", "raw": "{\n  \"fact\": \"Deployments run through Octopus on Fridays.\"\n}" },
             "url": "{{baseUrl}}/api/learn"
           }
+        },
+        {
+          "name": "Attach a file to a question (context, not memory)",
+          "description": "multipart/form-data — pick file(s) under `files`. Returns attachment ids to pass as `attachment_ids` on the chat request. These are per-question context (extracted to text, injected into the turn), NOT ingested into memory, and auto-deleted after the retention window. Capture an id into `attachmentId` to try the download below.",
+          "event": [{ "listen": "test", "script": { "exec": [
+            "try { pm.collectionVariables.set('attachmentId', pm.response.json().attachments[0].id); } catch (e) {}"
+          ], "type": "text/javascript" } }],
+          "request": {
+            "method": "POST",
+            "body": { "mode": "formdata", "formdata": [{ "key": "files", "type": "file", "src": [] }] },
+            "url": "{{baseUrl}}/api/chat/attachments"
+          }
+        },
+        {
+          "name": "Download a chat attachment (410 once expired)",
+          "description": "Streams the original attached file. Returns 410 Gone once the retention sweep has deleted it (the chat history still shows the name + deletion date).",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/chat/attachments/{{attachmentId}}/download" }
         },
         {
           "name": "Autocomplete suggestions",

@@ -1,0 +1,22 @@
+meta {
+  name: Ingest a server file path (JSON)
+  type: http
+  seq: 9
+}
+
+post {
+  url: {{baseUrl}}/api/uploads/local
+  body: json
+}
+
+body:json {
+  {
+    "path": "{{uploadPath}}"
+  }
+}
+
+docs {
+  The /qj-friendly variant: ingest a file the server can already read (an absolute path on the
+  server host). It's copied into the rolling uploads folder, so it becomes part of the Uploads
+  connector and survives future re-syncs. Set `uploadPath` in the Local environment.
+}

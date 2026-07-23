@@ -12,7 +12,7 @@ from urllib.parse import quote
 
 from quickjoiner.connectors.base import ConnectionStatus, Connector, Document, Mode
 from quickjoiner.connectors.registry import register
-from quickjoiner.connectors.util import get_json, resolve_secret
+from quickjoiner.connectors.util import get_json, prefetch_pages, resolve_secret
 from quickjoiner.llm.base import AgentTool, ToolSpec
 
 MAX_PAGES = 4
@@ -145,7 +145,8 @@ class GitLabConnector(Connector):
         since = state.get("since", "")
 
         # Phase labels only (no cheap total for the GitLab list APIs) — the UI shows a live
-        # shimmer, and each page fetch is a stop/pause checkpoint.
+        # shimmer. Each list prefetches the next page while the current one is parsed+embedded;
+        # each page fetch is still a stop/pause checkpoint.
         for label, endpoint, to_doc in (
             ("merge requests", "merge_requests", mr_document),
             ("issues", "issues", issue_document),
@@ -155,16 +156,21 @@ class GitLabConnector(Connector):
             }
             if since:
                 params["updated_after"] = since
-            for page in range(1, MAX_PAGES + 1):
-                self._stage(label)
+
+            def fetch(page, endpoint=endpoint, params=params):
+                page = page or 1
                 items = get_json(
                     f"{self._project_api()}/{endpoint}", headers=headers,
                     params={**params, "page": page},
                 )
+                more = len(items) == PER_PAGE and page < MAX_PAGES
+                return items, (page + 1 if more else None)
+
+            self._stage(label)
+            for items in prefetch_pages(fetch, 1, self._checkpoint):
+                self._stage(label)
                 for item in items:
                     yield to_doc(project, item)
-                if len(items) < PER_PAGE:
-                    break
 
         self._stage("pipelines")
         pipelines = get_json(

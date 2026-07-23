@@ -10,7 +10,7 @@ from urllib.parse import urlparse, urlunparse
 
 from quickjoiner.connectors.base import ConnectionStatus, Connector, Document, Mode
 from quickjoiner.connectors.deps import SKIP_DIRS, dependency_document
-from quickjoiner.connectors.files import read_file_document
+from quickjoiner.connectors.files import read_documents_parallel, read_file_document
 from quickjoiner.connectors.registry import register
 from quickjoiner.connectors.util import resolve_secret
 
@@ -76,14 +76,22 @@ class GitRepoConnector(Connector):
             if p.is_file() and not any(part in SKIP_DIRS for part in p.parts)
         ]
         total = len(files)
-        for i, path in enumerate(files):
-            self._stage("reading files", i, total)  # checkpoint + progress each file
+
+        def _read(path: Path) -> Document | None:
             doc = read_file_document(path, clone_dir)
-            if doc:
-                rel = path.relative_to(clone_dir).as_posix()
-                doc.uri = f"{repo_url}::{rel}"
-                doc.title = f"{self.name}/{rel}"
-                yield doc
+            if doc is None:
+                return None
+            rel = path.relative_to(clone_dir).as_posix()
+            doc.uri = f"{repo_url}::{rel}"
+            doc.title = f"{self.name}/{rel}"
+            return doc
+
+        # Read files concurrently (bounded, in-order) — disk I/O releases the GIL, so a large
+        # repo's file phase parallelizes and overlaps with the downstream embed. Stop/pause +
+        # progress still land per file via the stage callback.
+        yield from read_documents_parallel(
+            files, _read, stage=lambda done, tot: self._stage("reading files", done, tot)
+        )
 
         self._stage("dependency map", total, total)
         dep_doc = dependency_document(clone_dir, self.name, repo_url)

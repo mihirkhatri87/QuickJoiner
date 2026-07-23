@@ -6,7 +6,7 @@ from typing import Any, Iterator
 
 from quickjoiner.connectors.base import ConnectionStatus, Connector, Document, Mode
 from quickjoiner.connectors.registry import register
-from quickjoiner.connectors.util import get_json, resolve_secret
+from quickjoiner.connectors.util import get_json, prefetch_pages, resolve_secret
 from quickjoiner.llm.base import AgentTool, ToolSpec
 
 PAGE_SIZE = 50
@@ -119,25 +119,31 @@ class JiraConnector(Connector):
     def sync(self, state: dict[str, str]) -> Iterator[Document]:
         base, auth = self._base(), self._auth()
         jql = self._jql(state)
-        start = 0
         self._stage("issues")
-        while start < MAX_ISSUES:
-            self._checkpoint()  # stop/pause between page fetches
+        # Jira's search returns the matching total, so the % is accurate (capped at MAX_ISSUES,
+        # the ceiling we actually ingest). Prefetch the next offset page while parsing+embedding
+        # the current one, so the network round-trip overlaps the downstream work.
+        seen = 0
+        state_total = {"total": 0}
+
+        def fetch(start):
+            start = start or 0
             data = get_json(
                 f"{base}/rest/api/2/search",
                 auth=auth,
                 params={"jql": jql, "startAt": start, "maxResults": PAGE_SIZE, "fields": FIELDS},
             )
             issues = data.get("issues", [])
-            # Jira's search returns the matching total, so this % is accurate (capped at
-            # MAX_ISSUES, the ceiling we actually ingest).
-            total = min(data.get("total", 0) or 0, MAX_ISSUES)
+            state_total["total"] = min(data.get("total", 0) or 0, MAX_ISSUES)
+            next_start = start + len(issues)
+            more = bool(issues) and next_start < state_total["total"]
+            return issues, (next_start if more else None)
+
+        for issues in prefetch_pages(fetch, 0, self._checkpoint):
             for issue in issues:
                 yield issue_document(base, issue)
-            start += len(issues)
-            self._stage("issues", min(start, total), total)
-            if start >= data.get("total", 0) or not issues:
-                break
+            seen += len(issues)
+            self._stage("issues", min(seen, state_total["total"]), state_total["total"])
 
     def tools(self) -> list[AgentTool]:
         base, auth = self._base(), self._auth()

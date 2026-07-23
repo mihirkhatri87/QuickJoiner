@@ -18,7 +18,9 @@ import type {
   Settings,
   SourceRow,
   Status,
+  ChatAttachment,
   SyncJob,
+  UploadResult,
   UserRow,
 } from "./types";
 
@@ -101,6 +103,46 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ fact, topic: topic ?? null }),
     }),
+
+  // Upload documents straight into learned memory via the rolling Uploads connector. This is
+  // the EXPLICIT "learn this permanently" path (used by /qj and the API) — the chat composer's
+  // attach button uses uploadChatAttachments below instead, which is per-question context only.
+  uploadDocuments: async (files: File[]): Promise<UploadResult> => {
+    const form = new FormData();
+    for (const f of files) form.append("files", f);
+    const resp = await fetch("/api/uploads", { method: "POST", headers: { ...authHeaders() }, body: form });
+    const data = resp.status === 204 ? null : await resp.json().catch(() => null);
+    if (!resp.ok) throw new Error((data && (data as { detail?: string }).detail) || `${resp.status}`);
+    return data as UploadResult;
+  },
+
+  // Attach file(s) as per-question CONTEXT for a chat message. Extracted to text and injected
+  // into that turn only — NOT ingested into memory or the Uploads connector, and auto-deleted
+  // after the retention window. Returns metadata to pass as attachment_ids on streamChat.
+  uploadChatAttachments: async (files: File[]): Promise<ChatAttachment[]> => {
+    const form = new FormData();
+    for (const f of files) form.append("files", f);
+    const resp = await fetch("/api/chat/attachments", { method: "POST", headers: { ...authHeaders() }, body: form });
+    const data = resp.status === 204 ? null : await resp.json().catch(() => null);
+    if (!resp.ok) throw new Error((data && (data as { detail?: string }).detail) || `${resp.status}`);
+    return (data as { attachments: ChatAttachment[] }).attachments;
+  },
+  // Download a chat context file via an auth'd fetch → blob (a plain <a href> can't send the
+  // bearer token). Throws a friendly message on 410 (the file expired and was deleted).
+  downloadChatAttachment: async (id: string, filename: string): Promise<void> => {
+    const resp = await fetch(`/api/chat/attachments/${encodeURIComponent(id)}/download`, {
+      headers: { ...authHeaders() },
+    });
+    if (!resp.ok) {
+      throw new Error(resp.status === 410 ? "This file has expired and was deleted." : `${resp.status}`);
+    }
+    const blob = await resp.blob();
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  },
 
   sources: () => req<SourceRow[]>("/api/sources"),
   connectorTypes: () => req<ConnectorType[]>("/api/connectors/types"),
@@ -280,7 +322,7 @@ async function streamGetSSE<E>(path: string, onEvent: (e: E) => void): Promise<v
 
 /** Stream a chat turn. Calls onEvent for each SSE event; resolves when done. */
 export function streamChat(
-  body: { message: string; session_id: string | null; project: string | null },
+  body: { message: string; session_id: string | null; project: string | null; attachment_ids?: string[] },
   onEvent: (e: ChatEvent) => void,
 ): Promise<void> {
   return streamSSE("/api/chat", body, onEvent);

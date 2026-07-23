@@ -55,7 +55,11 @@ How each works is documented in `CLAUDE.md` — the source of truth for current 
 ### Tier 1 — highest leverage, low risk
 2. **AST-aware code chunking** (tree-sitter) — *adopt*. Functions/classes as chunk units
    with imports+signature context; symbol manifest feeds the graph. Target: large uplift on
-   code questions.
+   code questions. Externally validated by **Understand-Anything** (2026-07-23 scan), which
+   runs a tree-sitter structural engine in production. Also the prerequisite for function-level
+   `calls` edges — today `ingest/code_graph.py` extracts `defines`/`imports` by regex and
+   punts call graphs as "need tree-sitter" (`code_graph.py:10`) — which #27's blast-radius
+   analysis consumes at symbol granularity.
 5. **Recency & authority priors** — *adopt*. Small rank features (doc age, source type
    weight, in-graph degree) applied at RRF fusion — never at the gate (I1). Kill-switch
    per workspace.
@@ -132,6 +136,20 @@ How each works is documented in `CLAUDE.md` — the source of truth for current 
     Gate: connector unit tests (relations→edges, up-hierarchy walk, graph-signature backfill
     without re-embed), no `qj eval --compare` regression. Closes the Jira/ADO asymmetry and turns
     the sprint snapshot into a genuine feature→epic→story→PR fabric.
+29. **Architectural-layer classification** — *adopt* (validated by **Understand-Anything**,
+    which auto-groups nodes into API/Service/Data/UI/Utility). A deterministic pass tags each
+    repo/module/symbol entity with an architectural **layer** (API / Service / Data / UI /
+    Utility / Infra) from cheap, evidence-bearing signals — path segments (`/api`,
+    `/controllers`, `/services`, `/repositories`, `/components`), filename conventions, and
+    import direction from the existing `imports`/dependency-map edges — stored as an entity
+    attribute, **never inferred by the LLM** (I3, keyless/offline). Pays off three ways:
+    (a) GraphView groups/colors by layer so a dense multi-repo graph reads as an architecture,
+    not a node soup (FE surface: FRONTEND_ROADMAP F1); (b) it gives the guided tour (#28) its
+    **cross-repo spine** — order and cluster the walkthrough by layer, not just per-repo
+    dependency depth (the user's note that layer classification helps resolve cross-repo
+    relationships); (c) layer becomes a retrieval/answer signal ("where does auth live" →
+    Service-layer entities first). Gate: extractor unit tests + no `qj eval --compare`
+    regression (attribute-only, doesn't touch the gate).
 
 ### Tier 2 — strong, moderate effort
 6. **Query decomposition / multi-query** — *adopt*. LLM splits compound questions;
@@ -145,6 +163,18 @@ How each works is documented in `CLAUDE.md` — the source of truth for current 
    (#3 makes this safe). The compounding moat.
 10. **Semantic + late chunking** — *adopt*. Embed long windows, pool to sub-chunks so
     vectors inherit document context; A/B against the shipped breadcrumb form.
+30. **Persona-adaptive answer detail** — *adopt* (Understand-Anything adjusts density for
+    junior dev / PM / power user). A **persona lives on the user profile** (new-joiner
+    principal — the product default and wedge — / junior dev / PM / power user) and threads
+    into `prompts.py` as an answer-**shaping** directive: verbosity, what to foreground (a PM
+    wants flows and owners; a principal wants interfaces and failure modes; a junior wants more
+    explained-not-assumed), and depth. **The grounding gate and citation contract are untouched
+    (I1/I2): persona changes framing, never what counts as evidence or whether we refuse.**
+    FE surface (FRONTEND_ROADMAP F1, the user's explicit ask): a persona picker in
+    account/settings **and a small always-visible chip in the chat header naming the persona in
+    effect**. Cheap, local-first (just prompt framing), and reinforces the persona-sharpness
+    differentiator (`MARKET_ASSESSMENT.md`). Persona rides the chat request / `/api/settings`;
+    gate: no `qj eval --compare` regression (behavioral framing only).
 
 ### Tier 3 — differentiating, higher effort
 11. **Temporal knowledge (PRD W6)** — *adapt*. Bi-temporal doc records; staleness-aware
@@ -170,6 +200,34 @@ How each works is documented in `CLAUDE.md` — the source of truth for current 
     one proxy; ollama vision-native, ASR external/local; anthropic vision-native, ASR
     external). Full design: `docs/plans/07-multimodal-media.md`. Unlocks the knowledge
     class no text pipeline reaches: architecture diagrams and unwritten meetings.
+    **Seam already in place (2026-07-22):** text-first document ingestion shipped (Word/PPT/Excel/
+    PDF/HTML via `ingest/extract.py` + the rolling Uploads connector), and its extractor already
+    threads an optional `ImageHandler` that enumerates embedded images — so the *document* half of
+    this item (embedded images, scanned PDFs) becomes wiring-only: build the handler from `vision.py`
+    and pass it into `extract_text`. See plan 07 §0's shipped-seam note.
+27. **Blast-radius / diff-impact analysis** — *adopt* (Understand-Anything's `/understand-diff`:
+    "which parts of the system your changes affect before you commit"). "What does this change
+    touch?" We already store the edges (`defines`/`imports`/`publishes_to`/`subscribes_to`/
+    `stores_in`/dependency-map); add a `graph_impact(files|symbols|pr)` agent tool +
+    `GET /api/graph/impact` that walks **reverse** edges from the changed symbols/files to their
+    dependents (who imports/calls/subscribes-to this), returning the affected entities with
+    per-hop evidence and plan-06 confidence. **Cross-repo and cross-source** — a schema change's
+    blast radius reaches the service that `subscribes_to` its topic, which a single-repo tool
+    (UA) cannot see. Sharpest once #2's tree-sitter `calls` edges give function granularity, but
+    useful today at module/dependency granularity. A principal-engineer feature; impact is only
+    ever asserted along real, **cited** edges (I2 preserved — no invented reach). Gate:
+    graph-tool unit tests (reverse-walk correctness, cross-source reach), no eval regression.
+28. **Dependency-ordered guided tour** — *adapt* (Understand-Anything's `tour-builder`
+    generates dependency-ordered walkthroughs; fit here to our multi-source graph). A new
+    onboarding artifact beside `briefs.py`/`repo_docs.py`: a navigable "start here → next"
+    walkthrough that **sequences entities by dependency depth** (topological order over
+    `imports`/`depends_on`/dependency-map edges — foundations first, leaves last), each stop a
+    **cited** mini-explanation built from real retrieved evidence (refuses to invent, like the
+    existing briefs). Crosses repos via **#29's layer spine + #24's `same_as` bridges** rather
+    than touring one repo in isolation — the multi-source graph is exactly what UA (single-repo)
+    can't do, and directly serves the day-1 persona (`MARKET_ASSESSMENT.md` wedge). Saved +
+    re-ingested like the other briefs (`tour://…`), surfaced as a `qj brief tour` type and a UI
+    "Take the tour" entry. Gate: no `qj eval --compare` regression (reads graph + retrieval only).
 
 ### Tier 4 — the ragless track
 15. **Cost/quality router** — *adapt*. Per query choose hybrid RAG / graph-first /
@@ -232,7 +290,14 @@ before/after bench table, exactly as no quality work merges without `--compare`.
   digest / stable `extra_system` framing so caching survives session-summary refreshes;
   (c) keep volatile content (per-request scores, timestamps) after the last breakpoint as
   new prompt sections are added. (The narrow, cheap precursor to #16.)
-- **S6 — GPU-accelerated, resource-aware parallel ingestion** — *adopt*. Make a large sync /
+- **S6 — GPU-accelerated, resource-aware parallel ingestion** — *adopt*. **Partially shipped
+  2026-07-22 (the I/O half):** two reusable primitives now parallelize/overlap ingestion I/O —
+  `files.read_documents_parallel` (bounded in-order parallel reads: `files`/`git` file trees +
+  Octopus per-project releases; `QJ_READ_WORKERS`) and `connectors/util.prefetch_pages`
+  (1-page-ahead network prefetch: jira/github/gitlab/azure_devops/confluence). Both pause/stop-safe
+  and integrity-preserving (documented in CLAUDE.md's connector bullets). REMAINING (the compute
+  half): batched cross-document embedding + GPU execution provider + machine profiler + gate
+  recalibration described below. Make a large sync /
   full re-embed use the machine it runs on. Scope is honest: the only ingest stage that is
   local *compute* (not network pull or disk I/O) is **embedding** (`memory/embedder.py`
   `FastEmbedEmbedder`, ONNX), with the ANN index build and the reranker as secondary compute
@@ -420,6 +485,20 @@ Scan log: *(dated one-liners appended here by each scan)*
   moving sprint window → **#25 drain stale deferred graph work** accepted (Tier 1). Third,
   frontend: the graph view's per-entity edge budget resolves to 5 edges/node at this scale
   (~2.8% of edges shown), which reads as an empty graph → density-budget item added to FE F0.
+- 2026-07-23 — user-driven intake: analysis of **Understand-Anything** (Egonex-AI — a
+  single-repo, tree-sitter + multi-agent IDE plugin that builds a committable code
+  knowledge-graph) against QuickJoiner. Most of its surface we already cover more strongly
+  (multi-source connectors, grounded/refusal contract, hybrid retrieval + reranker,
+  cross-source `same_as` bridges + runtime `pubsub` edges it can't see, live tools, RBAC).
+  Four capabilities it specializes in passed the rubric and were accepted: **#27 blast-radius/
+  diff-impact** (Tier 3), **#28 dependency-ordered guided tour** (Tier 3), **#29
+  architectural-layer classification** (Tier 1), **#30 persona-adaptive answer detail**
+  (Tier 2). Its tree-sitter engine is external validation for existing **#2** (noted there; it
+  unblocks #27's function-level `calls` edges). **Noted-not-adopted** (model mismatch, not
+  rubric failure): UA's commit-once portable-graph JSON artifact and offline-no-API-key
+  dashboard are artifacts of being a local IDE plugin — QuickJoiner is a shared server with a
+  live GraphView, so both are already served in a different shape. Off-mission for our
+  onboarding wedge: wiki community-clustering and inline language-concept teaching.
 
 **Intake rejections** (don't re-propose without new evidence; mirrors the research archive):
 - **Full formal ontology** (OWL/RDF class hierarchies, reasoners, triple stores, interop

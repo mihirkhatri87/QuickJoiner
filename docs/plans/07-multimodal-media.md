@@ -31,6 +31,17 @@ docs), `code_graph.py` (source → edges), `pubsub.py` (SDK patterns → runtime
 plus a live-tool surface mirroring `/scrape` + `agent/ops.py` ("both hit the same service
 functions"; learning stays explicit).
 
+> **Already-shipped seam (2026-07-22) — document ingestion + `ingest/extract.py`.** Text-first
+> ingestion of Word/PowerPoint/Excel/PDF/HTML documents shipped (the rolling Uploads connector,
+> chat drag-drop, `/qj`). Its extractor already carries the **vision hook this plan fills in**: an
+> optional `ImageHandler = Callable[[bytes,str],str]` threads through `extract_text` and the
+> office/PDF/HTML extractors, which **already enumerate embedded images and call it** (`_derive_images`)
+> — inert (None) today ⇒ images skipped honestly. So the vision surface (§3 `vision.py`) plugs into
+> *documents* by building an `ImageHandler` from `describe_images(...)` and passing it into
+> `extract_text` at the ingest/uploads seam — **no change to the extractors**. That covers embedded
+> images and scanned-PDF pages (the "possible follow-up" noted in §10), landing this plan's document
+> half without new plumbing. The two features are deliberately linked; keep this note in sync.
+
 ## 1. Architecture — one primitives layer, three surfaces
 
 ```
@@ -280,8 +291,9 @@ it can take, so an audio-less workspace never advertises transcription):
 - OCR engines (tesseract) — the vision model covers raster text; revisit only with eval
   evidence.
 - Real-time/streaming transcription, speaker diarization, video *generation* — no.
-- PDF page rendering → vision (PDFs already ingest as text; scanned-PDF support is a
-  possible follow-up, not this plan).
+- PDF page rendering → vision (PDFs already ingest as text via `ingest/extract.py`; scanned-PDF /
+  embedded-image support is now a **wiring-only follow-up** — pass an `ImageHandler` built from
+  `vision.py` into `extract_text`, see the shipped-seam note in §0 — not a rewrite).
 
 ## 11. Testing matrix
 

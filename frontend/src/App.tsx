@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, streamChat } from "./api";
-import type { CandidateItem, GapsResponse, ProjectRow, SessionRow, SourceRow, Status, SyncJob } from "./types";
+import type { CandidateItem, ChatAttachment, GapsResponse, ProjectRow, SessionRow, SourceRow, Status, SyncJob } from "./types";
 import { buildCommands, startConnectFlow, type CommandCtx, type Flow } from "./commands";
 import { ArtifactModal, type Artifact } from "./components/ArtifactModal";
 import { Chat, type Msg } from "./components/Chat";
@@ -151,7 +151,7 @@ export default function App() {
         if (m.role === "tool" || !m.content) continue;
         msgs.push(
           m.role === "user"
-            ? { id: uid(), role: "user", text: m.content }
+            ? { id: uid(), role: "user", text: m.content, attachments: m.attachments }
             : { id: uid(), role: "agent", answer: m.content },
         );
       }
@@ -187,6 +187,13 @@ export default function App() {
   };
   const pushUser = (text: string) => setMessages((m) => [...m, { id: uid(), role: "user", text, ts: now() }]);
 
+  // Per-question context files: the 📎 button / drag-drop STAGE files for the next question.
+  // On send they upload as ephemeral context (NOT the Uploads connector / memory) and render
+  // beneath the question. Kept for the conversation, auto-deleted after the retention window.
+  const [pendingFiles, setPendingFiles] = useState<File[]>([]);
+  const attachFiles = (files: File[]) => setPendingFiles((prev) => [...prev, ...files]);
+  const removePending = (idx: number) => setPendingFiles((prev) => prev.filter((_, i) => i !== idx));
+
   // Pipeline stages 1-2 (flows + command registry) live in commands.ts;
   // App provides the capabilities and keeps only the agentic-chat stage.
   const ctx: CommandCtx = {
@@ -217,7 +224,8 @@ export default function App() {
 
   const send = async () => {
     const text = input.trim();
-    if (!text || busy) return;
+    const hasAttachments = pendingFiles.length > 0;
+    if ((!text && !hasAttachments) || busy) return;
     setInput("");
 
     // /qj <natural language>: control QuickJoiner in plain language. Strip the prefix and
@@ -234,7 +242,9 @@ export default function App() {
       return;
     }
 
-    if (!qj) {
+    // Slash commands / flows need typed text; an attach-only send (empty text + files) skips
+    // straight to the agentic path so the files become the question's context.
+    if (!qj && text) {
       // Stage 1: an active conversational flow gets first claim on the input.
       const flow = flowRef.current;
       if (flow && (await flow.handle(text))) return;
@@ -250,17 +260,34 @@ export default function App() {
     }
 
     // Stage 3: the agentic path — /api/chat tool-call loop.
+    // Upload any staged context files first (ephemeral, NOT memory), so their ids ride the turn
+    // and their metadata stamps the question. A failed upload aborts the send.
+    const message = effective || "Please review the attached file(s) and tell me what they contain.";
+    let attachmentMeta: ChatAttachment[] = [];
+    let attachmentIds: string[] = [];
+    if (hasAttachments) {
+      setBusy(true);
+      try {
+        attachmentMeta = await api.uploadChatAttachments(pendingFiles);
+        attachmentIds = attachmentMeta.map((a) => a.id);
+      } catch (err) {
+        setBusy(false);
+        sayError("Could not attach files: " + String(err));
+        return;
+      }
+      setPendingFiles([]);
+    }
     const agentId = uid();
     setMessages((m) => [
       ...m,
-      { id: uid(), role: "user", text: effective, ts: now() },
+      { id: uid(), role: "user", text: message, attachments: attachmentMeta.length ? attachmentMeta : undefined, ts: now() },
       { id: agentId, role: "agent", streaming: true, ts: now() },
     ]);
     setBusy(true);
     const patch = (fn: (m: Msg) => Msg) =>
       setMessages((list) => list.map((x) => (x.id === agentId ? fn(x) : x)));
     try {
-      await streamChat({ message: effective, session_id: sessionId, project: currentProject || null }, (e) => {
+      await streamChat({ message, session_id: sessionId, project: currentProject || null, attachment_ids: attachmentIds }, (e) => {
         if (e.type === "thinking") patch((m) => ({ ...m, thinking: (m.thinking || "") + e.data }));
         else if (e.type === "tool_call") patch((m) => ({ ...m, tools: [...(m.tools || []), e.data] }));
         else if (e.type === "delta") patch((m) => ({ ...m, streamText: (m.streamText || "") + e.data }));
@@ -397,7 +424,15 @@ export default function App() {
                   }}
                 />
               )}
-              <Composer value={input} onChange={setInput} onSend={send} disabled={busy} />
+              <Composer
+                value={input}
+                onChange={setInput}
+                onSend={send}
+                disabled={busy}
+                pending={pendingFiles.map((f) => f.name)}
+                onAttachFiles={attachFiles}
+                onRemovePending={removePending}
+              />
             </>
           )}
         </section>

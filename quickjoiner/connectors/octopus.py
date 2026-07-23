@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import Any, Iterator
 
 from quickjoiner.connectors.base import ConnectionStatus, Connector, Document, Mode
+from quickjoiner.connectors.files import read_documents_parallel
 from quickjoiner.connectors.registry import register
 from quickjoiner.connectors.util import as_bool, get_json, resolve_secret
 from quickjoiner.llm.base import AgentTool, ToolSpec
@@ -196,18 +197,27 @@ class OctopusConnector(Connector):
         # dashboard's id->name map regardless) — this is the fix for the 100-cap.
         self._stage("projects")
         projects = list(self._paged("projects"))
-        for i, project in enumerate(projects):
-            self._stage("releases", i, len(projects))  # checkpoint + progress per project
+        # Project docs are built from already-fetched data (no network) — yield them straight away.
+        for project in projects:
             yield project_document(server, project)
-            if changed is not None and project["Id"] not in changed:
-                continue  # unchanged since last sync — skip the per-project releases call
+        # Each project's releases is a SEPARATE network call — the sequential bottleneck on a big
+        # space (hundreds of projects were 100s of serial round-trips). Fetch them concurrently
+        # (bounded), yielding a releases doc per project. Incremental mode still skips unchanged
+        # projects. Stop/pause + % land per project via the stage callback.
+        targets = [p for p in projects if changed is None or p["Id"] in changed]
+
+        def _releases_doc(project: dict[str, Any]) -> Document | None:
             releases = get_json(
                 f"{self._api()}/projects/{project['Id']}/releases",
                 headers=headers,
                 params={"take": 20},
             ).get("Items", [])
-            if releases:
-                yield releases_document(server, project, releases)
+            return releases_document(server, project, releases) if releases else None
+
+        yield from read_documents_parallel(
+            targets, _releases_doc,
+            stage=lambda done, tot: self._stage("releases", done, tot),
+        )
 
         # The dashboard is a single call and reflects current deploy state, so it is
         # always refreshed (this is what carries the service->deploys->environment edges).

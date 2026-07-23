@@ -882,7 +882,8 @@ def serve(
 
     scheduler = start_scheduler(build_context(ws))
     if scheduler:
-        console.print(f"[green]Scheduler started[/green] ({len(scheduler.get_jobs())} periodic sync jobs)")
+        sync_jobs = sum(1 for j in scheduler.get_jobs() if j.id.startswith("sync-"))
+        console.print(f"[green]Scheduler started[/green] ({sync_jobs} periodic sync job(s) + context-file cleanup)")
     console.print(f"QuickJoiner UI: [bold]http://{host}:{port}[/bold]  (webhooks: POST /hooks/<source>)")
     try:
         uvicorn.run(create_app(ws), host=host, port=port, log_level="warning")

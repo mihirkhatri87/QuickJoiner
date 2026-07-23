@@ -3,6 +3,7 @@ and page-event webhooks (payloads without a body are re-fetched by id)."""
 
 from __future__ import annotations
 
+import concurrent.futures
 from typing import Any, Iterator
 
 from quickjoiner.connectors.base import ConnectionStatus, Connector, Document, Mode
@@ -61,21 +62,33 @@ class ConfluenceConnector(Connector):
 
     def _space_page_count(self, base: str, auth, space: str | None) -> int | None:
         """Best-effort up-front page count for a space, so the sync can report an accurate
-        %. The content-listing API gives no total, but the CQL search endpoint returns
-        `totalSize` (already used by the live search tool) for one cheap `limit=1` call.
-        Returns None — meaning "no %, show the shimmer" — when the pull isn't scoped to a
-        single space or the count fails; ingestion never depends on it."""
+        %. The content-listing endpoints give no total; the CQL **search** endpoint
+        (`/rest/api/search`, distinct from `/rest/api/content/search`) is the one that
+        returns `totalSize`, for one cheap `limit=1` call. Returns None — meaning "no %,
+        show the shimmer" — when the pull isn't scoped to a single space or the count
+        fails; ingestion never depends on it."""
         if not space:
             return None
         try:
             data = get_json(
-                f"{base}/rest/api/content/search", auth=auth,
+                f"{base}/rest/api/search", auth=auth,
                 params={"cql": f'type=page and space="{space}"', "limit": 1},
             )
             total = int(data.get("totalSize") or 0)
             return min(total, MAX_PAGES_PER_SPACE) if total > 0 else None
         except Exception:
             return None
+
+    def _fetch_page_batch(self, base: str, auth, space: str | None, start: int) -> dict:
+        params: dict[str, Any] = {
+            "type": "page",
+            "expand": "body.storage,version",
+            "limit": PAGE_SIZE,
+            "start": start,
+        }
+        if space:
+            params["spaceKey"] = space
+        return get_json(f"{base}/rest/api/content", auth=auth, params=params)
 
     def sync(self, state: dict[str, str]) -> Iterator[Document]:
         base, auth = self._base(), self._auth()
@@ -84,27 +97,30 @@ class ConfluenceConnector(Connector):
             label = f"pages · {space}" if space else "pages"
             total = self._space_page_count(base, auth, space)  # None ⇒ shimmer, not a bar
             self._stage(label, 0 if total is not None else None, total)
-            start = 0
-            while start < MAX_PAGES_PER_SPACE:
-                self._checkpoint()  # stop/pause between page fetches, not just between pages
-                params: dict[str, Any] = {
-                    "type": "page",
-                    "expand": "body.storage,version",
-                    "limit": PAGE_SIZE,
-                    "start": start,
-                }
-                if space:
-                    params["spaceKey"] = space
-                data = get_json(f"{base}/rest/api/content", auth=auth, params=params)
-                results = data.get("results", [])
-                for page in results:
-                    yield page_document(base, page)
-                start += len(results)
-                if total is not None:
-                    # Clamp: a space can grow between the preflight count and now.
-                    self._stage(label, min(start, total), total)
-                if len(results) < PAGE_SIZE:
-                    break
+            # Prefetch the NEXT batch on a worker thread while the pipeline parses+embeds the
+            # current one — the network round-trip (heavy, `body.storage` bodies) overlaps the
+            # downstream work instead of being a serial gap between batches. next_start is always
+            # derived from the actual result count (never guessed), so pagination stays correct.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                start = 0
+                future: concurrent.futures.Future | None = pool.submit(
+                    self._fetch_page_batch, base, auth, space, start
+                )
+                while future is not None and start < MAX_PAGES_PER_SPACE:
+                    self._checkpoint()  # stop/pause between batches
+                    results = future.result().get("results", [])
+                    next_start = start + len(results)
+                    more = len(results) == PAGE_SIZE and next_start < MAX_PAGES_PER_SPACE
+                    future = (
+                        pool.submit(self._fetch_page_batch, base, auth, space, next_start)
+                        if more else None
+                    )
+                    for page in results:
+                        yield page_document(base, page)
+                    start = next_start
+                    if total is not None:
+                        # Clamp: a space can grow between the preflight count and now.
+                        self._stage(label, min(start, total), total)
 
     def tools(self) -> list[AgentTool]:
         base, auth = self._base(), self._auth()

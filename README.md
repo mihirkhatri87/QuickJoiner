@@ -18,6 +18,17 @@ when memory has nothing relevant.
   Types: files/URLs, git, GitHub, GitLab, Jira, Confluence, Azure DevOps (cloud **and**
   on-prem Server/TFS), Octopus Deploy, Grafana, Datadog, Dynatrace, Elasticsearch, and a
   generic web scraper.
+- **Ask about a file (per-question attachments)** — click 📎 or drag files onto the chat to attach
+  **Word, PowerPoint, Excel, PDF, Markdown, text, JSON, HTML, or code** as *context for that
+  question*. The file's text is extracted and used to answer, and it shows up with a download link
+  right under your question. These are **ephemeral and private to the conversation** — never added
+  to learned memory — and are auto-deleted after 7 days (after which the history shows the filename
+  with a "deleted" warning instead of a link).
+- **Document uploads into memory** — to teach QuickJoiner a document *permanently*, ingest it into
+  the rolling **Uploads** connector — `POST /api/uploads`, or ask in chat (`/qj ingest C:\docs\spec.pdf`).
+  Text is extracted at ingest and the file becomes cited memory. One continuously-growing connector,
+  no new connector per file, re-syncable and cleanable like any other. (Text-only today; reading
+  images/scanned pages inside documents is on the roadmap.)
 - **Honesty by design** — a grounding contract forces citations and refusals, every refusal is
   captured as a **knowledge gap** with one-click remediation, and a **knowledge graph** links
   repos, packages, tickets, services, environments, **message topics, and datastores** so you
@@ -158,7 +169,8 @@ No external systems required — teach a fact, then ask about it:
 
 ```powershell
 qj learn "Deploys go out Tuesdays via Octopus; Priya owns the release calendar."
-qj learn C:\work\platform-docs        # or ingest a folder / single file / URL
+qj learn C:\work\platform-docs        # ingest a folder / single file / URL
+qj learn C:\work\Onboarding.docx      # Word/PowerPoint/Excel/PDF/Markdown are extracted too
 
 qj ask "How do deployments work here?" # grounded, cited answer (streams by default)
 qj ask "What is the airspeed of a swallow?"   # -> "I haven't learned that yet."

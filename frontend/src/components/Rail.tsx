@@ -264,7 +264,13 @@ export function Rail({
                             : "bg-gold shadow-[0_0_0_3px_var(--gold-soft)]",
                       )}
                     />
-                    <span className="truncate text-[13px]">{s.name}</span>
+                    <span className="truncate text-[13px]">
+                      {s.type === "uploads"
+                        ? "Uploaded documents"
+                        : s.type === "quickjoiner"
+                          ? "QuickJoiner control"
+                          : s.name}
+                    </span>
                     <span
                       className={cn(
                         "ml-auto flex-shrink-0 font-mono text-[10.5px] tabular-nums",

@@ -891,14 +891,19 @@ def test_scheduler_registers_interval_jobs(api_workspace):
         ctx.catalog.close()
 
 
-def test_scheduler_returns_none_without_interval_sources(tmp_path, monkeypatch):
+def test_scheduler_runs_context_cleanup_even_without_interval_sources(tmp_path, monkeypatch):
     from quickjoiner.scheduler import start_scheduler
 
     monkeypatch.setattr(app_module, "create_embedder", lambda cfg: FakeEmbedder())
     ctx = build_context(tmp_path / "empty-ws")
+    scheduler = start_scheduler(ctx)
     try:
-        assert start_scheduler(ctx) is None
+        # No interval sources, but the standing context-attachment cleanup sweep is always present.
+        assert scheduler is not None
+        assert scheduler.get_job("context-attachment-cleanup") is not None
+        assert scheduler.get_job("sync-handbook") is None
     finally:
+        scheduler.shutdown(wait=False)
         ctx.catalog.close()
 
 

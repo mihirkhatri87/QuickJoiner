@@ -2,12 +2,38 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import os
 import socket
 import time
-from typing import Any
+from typing import Any, Callable, Iterator, Optional
 
 import httpx
+
+
+def prefetch_pages(
+    fetch: Callable[[Any], tuple[list, Any]],
+    start_cursor: Any = None,
+    checkpoint: Optional[Callable[[], None]] = None,
+) -> Iterator[list]:
+    """Iterate a paginated API, prefetching the NEXT page on a worker thread while the caller
+    consumes the current one — so the network round-trip overlaps the caller's parse+embed
+    instead of being a serial gap between pages (the connector ingestion-speed win).
+
+    `fetch(cursor) -> (items, next_cursor)`: return this page's items and the cursor for the next
+    page, or `next_cursor=None` when there are no more pages. `checkpoint()` (optional — the
+    connector's `_checkpoint`) runs between pages for cooperative stop/pause; it may raise
+    `SyncStopped`, which unwinds cleanly because fetches are side-effect-free reads (nothing is
+    committed here — the pipeline ingests downstream, idempotently). Yields each page's `items`.
+    """
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future: Optional[concurrent.futures.Future] = pool.submit(fetch, start_cursor)
+        while future is not None:
+            if checkpoint is not None:
+                checkpoint()
+            items, next_cursor = future.result()
+            future = pool.submit(fetch, next_cursor) if next_cursor is not None else None
+            yield items
 
 
 def as_bool(value: Any, default: bool = True) -> bool:

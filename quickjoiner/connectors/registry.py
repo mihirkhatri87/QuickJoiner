@@ -34,6 +34,7 @@ def _load_builtin_connectors() -> None:
         jira,
         octopus,
         self_connector,
+        uploads,
     )
     from quickjoiner.connectors.browser import scraper  # noqa: F401
     from quickjoiner.connectors.logsearch import (  # noqa: F401

@@ -142,8 +142,19 @@ export interface SessionRow {
   created_at: string;
   updated_at: string;
 }
+/** A per-question chat context file (separate from learned memory; auto-expires). */
+export interface ChatAttachment {
+  id: string;
+  filename: string;
+  content_type?: string;
+  size?: number;
+  // Set once the retention sweep deleted the file — the UI then shows a warning, not a link.
+  // Also carries "gone" if the row itself vanished.
+  deleted_at?: string | null;
+}
+
 export interface SessionDetail extends SessionRow {
-  messages: { role: string; content: string }[];
+  messages: { role: string; content: string; attachments?: ChatAttachment[] }[];
 }
 
 export interface GraphNode {
@@ -227,3 +238,16 @@ export type ScrapeEvent =
   | { type: "answer"; data: string; path: string; pages: number }
   | { type: "error"; data: string }
   | { type: "done" };
+
+/** Per-file result of an /api/uploads ingest. */
+export interface UploadRowResult {
+  file: string;
+  title?: string;
+  ingested: boolean;
+  result?: string;
+  reason?: string;
+}
+export interface UploadResult {
+  uploaded: UploadRowResult[];
+  ingested: number;
+}

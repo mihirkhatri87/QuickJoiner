@@ -31,9 +31,9 @@ enhancement:
 
 ```
                         ┌──────────────────────────────────────────┐
- connectors (13) ─────► │ INGEST  normalize → sha256 dedupe →      │
- pull/push/live/        │         content-aware chunk → embed      │
- browser/scrape         │         + graph extract (deterministic)  │
+ connectors + uploads ─► │ INGEST  extract text (Word/PPT/Excel/    │
+ pull/push/live/        │         PDF/HTML) → normalize → dedupe →   │
+ browser/scrape/drop-box│         chunk → embed → graph extract      │
                         └───────────────┬──────────────────────────┘
                                         ▼
         ┌──────────────────── MEMORY (pluggable on DATABASE_URL) ─────────────────┐
@@ -96,6 +96,9 @@ Each maps to a pending item in `docs/AI_ROADMAP.md` (noted in parentheses).
    corpus-level questions (#12).
 8. **Nothing measures latency or cost** — no timing instrumentation anywhere in the answer
    or sync path; speed work is blind until the bench harness exists (S1).
+9. Document ingestion is **text-first**: Word/PPT/Excel/PDF/HTML extract their text layer, but
+   **images inside documents and scanned/image-only PDFs are not read** — the `ingest/extract.py`
+   `ImageHandler` seam is wired for it, awaiting the vision layer (#23, plan 07).
 
 ## 4. Forward roadmap → `docs/AI_ROADMAP.md`
 

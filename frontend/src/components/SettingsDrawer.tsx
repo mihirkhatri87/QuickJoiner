@@ -3,6 +3,7 @@ import {
   ChevronRight,
   Eraser,
   FileText,
+  Inbox,
   Lock,
   Plug,
   RefreshCw,
@@ -908,6 +909,9 @@ function Connectors({
         rows.map((c) =>
           c.type === "quickjoiner" ? (
             <ControlPlate key={c.name} />
+          ) : c.type === "uploads" ? (
+            <UploadsPlate key={c.name} c={c}
+                          job={syncJobs.find((j) => j.source === c.name)} onOpenSync={onOpenSync} />
           ) : (
             <ConnectorPlate key={c.name} c={c} types={types} auth={auth} reload={() => { load(); onChanged(); }}
                             onOpenArtifact={onOpenArtifact}
@@ -957,6 +961,103 @@ function ControlPlate() {
         <code className="font-mono text-[10.5px] text-gold">/qj</code> — connect sources, sync,
         teach, tune settings, manage access. What you can do follows your role.
       </p>
+    </div>
+  );
+}
+
+/** The permanent rolling Uploads connector: a special, un-deletable, un-renamable default
+ * source (a single drop-box for documents added to memory). Unlike the control connector it
+ * DOES ingest and so keeps Sync + Clean up — but never Delete / rename / share, so it stays a
+ * single, always-present source. Memory ingestion into it is explicit (/qj or the API); the
+ * chat attach button is per-question context, not this. */
+function UploadsPlate({
+  c,
+  job,
+  onOpenSync,
+}: {
+  c: ConnectorRow;
+  job?: SyncJob;
+  onOpenSync: (source: string, clean: boolean, autoStart?: boolean, kind?: "sync" | "cleanup") => void;
+}) {
+  const [pmsg, setPmsg] = useState("");
+  const [pok, setPok] = useState(true);
+  const [armedWipe, setArmedWipe] = useState(false);
+  const paused = job?.state === "paused";
+  const retrying = job?.state === "retrying";
+  const syncing = job?.state === "running" || job?.state === "stopping" || paused || retrying;
+  const flash = (m: string, ok = true) => {
+    setPmsg(m);
+    setPok(ok);
+  };
+
+  return (
+    <div className="mb-2.5 rounded-xl border border-line/60 bg-fill/60 p-3.5">
+      <div className="flex items-center gap-3">
+        <span className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg bg-accent-soft text-accent">
+          <Inbox size={15} />
+        </span>
+        <div className="min-w-0">
+          <div className="flex items-center gap-2 text-[13.5px] font-semibold">
+            Uploaded documents
+            <Lock size={11} className="text-muted" />
+          </div>
+          <div className="text-[11.5px] text-muted">Permanent · rolling drop-box</div>
+        </div>
+        {syncing && (
+          <button
+            onClick={() => onOpenSync(c.name, Boolean(job?.clean))}
+            title="Open the live sync log"
+            className={cn(
+              "flex flex-shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 font-mono text-[9px] uppercase tracking-[0.12em] transition hover:brightness-110",
+              paused || retrying ? "bg-gold-soft text-gold" : "bg-accent-soft text-accent",
+            )}
+          >
+            <span className={cn("h-[6px] w-[6px] rounded-full", paused ? "bg-gold" : "animate-pulse bg-accent")} />
+            {paused ? "paused" : retrying ? "retrying" : job?.kind === "cleanup" ? "cleaning" : "syncing"}
+          </button>
+        )}
+      </div>
+      <p className="mt-2 text-[11.5px] leading-relaxed text-muted">
+        Documents you add to memory — via{" "}
+        <code className="font-mono text-[10.5px] text-gold">/qj</code> (“ingest this file…”) or the
+        API — collect here as one rolling source. Sync to pick up new files in its folder, or clean
+        up to forget them. Attaching files in chat is per-question context, not this.
+      </p>
+      <div className="mt-2.5 flex flex-wrap gap-x-2.5 gap-y-1 font-mono text-[10.5px] tabular-nums text-faint">
+        <span>commons</span>
+        <span>{c.documents} docs</span>
+        <span>{c.last_sync ? `synced ${c.last_sync.slice(0, 16).replace("T", " ")}` : "never synced"}</span>
+      </div>
+      <div className="mt-3 flex flex-wrap items-center gap-1">
+        <IconButton
+          title={syncing ? "A sync is already running — open its log" : "Sync now — pick up new files added to the uploads folder"}
+          onClick={() => onOpenSync(c.name, syncing ? Boolean(job?.clean) : false, !syncing)}
+        >
+          <RefreshCw size={15} className={syncing ? "animate-spin text-accent" : ""} />
+        </IconButton>
+        <IconButton
+          className="hover:bg-danger-soft hover:text-danger disabled:opacity-35 disabled:hover:bg-transparent disabled:hover:text-muted"
+          disabled={syncing}
+          title={
+            armedWipe
+              ? "Click again to confirm — forgets every uploaded document, keeping the drop-box"
+              : "Clean up — forget the uploaded documents, vectors and graph edges (keeps the connector)"
+          }
+          onClick={() => {
+            if (!armedWipe) {
+              setArmedWipe(true);
+              flash(`Click again to confirm — forgets ${c.documents} uploaded document(s).`);
+              setTimeout(() => setArmedWipe(false), 5000);
+              return;
+            }
+            setArmedWipe(false);
+            onOpenSync(c.name, false, true, "cleanup");
+          }}
+        >
+          <Eraser size={15} className={armedWipe ? "text-danger" : ""} />
+        </IconButton>
+      </div>
+      {pmsg && <div className={cn("mt-2.5 font-mono text-[11px]", pok ? "text-muted" : "text-danger")}>{pmsg}</div>}
     </div>
   );
 }

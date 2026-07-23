@@ -1,0 +1,25 @@
+meta {
+  name: Attach a file to a question
+  type: http
+  seq: 5
+}
+
+post {
+  url: {{baseUrl}}/api/chat/attachments
+  body: multipartForm
+}
+
+body:multipart-form {
+  files: @file(/absolute/path/to/a/document.pdf)
+}
+
+script:post-response {
+  try { bru.setVar("attachmentId", res.body.attachments[0].id); } catch (e) {}
+}
+
+docs {
+  Attach file(s) as CONTEXT for a chat question (not memory): the text is extracted and injected
+  into the turn only. Returns attachment ids — pass them as `attachment_ids` in the Ask request's
+  body. These are ephemeral and auto-deleted after the retention window. This request captures the
+  first id into `attachmentId` for the download request below.
+}

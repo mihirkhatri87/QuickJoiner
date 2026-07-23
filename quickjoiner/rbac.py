@@ -111,12 +111,16 @@ _ROUTES: list[tuple[str, str, str, Optional[str]]] = [
     ("GET", "/api/sync/{source_name}/logs", "connectors:read", "source_name"),
     ("POST", "/api/memory/reset", "memory:reset", None),
     ("POST", "/api/learn", "memory:write", None),
+    ("POST", "/api/uploads", "memory:write", None),
+    ("POST", "/api/uploads/local", "memory:write", None),
     # Ask & search
     ("GET", "/api/search", "search:read", None),
     ("GET", "/api/suggest", "search:read", None),
     ("GET", "/api/documents/{doc_id}/file", "search:read", None),
     ("POST", "/api/scrape", "scrape:run", None),
     ("POST", "/api/chat", "chat:use", None),
+    ("POST", "/api/chat/attachments", "chat:use", None),
+    ("GET", "/api/chat/attachments/{att_id}/download", "chat:use", None),
     # Knowledge graph
     ("GET", "/api/graph", "graph:read", None),
     ("GET", "/api/graph/path", "graph:read", None),

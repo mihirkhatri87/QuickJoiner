@@ -61,6 +61,16 @@ Debt, named:
 - **Analytics dashboard (W1)** and **gap backlog (W2)** views: new routes, chart primitives
   (sparkline/area/bar) built on the design tokens — no chart mega-library; follow dataviz
   discipline (tabular-nums, endpoint emphasis, both themes).
+- **Layer-grouped GraphView** (AI #29): color/cluster graph nodes by architectural layer
+  (API / Service / Data / UI / Utility / Infra) from the server-supplied entity `layer`
+  attribute, so a dense multi-repo graph reads as an architecture rather than a node soup.
+  Builds on F0's density-budget work; the layer is a data attribute, so the canvas/adapter
+  split (rule 3) is preserved — legend + optional per-layer collapse, no renderer-owned logic.
+- **Persona picker + active-persona chip** (AI #30): a persona selector in account/settings
+  (new-joiner principal / junior dev / PM / power user) and a small **always-visible chip in
+  the chat header naming the persona in effect** (the user's explicit ask). The persona rides
+  the user profile / `/api/settings` and is passed on the chat request; the chip is read-only
+  UI state, so it needs no new store. Answer-shaping itself is server-side (AI #30).
 - **Accessibility pass to WCAG 2.2 AA**: axe in CI, keyboard paths for wizard/modal/graph
   (graph needs a list-mode fallback — the a11y answer to canvas), focus management in modal.
 - **Perf budgets**: initial JS ≤ 250 KB gz (mermaid/d3/graph stay lazy); route-level code

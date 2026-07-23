@@ -119,7 +119,10 @@ Persona relevance = value to the new-joiner principal engineer (our wedge), not 
 enterprise search value.
 
 For context, ours (13): files, git, github, gitlab, jira, confluence, azure_devops,
-octopus, grafana, datadog, dynatrace, elastic, web_scrape.
+octopus, grafana, datadog, dynatrace, elastic, web_scrape — plus a permanent rolling **Uploads**
+drop-box that ingests ad-hoc **Word/PowerPoint/Excel/PDF/Markdown/HTML** documents (chat drag-drop,
+`/qj`, or `POST /api/uploads`); text extracted at ingest, one continuously-growing source rather
+than a connector per file.
 
 | Category | Competitor connectors we lack | Persona relevance |
 |---|---|---|

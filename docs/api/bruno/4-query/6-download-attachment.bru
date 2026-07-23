@@ -1,0 +1,15 @@
+meta {
+  name: Download a chat attachment
+  type: http
+  seq: 6
+}
+
+get {
+  url: {{baseUrl}}/api/chat/attachments/{{attachmentId}}/download
+}
+
+docs {
+  Download the original attached file. Returns 410 Gone once the retention sweep has deleted it
+  (the chat history keeps the filename + deletion date). Uses `attachmentId`, captured by the
+  "Attach a file to a question" request.
+}

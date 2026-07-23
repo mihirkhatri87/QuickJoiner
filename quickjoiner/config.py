@@ -71,6 +71,16 @@ class EmbeddingConfig(BaseModel):
     # for nomic/e5 passages change too => re-sync to re-embed. OFF by default to preserve
     # existing corpora and the bge-tuned 0.55 gate. See memory/embedder._INSTRUCTIONS.
     instruct: bool = False
+    # fastembed only: which execution device runs the ONNX embedding model.
+    #   "auto" (default) — use an NVIDIA GPU if onnxruntime exposes CUDAExecutionProvider
+    #     (i.e. the `[gpu]` extra / onnxruntime-gpu is installed AND CUDA/cuDNN load), else CPU.
+    #   "cuda"/"gpu" — require the GPU (falls back to CPU with a warning if unavailable).
+    #   "cpu" — force CPU (the prior behaviour).
+    # Embedding is the CPU bottleneck on a large ingest; the GPU offloads it. Same model either
+    # way, so vectors differ only by tiny float rounding — but any embedding change warrants a
+    # gate re-check (retrieval.min_score) per the house rule; run `qj eval --calibrate` after
+    # switching an existing corpus to GPU.
+    device: str = "auto"
 
     def resolved_model(self) -> str:
         return self.model or DEFAULT_EMBED_MODELS.get(self.provider, "BAAI/bge-small-en-v1.5")
@@ -135,6 +145,11 @@ class ChatConfig(BaseModel):
     # can't overflow the context window and make the provider reject the follow-up turn.
     live_tool_result_max_chars: int = 24000
     learn_from_conversations: bool = True  # distill durable facts into memory on compression
+    # Per-question file attachments (context for a single question, NOT long-term memory —
+    # kept separate from the Uploads connector). Their extracted text injected into the turn
+    # is capped to this many chars, and the files themselves are auto-deleted after N days.
+    attachment_context_max_chars: int = 24000
+    context_retention_days: int = 7
 
 
 class GapsConfig(BaseModel):

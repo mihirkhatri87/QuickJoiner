@@ -140,7 +140,7 @@ def test_open_mode_connector_crud(tmp_path, monkeypatch):
     row = resp.json()
     assert row["shared"] is True and row["owner"] is None and row["test"]["ok"]
 
-    rows = [r for r in client.get("/api/connectors").json() if r["name"] != "quickjoiner"]
+    rows = [r for r in client.get("/api/connectors").json() if r["name"] not in ("quickjoiner", "uploads")]
     assert [r["name"] for r in rows] == ["handbook"]
     assert "pull" in rows[0]["modes"]
 
@@ -149,7 +149,7 @@ def test_open_mode_connector_crud(tmp_path, monkeypatch):
     assert client.delete("/api/connectors/handbook").status_code == 409
     _wait_idle(client, "handbook")
     assert client.delete("/api/connectors/handbook").status_code == 200
-    assert [r["name"] for r in client.get("/api/connectors").json() if r["name"] != "quickjoiner"] == []
+    assert [r["name"] for r in client.get("/api/connectors").json() if r["name"] not in ("quickjoiner", "uploads")] == []
 
 
 def test_auth_enables_private_connectors_and_sharing(tmp_path, monkeypatch):
@@ -187,7 +187,7 @@ def test_auth_enables_private_connectors_and_sharing(tmp_path, monkeypatch):
 
     # Raj can't see, sync, or remove it. (The commons control connector is always visible.)
     assert [r["name"] for r in client.get("/api/connectors", headers=_bearer(raj["token"])).json()
-            if r["name"] != "quickjoiner"] == []
+            if r["name"] not in ("quickjoiner", "uploads")] == []
     assert client.post("/api/sync/meena-notes", headers=_bearer(raj["token"])).status_code == 404
     assert client.delete("/api/connectors/meena-notes", headers=_bearer(raj["token"])).status_code == 404
     # And can't squat the name.
@@ -200,7 +200,7 @@ def test_auth_enables_private_connectors_and_sharing(tmp_path, monkeypatch):
                         headers=_bearer(meena["token"]))
     assert resp.status_code == 200 and resp.json()["shared"] is True
     rows = [r for r in client.get("/api/connectors", headers=_bearer(raj["token"])).json()
-            if r["name"] != "quickjoiner"]
+            if r["name"] not in ("quickjoiner", "uploads")]
     assert [r["name"] for r in rows] == ["meena-notes"]
     assert rows[0]["can_manage"] is False
     assert client.post("/api/sync/meena-notes", headers=_bearer(raj["token"])).status_code == 200

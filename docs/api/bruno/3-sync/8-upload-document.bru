@@ -1,0 +1,21 @@
+meta {
+  name: Upload a document (multipart)
+  type: http
+  seq: 8
+}
+
+post {
+  url: {{baseUrl}}/api/uploads
+  body: multipartForm
+}
+
+body:multipart-form {
+  files: @file(/absolute/path/to/a/document.pdf)
+}
+
+docs {
+  Upload one or more documents (Word, PowerPoint, Excel, PDF, Markdown, text, JSON, HTML, code)
+  straight into memory via the rolling Uploads connector. Text is extracted at ingest. Point the
+  `files` part at a real file on disk (repeat the part for multiple files). The browser/Bruno set
+  the multipart boundary — don't add a Content-Type header.
+}

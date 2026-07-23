@@ -2,11 +2,46 @@
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 
 import httpx
 
 from quickjoiner.config import EmbeddingConfig
+
+logger = logging.getLogger(__name__)
+
+
+def _resolve_providers(device: str) -> tuple[list[str] | None, str]:
+    """Pick the onnxruntime execution providers for fastembed given the configured `device`.
+
+    Returns `(providers | None, label)`; `None` means "let fastembed default" (CPU). `device`:
+    - "auto"        → CUDA if onnxruntime exposes CUDAExecutionProvider (the `[gpu]` extra +
+                      a working CUDA/cuDNN), else CPU. This is the resource-aware default: a
+                      GPU is used automatically when present, and a plain CPU install is
+                      byte-for-byte unaffected.
+    - "cuda"/"gpu"  → require the GPU; fall back to CPU with a warning if it isn't available
+                      (so a mis-set config never hard-fails a sync).
+    - "cpu"         → force CPU (the prior behaviour).
+    """
+    dev = (device or "auto").strip().lower()
+    if dev == "cpu":
+        return None, "cpu"
+    try:
+        import onnxruntime as ort
+
+        available = ort.get_available_providers()
+    except Exception:  # onnxruntime import problem — let fastembed sort it out on CPU
+        available = []
+    if "CUDAExecutionProvider" in available:
+        return ["CUDAExecutionProvider", "CPUExecutionProvider"], "cuda"
+    if dev in ("cuda", "gpu"):
+        logger.warning(
+            "embedding.device=%r but CUDAExecutionProvider is unavailable — falling back to CPU. "
+            "Install the GPU runtime (pip install fastembed-gpu / onnxruntime-gpu) and a matching "
+            "CUDA/cuDNN.", device,
+        )
+    return None, "cpu"
 
 # Asymmetric-retrieval instruction prefixes, keyed by a substring of the resolved model
 # name -> (query_prefix, passage_prefix). These models were trained to embed queries and
@@ -71,8 +106,13 @@ class FastEmbedEmbedder(Embedder):
         from fastembed import TextEmbedding
 
         cache = os.environ.get("FASTEMBED_CACHE_PATH")
-        kwargs = {"cache_dir": cache} if cache else {}
+        kwargs: dict = {"cache_dir": cache} if cache else {}
+        providers, device = _resolve_providers(config.device)
+        if providers is not None:
+            kwargs["providers"] = providers
         self._model = TextEmbedding(model_name=config.resolved_model(), **kwargs)
+        logger.info("fastembed embedding model %s on %s", config.resolved_model(), device)
+        self._device = device
         self._q_prefix, self._p_prefix = _resolve_prefixes(config)
 
     def _raw(self, texts: list[str]) -> list[list[float]]:
