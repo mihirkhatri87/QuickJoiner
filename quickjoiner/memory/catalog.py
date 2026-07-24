@@ -113,6 +113,11 @@ _MIGRATION_STATEMENTS = [
     # RBAC (docs/plans/08): a user's role gates which parts of the API they may use.
     # Existing single-user workspaces get 'admin' so nobody is locked out by the upgrade.
     "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'admin'",
+    # Graph-extractor version per doc (2026-07-23): lets a plain sync rebuild the knowledge
+    # graph for a re-fetched doc when the DETERMINISTIC extractors changed but the content
+    # didn't — without re-embedding. Existing docs default 0 (< current) so the next sync
+    # that re-provides them refreshes their graph once, then settles.
+    "ALTER TABLE documents ADD COLUMN graph_version INTEGER NOT NULL DEFAULT 0",
 ]
 
 
@@ -275,6 +280,16 @@ class _SqlCatalog:
         row = self._read_one("SELECT content_hash FROM documents WHERE doc_id = ?", (doc_id,))
         return row["content_hash"] if row else None
 
+    def get_document_graph_version(self, doc_id: str) -> int:
+        """The graph-extractor version this doc's edges were last built with (0 if never
+        recorded / pre-migration). The pipeline refreshes the graph when this is below the
+        current `GRAPH_EXTRACTOR_VERSION` even though the content is unchanged."""
+        row = self._read_one("SELECT graph_version FROM documents WHERE doc_id = ?", (doc_id,))
+        return int(row["graph_version"]) if row and row["graph_version"] is not None else 0
+
+    def set_document_graph_version(self, doc_id: str, version: int) -> None:
+        self._write("UPDATE documents SET graph_version = ? WHERE doc_id = ?", (version, doc_id))
+
     def get_document(self, doc_id: str) -> dict | None:
         return self._read_one("SELECT * FROM documents WHERE doc_id = ?", (doc_id,))
 
@@ -284,15 +299,17 @@ class _SqlCatalog:
         )
 
     def upsert_document(self, doc_id, source_id, uri, title, kind, content_hash,
-                        updated_at, chunk_count) -> None:
+                        updated_at, chunk_count, graph_version: int = 0) -> None:
         self._write(
-            """INSERT INTO documents (doc_id, source_id, uri, title, kind, content_hash, updated_at, chunk_count)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """INSERT INTO documents (doc_id, source_id, uri, title, kind, content_hash, updated_at, chunk_count, graph_version)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(doc_id) DO UPDATE SET
                    source_id=excluded.source_id, uri=excluded.uri, title=excluded.title,
                    kind=excluded.kind, content_hash=excluded.content_hash,
-                   updated_at=excluded.updated_at, chunk_count=excluded.chunk_count""",
-            (doc_id, source_id, uri, title, kind, content_hash, updated_at or _now(), chunk_count),
+                   updated_at=excluded.updated_at, chunk_count=excluded.chunk_count,
+                   graph_version=excluded.graph_version""",
+            (doc_id, source_id, uri, title, kind, content_hash, updated_at or _now(),
+             chunk_count, graph_version),
         )
 
     def delete_document(self, doc_id: str) -> None:
@@ -827,44 +844,62 @@ class _SqlCatalog:
         """Nodes + edges for /api/graph: one entity's neighborhood, or the whole
         graph capped at `limit` edges.
 
-        The whole-graph case is sampled *fairly across source entities*, not just
-        the alphabetically-first `limit` rows: a plain `ORDER BY src, rel LIMIT n`
-        lets one high-degree entity (e.g. a repo with thousands of `defines`
-        edges) consume the entire budget before the scan ever reaches another
-        entity's edges — so a workspace with multiple sources would silently
-        render as a single star, with every other source's edges invisible
-        despite being fully present in the table. Instead every distinct `src`
-        gets an even share of the budget (a windowed per-entity cap) before the
-        overall `limit` is applied, so small/less-connected sources still show up
-        next to a dominant one."""
+        The whole-graph case is sampled *fairly across entity TYPES* (and across
+        src within a type), not just the alphabetically-first `limit` rows. Two
+        failure modes this avoids: (1) a plain `ORDER BY src LIMIT n` lets one
+        high-degree entity consume the whole budget (renders as a single star);
+        (2) a per-src cap alone still front-loads whichever type sorts first and
+        is numerous — after a GitLab sync the hundreds of `branch:` entities
+        (sorting before every other type) ate the entire 400-edge budget via
+        belongs_to/for_ticket, hiding the services/deps/deploys/code that are
+        fully present. So each src_type gets an even share (`per_type_cap`), and
+        within a type a round-robin over src spreads that share across many
+        entities — a representative multi-type view at any `limit`."""
         if entity_id:
             rows = self.graph_neighbors(entity_id)[:limit]
         else:
-            distinct = self._read_one("SELECT COUNT(DISTINCT src) AS n FROM edges")
-            n_src = max(1, (distinct["n"] if distinct else 0) or 1)
-            per_entity_cap = max(5, limit // n_src)
+            # Balance the sample across entity TYPES, then across src within a type. A plain
+            # per-src cap still front-loads whichever type sorts first alphabetically and is
+            # numerous — e.g. after GitLab sync the 329 `branch:` entities (sorting before
+            # every other type) consumed the entire 400-edge budget via belongs_to/for_ticket,
+            # rendering the whole graph as branches+tickets and hiding services/deps/deploys/
+            # code that are fully present. So: each src_type gets an even share of the budget
+            # (per_type_cap), and within a type the round-robin over src (rn_src) spreads it
+            # across many entities rather than one dominant node.
+            tcount = self._read_one(
+                "SELECT COUNT(DISTINCT s.type) AS n FROM edges g LEFT JOIN entities s ON s.id = g.src"
+            )
+            n_types = max(1, (tcount["n"] if tcount else 0) or 1)
+            per_type_cap = max(5, limit // n_types)
             rows = self._read_all(
                 f"""SELECT src, rel, dst, detail, evidence_doc_id,
                            src_name, src_type, dst_name, dst_type,
                            evidence_title, evidence_uri, evidence_kind
                     FROM (
-                        SELECT g.src, g.rel, g.dst, g.detail, g.evidence_doc_id,
-                               s.name AS src_name, s.type AS src_type,
-                               t.name AS dst_name, t.type AS dst_type,
-                               d.title AS evidence_title, d.uri AS evidence_uri,
-                               d.kind AS evidence_kind,
+                        SELECT src, rel, dst, detail, evidence_doc_id, src_name, src_type,
+                               dst_name, dst_type, evidence_title, evidence_uri, evidence_kind,
                                ROW_NUMBER() OVER (
-                                   PARTITION BY g.src ORDER BY g.rel, g.dst
-                               ) AS rn
-                        FROM edges g
-                        LEFT JOIN entities s ON s.id = g.src
-                        LEFT JOIN entities t ON t.id = g.dst
-                        LEFT JOIN documents d ON d.doc_id = g.evidence_doc_id
-                    ) capped
-                    WHERE rn <= ?
-                    ORDER BY src, rel
+                                   PARTITION BY src_type ORDER BY rn_src, src, rel, dst
+                               ) AS rn_type
+                        FROM (
+                            SELECT g.src, g.rel, g.dst, g.detail, g.evidence_doc_id,
+                                   s.name AS src_name, s.type AS src_type,
+                                   t.name AS dst_name, t.type AS dst_type,
+                                   d.title AS evidence_title, d.uri AS evidence_uri,
+                                   d.kind AS evidence_kind,
+                                   ROW_NUMBER() OVER (
+                                       PARTITION BY g.src ORDER BY g.rel, g.dst
+                                   ) AS rn_src
+                            FROM edges g
+                            LEFT JOIN entities s ON s.id = g.src
+                            LEFT JOIN entities t ON t.id = g.dst
+                            LEFT JOIN documents d ON d.doc_id = g.evidence_doc_id
+                        ) capped
+                    ) typed
+                    WHERE rn_type <= ?
+                    ORDER BY src_type, rn_type
                     LIMIT ?""",
-                (per_entity_cap, limit),
+                (per_type_cap, limit),
             )
         nodes: dict[str, dict] = {}
         edges = []

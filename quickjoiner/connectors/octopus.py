@@ -148,19 +148,35 @@ class OctopusConnector(Connector):
         events shape should be verified against your server before trusting it)."""
         return as_bool(self.options.get("incremental"), default=False)
 
-    def _paged(self, endpoint: str, params: dict[str, Any] | None = None) -> Iterator[dict]:
+    def _paged(
+        self, endpoint: str, params: dict[str, Any] | None = None, stage: str | None = None
+    ) -> Iterator[dict]:
         """Yield every item across all Octopus pages. Octopus returns a server-relative
         `Links["Page.Next"]` while more remain and omits it on the last page; this walks
         that chain (falling back to nothing when absent) instead of taking only the first
-        page — the reason a >100-project space was previously truncated at 100."""
+        page — the reason a >100-project space was previously truncated at 100.
+
+        When `stage` is given, reports phase progress from the Octopus `TotalResults`
+        count (present on list responses) and checkpoints between pages, so a long list
+        pull (a big project space) shows a real percent and honors stop/pause instead of
+        sitting on an empty bar. Progress-less callers (`_changed_project_ids`,
+        `_name_map`) omit `stage` on purpose — the former's `except Exception` would
+        otherwise swallow a cooperative `SyncStopped`."""
         url: str | None = f"{self._api()}/{endpoint}"
         p = {"take": TAKE, **(params or {})}
+        fetched, total = 0, None
         for _ in range(MAX_PAGES):
             if not url:
                 return
             data = get_json(url, headers=self._headers(), params=p)
+            if total is None:
+                total = data.get("TotalResults")  # None on servers that omit it -> shimmer
             for item in data.get("Items", []):
                 yield item
+                fetched += 1
+            if stage:
+                self._stage(stage, fetched, total)
+                self._checkpoint()
             nxt = (data.get("Links") or {}).get("Page.Next")
             # Page.Next is relative to the server root and already carries skip/take.
             url = f"{self._server()}{nxt}" if nxt else None
@@ -196,7 +212,7 @@ class OctopusConnector(Connector):
         # The project list itself is always fully paginated (cheap; needed for the
         # dashboard's id->name map regardless) — this is the fix for the 100-cap.
         self._stage("projects")
-        projects = list(self._paged("projects"))
+        projects = list(self._paged("projects", stage="projects"))
         # Project docs are built from already-fetched data (no network) — yield them straight away.
         for project in projects:
             yield project_document(server, project)

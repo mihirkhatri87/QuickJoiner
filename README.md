@@ -257,7 +257,23 @@ Register a source from the CLI (or just say **`/qj connect a <type> …`** in th
 
 ```powershell
 qj connect git --name platform --option url=https://github.com/acme/platform.git --option token=env:GIT_TOKEN
+# ^ if the URL is a GitHub/GitLab repo, qj offers to ALSO wire up the matching API connector
+#   (merge requests, issues, pipelines + the ticket<->MR graph) — one prompt, no retyping.
 qj connect github --name platform-gh --option repo=acme/platform --option token=env:GITHUB_TOKEN
+qj connect gitlab --name platform-gl --option project=grp/subgrp/platform --option token=env:GITLAB_TOKEN
+# GitLab MRs are linked in the knowledge graph to their repo + source branch, keyed by name — so
+# they merge with TFS work-item "Development" links (same repo + branch name, group nesting aside)
+# and you can ask "what's the MR for this TFS issue?". The agent also answers live, read-only
+# questions the API exposes but memory can't — "list all open MRs", "who reviewed !88", "did the
+# build for branch X pass (and link)", "which jobs failed", "compare develop..feature/x", "recent
+# commits by <author>", "project languages/default branch". GitHub gets the same tool family; ADO
+# adds work-item detail + build details/logs. All READ-ONLY (nothing is ever changed remotely).
+# Leave --option token off to use $GITLAB_TOKEN.
+# Org-specific rules (opt-in, off by default): --option ticket_in_branch=true links each MR/branch
+# straight to its TFS ticket when the work-item id is in the branch name (e.g. feature/team/321135-x
+# -> ticket #321135; override the pattern with --option ticket_pattern="(\d{4,})"). And if your
+# pipelines mirror branches into TFS, --option tfs_sync_stage=<sync job/stage name> captures, per
+# branch, the most recent successful TFS-sync pipeline (--option tfs_sync_lookback_days=15).
 qj connect jira --name pay-jira --option base_url=https://acme.atlassian.net --option email=me@acme.com --option api_token=env:JIRA_API_TOKEN --option projects=PAY,LEDG
 qj connect confluence --name wiki --option base_url=https://acme.atlassian.net --option email=me@acme.com --option api_token=env:JIRA_API_TOKEN --option spaces=ENG
 qj connect azure_devops --name ado --option organization=acme --option project=Payments --option token=env:AZURE_DEVOPS_PAT
@@ -265,6 +281,9 @@ qj connect azure_devops --name ado --option organization=acme --option project=P
 # window with --option teams=... --option sprints=...  Build pipelines are mapped to the repos
 # they build and recent builds are recorded per source branch (a GitLab<->TFS bridge when branches
 # mirror into TFS) — ask "did branch X build?" and the agent checks TFS live. PRs are not ingested.
+# Each work item's "Development" links (commits/branches/PRs) are turned into graph edges
+# (ticket -> implemented_in -> repo, ticket -> on_branch -> branch), keyed by repo/branch NAME so
+# they join the GitLab side — the basis for "what's the MR for this TFS issue?" (needs a clean re-sync).
 # on-prem Azure DevOps Server / TFS: use server_url + collection instead of organization
 # (verify_tls=false for a self-signed cert; api_version to match an older server):
 qj connect azure_devops --name tfs --option server_url=https://tfs.company.com/tfs --option collection=DefaultCollection --option project=Payments --option token=env:AZURE_DEVOPS_PAT --option teams="Payments Team,Platform Team" --option sprints=10
@@ -276,6 +295,10 @@ qj sync            # incremental pull from every source
 qj sync pay-jira   # or just one source
 qj resync pay-jira # purge that source (docs, vectors, graph) and re-sync from scratch
 qj test pay-jira   # credential / reachability check
+# A plain `sync` never re-embeds unchanged content, and now also REBUILDS the knowledge
+# graph for re-fetched docs when the graph extractors have been upgraded — so a graph-only
+# improvement lands on your next ordinary sync (no re-embed), and a full `resync` is only
+# needed to re-embed changed extraction or reach docs an incremental pull no longer re-fetches.
 ```
 
 Secrets use env indirection (`token=env:GITHUB_TOKEN`) — literal secrets are never stored.

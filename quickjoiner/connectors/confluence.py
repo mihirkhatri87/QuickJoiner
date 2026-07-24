@@ -18,7 +18,16 @@ MAX_PAGES_PER_SPACE = 2000
 def page_document(base_url: str, page: dict[str, Any]) -> Document:
     from bs4 import BeautifulSoup
 
-    html = page.get("body", {}).get("storage", {}).get("value", "")
+    body = page.get("body", {}) or {}
+    # Prefer the SERVER-RENDERED `view` body over raw `storage`. In storage format a
+    # user-mention is an empty element (`<ac:link><ri:user account-id="…"/></ac:link>`)
+    # carrying only an account id, and many macros are `<ac:structured-macro>` shells —
+    # BeautifulSoup's get_text() drops them, so a page that lists its team via @mentions
+    # ingested with the names BLANK (observed: a "Team Charter" whose Members table came
+    # through as roles with no people). `body.view` renders mentions to their display
+    # name, expands macros, and renders tables, so get_text captures them. Fall back to
+    # storage when view is absent (e.g. a webhook payload that only carries storage).
+    html = (body.get("view", {}) or {}).get("value") or (body.get("storage", {}) or {}).get("value", "")
     soup = BeautifulSoup(html, "html.parser")
     text = "\n".join(line.strip() for line in soup.get_text("\n").splitlines() if line.strip())
     link = page.get("_links", {}).get("webui", "")
@@ -81,8 +90,10 @@ class ConfluenceConnector(Connector):
 
     def _fetch_page_batch(self, base: str, auth, space: str | None, start: int) -> dict:
         params: dict[str, Any] = {
+            # body.view (server-rendered) not body.storage — renders user-mentions to
+            # display names, expands macros, and renders tables (see page_document).
             "type": "page",
-            "expand": "body.storage,version",
+            "expand": "body.view,version",
             "limit": PAGE_SIZE,
             "start": start,
         }
@@ -169,8 +180,9 @@ class ConfluenceConnector(Connector):
             page = payload  # some webhook shapes put the page at the top level
         if not page:
             return
-        if page.get("body", {}).get("storage", {}).get("value"):
-            yield page_document(self._base(), page)
+        body = page.get("body", {}) or {}
+        if (body.get("view", {}) or {}).get("value") or (body.get("storage", {}) or {}).get("value"):
+            yield page_document(self._base(), page)  # page_document prefers view, falls back to storage
             return
         # Confluence webhooks usually omit the body; re-fetch the page by id.
         page_id = page.get("id")
@@ -180,7 +192,7 @@ class ConfluenceConnector(Connector):
             full = get_json(
                 f"{self._base()}/rest/api/content/{page_id}",
                 auth=self._auth(),
-                params={"expand": "body.storage,version"},
+                params={"expand": "body.view,version"},
             )
         except Exception:
             return  # page deleted or no access; nothing to ingest

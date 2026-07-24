@@ -77,10 +77,28 @@ FORM_SPECS: dict[str, dict] = {
         "blurb": "Merge requests, issues, pipelines, and wikis. Live code search too.",
         "suggests": ["What are the main repositories?", "What changed in recent merge requests?"],
         "fields": [
-            _f("project", "Project (group/name)", required=True, placeholder="platform/payments"),
+            _f("project", "Project (group/name)", placeholder="platform/payments",
+               help="A single repo to connect. For a whole group instead, use 'Group' below."),
+            _f("group", "Group / namespace", placeholder="zix",
+               help="Group-scoped connector: its live tools reach ANY repo in the group by name and "
+                    "can list group-wide (all open MRs). One connector instead of one per repo."),
+            _f("projects", "Repos to ingest", list_=True, placeholder="grp/repo-a, grp/repo-b",
+               help="For a group connector: which repos' MRs/issues/graph to actually ingest into "
+                    "memory (tools still reach the whole group). Leave empty for tools-only."),
             _f("token", "Personal access token", secret=True, env="GITLAB_TOKEN"),
             _f("base_url", "Instance URL", placeholder="https://gitlab.com",
                help="Self-managed instances: https://gitlab.yourcompany.net"),
+            _f("ticket_in_branch", "Ticket id in branch/MR name", placeholder="false",
+               help="Org rule (opt-in): your branches/MRs start with the TFS work-item number "
+                    "(e.g. 320753-fix). Links each MR/branch directly to ticket #320753."),
+            _f("ticket_pattern", "…custom ticket regex", placeholder="(\\d{4,})",
+               help="Override the ticket-id pattern (regex, group 1 = the id). Defaults to the "
+                    "first run of 4+ digits when 'Ticket id in branch/MR name' is on."),
+            _f("tfs_sync_stage", "TFS-sync job/stage name", placeholder="tfs",
+               help="Org rule (opt-in): if your pipelines mirror branches to TFS, the job or stage "
+                    "name (substring) of that step. Enables per-branch 'last synced to TFS' capture."),
+            _f("tfs_sync_lookback_days", "TFS-sync look-back (days)", placeholder="15",
+               help="How far back to search for the most recent successful TFS-sync pipeline."),
         ],
     },
     "jira": {

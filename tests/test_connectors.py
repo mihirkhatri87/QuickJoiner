@@ -6,12 +6,14 @@ from quickjoiner.config import SourceConfig
 from quickjoiner.connectors.azure_devops import (
     build_map_document,
     builds_document,
+    dev_link_graph,
     select_recent_iterations,
     work_item_document,
 )
 from quickjoiner.connectors.base import Mode
 from quickjoiner.connectors.github import issue_document as gh_issue_document
 from quickjoiner.connectors.github import pr_document, runs_document
+from quickjoiner.connectors.gitlab import branch_sync_document, mr_document, mr_graph
 from quickjoiner.connectors.jira import _adf_to_text, issue_document as jira_issue_document
 from quickjoiner.connectors.registry import CONNECTOR_TYPES, _load_builtin_connectors, create_connector
 from quickjoiner.connectors.util import resolve_secret
@@ -131,7 +133,76 @@ def test_gitlab_sync_reports_phase_labels(tmp_path, monkeypatch):
     monkeypatch.setattr("quickjoiner.connectors.gitlab.get_json", lambda *a, **k: [])
     with pytest.raises(SyncStopped):
         list(conn.sync({}))
-    assert conn._control.stages and conn._control.stages[0][0] == "merge requests"
+    # stage now carries the repo it's syncing ("merge requests · app") since one connector
+    # can ingest several projects (group-scoped).
+    assert conn._control.stages and conn._control.stages[0][0].startswith("merge requests")
+
+
+def test_gitlab_mr_graph_links_mr_branch_and_repo():
+    mr = {"iid": 88, "title": "Pre-seed usage", "source_branch": "feature/pre-seed",
+          "target_branch": "develop"}
+    g = mr_graph("AppRiver.Connector", mr)
+    types = {e[0]: e[2] for e in g["entities"]}
+    assert types["merge_request:appriver.connector/!88"] == "merge_request"
+    assert types["branch:appriver.connector/feature/pre-seed"] == "branch"
+    assert types["repo:appriver.connector"] == "repo"
+    edges = {(s, r, d) for s, r, d, _ in g["edges"]}
+    assert ("merge_request:appriver.connector/!88", "from_branch",
+            "branch:appriver.connector/feature/pre-seed") in edges
+    assert ("merge_request:appriver.connector/!88", "in_repo", "repo:appriver.connector") in edges
+    assert ("branch:appriver.connector/feature/pre-seed", "belongs_to", "repo:appriver.connector") in edges
+
+
+def test_gitlab_mr_branch_entity_matches_tfs_dev_link_branch():
+    # THE JOIN: a GitLab MR's source-branch entity and a TFS work item's dev-link branch
+    # entity resolve to the SAME id (name parity), so ticket --on_branch--> branch <--
+    # from_branch-- merge_request connects a TFS ticket to its GitLab MR. This is the whole
+    # point of "what's the MR for this TFS issue?".
+    tfs_item = {"id": 320753, "relations": [
+        {"rel": "ArtifactLink", "url": "vstfs:///Git/Ref/proj%2Fguid%2FGBfeature%2Fpre-seed",
+         "attributes": {"name": "Branch"}}]}
+    tfs = dev_link_graph(tfs_item, {"guid": "AppRiver.Connector"})
+    mr = mr_graph("AppRiver.Connector", {"iid": 88, "source_branch": "feature/pre-seed"})
+    tfs_branch = next(e[0] for e in tfs["entities"] if e[2] == "branch")
+    mr_branch = next(e[0] for e in mr["entities"] if e[2] == "branch")
+    assert tfs_branch == mr_branch == "branch:appriver.connector/feature/pre-seed"
+
+
+def test_gitlab_ticket_in_branch_rule_links_mr_directly_to_ticket():
+    # Org-specific opt-in rule: the branch/MR name starts with the TFS work-item id, so a
+    # DIRECT merge_request --implements--> ticket:#N edge is emitted (and branch --for_ticket).
+    import re
+    mr = {"iid": 88, "title": "pre-seed usage", "source_branch": "320753-pre-seed"}
+    g = mr_graph("AppRiver.Connector", mr, re.compile(r"(\d{4,})"))
+    edges = {(s, r, d) for s, r, d, _ in g["edges"]}
+    assert ("merge_request:appriver.connector/!88", "implements", "ticket:#320753") in edges
+    assert ("branch:appriver.connector/320753-pre-seed", "for_ticket", "ticket:#320753") in edges
+    # ticket:#320753 is exactly how the ADO connector keys the same work item -> they merge
+    assert any(e[0] == "ticket:#320753" and e[2] == "ticket" for e in g["entities"])
+
+
+def test_gitlab_ticket_in_branch_off_by_default():
+    g = mr_graph("Repo", {"iid": 1, "source_branch": "320753-x"})  # no pattern -> rule off
+    assert not any(r == "implements" for _, r, _, _ in g["edges"])
+
+
+def test_gitlab_mr_document_attaches_graph_only_with_repo_name():
+    mr = {"iid": 5, "title": "T", "source_branch": "topic/x"}
+    assert not mr_document("grp/app", mr).metadata.get("graph")  # no repo_name -> no graph
+    doc = mr_document("grp/app", mr, "MyRepo")
+    assert any(e[1] == "from_branch" for e in doc.metadata["graph"]["edges"])
+
+
+def test_gitlab_branch_sync_document_records_tfs_mirror():
+    syncs = [
+        {"branch": "feature/pre-seed", "pipeline_id": 4321,
+         "pipeline_url": "https://gl/p/4321", "job": "sync-to-tfs", "finished_at": "2026-07-21T09:00:00Z"},
+    ]
+    doc = branch_sync_document("grp/app", "AppRiver.Connector", syncs)
+    assert "feature/pre-seed" in doc.text and "#4321" in doc.text and "sync-to-tfs" in doc.text
+    edges = {(s, r, d) for s, r, d, _ in doc.metadata["graph"]["edges"]}
+    assert ("branch:appriver.connector/feature/pre-seed", "synced_to_tfs",
+            "repo:appriver.connector") in edges
 
 
 def test_resolve_secret_precedence(monkeypatch):
@@ -141,6 +212,168 @@ def test_resolve_secret_precedence(monkeypatch):
     assert resolve_secret({"token": "env:MY_TOKEN"}, "token", "FALLBACK_TOKEN") == "from-env-indirect"
     assert resolve_secret({}, "token", "FALLBACK_TOKEN") == "from-fallback"
     assert resolve_secret({}, "token") is None
+
+
+def test_gitlab_list_tools_enumerate_live_by_state(tmp_path, monkeypatch):
+    # "list all open MRs" is an ENUMERATION query — learned memory returns top-k by similarity,
+    # never all-matching-a-filter, so it must go live. The connector exposes list tools for it.
+    from quickjoiner.connectors.gitlab import GitLabConnector
+
+    seen = {}
+
+    def fake_get_json(url, **kw):
+        seen["endpoint"] = url.rsplit("/", 1)[-1]
+        seen["state"] = kw["params"]["state"]
+        return [{"iid": 94, "state": "opened", "title": "Product card",
+                 "source_branch": "feature/x", "author": {"username": "blambert"},
+                 "web_url": "https://gl/mr/94"}]
+
+    monkeypatch.setattr("quickjoiner.connectors.gitlab.get_json", fake_get_json)
+    conn = GitLabConnector("Connector GitLab", {"project": "zix/appriver.connector"}, tmp_path)
+    names = [t.spec.name for t in conn.tools()]
+    # Consolidated (plan 09): type-level names, no per-source suffix, `project` selector optional
+    # for a single connector.
+    assert "gitlab_list_merge_requests" in names and "gitlab_list_issues" in names
+
+    mr = next(t for t in conn.tools() if t.spec.name == "gitlab_list_merge_requests")
+    out = mr.fn(state="opened", max_results=40)
+    assert seen["endpoint"] == "merge_requests" and seen["state"] == "opened"
+    assert "!94" in out and "opened" in out and "https://gl/mr/94" in out and "feature/x" in out
+    # an invalid state falls back to opened (never sends a bad filter to the API)
+    mr.fn(state="garbage")
+    assert seen["state"] == "opened"
+    # issues tool hits the issues endpoint
+    iss = next(t for t in conn.tools() if t.spec.name == "gitlab_list_issues")
+    iss.fn(state="closed")
+    assert seen["endpoint"] == "issues" and seen["state"] == "closed"
+
+
+def test_gitlab_type_tools_consolidate_across_projects_with_selector(tmp_path, monkeypatch):
+    # Plan 09 Phase 0: N GitLab connectors -> ONE tool set (not N×), each tool taking a `project`
+    # selector that routes to the right connector; an unresolved selector returns a "which?" hint.
+    from quickjoiner.connectors.gitlab import GitLabConnector
+
+    hit = {}
+
+    def fake_get_json(url, **kw):
+        hit["url"] = url
+        return []
+
+    monkeypatch.setattr("quickjoiner.connectors.gitlab.get_json", fake_get_json)
+    conns = [
+        GitLabConnector("Connector GitLab", {"project": "grp/appriver.connector"}, tmp_path / "a"),
+        GitLabConnector("Nautical GitLab", {"project": "grp/appriver.nautical"}, tmp_path / "b"),
+    ]
+    tools = GitLabConnector.type_tools(conns)
+    names = [t.spec.name for t in tools]
+    # one consolidated set (~13), type-level names, no per-source suffix
+    assert len(tools) >= 12 and names.count("gitlab_list_merge_requests") == 1
+    mr = next(t for t in tools if t.spec.name == "gitlab_list_merge_requests")
+    # selector routes to the matching project
+    mr.fn(project="nautical", state="opened")
+    assert "appriver.nautical" in hit["url"]
+    # ambiguous (no selector, multiple connectors) -> helpful hint, no call made
+    out = mr.fn(state="opened")
+    assert "Specify which project" in out
+
+
+def test_gitlab_group_connector_resolves_repos_by_name_and_enumerates(tmp_path, monkeypatch):
+    # Plan 09 Phase 3: ONE group-scoped connector reaches any repo in the group by name, and
+    # enumerates group-wide — so you connect the org once instead of one connector per repo.
+    from quickjoiner.connectors.gitlab import GitLabConnector
+
+    calls = {}
+
+    def fake_get_json(url, **kw):
+        calls["url"] = url
+        if "/groups/zix/projects" in url:  # dynamic repo resolution
+            return [{"id": 42, "name": "appriver.connector", "path": "appriver.connector",
+                     "path_with_namespace": "zix/dev/appriver.connector"}]
+        if "/groups/zix/merge_requests" in url:  # group-wide enumeration
+            return [{"iid": 9, "state": "opened", "title": "X", "source_branch": "b",
+                     "author": {"username": "u"}, "web_url": "https://gl/9"}]
+        return [{"iid": 9, "state": "opened", "title": "X", "author": {"username": "u"},
+                 "web_url": "https://gl/9", "source_branch": "b"}]
+
+    monkeypatch.setattr("quickjoiner.connectors.gitlab.get_json", fake_get_json)
+    gc = GitLabConnector("Gitlab Zix", {"base_url": "https://gl", "group": "zix"}, tmp_path)
+    tools = {t.spec.name: t for t in GitLabConnector.type_tools([gc])}
+    # name a repo -> resolves via the group projects search, then hits that project
+    out = tools["gitlab_list_merge_requests"].fn(project="connector", state="opened")
+    assert "/projects/42/merge_requests" in calls["url"]
+    # no repo named -> group-wide enumeration across zix
+    out2 = tools["gitlab_list_merge_requests"].fn(state="opened")
+    assert "across group zix" in out2 and "/groups/zix/merge_requests" in calls["url"]
+    # ingest list drives what a group connector syncs (tools reach the whole group regardless)
+    assert GitLabConnector("g", {"group": "zix", "projects": ["a", "b"]}, tmp_path)._ingest_projects() == ["a", "b"]
+
+
+def test_github_type_tools_expose_the_pr_family(tmp_path, monkeypatch):
+    from quickjoiner.connectors.github import GitHubConnector
+
+    seen = {}
+
+    def fake_get_json(url, **kw):
+        seen["url"] = url
+        seen["state"] = (kw.get("params") or {}).get("state")
+        return [{"number": 7, "state": "open", "title": "Fix", "head": {"ref": "topic"},
+                 "user": {"login": "octocat"}, "html_url": "https://gh/pr/7"}]
+
+    monkeypatch.setattr("quickjoiner.connectors.github.get_json", fake_get_json)
+    conn = GitHubConnector("gh", {"repo": "acme/platform"}, tmp_path)
+    names = [t.spec.name for t in conn.tools()]
+    for n in ("github_list_pull_requests", "github_get_pull_request", "github_workflow_runs",
+              "github_list_issues", "github_compare", "github_repo_info"):
+        assert n in names
+    pr = next(t for t in conn.tools() if t.spec.name == "github_list_pull_requests")
+    out = pr.fn(state="open")
+    assert seen["url"].endswith("/pulls") and seen["state"] == "open"
+    assert "#7" in out and "topic" in out and "https://gh/pr/7" in out
+
+
+def test_gitlab_pipeline_status_tool_is_live_and_links(tmp_path, monkeypatch):
+    # "did the build succeed / link to the build" is LIVE state, not learned memory.
+    from quickjoiner.connectors.gitlab import GitLabConnector
+
+    def fake_get_json(url, **kw):
+        assert url.endswith("/pipelines") and kw["params"]["ref"] == "feature/x"
+        return [{"id": 13208669, "status": "success", "updated_at": "2026-06-26T14:37:15Z",
+                 "web_url": "https://gl/pipelines/13208669"}]
+
+    monkeypatch.setattr("quickjoiner.connectors.gitlab.get_json", fake_get_json)
+    conn = GitLabConnector("g", {"project": "grp/app"}, tmp_path)
+    tool = next(t for t in conn.tools() if "pipeline_status" in t.spec.name)
+    out = tool.fn("feature/x")
+    assert "#13208669" in out and "success" in out and "https://gl/pipelines/13208669" in out
+    assert tool.fn("") == "Provide a branch/ref name."  # empty ref guarded
+
+
+def test_suggest_api_connector_detects_github_and_gitlab():
+    from quickjoiner.connectors.git_repo import suggest_api_connector
+
+    gh = suggest_api_connector("https://github.com/acme/platform.git")
+    assert gh == {"type": "github", "options": {"repo": "acme/platform"},
+                  "label": "GitHub repo acme/platform"}
+    # self-managed GitLab keeps its full group path + base_url
+    gl = suggest_api_connector("https://gitlab.otxlab.net/zix/Development/secure-cloud/appriver.connector.git")
+    assert gl["type"] == "gitlab"
+    assert gl["options"] == {"project": "zix/Development/secure-cloud/appriver.connector",
+                             "base_url": "https://gitlab.otxlab.net"}
+    # scp form
+    scp = suggest_api_connector("git@github.com:acme/platform.git")
+    assert scp["type"] == "github" and scp["options"]["repo"] == "acme/platform"
+    # GitHub Enterprise carries base_url
+    ent = suggest_api_connector("https://github.acme.com/org/repo.git")
+    assert ent["options"] == {"repo": "org/repo", "base_url": "https://github.acme.com"}
+
+
+def test_suggest_api_connector_returns_none_for_unknown_hosts():
+    from quickjoiner.connectors.git_repo import suggest_api_connector
+
+    assert suggest_api_connector("https://git.company.com/team/thing.git") is None
+    assert suggest_api_connector("https://bitbucket.org/team/repo.git") is None
+    assert suggest_api_connector("") is None
+    assert suggest_api_connector("not a url") is None
 
 
 def test_github_pr_document():
@@ -238,6 +471,65 @@ def test_azure_devops_documents():
     assert doc.kind == "ticket"
     assert "Nightly settlement job times out" in doc.title
     assert "Chen" in doc.text and "30m" in doc.text and "<div>" not in doc.text
+    assert not doc.metadata.get("graph")  # no relations -> no dev-link graph
+
+
+def test_ado_dev_link_graph_links_ticket_to_repo_and_branch():
+    # A work item's Development links (its `relations`) tie the ticket to the code that
+    # implements it. The repo GUID in each artifact URL is resolved to a name via repo_names,
+    # so the edges key by NAME and merge with the GitLab connector's repo:<name> entity.
+    repo_names = {"aaaa1111-bbbb": "AppRiver.Connector", "cccc2222-dddd": "AppRiver.Nautical"}
+    item = {
+        "id": 320753,
+        "fields": {"System.Title": "Pre-seed usage data", "System.WorkItemType": "Product Backlog Item"},
+        "relations": [
+            {"rel": "ArtifactLink",
+             "url": "vstfs:///Git/Ref/proj%2Faaaa1111-bbbb%2FGBfeature%2Fpre-seed",
+             "attributes": {"name": "Branch"}},
+            {"rel": "ArtifactLink",
+             "url": "vstfs:///Git/Commit/proj%2Faaaa1111-bbbb%2Fdeadbeefcafe",
+             "attributes": {"name": "Fixed in Commit"}},
+            {"rel": "ArtifactLink",  # unknown repo GUID -> skipped, never guessed
+             "url": "vstfs:///Git/Ref/proj%2Fzzzz9999-eeee%2FGBmain",
+             "attributes": {"name": "Branch"}},
+            {"rel": "Hyperlink", "url": "https://wiki/x"},  # not an artifact link -> ignored
+        ],
+    }
+    g = dev_link_graph(item, repo_names)
+    edges = {(s, r, d) for s, r, d, _ in g["edges"]}
+    types = {e[0]: e[2] for e in g["entities"]}
+    assert types["ticket:#320753"] == "ticket"
+    assert types["repo:appriver.connector"] == "repo"
+    assert types["branch:appriver.connector/feature/pre-seed"] == "branch"
+    # ticket -> repo (branch + commit both resolve to the same repo edge, deduped)
+    assert ("ticket:#320753", "implemented_in", "repo:appriver.connector") in edges
+    # ticket -> branch, branch -> repo
+    assert ("ticket:#320753", "on_branch", "branch:appriver.connector/feature/pre-seed") in edges
+    assert ("branch:appriver.connector/feature/pre-seed", "belongs_to", "repo:appriver.connector") in edges
+    # the unknown-GUID repo produced nothing
+    assert not any("zzzz9999" in e[2] or "main" in e[2] for e in edges)
+
+
+def test_ado_dev_link_graph_empty_without_git_links():
+    assert dev_link_graph({"id": 1, "relations": []}, {"g": "Repo"}) == {}
+    assert dev_link_graph({"id": 1}, {}) == {}
+    # a PR artifact link still ties the ticket to its repo
+    item = {"id": 5, "relations": [
+        {"rel": "ArtifactLink", "url": "vstfs:///Git/PullRequestId/proj%2Fg1%2F42",
+         "attributes": {"name": "Pull Request"}}]}
+    g = dev_link_graph(item, {"g1": "MyRepo"})
+    assert ("ticket:#5", "implemented_in", "repo:myrepo") in {(s, r, d) for s, r, d, _ in g["edges"]}
+
+
+def test_ado_work_item_document_attaches_dev_link_graph():
+    item = {
+        "id": 77, "fields": {"System.Title": "T"},
+        "relations": [{"rel": "ArtifactLink",
+                       "url": "vstfs:///Git/Ref/p%2Fg1%2FGBmain", "attributes": {"name": "Branch"}}],
+    }
+    doc = work_item_document("https://tfs/AppRiver", item, {"g1": "Widgets"})
+    assert doc.metadata["graph"]["edges"]
+    assert any(e[1] == "implemented_in" for e in doc.metadata["graph"]["edges"])
 
 
 def test_ado_select_recent_iterations_takes_last_started_sprints():
@@ -289,7 +581,7 @@ def test_confluence_page_document():
     page = {
         "id": "98765",
         "title": "Incident response runbook",
-        "body": {"storage": {"value": "<h1>Sev1</h1><p>Page the on-call via PagerDuty.</p>"}},
+        "body": {"view": {"value": "<h1>Sev1</h1><p>Page the on-call via PagerDuty.</p>"}},
         "version": {"when": "2026-06-30T00:00:00Z"},
         "_links": {"webui": "/spaces/ENG/pages/98765"},
     }
@@ -297,6 +589,42 @@ def test_confluence_page_document():
     assert doc.title == "Incident response runbook"
     assert "PagerDuty" in doc.text and "<p>" not in doc.text
     assert doc.uri == "https://acme.atlassian.net/wiki/spaces/ENG/pages/98765"
+
+
+def test_confluence_view_body_captures_rendered_user_mentions():
+    # The bug this fixes: storage-format @mentions are empty <ri:user> elements that
+    # strip to nothing, so a team roster ingested with BLANK names. body.view renders
+    # each mention to the person's display name, so get_text captures it.
+    from quickjoiner.connectors.confluence import page_document
+
+    page = {
+        "id": "5108498435",
+        "title": "Caffeine - Team Charter",
+        "body": {"view": {"value": (
+            "<table><tr><th>Role</th><th>Name</th></tr>"
+            '<tr><td>Team Lead</td><td><a class="user-mention">Kasper Vervaecke</a></td></tr>'
+            "</table>"
+        )}},
+        "version": {"when": "2026-06-30T00:00:00Z"},
+        "_links": {"webui": "/spaces/DEVKB/pages/5108498435/Caffeine"},
+    }
+    doc = page_document("https://acme.atlassian.net/wiki", page)
+    assert "Kasper Vervaecke" in doc.text and "Team Lead" in doc.text
+
+
+def test_confluence_page_document_falls_back_to_storage():
+    # A webhook payload may carry only storage; page_document must still read it.
+    from quickjoiner.connectors.confluence import page_document
+
+    page = {
+        "id": "1",
+        "title": "P",
+        "body": {"storage": {"value": "<p>fallback body</p>"}},
+        "version": {"when": "2026-06-30T00:00:00Z"},
+        "_links": {"webui": "/x"},
+    }
+    doc = page_document("https://acme.atlassian.net/wiki", page)
+    assert "fallback body" in doc.text
 
 
 def test_confluence_live_and_push_modes(tmp_path):
@@ -339,8 +667,10 @@ def test_azure_devops_live_tools(tmp_path):
         tmp_path,
     )
     names = [t.spec.name for t in connector.tools()]
-    assert names == ["ado_query_work_items_ado", "ado_search_code_ado", "ado_get_file_ado",
-                     "ado_build_status_ado"]
+    assert set(names) == {"ado_get_work_item_ado", "ado_build_details_ado", "ado_build_log_ado",
+                          "ado_list_repos_ado", "ado_list_pipelines_ado", "ado_list_commits_ado",
+                          "ado_test_results_ado", "ado_query_work_items_ado", "ado_search_code_ado",
+                          "ado_get_file_ado", "ado_build_status_ado"}
 
 
 def _ado(tmp_path, **options):

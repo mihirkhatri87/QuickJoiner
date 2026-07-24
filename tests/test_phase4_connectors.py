@@ -213,6 +213,44 @@ def test_octopus_sync_paginates_all_projects(tmp_path, monkeypatch):
     assert any("Projects-2/releases" in u for u in fake.calls)
 
 
+def test_octopus_projects_phase_reports_percent_from_totalresults(tmp_path, monkeypatch):
+    # The projects list pull now carries a phase total (Octopus `TotalResults`), so the
+    # UI shows a real percent across pages instead of sitting on an empty bar — the
+    # "stuck on Stage · projects" report. Regression guard for that fix.
+    routes = [
+        ("projects?skip=100", {"Items": [{"Id": "Projects-2", "Name": "Beta", "Slug": "beta"}], "Links": {}}),
+        ("/projects", {
+            "Items": [{"Id": "Projects-1", "Name": "Alpha", "Slug": "alpha"}],
+            "Links": {"Page.Next": "/api/Spaces-1/projects?skip=100&take=100"},
+            "TotalResults": 2,
+        }),
+        ("Projects-1/releases", {"Items": []}),
+        ("Projects-2/releases", {"Items": []}),
+        ("/dashboard", {"Items": []}),
+        ("/environments", {"Items": []}),
+    ]
+    fake = _FakeOctopus(routes)
+    monkeypatch.setattr("quickjoiner.connectors.octopus.get_json", fake)
+    conn = _octopus(tmp_path)
+
+    stages: list[tuple] = []
+
+    class _Rec:
+        def stage(self, name, done=None, total=None):
+            stages.append((name, done, total))
+
+        def check(self):
+            pass
+
+    conn._control = _Rec()
+    list(conn.sync({}))
+
+    proj = [s for s in stages if s[0] == "projects"]
+    # Reaches 2/2 across the two pages, and the total is the real TotalResults (not None).
+    assert proj[-1] == ("projects", 2, 2)
+    assert any(total == 2 for _, _, total in proj)
+
+
 def test_octopus_incremental_skips_unchanged_project_releases(tmp_path, monkeypatch):
     routes = [
         ("/projects", {

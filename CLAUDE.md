@@ -140,7 +140,26 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   `StoreBackend` Protocols. `PgVectorStore` mirrors `KnowledgeStore` on a pgvector `chunks` table
   (HNSW cosine). Cloud deps are the `cloud` extra; `docker-compose.cloud.yml` runs app+pgvector.
   Postgres path verified by `tests/test_pg_backend.py` (env-gated on `QJ_TEST_DATABASE_URL`,
-  incl. a SQLite-parity retrieval test). `store.py` (LanceDB, cosine; score = 1 − distance), `catalog.py`
+  incl. a SQLite-parity retrieval test). `store.py` (LanceDB, cosine; score = 1 − distance;
+  **LanceDB disk reclamation, 2026-07-23**: LanceDB is copy-on-write — every `delete`/`add`/upsert
+  writes a new table version and leaves the superseded data files + version manifests on disk, and
+  **nothing pruned them**, so a workspace grew without bound across syncs / clean re-syncs / connector
+  cleanups — observed live at ~55k dead versions / **54 GB** of manifests behind a ~250 MB live
+  corpus (a `reset` already reclaims, since `drop_table` removes the table dir outright; the leak was
+  ongoing sync churn). `KnowledgeStore.compact()` runs `table.optimize(cleanup_older_than=0,
+  delete_unverified=False)` to prune every version but the latest + compact fragments; the safe
+  `delete_unverified=False` default means it **never removes another source's in-flight files on the
+  shared table**, so it's safe while other sources sync concurrently (`aggressive=True` is opt-in for
+  a single-process maintenance pass only). `maybe_compact()` self-throttles via a
+  `<lancedb>/.compacted_version` marker — it only optimizes once `_COMPACT_EVERY_VERSIONS` (500) table
+  versions have accumulated since the last pass (matching LanceDB's "optimize every ~20 modification
+  ops" guidance), so a stream of small incremental syncs doesn't pay for a full optimize each time.
+  Wired in: `pipeline.ingest` calls `maybe_compact` (throttled) after each batch alongside
+  `ensure_ann_index` (both via `getattr` ⇒ absent on `PgVectorStore`, where autovacuum handles it);
+  `delete_source` (clean re-sync purge / connector cleanup — a big explicit delete with no following
+  ingest) calls `compact()` immediately; `reset` clears the throttle marker. Best-effort throughout
+  (any optimize failure leaves data correct, just larger — never breaks a sync). Tests:
+  `tests/test_store_compaction.py`), `catalog.py`
   (SQLite: **workspace config in a `settings` table, connector sources in the `sources` table**
   (columns owner/shared/configured/sync_interval), document hashes, sync state, users/tokens,
   `sync_events` (the rolling sync/cleanup history behind the notification menu, incl. a `kind`
@@ -203,7 +222,11 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   layer recompute, called best-effort by `pipeline.ingest` after any batch with adds/updates;
   `graph_path` traverses bridges natively, `graph_expand` extends its seed entities across them but
   still returns only real cited documents. A bridge, deliberately NOT a merge: one row to delete if
-  wrong. Tests: `tests/test_bridges.py`.
+  wrong. **Branch bridge (same-type, 2026-07-23):** a second pass bridges `branch:<repoA>/<x>` ⇔
+  `branch:<repoB>/<x>` when the repo parts belong to the same **repo family** (`_repo_family_finder`
+  union-find over repo names + aliases) — so a GitLab MR's source branch and a TFS work-item dev-link
+  branch join even when the repo is spelled differently on each side. Guard `MAX_BRANCH_GROUP`=8; the
+  repo-name-parity case needs no bridge (ids already equal). Tests: `tests/test_bridges.py`.
   **Alias query expansion** (`memory/expansion.py`, `expand_query(catalog, query)`,
   `retrieval.alias_expansion`, on): the query-side twin of ingest-time aliasing (`connectors/deps.py`).
   Slides 1–4-token windows over the normalized query, resolves each against the knowledge graph
@@ -239,7 +262,21 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   `NAMED_TEXT_FILES` live here now (`files.py` re-exports them). Tests: `tests/test_extract.py`
   (per-format, HTML alt-text, corrupt→error, inert-vs-invoked vision seam).
   `pipeline.py` (**normalize → sha256 dedupe → chunk → embed → upsert;
-  idempotent**; optionally injected a `triple_extractor`), `chunkers.py` (markdown/code/prose aware;
+  idempotent**; optionally injected a `triple_extractor`).
+  **Graph-extractor version — refresh the graph on a plain sync, no re-embed (2026-07-23):**
+  `GRAPH_EXTRACTOR_VERSION` (module constant, bump when the DETERMINISTIC extractors change —
+  code_graph/pubsub/deps/ticket-keys or a connector's `metadata["graph"]` like ADO dev-links / GitLab
+  MRs) + a per-doc `graph_version` column. In `_ingest_one`, an UNCHANGED doc whose stored
+  `graph_version < GRAPH_EXTRACTOR_VERSION` re-runs `_sync_graph` (rebuilding edges from the
+  freshly-fetched doc's text+metadata) and stamps the version, **skipping chunk/embed** — so a
+  graph-only feature rolls out on the next ORDINARY sync (that re-provides the doc) instead of a clean
+  re-sync (`stats.graph_refreshed` counts it). Existing docs default to `graph_version=0` (< current) so
+  they refresh once, then settle. Cheap when LLM triples are off (deterministic only); with
+  `graph.extract_triples` on, a version bump re-queues triples for re-fetched unchanged docs (one-time).
+  Only reaches docs the connector actually **re-provides** that sync (full-refresh connectors
+  files/git/confluence/ADO-recent-sprints do; watermark-incremental github/gitlab/jira only re-fetch
+  changed docs, so their unchanged docs refresh on a clean re-sync). Version stamped on full ingest
+  (`upsert_document(graph_version=…)`) and after the triple drain (`_apply_triples`). `chunkers.py` (markdown/code/prose aware;
   large markdown sections carry their heading onto every sub-chunk), `normalize.py` (NFKC + typographic
   folding: curly quotes/dashes/NBSP/zero-width/CRLF → plain ASCII, applied to doc text before
   hashing and to queries in both stores — cosmetic variants dedupe instead of re-embedding;
@@ -331,6 +368,16 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   `ingest.extract` (roomier `MAX_DOC_BYTES` cap) alongside the text/code/markdown it already read,
   so the `files`/`git` connectors ingest Word/PowerPoint/Excel/PDF too (a file we can't parse is
   skipped, not fatal).
+  **Auto-wire the API connector from a git URL** (`git_repo.suggest_api_connector`, 2026-07-23): a
+  pure host-heuristic that maps a clone URL to the matching **API** connector that layers
+  MRs/issues/pipelines + the ticket↔MR graph on top of the cloned code — `github.com`/`github.*` →
+  `github` (`repo=org/name`), `gitlab.com`/`*gitlab*` → `gitlab` (`project=full/group/path` +
+  `base_url` for self-managed); `None` for a plain host. Token left unset ⇒ falls back to
+  `$GITHUB_TOKEN`/`$GITLAB_TOKEN`. Handles https + scp (`git@host:group/repo.git`). Wired into
+  `cli.py connect`: after saving a `git` source it offers (interactive `typer.confirm`) to also create
+  the API connector, or prints the ready-to-run command non-interactively. The web wizard consumes the
+  same helper (planned — see the connector-forms note). Tests: `tests/test_connectors.py`
+  (`suggest_api_connector` github/gitlab/enterprise/scp + None for unknown hosts).
   `uploads.py` — **the rolling Uploads connector** (2026-07-22): one permanent, continuously-growing
   document drop-box instead of a connector-per-file. Everything a user adds ad-hoc — a chat
   drag-drop, a `/qj` "ingest this file", the `POST /api/uploads[/local]` endpoints — lands in one
@@ -381,9 +428,26 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   build's **source branch** + repo + outcome, and a live **`ado_build_status(branch, repository?)`**
   tool answers "did branch X build?" from a GitLab branch name (4th tool alongside WIQL / code-search
   / get-file). `queueTimeDescending` (not `finishTime`) so never-started builds don't sort to the top.
+  **Work-item Development links → ticket↔code↔GitLab graph** (`dev_link_graph`, 2026-07-23): each
+  work item's `relations` (its "Development" section) carry `vstfs:///Git/{Ref|Commit|PullRequestId}/…`
+  **artifact links** encoding the repo GUID + branch/commit/PR it was implemented in. The batch
+  work-item fetch now passes **`$expand=relations`** (same call, no extra round-trip), a single
+  `_git_repo_names` call maps repo GUID→name, and `_decode_git_artifact` (pure) + `dev_link_graph`
+  (pure) emit deterministic edges — evidence = the work item, TFS *stated* the link, not inferred:
+  `ticket:#N --implemented_in--> repo:<name>` (branch/commit/PR), plus for branch (GB) refs
+  `ticket:#N --on_branch--> branch:<repo>/<name>` + `branch --belongs_to--> repo` (GT tags → repo edge
+  only, no branch node). Entities key by **name**, so name parity with the GitLab connector's
+  `repo:<name>` links a TFS ticket through to the **GitLab repo it was implemented in** regardless of
+  GitLab's differing group nesting (the user's TFS↔GitLab mirroring: same repo + branch name). A link
+  whose repo GUID can't be named is **skipped, never guessed**; best-effort throughout (a repos-list
+  failure ⇒ no dev-link edges, never a failed sync). New graph vocab: entity type `branch`, rels
+  `implemented_in`/`on_branch`/`belongs_to` (connector-emitted metadata, not the LLM triple vocab —
+  see `docs/KNOWLEDGE_GRAPH.md`). **Needs an ADO re-sync** to populate. Content hyperlinks in
+  descriptions/comments/ACs are still NOT turned into edges (that's Phase 2 — designed, not built).
   Tests in `tests/test_connectors.py` (on-prem URL/search-host/api/verify + SaaS guard;
   `select_recent_iterations` future-exclusion; `build_map_document` builds-edges; `builds_document`
-  source-branch; 4-tool name list).
+  source-branch; 4-tool name list; `dev_link_graph` ref/commit/PR edges + unknown-GUID skip +
+  `work_item_document` graph attach).
   `octopus.py` **paginates** every list endpoint via `_paged` (follows `Links["Page.Next"]`) — a
   space with >100 projects previously truncated at the `take=100` first page. Pull is a full refresh
   (idempotent via hash dedupe); opt-in `incremental=true` fetches per-project releases only for
@@ -393,6 +457,69 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   any events error. True zero-poll freshness is PUSH via an Octopus Subscription → `/hooks/<source>`.
   Tests in `tests/test_phase4_connectors.py` (paging walks Page.Next, incremental skips unchanged,
   no-watermark full fallback).
+  `gitlab.py` ingests MRs/issues/pipelines/wiki via the REST API (the code itself is indexed by the
+  separate `git` clone connector). **Comprehensive READ-ONLY live tools (plan 09, 2026-07-23) — the
+  ENUMERATION + CURRENT-STATE path** that learned memory can't serve (memory returns top-k *similar*
+  chunks, never "all matching a filter", and a "list all open MRs" query often scores *below* `min_score`
+  and refuses). GitLab's 19-tool family: MRs (`list`/`get`/`reviews`), `list_issues`, pipelines
+  (`pipeline_status`/`pipeline_jobs`/`job_log`), `list_commits`/`compare`/`list_branches`,
+  `project_info`, `search_code`/`get_file`, and P2: `list_releases`/`list_milestones`/`list_members`/
+  `list_contributors`/`list_environments`/`list_tree`. GitHub has the **parallel** 18-tool family
+  (PRs `list`/`get`/`reviews`, issues, `workflow_runs`/`run_jobs`/`job_log`, commits/compare/branches,
+  `repo_info`, search/get_file, releases/milestones/contributors/environments/tree); ADO added
+  `ado_get_work_item` (+ dev-links/acceptance-criteria), `ado_build_details`, `ado_build_log`,
+  `ado_list_repos`/`ado_list_pipelines`/`ado_list_commits`/`ado_test_results`.
+  All GET-only — **no mutating call**. Built via `connectors/live_tools.py` (`read_tool` + `bounded`
+  output cap + `make_resolver`). **Consolidated per TYPE, not per instance (Phase 0):** the tools are a
+  `@classmethod type_tools(connectors)` returning ONE set with a `project`/`repo` **selector** arg
+  (resolved by `make_resolver`; optional when a single connector of that type is configured, a
+  "specify which project (one of: …)" hint when ambiguous), so AppRiver's 3 GitLab projects don't
+  multiply into 3×13 tools. `app.py::connector_tools` groups sources by type and calls `type_tools` when
+  present (else per-instance `tools()`, which now just delegates to `type_tools([self])`). The
+  enumeration/current-state → live-tool split is taught in `agent/prompts.py`. **Group/org-scoping
+  (Phase 3, 2026-07-24):** a GitLab connector configured with a **`group`** (e.g. `zix`) instead of a
+  single `project` goes org-wide — its selector resolves ANY repo in the group **by name** via
+  `GET /groups/{g}/projects?search=…&include_subgroups=true` (`_resolve_project_in_group`, cached;
+  ranks exact/suffix then shortest so "connector" → `appriver.connector` not `…azure.connector`), and
+  `list_merge_requests`/`list_issues` with no repo named enumerate **group-wide**
+  (`/groups/{g}/merge_requests`). INGESTION stays explicit: a group connector ingests only the paths in
+  its **`projects`** list (`sync` loops `_sync_project` per path; empty ⇒ tools-only), so one
+  `group=zix` connector replaces one-per-repo without auto-ingesting hundreds. `project` is no longer a
+  required FORM_SPECS field (`group`/`projects` added). Tests:
+  `tests/test_connectors.py` (consolidation+selector, group resolution + group-wide enum, GitLab/GitHub
+  families, ADO name set).
+  **Repo/branch/MR graph** (`mr_graph`, 2026-07-23): each MR emits
+  `merge_request:<repo>/!<iid>` + `branch:<repo>/<src>` + `repo:<repo>` entities and
+  `mr --from_branch--> branch`, `mr --in_repo--> repo`, `branch --belongs_to--> repo` edges. The
+  `repo`/`branch` entities are keyed by the repo's own **name** (`_repo_name` prefers the GitLab
+  project's `name` field, group-independent), so they **merge with the TFS dev-link side** by name
+  parity — `ticket --on_branch--> branch:<repo>/<x> <--from_branch-- merge_request:<repo>/!N` is the
+  join that answers **"what's the MR for this TFS issue?"** (new entity type `merge_request`; rels
+  `from_branch`/`in_repo`). **Org-specific integration rules (all OPT-IN, off by default — not every org
+  shares these conventions):** (1) **`ticket_in_branch`** (or custom `ticket_pattern`, regex group 1 =
+  id): a TFS work-item id embedded in a branch/MR name yields a DIRECT `merge_request --implements-->
+  ticket:#<id>` (+ `branch --for_ticket--> ticket:#<id>`) edge — the strongest join (keys `ticket:#<id>`
+  exactly as the ADO connector does). Default pattern = first run of **4+ digits, searched anywhere**
+  (not anchored); live-verified against AppRiver whose branches are `type/team/<ticket>-slug`
+  (`feature/acadia/321135-ceb-product-card` → #321135), so the id is NOT the first segment. (2)
+  **`tfs_sync_stage`** — see below. **Branch identity bridge** (`ingest/bridges.py`): branch entities are
+  same-type so the cross-type bridge pass skips them; a second pass bridges `branch:<repoA>/<x>` ⇔
+  `branch:<repoB>/<x>` when the repo parts are the **same repo family** (union-find over repo names +
+  aliases), so the ticket↔MR join survives a repo spelled differently on each side (`connector` vs
+  `appriver.connector`); the name-parity case needs no bridge (ids already equal, as AppRiver's are).
+  Guard: `MAX_BRANCH_GROUP`=8. **Live-verified 2026-07-23** against real AppRiver GitLab: connection OK,
+  `_repo_name` → `AppRiver.Connector` (== TFS), MR edges + ticket extraction correct on 5 real MRs.
+  **Per-branch "synced to TFS" capture** (`branch_sync_document` +
+  `_find_tfs_sync`, **opt-in** via the `tfs_sync_stage` option = the mirror job/stage name substring;
+  `tfs_sync_lookback_days` default 15): for each recent MR source branch, walks that branch's pipelines
+  newest-first within the look-back and records the first with a **successful** job matching
+  `tfs_sync_stage` — the GitLab→TFS mirror that underpins the branch parity — as one doc carrying
+  `branch --synced_to_tfs--> repo` edges (detail = pipeline id + date). Bounded
+  (`TFS_SYNC_MAX_BRANCHES`=60, `…_PIPELINES_PER_BRANCH`=10) + `_checkpoint`ed + best-effort (any API
+  error ⇒ skip, never fails the sync). **Needs a GitLab connector + sync** to populate; the token
+  falls back to `$GITLAB_TOKEN` when the field is blank (`resolve_secret`). Tests in
+  `tests/test_connectors.py` (`mr_graph` edges; the TFS↔GitLab **branch-id join**; `mr_document` graph
+  attach; `branch_sync_document`). *Phase 2 still open:* content-hyperlink harvesting (Confluence/ADO).
   `logsearch/` (grafana/datadog/dynatrace/elastic) ingests
   inventory only — logs are queried live via tools, never vectorized. `browser/` holds the
   Playwright persistent-profile session (`session.py`, optional dep `.[browser]`) and the
@@ -456,7 +583,12 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   re-entering the model context**, so an unbounded connector tool like the full Octopus dashboard
   can't overflow the window and make the provider reject the follow-up turn; on hitting the round
   limit the agent makes **one final tool-free turn** so a model that loops on searches still
-  answers or properly refuses from what it gathered, instead of a canned "hit the limit" message),
+  answers or properly refuses from what it gathered, instead of a canned "hit the limit" message.
+  **Empty-completion guard (2026-07-23):** a round that returns NO tool call AND blank text — a
+  reasoning model (gpt-oss) that emitted only a thinking channel, or an empty completion — no longer
+  returns that blank ("qj ended with no response"); it breaks to the same final tool-free turn, and
+  if THAT is also blank a graceful fallback message is returned. The candidates-carousel case
+  (non-blank text whose prose is stripped to empty) is untouched. Tests: `tests/test_agent_loop.py`),
   onboarding briefs (`briefs.py`: seed queries → retrieved chunks → one-shot LLM call → saved to
   `<workspace>/briefs/` and re-ingested; refuses without hits and without building a provider).
   **Repo architecture briefs** (`repo_docs.py`, `qj agents-md <source>` / `POST
@@ -574,7 +706,12 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   independently-scrolling conversations / pinned-bottom systems layout with `min-h-0`; per-row
   **delete** on hover + **Clear all** in the Conversations header → `DELETE /api/sessions[/{id}]`,
   clear-all confirmed + project-scoped to what's shown; each **Connected systems** row shows a
-  pulsing "syncing…" state and re-opens that job's live log when it has one), `TopBar` (hosts the
+  pulsing "syncing…" state and re-opens that job's live log when it has one. **Connected systems are
+  grouped by connector type** (2026-07-23): a type with ≥2 members collapses into one header
+  (default collapsed, biggest group first) showing its count + a `TYPE_LABELS` friendly name
+  (`GitLab`, `Azure DevOps`, `Git repositories`, …) and a pulse dot if any member is syncing; a lone
+  system stays a plain row — keeps a workspace with many sources scannable. `renderSystemRow(s, nested?)`
+  is the shared row; `expandedGroups` is per-type toggle state), `TopBar` (hosts the
   **`NotificationsMenu`** bell before Settings), `Composer` (also a **per-question attachment
   drop-zone**: a paperclip attach button + drag-and-drop **stage** files as context for the NEXT
   question — `App.pendingFiles` shows removable chips; on send they upload via
@@ -584,7 +721,11 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   `Chat.AttachmentChips` renders each attachment beneath its question: a download button, or —
   once the 7-day retention sweep deleted it — a struck-through name + warning icon + a
   when-deleted tooltip),
-  `EmptyState`, `SettingsDrawer` (account + workspace settings + connector plates/forms; the
+  `EmptyState`, `SettingsDrawer` (account + workspace settings + connector plates/forms; **connector
+  plates are grouped by type** (2026-07-23, `ConnectorGroup`) exactly like the Rail — a type with ≥2
+  members collapses into one header (default collapsed, biggest first) showing a count + syncing dot,
+  a lone system stays a flat plate; friendly labels come from the fetched connector catalog
+  (`types[].label`); the
   workspace pane exposes provider config incl. LiteLLM proxy URL + api-key env var with a
   **Test connection** button hitting `POST /api/llm/test`, and **Retrieval/Knowledge-graph
   toggles** — hybrid, cross-encoder reranker, graph-expansion, contextual chunking (ingest-time),
@@ -707,11 +848,25 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   sets the gate so a paused worker wakes to cancel. **Stages + estimated %**: connectors call
   `_stage()`. **Accurate %** where a total is knowable up front: `files`/`git` (scanning → reading
   N/total → dependency map), `azure_devops` (phase + per-team `work items · Team A`, i/teams), `jira`
-  (from the search API's `total`), `octopus` (per-project), `confluence` (per space, via a one-call
+  (from the search API's `total`), `octopus` (project-list pull paged with `%` from the response's
+  `TotalResults` via `_paged(stage=…)` — checkpoints between pages; then per-project releases), `confluence` (per space, via a one-call
   CQL `totalSize` preflight — `_space_page_count`; unscoped all-spaces pull ⇒ no total ⇒ shimmer).
+  **Confluence body extraction uses `body.view`, not `body.storage`** (2026-07-23): `page_document`
+  reads the **server-rendered** `body.view` HTML (falling back to `body.storage` when only that is
+  present, e.g. a webhook payload). Storage format leaves user-mentions as empty
+  `<ac:link><ri:user account-id=…/></ac:link>` elements and macros as `<ac:structured-macro>` shells
+  that `get_text()` drops — so a page listing its team via @mentions ingested with the member **names
+  blank** (found live debugging "composition of team Caffeine": the Members table came through as
+  roles with no people, while a sibling charter that typed plain-text names extracted fine). `body.view`
+  renders mentions to display names, expands macros, and renders tables. The `sync`/webhook `expand`
+  is `body.view,version`. **Needs a Confluence re-sync** to re-ingest existing pages (hash changes ⇒
+  re-embed). Tests: `test_confluence_view_body_captures_rendered_user_mentions` +
+  `test_confluence_page_document_falls_back_to_storage`. NOTE: hyperlinks in the body (inter-page,
+  and links to GitLab/TFS) are still stripped to text and are **not** turned into graph edges — the
+  cross-source link-graph is a designed-not-built enhancement (see below / `docs/KNOWLEDGE_GRAPH.md`).
   **Confluence batch prefetch** (2026-07-22): `sync` prefetches the NEXT page batch on a worker
   thread (`_fetch_page_batch`, `ThreadPoolExecutor(max_workers=1)`) while the pipeline parses+embeds
-  the current one, so the heavy `body.storage` network round-trip overlaps the downstream work
+  the current one, so the heavy `body.view` network round-trip overlaps the downstream work
   instead of being a serial gap between batches; `next_start` is always derived from the actual
   result count (never guessed), so pagination stays correct and `_checkpoint()` still lands between
   batches. Tests: the existing confluence paging/percent tests in `tests/test_connectors.py` cover it.
@@ -1408,6 +1563,16 @@ Post-phase additions (2026-07-07, all tested — suite: **89 passed**):
    doc (`pipeline.ticket_keys`, stoplisted); edges replaced per evidence doc,
    `delete_document` cascades; `graph_neighbors` agent tool with alias resolution + prompt
    guidance; `GET /api/graph?entity=&limit=` snapshot; tests/test_graph.py).
+   **`graph_snapshot` whole-graph sampling is TYPE-BALANCED (2026-07-23):** the view can only draw
+   ~`limit` (400) of tens of thousands of edges, so it samples — and the sample must be
+   representative. A per-src cap alone still front-loads whichever entity type sorts first and is
+   numerous: after the GitLab sync the hundreds of `branch:` entities (sorting before every other
+   type) consumed the entire 400-edge budget via belongs_to/for_ticket, so the whole graph rendered
+   as branches+tickets and hid the services/deps/deploys/code that were fully present (the "graph
+   looks like a subset" report). Fixed by giving each `src_type` an even share (`per_type_cap =
+   limit // n_types`) and round-robining across src within a type — a representative multi-type view
+   (services/repos/deps/deploys/branches/MRs together) at any limit. Portable window-function SQL
+   (both backends); regression-tested (`test_graph_snapshot_balances_across_types_not_one_numerous_type`).
    ~~Phase B~~ DONE 2026-07-11: `graph_path` (undirected BFS, evidence per hop — catalog +
    agent tool + `GET /api/graph/path`); Jira issue docs assert ticket→part_of→project/epic,
    Octopus asserts service entities + service→deploys→environment; React "Knowledge" view

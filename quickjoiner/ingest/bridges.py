@@ -37,6 +37,7 @@ BRIDGE_TYPES = frozenset({"service", "repo", "project", "pipeline"})
 
 MIN_NORM_LEN = 5  # "api"/"web"/"core" are too short & generic to assert identity
 MAX_GROUP = 6  # a name shared by more entities than this is generic, not an identity
+MAX_BRANCH_GROUP = 8  # a (repo-family, branch) shared by more than this is suspect, skip
 
 _ALNUM = re.compile(r"[^a-z0-9]+")
 
@@ -45,6 +46,49 @@ def normalize_name(name: str) -> str:
     """Collapse a spoken/dotted/hyphenated name to its comparable core:
     'AppRiver.Connector' / 'appriver-connector' / 'AppRiver Connector' all agree."""
     return _ALNUM.sub("", (name or "").lower())
+
+
+def _parse_branch_id(bid: str) -> tuple[str, str] | None:
+    """`branch:<repo>/<branch>` → (repo, branch). Branch names contain '/', so split on
+    the FIRST slash only (`partition`)."""
+    if not bid.startswith("branch:"):
+        return None
+    repo, sep, branch = bid[len("branch:"):].partition("/")
+    if not sep or not repo or not branch:
+        return None
+    return repo, branch
+
+
+def _repo_family_finder(all_entities, aliases_by_id):
+    """Union-find over repo-name norms so different spoken forms of the SAME repo share a
+    family root — `repo:connector` (alias 'appriver.connector') unifies 'connector' with
+    'appriverconnector', so a `branch:connector/x` (GitLab) and `branch:appriver.connector/x`
+    (TFS) map to the same family even though the repo names differ. Returns `find(norm)`."""
+    parent: dict[str, str] = {}
+
+    def find(x: str) -> str:
+        parent.setdefault(x, x)
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:  # path compression
+            parent[x], x = root, parent[x]
+        return root
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for e in all_entities:
+        if e.get("type") != "repo":
+            continue
+        norms = {normalize_name(e.get("name") or "")}
+        norms.update(normalize_name(al) for al in aliases_by_id.get(e["id"], ()))
+        norms = [n for n in norms if n]
+        for n in norms[1:]:
+            union(norms[0], n)
+    return find
 
 
 def _all_generic(name: str) -> bool:
@@ -66,8 +110,14 @@ def compute_same_as_bridges(
 
     One row per pair, endpoints in sorted order (the graph consumers are undirected).
     Pure: rows with id/name/type in, edge tuples out — no I/O."""
+    all_entities = list(entities)
+    alias_list = list(aliases)
+    aliases_by_id: dict[str, list[str]] = {}
+    for entity_id, alias in alias_list:
+        if alias:
+            aliases_by_id.setdefault(entity_id, []).append(alias)
     by_id: dict[str, dict[str, Any]] = {
-        e["id"]: e for e in entities if e.get("type") in BRIDGE_TYPES
+        e["id"]: e for e in all_entities if e.get("type") in BRIDGE_TYPES
     }
     # norm -> {entity_id: via} — via is None for the entity's own name, else the alias
     # that put it there (kept for the detail text; own-name membership wins).
@@ -83,7 +133,7 @@ def compute_same_as_bridges(
 
     for e in by_id.values():
         _join(e.get("name") or "", e, None)
-    for entity_id, alias in aliases:
+    for entity_id, alias in alias_list:
         e = by_id.get(entity_id)
         if e is not None and alias:
             _join(alias, e, alias)
@@ -105,6 +155,37 @@ def compute_same_as_bridges(
             detail = (
                 f"deterministic identity bridge: {how} "
                 f"({a['type']} = {b['type']}); no document asserts this identity"
+            )
+            bridges.append((aid, "same_as", bid, detail))
+
+    # Branch bridges (same-type, so NOT covered by the cross-type pass above): a GitLab MR
+    # and a TFS work item can name the same real branch under DIFFERENT repo spellings
+    # (`branch:connector/x` vs `branch:appriver.connector/x`). Group branches by
+    # (repo-FAMILY, branch name) — the family unifies repo spellings via names + aliases —
+    # and bridge them, so `ticket --on_branch--> branch <--from_branch-- merge_request`
+    # joins even when the two sides key the repo differently. The repo-name-parity case
+    # needs no bridge (the ids already match); this rescues the mismatch case.
+    find_family = _repo_family_finder(all_entities, aliases_by_id)
+    branch_groups: dict[tuple[str, str], set[str]] = {}
+    for e in all_entities:
+        if e.get("type") != "branch":
+            continue
+        parsed = _parse_branch_id(e["id"])
+        if not parsed:
+            continue
+        repo_part, branch_part = parsed
+        fam = find_family(normalize_name(repo_part))
+        branch_groups.setdefault((fam, branch_part), set()).add(e["id"])
+    for (_fam, branch_part), ids in branch_groups.items():
+        if len(ids) < 2 or len(ids) > MAX_BRANCH_GROUP:
+            continue  # single spelling (already one id) / suspiciously shared
+        for aid, bid in combinations(sorted(ids), 2):
+            if (aid, bid) in seen_pairs:
+                continue
+            seen_pairs.add((aid, bid))
+            detail = (
+                f"deterministic identity bridge: same branch '{branch_part}' of the same "
+                f"repo family under different spellings; no document asserts this identity"
             )
             bridges.append((aid, "same_as", bid, detail))
     return bridges

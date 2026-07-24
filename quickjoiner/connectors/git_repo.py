@@ -17,6 +17,48 @@ from quickjoiner.connectors.util import resolve_secret
 HISTORY_COMMITS = 200
 
 
+def suggest_api_connector(git_url: str) -> dict | None:
+    """Given a git clone URL, suggest the matching **API** connector (github/gitlab) that
+    layers merge requests / issues / pipelines / wiki + the ticket↔MR graph on top of the
+    cloned code — the "connect as many modes as possible" nudge. Returns
+    `{"type", "options", "label"}` (ready to hand to the connect flow) or None for a plain /
+    unrecognized host. Pure + host-heuristic:
+      github.com / github.* (Enterprise)  → github, options.repo = "org/repo"
+      gitlab.com / *gitlab*  (self-managed) → gitlab, options.project = full group/…/repo path
+    A self-managed host carries its `base_url`; the token is left unset so it falls back to the
+    `$GITHUB_TOKEN`/`$GITLAB_TOKEN` env var. Handles `https://…`, `http://…`, and scp-style
+    `git@host:group/repo.git`."""
+    url = (git_url or "").strip()
+    if not url:
+        return None
+    if url.startswith("git@") and ":" in url:  # scp form → https for a uniform parse
+        host, _, path = url[4:].partition(":")
+        url = f"https://{host}/{path}"
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    path = parsed.path.strip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    if not host or not path:
+        return None
+    scheme = parsed.scheme or "https"
+    segments = path.split("/")
+    if host == "github.com" or host.startswith("github."):
+        if len(segments) < 2:
+            return None
+        repo = "/".join(segments[:2])  # github repos are exactly org/name
+        options = {"repo": repo}
+        if host != "github.com":
+            options["base_url"] = f"{scheme}://{host}"  # GitHub Enterprise
+        return {"type": "github", "options": options, "label": f"GitHub repo {repo}"}
+    if host == "gitlab.com" or "gitlab" in host:
+        options = {"project": path}  # gitlab wants the full group/subgroup/name path
+        if host != "gitlab.com":
+            options["base_url"] = f"{scheme}://{host}"  # self-managed instance
+        return {"type": "gitlab", "options": options, "label": f"GitLab project {path}"}
+    return None
+
+
 @register
 class GitRepoConnector(Connector):
     type_name = "git"

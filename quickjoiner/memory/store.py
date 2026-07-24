@@ -21,6 +21,7 @@ import re
 import sqlite3
 import threading
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 
 import lancedb
@@ -32,6 +33,17 @@ from quickjoiner.memory.hybrid import rrf_fuse
 
 _TABLE = "chunks"
 _TOKEN = re.compile(r"[A-Za-z0-9_]+")
+
+# LanceDB is copy-on-write: every delete/add/upsert writes a new table version and
+# leaves the superseded data files + version manifests on disk until they're pruned.
+# Nothing prunes them automatically, so a workspace grows without bound across syncs,
+# clean re-syncs and resets (observed live: ~55k dead versions / 54 GB of manifests
+# behind a ~250 MB live corpus). `maybe_compact` reclaims them, throttled to fire only
+# once this many table versions have accumulated since the last pass — matching
+# LanceDB's own "optimize every ~20 modification operations" guidance so a stream of
+# small incremental syncs doesn't trigger a full optimize each time.
+_COMPACT_EVERY_VERSIONS = 500
+_COMPACT_MARKER = ".compacted_version"
 
 
 @dataclass
@@ -53,7 +65,8 @@ class KnowledgeStore:
         retrieval: RetrievalConfig | None = None,
         reranker=None,
     ):
-        self._db = lancedb.connect(str(workspace / "lancedb"))
+        self._lance_dir = workspace / "lancedb"
+        self._db = lancedb.connect(str(self._lance_dir))
         self._embedder = embedder
         self._retrieval = retrieval or RetrievalConfig()
         self._reranker = reranker
@@ -201,14 +214,71 @@ class KnowledgeStore:
         if table is not None:
             table.delete(f'source_id = "{source_id}"')
         self._fts_write("DELETE FROM chunks_fts WHERE source_id = ?", (source_id,))
+        # A source purge (clean re-sync / connector cleanup) is a big, explicit delete;
+        # reclaim the versions it superseded right away rather than leaving them for the
+        # throttled ingest-time pass (a cleanup with no following ingest would never hit it).
+        self.compact()
 
     def reset(self) -> None:
         """Drop every vector + FTS row — the whole corpus. Drops the LanceDB table
         outright (fast, and it's recreated on the next upsert) rather than a per-row
-        delete, and clears the FTS sidecar. Used by the global memory reset."""
+        delete, and clears the FTS sidecar. Used by the global memory reset.
+
+        drop_table removes the table directory entirely — including every superseded
+        version — so a system-wide reset reclaims all vector disk on its own (no
+        compaction needed). The stale-compaction marker is cleared so the next corpus
+        starts its version accounting fresh."""
         if _TABLE in self._db.list_tables().tables:
             self._db.drop_table(_TABLE)
         self._fts_write("DELETE FROM chunks_fts")
+        try:
+            (self._lance_dir / _COMPACT_MARKER).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    # ------------------------------------------------------------ compaction
+    def compact(self, *, aggressive: bool = False) -> None:
+        """Reclaim disk by pruning every superseded LanceDB version (keeping only the
+        latest) and compacting small data fragments. Best-effort — any failure leaves
+        the data correct, just larger — so it never breaks a sync.
+
+        Safe to call while OTHER sources sync concurrently on the shared table: it
+        prunes old versions but keeps `delete_unverified=False`, so files from an
+        in-flight append are never removed. `aggressive=True` (delete_unverified) is
+        ONLY for a single-process maintenance pass with no concurrent writers."""
+        table = self._table()
+        if table is None:
+            return
+        try:
+            table.optimize(cleanup_older_than=timedelta(0), delete_unverified=aggressive)
+        except Exception:
+            pass
+
+    def maybe_compact(self, *, every: int = _COMPACT_EVERY_VERSIONS) -> None:
+        """Compact only once `every` table versions have accumulated since the last
+        pass. Called at the end of each ingest batch so incremental/normal/clean syncs
+        all reclaim disk, while a stream of tiny syncs doesn't pay for a full optimize
+        every time. The marker is a small file in the lancedb dir (survives restarts;
+        no catalog coupling)."""
+        table = self._table()
+        if table is None:
+            return
+        try:
+            current = int(table.version)
+        except Exception:
+            return
+        marker = self._lance_dir / _COMPACT_MARKER
+        try:
+            last = int(marker.read_text())
+        except (OSError, ValueError):
+            last = 0
+        if current - last < every:
+            return
+        self.compact()
+        try:
+            marker.write_text(str(int(self._table().version)))
+        except (OSError, AttributeError, TypeError):
+            pass
 
     # -------------------------------------------------------------------- ANN
     def ensure_ann_index(self) -> None:

@@ -56,6 +56,8 @@ CREATE TABLE IF NOT EXISTS entities (
     id         TEXT PRIMARY KEY,     -- normalized: "<type>:<lowercased name>"
     name       TEXT NOT NULL,        -- display form, e.g. "AppRiver.Nautical.Models"
     type       TEXT NOT NULL,        -- repo | package | project | service | ticket | person
+                                     -- | pipeline | topic | datastore | branch | merge_request
+                                     -- | symbol | module | team | environment
     source_id  TEXT NOT NULL DEFAULT ''   -- connector that first asserted it
 );
 
@@ -69,6 +71,10 @@ CREATE TABLE IF NOT EXISTS edges (
     src        TEXT NOT NULL,        -- entities.id
     rel        TEXT NOT NULL,        -- depends_on | provides | references | part_of | deploys
                                      -- | owns | works_on | publishes_to | subscribes_to | stores_in
+                                     -- | builds | same_as | defines | imports
+                                     -- | implemented_in | on_branch | belongs_to  (ADO dev-links, 2026-07-23)
+                                     -- | from_branch | in_repo | synced_to_tfs     (GitLab MRs, 2026-07-23)
+                                     -- | implements | for_ticket                   (org rule: ticket id in branch name)
     dst        TEXT NOT NULL,        -- entities.id
     evidence_doc_id TEXT NOT NULL DEFAULT '',  -- catalog documents.doc_id that proves it
     detail     TEXT NOT NULL DEFAULT '',       -- e.g. "3.2.0 via src/Api/Api.csproj"
@@ -116,6 +122,36 @@ Notes:
    confidence class — so a chain crossing one is capped low and flagged.
    `graph_path` traverses bridges natively; `graph_expand` extends its seed
    entities across them but only ever returns real, citable documents.
+6. **Work-item Development links** (shipped 2026-07-23, `azure_devops.dev_link_graph`):
+   each ADO work item's `relations` "Development" artifact links
+   (`vstfs:///Git/{Ref|Commit|PullRequestId}/…`) are decoded to the repo + branch
+   they were implemented in (`$expand=relations` on the existing batch fetch, plus
+   one repo GUID→name call). Emits `ticket --implemented_in--> repo`, and for branch
+   refs `ticket --on_branch--> branch --belongs_to--> repo`. Deterministic, evidence =
+   the work item (TFS stated the link). Because repo/branch entities key by **name**,
+   name parity with the GitLab connector's `repo:<name>` connects a TFS ticket to the
+   **GitLab repo it was implemented in** despite GitLab's differing group nesting — the
+   ticket→code→GitLab chain. A repo GUID that can't be named is skipped, never guessed.
+   *Phase 2 (designed, not built):* harvest content hyperlinks (Confluence `body.view`
+   hrefs, ADO description/comments/acceptance-criteria) into `references` edges via a
+   shared URL→entity resolver, giving Confluence↔GitLab↔TFS↔Octopus link edges.
+7. **GitLab MRs → the TFS↔GitLab join** (shipped 2026-07-23, `gitlab.mr_graph`): each MR
+   emits `merge_request:<repo>/!<iid>`, `branch:<repo>/<src>`, `repo:<repo>` with
+   `mr --from_branch--> branch`, `mr --in_repo--> repo`, `branch --belongs_to--> repo`.
+   Because the `branch:<repo>/<name>` id is **identical** to the one a TFS work item's
+   Development "Branch" link emits (#6, name parity), the graph joins them —
+   `ticket --on_branch--> branch <--from_branch-- merge_request` answers "what's the MR for
+   this TFS issue?". Opt-in per-branch **`branch --synced_to_tfs--> repo`** evidence
+   (`branch_sync_document`, `tfs_sync_stage` option) records the most recent successful
+   GitLab→TFS mirror pipeline (15-day look-back) — the provenance for the branch parity.
+   **Org-specific opt-in rules** (off by default; conventions not all orgs share):
+   `ticket_in_branch`/`ticket_pattern` extracts a TFS work-item id embedded in a branch/MR
+   name → a DIRECT `merge_request --implements--> ticket:#<id>` edge (the strongest, most
+   direct join; default matches the first 4+-digit run anywhere in the name — AppRiver's
+   real branches are `type/team/<ticket>-slug`). The **branch identity bridge** (`bridges.py`,
+   a second, same-type pass) bridges the same branch under different repo spellings via the
+   repo family (union-find over repo names + aliases), so the join holds even when GitLab and
+   TFS name the repo differently.
 
 ## Query surface
 

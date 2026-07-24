@@ -64,8 +64,14 @@ class OnboardingAgent:
                 messages, system=self._system, tools=specs, on_stream=on_stream
             )
             if not result.tool_calls:
-                messages.append({"role": "assistant", "content": result.text})
-                return self._finalize(result.text, messages, on_event), messages
+                if result.text and result.text.strip():
+                    messages.append({"role": "assistant", "content": result.text})
+                    return self._finalize(result.text, messages, on_event), messages
+                # No tool call AND no text — a reasoning model (gpt-oss) that emitted only a
+                # thinking channel, or an empty completion. Returning this blank is the "qj
+                # ended with no response" bug; fall through to a final tool-free turn that
+                # forces a real answer or an honest refusal, never nothing.
+                break
 
             assistant: Message = {
                 "role": "assistant", "content": result.text, "tool_calls": result.tool_calls,
@@ -108,7 +114,7 @@ class OnboardingAgent:
         # instead of emitting an unhelpful canned message.
         try:
             final = self._provider.chat(messages, system=self._system, tools=None, on_stream=on_stream)
-            if final.text:
+            if final.text and final.text.strip():
                 messages.append({"role": "assistant", "content": final.text})
                 return self._finalize(final.text, messages, on_event), messages
         except Exception:

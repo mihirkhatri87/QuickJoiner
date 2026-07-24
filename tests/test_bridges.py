@@ -73,6 +73,34 @@ def test_types_outside_the_identity_cluster_are_ignored():
     ]) == []
 
 
+def test_branch_bridge_links_same_branch_under_different_repo_spellings():
+    # A GitLab MR (repo spelled "connector") and a TFS dev-link (repo "appriver.connector")
+    # both name branch feature/x. They key DIFFERENT branch ids; the repo family — unified
+    # by the git-clone repo's alias — bridges them so the ticket↔MR join survives a name
+    # mismatch. (The repo-name-parity case needs no bridge; this rescues the mismatch.)
+    entities = [
+        _e("repo:connector", "Connector", "repo"),  # git clone, short name
+        _e("repo:appriver.connector", "AppRiver.Connector", "repo"),  # TFS
+        _e("branch:connector/feature/x", "feature/x", "branch"),  # GitLab MR side
+        _e("branch:appriver.connector/feature/x", "feature/x", "branch"),  # TFS dev-link side
+    ]
+    aliases = [("repo:connector", "appriver.connector")]  # deps.py org-convention alias
+    bridges = compute_same_as_bridges(entities, aliases)
+    branch_bridge = [b for b in bridges if b[0].startswith("branch:") and b[2].startswith("branch:")]
+    assert branch_bridge, "the two branch spellings should be bridged via the repo family"
+    a, _, b, _ = branch_bridge[0]
+    assert {a, b} == {"branch:connector/feature/x", "branch:appriver.connector/feature/x"}
+
+
+def test_branch_bridge_does_not_cross_different_repos():
+    # Same branch name, genuinely different repos (no family link) → NOT bridged.
+    bridges = compute_same_as_bridges([
+        _e("repo:alpha", "Alpha", "repo"), _e("repo:beta", "Beta", "repo"),
+        _e("branch:alpha/main", "main", "branch"), _e("branch:beta/main", "main", "branch"),
+    ])
+    assert not [b for b in bridges if b[0].startswith("branch:")]
+
+
 def test_declared_alias_bridges_what_names_never_could():
     # Repo "Stevedore" aka "appriver.provisioning" ⇔ the Octopus service of that name —
     # no name match exists, only the human-declared alias.

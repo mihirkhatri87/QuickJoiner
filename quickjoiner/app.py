@@ -77,15 +77,37 @@ class AppContext:
 
         `sources=None` means all configured sources; pass a filtered list to
         scope the agent's live tools to what a given user may see.
+
+        Consolidation (plan 09): connectors are grouped by TYPE, and a class that exposes a
+        `type_tools(connectors)` classmethod (gitlab/github/…) contributes ONE tool set for all
+        its instances (each tool taking a `project`/`repo` selector) instead of N near-duplicate
+        sets — otherwise 3 GitLab projects × ~13 tools would flood the model's context. Classes
+        without it fall back to per-instance `tools()`.
         """
         from quickjoiner.connectors.registry import create_connector
 
-        tools = []
+        by_type: dict[str, list] = {}
         for source in self.config.sources if sources is None else sources:
             try:
-                tools.extend(create_connector(source, self.workspace).tools())
+                conn = create_connector(source, self.workspace)
             except Exception:
                 continue  # a misconfigured source shouldn't break the agent
+            by_type.setdefault(source.type, []).append(conn)
+
+        tools = []
+        for conns in by_type.values():
+            type_tools = getattr(type(conns[0]), "type_tools", None)
+            if callable(type_tools):
+                try:
+                    tools.extend(type_tools(conns))
+                except Exception:
+                    continue
+            else:
+                for conn in conns:
+                    try:
+                        tools.extend(conn.tools())
+                    except Exception:
+                        continue
         return tools
 
     def visible_sources(self, user: str | None):

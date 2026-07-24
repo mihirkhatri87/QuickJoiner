@@ -413,6 +413,34 @@ def connect(
     scope = "shared with everyone" if source.shared else f"private to {user}" if user else "shared"
     console.print(f"[green]Source '{name}' ({type}) saved — {scope}.[/green] Run [bold]qj sync {name}[/bold] to learn from it.")
 
+    # Auto-wire nudge: a git URL for a GitHub/GitLab host has a matching API connector that
+    # adds MRs/issues/pipelines + the ticket↔MR graph on top of the cloned code.
+    if type == "git":
+        from quickjoiner.connectors.git_repo import suggest_api_connector
+
+        sug = suggest_api_connector(str(options.get("url", "")))
+        if sug:
+            api_name = f"{name} {sug['type']}"
+            opts_str = " ".join(f'--option {k}={v}' for k, v in sug["options"].items())
+            manual = f'qj connect {sug["type"]} --name "{api_name}" {opts_str}'
+            if sys.stdin.isatty() and typer.confirm(
+                f"\nThis looks like a {sug['label']}. Also connect its merge requests, "
+                f"issues & pipelines (adds the ticket↔MR graph)?", default=True
+            ):
+                api_source = SourceConfig(name=api_name, type=sug["type"],
+                                          options=sug["options"], owner=user, shared=shared)
+                res = create_connector(api_source, ctx.workspace).test()
+                if res.ok:
+                    ctx.config.sources = ([s for s in ctx.config.sources if s.name != api_name]
+                                          + [api_source])
+                    ctx.catalog.save_config(ctx.config)
+                    console.print(f"[green]Also saved '{api_name}' ({sug['type']}).[/green] "
+                                  f"Run [bold]qj sync {api_name}[/bold].")
+                else:
+                    console.print(f"[yellow]Couldn't reach it ({res.message}); add it later with:[/yellow]\n  {manual}")
+            elif not sys.stdin.isatty():
+                console.print(f"[dim]Tip — also learn its MRs/issues/pipelines:[/dim]\n  {manual}")
+
 
 @app.command()
 def sync(

@@ -73,14 +73,25 @@ class IngestStats:
     updated: int = 0
     skipped: int = 0
     chunks: int = 0
+    graph_refreshed: int = 0  # unchanged docs whose graph was rebuilt (extractors bumped)
     errors: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
         return (
             f"{self.added} added, {self.updated} updated, {self.skipped} unchanged, "
             f"{self.chunks} chunks written"
+            + (f", {self.graph_refreshed} graph-refreshed" if self.graph_refreshed else "")
             + (f", {len(self.errors)} errors" if self.errors else "")
         )
+
+
+# Bump when the DETERMINISTIC graph extractors change (a new/changed edge shape from
+# code_graph / pubsub / deps / ticket keys / a connector's `metadata["graph"]` such as ADO
+# dev-links or GitLab MRs). A plain sync that re-fetches a doc whose content is unchanged but
+# whose stored `graph_version` is below this rebuilds its graph edges WITHOUT re-embedding —
+# so a graph-only feature rolls out on the next ordinary sync instead of needing a clean
+# re-sync. History: v2 (2026-07-23) = ADO Development-link edges + GitLab MR/branch graph.
+GRAPH_EXTRACTOR_VERSION = 2
 
 
 def _doc_id(source_id: str, uri: str) -> str:
@@ -161,6 +172,13 @@ class IngestPipeline:
             ensure_index = getattr(self._store, "ensure_ann_index", None)
             if ensure_index is not None:
                 ensure_index()
+            # Reclaim the LanceDB versions this batch's deletes/adds superseded. Throttled
+            # inside the store (only fires once enough versions accumulate), so a stream of
+            # small incremental syncs doesn't pay for a full optimize each time. Best-effort
+            # and absent on the Postgres store (autovacuum handles it there) — hence getattr.
+            maybe_compact = getattr(self._store, "maybe_compact", None)
+            if maybe_compact is not None:
+                maybe_compact()
         return stats
 
     def _ingest_one(self, doc: Document, source_id: str, stats: IngestStats, pending: list) -> None:
@@ -171,15 +189,25 @@ class IngestPipeline:
         content_hash = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
         existing = self._catalog.get_document_hash(doc_id)
         unchanged = existing == content_hash
-        if unchanged and not self._catalog.is_graph_pending(doc_id):
-            stats.skipped += 1
-            return
         if unchanged:
-            # Content itself didn't change, but a prior run was interrupted before
-            # this doc's deferred graph work (LLM triples) got persisted — retry
-            # just that, skipping the redundant re-chunk/re-embed below.
+            graph_pending = self._catalog.is_graph_pending(doc_id)
+            stale_graph = self._catalog.get_document_graph_version(doc_id) < GRAPH_EXTRACTOR_VERSION
+            if not graph_pending and not stale_graph:
+                stats.skipped += 1
+                return
+            # Content didn't change, but either a prior run was interrupted before this doc's
+            # deferred graph work persisted (graph_pending) OR the deterministic extractors
+            # changed since it was last built (stale_graph). Rebuild the graph from the
+            # freshly-provided doc (its metadata — e.g. ADO relations — is available) WITHOUT
+            # re-chunk/re-embed. NB: if LLM triple extraction is enabled this re-queues it;
+            # with it off (the default) the refresh is purely deterministic and cheap.
             stats.skipped += 1
             self._sync_graph(doc, doc_id, source_id, text, pending)
+            if stale_graph and not graph_pending:
+                # graph_pending docs get their version stamped when the pending drains;
+                # a pure version-refresh has no pending work, so stamp it now.
+                self._catalog.set_document_graph_version(doc_id, GRAPH_EXTRACTOR_VERSION)
+                stats.graph_refreshed += 1
             return
 
         chunks = chunk_document(text, doc.kind)
@@ -205,6 +233,7 @@ class IngestPipeline:
             content_hash=content_hash,
             updated_at=doc.updated_at,
             chunk_count=written,
+            graph_version=GRAPH_EXTRACTOR_VERSION,  # freshly built with the current extractors
         )
         self._sync_graph(doc, doc_id, source_id, text, pending)
         stats.chunks += written
@@ -324,6 +353,9 @@ class IngestPipeline:
             alias_rows = alias_rows + g["aliases"]
             edges = edges + g["edges"]
         self._persist_graph(doc_id, entities, alias_rows, edges, source_id, title, kind)
+        # The graph for this doc is now fully built with the current extractors — stamp the
+        # version so a stale-graph refresh (or graph_pending retry) doesn't fire again next sync.
+        self._catalog.set_document_graph_version(doc_id, GRAPH_EXTRACTOR_VERSION)
 
     def _persist_graph(self, doc_id: str, entities: list, alias_rows: list,
                         edges: list, source_id: str,

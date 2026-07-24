@@ -28,6 +28,30 @@ def test_catalog_entity_alias_resolution(catalog):
     assert catalog.resolve_entity("does-not-exist") is None
 
 
+def test_graph_snapshot_balances_across_types_not_one_numerous_type(catalog):
+    # Regression: after a GitLab sync the many `branch:` entities (sorting before every other
+    # type) monopolized the whole-graph snapshot budget, rendering it as branches+tickets only
+    # and hiding services/repos/deps. The snapshot must balance across entity TYPES so a
+    # numerous type can't crowd everything else out.
+    for i in range(40):
+        catalog.upsert_entity(f"branch:r/b{i}", f"b{i}", "branch")
+    for eid, name, typ in [("repo:r", "R", "repo"), ("service:s", "S", "service"),
+                           ("package:p", "P", "package"), ("environment:e", "E", "environment")]:
+        catalog.upsert_entity(eid, name, typ)
+    edges = [(f"branch:r/b{i}", "belongs_to", "repo:r", "") for i in range(40)]
+    edges += [("service:s", "depends_on", "package:p", ""),
+              ("service:s", "deploys", "environment:e", "")]
+    catalog.replace_doc_edges("d", edges)
+
+    snap = catalog.graph_snapshot(None, limit=20)
+    types = {n["type"] for n in snap["nodes"]}
+    # branches would fill a 20-edge budget alone; type balancing must surface the rest
+    assert "service" in types and "repo" in types
+    assert {"package", "environment"} <= types
+    # branches still appear (they're not suppressed) — just capped to a fair share
+    assert "branch" in types
+
+
 def test_catalog_edges_replace_and_cascade(catalog):
     catalog.upsert_document("mapdoc", "files:a", "u", "a: dependencies & packages",
                             "doc", "h1", None, 1)

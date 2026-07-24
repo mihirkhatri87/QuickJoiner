@@ -71,6 +71,19 @@ Debt, named:
   the chat header naming the persona in effect** (the user's explicit ask). The persona rides
   the user profile / `/api/settings` and is passed on the chat request; the chip is read-only
   UI state, so it needs no new store. Answer-shaping itself is server-side (AI #30).
+- **Auto-wire the API connector after a git connect** (2026-07-23; CLI half shipped): the backend
+  helper `git_repo.suggest_api_connector(url)` already maps a git clone URL → the matching
+  `github`/`gitlab` connector config (adds MRs/issues/pipelines + the ticket↔MR graph). CLI prompts
+  today; the **web wizard** should too. Plan: (1) tiny endpoint `POST /api/connectors/suggest-api
+  {url}` → `{type, options, label} | null` wrapping the helper (single source of truth; keep Swagger
+  tag + Postman/Bruno in sync per the house rule). (2) In `wizard.ts`, after a `git` connector is
+  created, call it; on a non-null suggestion add a **follow-up step** — same pattern as the existing
+  post-scrape *"persist as a connector?"* flow — a card: *"This looks like a {label}. Also connect its
+  merge requests, issues & pipelines?"* with **Connect** (pre-fills the derived type+options, token
+  defaults to the env var, runs test→create→optional sync) / **Not now**. (3) Reuse `ConnectorPlate`/
+  the connect form for the confirm; no new store (wizard is already a state machine). (4) Verify in
+  Chrome (Playwright): git-with-github-URL → prompt appears → one click creates the github connector.
+  Small, high-value, and closes the "user had to know to add both" gap.
 - **Accessibility pass to WCAG 2.2 AA**: axe in CI, keyboard paths for wizard/modal/graph
   (graph needs a list-mode fallback — the a11y answer to canvas), focus management in modal.
 - **Perf budgets**: initial JS ≤ 250 KB gz (mermaid/d3/graph stay lazy); route-level code

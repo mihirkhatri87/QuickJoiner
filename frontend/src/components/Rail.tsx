@@ -3,6 +3,26 @@ import { useState } from "react";
 import type { ProjectRow, SessionRow, SourceRow, Status, SyncJob } from "../types";
 import { Button, cn, Eyebrow, Select } from "./ui";
 
+const TYPE_LABELS: Record<string, string> = {
+  git: "Git repositories",
+  github: "GitHub",
+  gitlab: "GitLab",
+  jira: "Jira",
+  confluence: "Confluence",
+  azure_devops: "Azure DevOps",
+  octopus: "Octopus",
+  grafana: "Grafana",
+  datadog: "Datadog",
+  dynatrace: "Dynatrace",
+  elastic: "Elastic",
+  web_scrape: "Web pages",
+  files: "Files",
+  uploads: "Uploaded documents",
+  quickjoiner: "QuickJoiner control",
+  conversations: "Conversations",
+};
+const typeLabel = (t: string) => TYPE_LABELS[t] ?? t;
+
 export function Rail({
   open,
   collapsed,
@@ -58,6 +78,76 @@ export function Rail({
   const jobBySource = new Map<string, SyncJob>();
   for (const j of syncJobs) if (!jobBySource.has(j.source)) jobBySource.set(j.source, j);
   const visible = sessions.filter((s) => s.title || s.est_tokens > 0).slice(0, 40);
+
+  // Connected systems grouped by connector type — a type with 2+ members collapses into one
+  // header (default collapsed) showing its count, so many systems stay scannable; a lone
+  // system renders as a plain row. Groups ordered biggest-first, then by label.
+  const groups = new Map<string, SourceRow[]>();
+  for (const s of configured) groups.set(s.type, [...(groups.get(s.type) ?? []), s]);
+  const groupList = [...groups.entries()].sort(
+    (a, b) => b[1].length - a[1].length || typeLabel(a[0]).localeCompare(typeLabel(b[0])),
+  );
+  const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
+  const isSyncing = (name: string) => {
+    const st = jobBySource.get(name)?.state;
+    return st === "running" || st === "stopping" || st === "paused" || st === "retrying";
+  };
+  const renderSystemRow = (s: SourceRow, nested = false) => {
+    const job = jobBySource.get(s.name);
+    const paused = job?.state === "paused";
+    const retrying = job?.state === "retrying";
+    const syncing = job?.state === "running" || job?.state === "stopping" || paused || retrying;
+    const watchable = Boolean(job?.live);
+    const Row = watchable ? "button" : "div";
+    return (
+      <Row
+        key={s.id}
+        {...(watchable
+          ? { onClick: () => onOpenSync(s.name, job!.clean), title: "Open the live sync log" }
+          : { title: `${s.type} · ${s.documents} docs` })}
+        className={cn(
+          "flex w-full flex-shrink-0 items-center gap-2.5 rounded-xs py-1.5 text-left transition hover:bg-fill",
+          nested ? "pl-8 pr-3" : "px-3",
+        )}
+      >
+        <span
+          className={cn(
+            "h-[7px] w-[7px] flex-shrink-0 rounded-full",
+            paused
+              ? "bg-gold shadow-[0_0_0_3px_var(--gold-soft)]"
+              : syncing
+                ? "animate-pulse bg-accent shadow-[0_0_0_3px_var(--accent-soft)]"
+                : "bg-gold shadow-[0_0_0_3px_var(--gold-soft)]",
+          )}
+        />
+        <span className="truncate text-[13px]">
+          {s.type === "uploads"
+            ? "Uploaded documents"
+            : s.type === "quickjoiner"
+              ? "QuickJoiner control"
+              : s.name}
+        </span>
+        <span
+          className={cn(
+            "ml-auto flex-shrink-0 font-mono text-[10.5px] tabular-nums",
+            paused ? "text-gold" : syncing ? "text-accent" : "text-faint",
+          )}
+        >
+          {paused
+            ? "paused"
+            : retrying
+              ? "retrying…"
+              : syncing
+                ? job?.percent != null
+                  ? `${job.percent}%`
+                  : job?.kind === "cleanup"
+                    ? "cleaning…"
+                    : "syncing…"
+                : s.documents}
+        </span>
+      </Row>
+    );
+  };
 
   return (
     <>
@@ -237,61 +327,34 @@ export function Rail({
             </p>
           ) : (
             <div className="scroll-thin -mr-1 flex max-h-[148px] flex-col overflow-y-auto pr-1">
-              {configured.map((s) => {
-                const job = jobBySource.get(s.name);
-                const paused = job?.state === "paused";
-                const retrying = job?.state === "retrying";
-                const syncing = job?.state === "running" || job?.state === "stopping" || paused || retrying;
-                const watchable = Boolean(job?.live);
-                const Row = watchable ? "button" : "div";
-                return (
-                  <Row
-                    key={s.id}
-                    {...(watchable
-                      ? { onClick: () => onOpenSync(s.name, job!.clean), title: "Open the live sync log" }
-                      : { title: `${s.type} · ${s.documents} docs` })}
-                    className={cn(
-                      "flex w-full flex-shrink-0 items-center gap-2.5 rounded-xs px-3 py-1.5 text-left transition hover:bg-fill",
-                    )}
-                  >
-                    <span
-                      className={cn(
-                        "h-[7px] w-[7px] flex-shrink-0 rounded-full",
-                        paused
-                          ? "bg-gold shadow-[0_0_0_3px_var(--gold-soft)]"
-                          : syncing
-                            ? "animate-pulse bg-accent shadow-[0_0_0_3px_var(--accent-soft)]"
-                            : "bg-gold shadow-[0_0_0_3px_var(--gold-soft)]",
-                      )}
-                    />
-                    <span className="truncate text-[13px]">
-                      {s.type === "uploads"
-                        ? "Uploaded documents"
-                        : s.type === "quickjoiner"
-                          ? "QuickJoiner control"
-                          : s.name}
-                    </span>
-                    <span
-                      className={cn(
-                        "ml-auto flex-shrink-0 font-mono text-[10.5px] tabular-nums",
-                        paused ? "text-gold" : syncing ? "text-accent" : "text-faint",
-                      )}
+              {groupList.map(([type, rows]) =>
+                rows.length >= 2 ? (
+                  <div key={type} className="flex flex-shrink-0 flex-col">
+                    <button
+                      onClick={() => setExpandedGroups((e) => ({ ...e, [type]: !e[type] }))}
+                      title={`${rows.length} ${typeLabel(type)} systems`}
+                      className="flex w-full items-center gap-2 rounded-xs px-3 py-1.5 text-left transition hover:bg-fill"
                     >
-                      {paused
-                        ? "paused"
-                        : retrying
-                          ? "retrying…"
-                          : syncing
-                            ? job?.percent != null
-                              ? `${job.percent}%`
-                              : job?.kind === "cleanup"
-                                ? "cleaning…"
-                                : "syncing…"
-                            : s.documents}
-                    </span>
-                  </Row>
-                );
-              })}
+                      <ChevronRight
+                        size={12}
+                        className={cn("flex-shrink-0 text-faint transition", expandedGroups[type] && "rotate-90")}
+                      />
+                      {rows.some((r) => isSyncing(r.name)) && (
+                        <span className="h-[7px] w-[7px] flex-shrink-0 animate-pulse rounded-full bg-accent shadow-[0_0_0_3px_var(--accent-soft)]" />
+                      )}
+                      <span className="truncate text-[13px] font-medium">{typeLabel(type)}</span>
+                      <span className="ml-auto flex-shrink-0 font-mono text-[10.5px] tabular-nums text-faint">
+                        {rows.length}
+                      </span>
+                    </button>
+                    {expandedGroups[type] && (
+                      <div className="flex flex-col">{rows.map((s) => renderSystemRow(s, true))}</div>
+                    )}
+                  </div>
+                ) : (
+                  renderSystemRow(rows[0])
+                ),
+              )}
             </div>
           )}
         </div>

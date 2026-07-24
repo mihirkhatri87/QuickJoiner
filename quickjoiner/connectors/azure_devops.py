@@ -18,7 +18,81 @@ TEAM_PAGE = 100            # teams list page size
 MAX_WORK_ITEMS = 8000      # safety cap across all teams' recent sprints
 
 
-def work_item_document(org_url: str, item: dict[str, Any]) -> Document:
+def _decode_git_artifact(url: str) -> tuple[str, str, str] | None:
+    """Decode a TFS Git artifact-link URL into `(kind, repo_id, tail)`, or None.
+
+    Work-item "Development" links are `relations` with a `vstfs:///Git/<Kind>/<payload>`
+    URL where the payload is the URL-encoded `{projectId}/{repoId}/{ref-or-commit-or-pr}`:
+      - `vstfs:///Git/Ref/{proj}%2F{repo}%2FGB{branch}`      (GB=branch, GT=tag)
+      - `vstfs:///Git/Commit/{proj}%2F{repo}%2F{sha}`
+      - `vstfs:///Git/PullRequestId/{proj}%2F{repo}%2F{prId}`
+    repo_id is a GUID (resolved to a name via the repos list); tail is the branch ref /
+    commit sha / PR id. Branch names contain slashes (feature/x), so the payload is split
+    with maxsplit=2. Returns None for any non-Git artifact (wiki/build/test links, etc.)."""
+    import urllib.parse
+
+    prefix = "vstfs:///Git/"
+    if not url.lower().startswith(prefix.lower()):
+        return None
+    kind, _, encoded = url[len(prefix):].partition("/")
+    parts = urllib.parse.unquote(encoded).split("/", 2)
+    if len(parts) < 3:
+        return None
+    _project_id, repo_id, tail = parts
+    return kind.lower(), repo_id, tail
+
+
+def dev_link_graph(item: dict[str, Any], repo_names: dict[str, str]) -> dict:
+    """Knowledge-graph assertions from a work item's Development links (its `relations`).
+
+    Ties a ticket to the code that implements it — deterministically, from TFS's own
+    artifact links (strong evidence, not inferred):
+      `ticket:#N --implemented_in--> repo:<name>` (branch/commit/PR link),
+      `ticket:#N --on_branch--> branch:<repo>/<name>` + `branch --belongs_to--> repo` (Ref links).
+    The repo/branch entities are keyed by NAME, so name parity with the GitLab connector's
+    `repo:<name>` (and future branch) entities links a TFS ticket through to the GitLab repo
+    it was implemented in — regardless of GitLab's differing group nesting (the user's TFS↔
+    GitLab methodology). `repo_names` maps a repo GUID → name (from the Git repos list); a
+    link whose repo GUID we can't name is skipped rather than guessed. Returns {} when there
+    are no resolvable Git dev-links (so `work_item_document` attaches no graph metadata)."""
+    wid = item.get("id")
+    if wid is None:
+        return {}
+    ticket_id = f"ticket:#{wid}"
+    entities: dict[str, tuple[str, str, str]] = {}
+    edges: dict[tuple[str, str, str], tuple[str, str, str, str]] = {}
+    for rel in item.get("relations", []) or []:
+        if rel.get("rel") != "ArtifactLink":
+            continue
+        decoded = _decode_git_artifact(rel.get("url", ""))
+        if decoded is None:
+            continue
+        kind, repo_id, tail = decoded
+        name = repo_names.get(repo_id.lower())
+        if not name:
+            continue  # unknown repo GUID — never guess a name
+        label = (rel.get("attributes") or {}).get("name") or kind
+        rid = f"repo:{name.lower()}"
+        entities[rid] = (rid, name, "repo")
+        entities[ticket_id] = (ticket_id, f"#{wid}", "ticket")
+        if kind == "ref" and tail[:2] == "GB":  # GB=branch (GT=tag: repo edge only, no branch node)
+            branch = tail[2:]
+            if branch:
+                bid = f"branch:{name.lower()}/{branch.lower()}"
+                entities[bid] = (bid, branch, "branch")
+                edges[(ticket_id, "on_branch", bid)] = (
+                    ticket_id, "on_branch", bid, f"{label} in {name}")
+                edges[(bid, "belongs_to", rid)] = (bid, "belongs_to", rid, f"branch of {name}")
+        edges[(ticket_id, "implemented_in", rid)] = (
+            ticket_id, "implemented_in", rid, f"{label}: {tail[:40]}")
+    if not edges:
+        return {}
+    return {"entities": list(entities.values()), "aliases": [], "edges": list(edges.values())}
+
+
+def work_item_document(
+    org_url: str, item: dict[str, Any], repo_names: dict[str, str] | None = None
+) -> Document:
     f = item.get("fields", {})
     assignee = (f.get("System.AssignedTo") or {})
     assignee_name = assignee.get("displayName", "unassigned") if isinstance(assignee, dict) else str(assignee)
@@ -29,12 +103,14 @@ def work_item_document(org_url: str, item: dict[str, Any]) -> Document:
         f"Tags: {f.get('System.Tags', 'none')} | Updated: {f.get('System.ChangedDate', '')}\n\n"
         f"{_strip_html(f.get('System.Description') or '(no description)')}"
     )
+    graph = dev_link_graph(item, repo_names or {})
     return Document(
         uri=f"{org_url}/_workitems/edit/{item['id']}",
         title=f"#{item['id']}: {f.get('System.Title', '')}",
         text=text,
         kind="ticket",
         updated_at=f.get("System.ChangedDate"),
+        metadata={"graph": graph} if graph else {},
     )
 
 
@@ -185,6 +261,21 @@ class AzureDevOpsConnector(Connector):
         except Exception as exc:
             return ConnectionStatus(False, f"Azure DevOps API error: {exc}")
 
+    def _git_repo_names(self, org_url: str, project: str, headers: dict, api: str,
+                        verify: bool) -> dict[str, str]:
+        """`{repo GUID (lower) -> repo name}` for the project's Git repos, one cheap call.
+        Used to name the repos in work-item Development links (their artifact URLs carry a
+        repo GUID, not a name). Best-effort: on failure returns {} and dev-link edges that
+        need a name are simply skipped — the sync never fails over this enrichment."""
+        try:
+            repos = get_json(
+                f"{org_url}/{project}/_apis/git/repositories?{api}",
+                headers=headers, verify=verify,
+            ).get("value", [])
+        except Exception:
+            return {}
+        return {r["id"].lower(): r["name"] for r in repos if r.get("id") and r.get("name")}
+
     def _teams(self, org_url: str, headers: dict, api: str, verify: bool,
                control: Any = None) -> list[str]:
         """Team names to ingest. The `teams` option restricts to a named subset;
@@ -256,6 +347,9 @@ class AzureDevOpsConnector(Connector):
         # interruptible, instead of a long silent, unstoppable enumeration up front.
         seen: set[int] = set()
         total = 0
+        # Repo GUID→name map (one call) so work-item Development links can name the repo
+        # they point at — the ticket→implemented_in→repo→(GitLab repo) chain.
+        repo_names = self._git_repo_names(org_url, project, headers, api, verify)
         # `_teams` may itself paginate for a while before the first team; report the phase
         # so it never looks hung, and let the enumeration be interrupted between pages.
         self._stage("work items")
@@ -297,14 +391,17 @@ class AzureDevOpsConnector(Connector):
                     items = get_json(
                         f"{org_url}/{project}/_apis/wit/workitems?{api}",
                         headers=headers,
-                        params={"ids": ",".join(map(str, batches[idx]))},
+                        # $expand=relations returns the "Development" artifact links (commits/
+                        # branches/PRs) in the SAME batch call — no extra round-trip. (ADO
+                        # forbids `fields` alongside $expand; we pass none, so this is fine.)
+                        params={"ids": ",".join(map(str, batches[idx])), "$expand": "relations"},
                         verify=verify,
                     ).get("value", [])
                     return items, (idx + 1 if idx + 1 < len(batches) else None)
 
                 for items in prefetch_pages(fetch_batch, 0, self._checkpoint):
                     for item in items:
-                        yield work_item_document(org_url, item)
+                        yield work_item_document(org_url, item, repo_names)
                         total += 1
             if total >= MAX_WORK_ITEMS:
                 break
@@ -383,7 +480,181 @@ class AzureDevOpsConnector(Connector):
                 for b in builds[:10]
             )
 
+        def ado_get_work_item(work_item_id: int) -> str:
+            """Full details of one work item — the fields memory doesn't hold (acceptance
+            criteria, the Development relations → commits/branches/PRs, tags)."""
+            data = get_json(
+                f"{org_url}/_apis/wit/workitems/{work_item_id}?{api}",
+                headers=headers, params={"$expand": "relations"}, verify=verify,
+            )
+            f = data.get("fields", {})
+            ac = _strip_html(f.get("Microsoft.VSTS.Common.AcceptanceCriteria") or "")
+            rels = []
+            for rel in data.get("relations", []) or []:
+                if rel.get("rel") == "ArtifactLink":
+                    name = (rel.get("attributes") or {}).get("name", "link")
+                    rels.append(f"  {name}: {rel.get('url', '')}")
+            assignee = f.get("System.AssignedTo") or {}
+            aname = assignee.get("displayName", "unassigned") if isinstance(assignee, dict) else str(assignee)
+            out = (
+                f"#{data.get('id')} [{f.get('System.WorkItemType', '?')}]: {f.get('System.Title', '')}\n"
+                f"State: {f.get('System.State', '?')} | Assigned: {aname} | "
+                f"Area: {f.get('System.AreaPath', '')} | Iteration: {f.get('System.IterationPath', '')}\n"
+                f"Tags: {f.get('System.Tags', 'none')}\n\n"
+                f"Description:\n{_strip_html(f.get('System.Description') or '(none)')}\n"
+            )
+            if ac:
+                out += f"\nAcceptance criteria:\n{ac}\n"
+            if rels:
+                out += "\nDevelopment links:\n" + "\n".join(rels)
+            return out[:12000]
+
+        def ado_build_details(build_id: int) -> str:
+            """One build's result + its timeline (stages/jobs) — what ran and what failed."""
+            b = get_json(f"{org_url}/{project}/_apis/build/builds/{build_id}?{api}",
+                         headers=headers, verify=verify)
+            stages = []
+            try:
+                tl = get_json(f"{org_url}/{project}/_apis/build/builds/{build_id}/timeline?{api}",
+                              headers=headers, verify=verify).get("records", [])
+                stages = [f"  [{r.get('result') or r.get('state') or '?'}] {r.get('type', '?')}: {r.get('name', '?')}"
+                          for r in tl if r.get("type") in ("Stage", "Job", "Phase")][:40]
+            except Exception:
+                pass
+            out = (
+                f"Build #{b.get('id')} — {(b.get('definition') or {}).get('name', '?')}\n"
+                f"Result: {b.get('result') or b.get('status') or '?'} | Branch: {b.get('sourceBranch', '?')} | "
+                f"Repo: {(b.get('repository') or {}).get('name', '?')}\n"
+                f"Finished: {b.get('finishTime') or b.get('queueTime', '')}\nURL: {b.get('_links', {}).get('web', {}).get('href', '')}\n"
+            )
+            if stages:
+                out += "\nTimeline:\n" + "\n".join(stages)
+            return out[:12000]
+
+        def ado_build_log(build_id: int, log_id: int = 0) -> str:
+            """Tail of a build's log — 'why did the build fail'. With no log_id, returns the
+            list of logs; pass a log_id (from that list) for its tail."""
+            base = f"{org_url}/{project}/_apis/build/builds/{build_id}/logs"
+            if not log_id:
+                logs = get_json(f"{base}?{api}", headers=headers, verify=verify).get("value", [])
+                if not logs:
+                    return f"No logs for build #{build_id}."
+                return "Logs (pass a log_id for its tail):\n" + "\n".join(
+                    f"- log {lg.get('id')} ({lg.get('lineCount', '?')} lines)" for lg in logs)
+            import httpx
+            resp = httpx.get(f"{base}/{log_id}?{api}", headers=headers, verify=verify,
+                             timeout=60.0, follow_redirects=True)
+            resp.raise_for_status()
+            trace = resp.text
+            return f"Log {log_id} tail (build #{build_id}):\n{trace[-6000:] if len(trace) > 6000 else trace}"
+
+        # ---- P2 ----
+        def ado_list_repos() -> str:
+            repos = get_json(f"{org_url}/{project}/_apis/git/repositories?{api}",
+                             headers=headers, verify=verify).get("value", [])
+            if not repos:
+                return f"No Git repositories in {project}."
+            return "\n".join(
+                f"- {r.get('name')} (default {str(r.get('defaultBranch') or '').replace('refs/heads/', '') or '?'})"
+                for r in repos)[:12000]
+
+        def ado_list_pipelines() -> str:
+            defs = get_json(f"{org_url}/{project}/_apis/build/definitions?{api}",
+                            headers=headers, params={"$top": 200}, verify=verify).get("value", [])
+            if not defs:
+                return f"No build pipelines in {project}."
+            return "\n".join(f"- {d.get('name')} (id {d.get('id')})" for d in defs[:200])[:12000]
+
+        def ado_list_commits(repository: str, branch: str = "", top: int = 20) -> str:
+            params = {"$top": max(1, min(int(top or 20), 100))}
+            if branch:
+                params["searchCriteria.itemVersion.version"] = branch
+            commits = get_json(
+                f"{org_url}/{project}/_apis/git/repositories/{repository}/commits?{api}",
+                headers=headers, params=params, verify=verify).get("value", [])
+            if not commits:
+                return f"No commits found in {repository}."
+            return "\n".join(
+                f"- {c.get('commitId', '')[:8]} {(c.get('comment') or '').splitlines()[0][:70] if c.get('comment') else ''} "
+                f"— {(c.get('author') or {}).get('name', '?')}" for c in commits)[:12000]
+
+        def ado_test_results(build_id: int) -> str:
+            runs = get_json(f"{org_url}/{project}/_apis/test/runs?{api}",
+                            headers=headers, params={"buildIds": build_id}, verify=verify).get("value", [])
+            if not runs:
+                return f"No test runs for build #{build_id}."
+            return "\n".join(
+                f"- {r.get('name', '?')}: {r.get('passedTests', '?')} passed / "
+                f"{r.get('totalTests', '?')} total (state {r.get('state', '?')})" for r in runs)[:12000]
+
         return [
+            AgentTool(
+                spec=ToolSpec(
+                    name=f"ado_list_repos_{self.name}",
+                    description=f"List the Git repositories in Azure DevOps project {project} (name + default branch).",
+                    input_schema={"type": "object", "properties": {}},
+                ),
+                fn=ado_list_repos,
+            ),
+            AgentTool(
+                spec=ToolSpec(
+                    name=f"ado_list_pipelines_{self.name}",
+                    description=f"List the build pipelines/definitions in project {project} (name + id).",
+                    input_schema={"type": "object", "properties": {}},
+                ),
+                fn=ado_list_pipelines,
+            ),
+            AgentTool(
+                spec=ToolSpec(
+                    name=f"ado_list_commits_{self.name}",
+                    description="Recent commits in a TFS Git repository, optionally on a branch.",
+                    input_schema={"type": "object", "properties": {
+                        "repository": {"type": "string"}, "branch": {"type": "string"},
+                        "top": {"type": "integer"}}, "required": ["repository"]},
+                ),
+                fn=ado_list_commits,
+            ),
+            AgentTool(
+                spec=ToolSpec(
+                    name=f"ado_test_results_{self.name}",
+                    description="Test run pass/fail summary for a TFS build (by build id).",
+                    input_schema={"type": "object", "properties": {"build_id": {"type": "integer"}},
+                                  "required": ["build_id"]},
+                ),
+                fn=ado_test_results,
+            ),
+            AgentTool(
+                spec=ToolSpec(
+                    name=f"ado_get_work_item_{self.name}",
+                    description="Full details of ONE work item by id — acceptance criteria, the "
+                    "Development links (commits/branches/PRs), tags, full description. Use when memory "
+                    "lacks a specific #id or these fields.",
+                    input_schema={"type": "object", "properties": {"work_item_id": {"type": "integer"}},
+                                  "required": ["work_item_id"]},
+                ),
+                fn=ado_get_work_item,
+            ),
+            AgentTool(
+                spec=ToolSpec(
+                    name=f"ado_build_details_{self.name}",
+                    description="One TFS build's result + timeline (stages/jobs — what ran, what "
+                    "failed), by build id. Get ids from ado_build_status.",
+                    input_schema={"type": "object", "properties": {"build_id": {"type": "integer"}},
+                                  "required": ["build_id"]},
+                ),
+                fn=ado_build_details,
+            ),
+            AgentTool(
+                spec=ToolSpec(
+                    name=f"ado_build_log_{self.name}",
+                    description="A TFS build's logs — call with just build_id to list logs, then with "
+                    "a log_id for its tail ('why did the build fail').",
+                    input_schema={"type": "object",
+                                  "properties": {"build_id": {"type": "integer"}, "log_id": {"type": "integer"}},
+                                  "required": ["build_id"]},
+                ),
+                fn=ado_build_log,
+            ),
             AgentTool(
                 spec=ToolSpec(
                     name=f"ado_query_work_items_{self.name}",

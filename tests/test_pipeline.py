@@ -23,6 +23,37 @@ def test_ingest_is_idempotent(store, catalog):
     assert second.chunks == 0
 
 
+def test_stale_graph_version_refreshes_edges_without_reembedding(store, catalog):
+    # A plain sync that re-provides an UNCHANGED doc whose graph was built by an older
+    # extractor version rebuilds its graph edges WITHOUT re-embedding — the mechanism that
+    # rolls out a graph-only feature (e.g. ADO dev-links) on the next ordinary sync instead
+    # of a clean re-sync.
+    from quickjoiner.ingest.pipeline import GRAPH_EXTRACTOR_VERSION, _doc_id
+
+    pipeline = IngestPipeline(store, catalog)
+    plain = Document(uri="repo://x", title="x", text="hello world")
+    pipeline.ingest([plain], "test:src")
+    doc_id = _doc_id("test:src", "repo://x")
+    catalog.set_document_graph_version(doc_id, 0)  # simulate an older-extractor ingest
+
+    # same content, but a new extractor now emits graph metadata for it
+    enriched = Document(uri="repo://x", title="x", text="hello world",
+                        metadata={"graph": {
+                            "entities": [("repo:x", "X", "repo"), ("ticket:#1", "#1", "ticket")],
+                            "aliases": [], "edges": [("repo:x", "references", "ticket:#1", "t")]}})
+    stats = pipeline.ingest([enriched], "test:src")
+    assert stats.graph_refreshed == 1
+    assert stats.chunks == 0 and stats.added == 0 and stats.updated == 0  # NOT re-embedded
+
+    triples = {(n["src"], n["rel"], n["dst"]) for n in catalog.graph_neighbors("repo:x")}
+    assert ("repo:x", "references", "ticket:#1") in triples
+    assert catalog.get_document_graph_version(doc_id) == GRAPH_EXTRACTOR_VERSION
+
+    # now current — the next identical sync skips it entirely (no repeated refresh)
+    again = pipeline.ingest([enriched], "test:src")
+    assert again.skipped == 1 and again.graph_refreshed == 0
+
+
 def test_changed_document_is_updated(store, catalog):
     pipeline = IngestPipeline(store, catalog)
     pipeline.ingest(_docs(), "test:src")

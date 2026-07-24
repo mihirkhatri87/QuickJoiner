@@ -829,6 +829,46 @@ function WorkspaceSettings({
   );
 }
 
+/** Collapsible group of connector plates of one type — keeps a workspace with many connected
+ * systems scannable (default collapsed; count + a syncing dot on the header). A type with a
+ * single member renders as a flat plate instead. */
+function ConnectorGroup({
+  label,
+  count,
+  syncing,
+  children,
+}: {
+  label: string;
+  count: number;
+  syncing: boolean;
+  children: React.ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="mb-2.5 overflow-hidden rounded-xl border border-line/60 bg-fill/40">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        className="flex w-full items-center gap-2 px-3.5 py-2.5 text-left text-[13px] font-medium text-ink transition hover:bg-fill/60"
+      >
+        <ChevronRight
+          size={13}
+          className={cn("flex-shrink-0 text-faint transition-transform", open && "rotate-90")}
+        />
+        {syncing && (
+          <span className="h-[7px] w-[7px] flex-shrink-0 animate-pulse rounded-full bg-accent shadow-[0_0_0_3px_var(--accent-soft)]" />
+        )}
+        {label}
+        <span className="ml-auto flex-shrink-0 rounded-full bg-fill px-2 py-0.5 font-mono text-[10px] tabular-nums text-muted">
+          {count}
+        </span>
+      </button>
+      {open && <div className="px-2 pt-1.5">{children}</div>}
+    </div>
+  );
+}
+
 /* ---------- connectors ---------- */
 function Connectors({
   auth,
@@ -896,6 +936,30 @@ function Connectors({
     );
   }
 
+  const labelOf = (t: string) => types.find((x) => x.type === t)?.label ?? t;
+  const isSyncing = (name: string) => {
+    const st = syncJobs.find((j) => j.source === name)?.state;
+    return st === "running" || st === "stopping" || st === "paused" || st === "retrying";
+  };
+  const renderPlate = (c: ConnectorRow) =>
+    c.type === "quickjoiner" ? (
+      <ControlPlate key={c.name} />
+    ) : c.type === "uploads" ? (
+      <UploadsPlate key={c.name} c={c}
+                    job={syncJobs.find((j) => j.source === c.name)} onOpenSync={onOpenSync} />
+    ) : (
+      <ConnectorPlate key={c.name} c={c} types={types} auth={auth} reload={() => { load(); onChanged(); }}
+                      onOpenArtifact={onOpenArtifact}
+                      job={syncJobs.find((j) => j.source === c.name)} onOpenSync={onOpenSync} />
+    );
+  // Group by connector type; a type with 2+ members collapses into one group (biggest first),
+  // a lone system stays a flat plate.
+  const grouped = new Map<string, ConnectorRow[]>();
+  for (const c of rows ?? []) grouped.set(c.type, [...(grouped.get(c.type) ?? []), c]);
+  const groupList = [...grouped.entries()].sort(
+    (a, b) => b[1].length - a[1].length || labelOf(a[0]).localeCompare(labelOf(b[0])),
+  );
+
   return (
     <div>
       {rows == null ? (
@@ -906,16 +970,14 @@ function Connectors({
           QuickJoiner learns from them.
         </p>
       ) : (
-        rows.map((c) =>
-          c.type === "quickjoiner" ? (
-            <ControlPlate key={c.name} />
-          ) : c.type === "uploads" ? (
-            <UploadsPlate key={c.name} c={c}
-                          job={syncJobs.find((j) => j.source === c.name)} onOpenSync={onOpenSync} />
+        groupList.map(([type, cs]) =>
+          cs.length >= 2 ? (
+            <ConnectorGroup key={type} label={labelOf(type)} count={cs.length}
+                            syncing={cs.some((c) => isSyncing(c.name))}>
+              {cs.map(renderPlate)}
+            </ConnectorGroup>
           ) : (
-            <ConnectorPlate key={c.name} c={c} types={types} auth={auth} reload={() => { load(); onChanged(); }}
-                            onOpenArtifact={onOpenArtifact}
-                            job={syncJobs.find((j) => j.source === c.name)} onOpenSync={onOpenSync} />
+            renderPlate(cs[0])
           ),
         )
       )}

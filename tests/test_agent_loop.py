@@ -26,6 +26,29 @@ def _echo_tool():
     )
 
 
+def test_empty_completion_falls_through_to_a_final_answer():
+    # Regression ("qj ended with no response"): a reasoning model that returns NO tool call
+    # and NO text must not yield a blank answer — the agent makes a final tool-free turn.
+    provider = ScriptedProvider(
+        [
+            ChatResult(text="", tool_calls=[ToolCall(id="c1", name="echo", input={})]),
+            ChatResult(text="   "),  # no tool calls, blank text -> the bug trigger
+            ChatResult(text="here is the build link"),  # forced final tool-free turn
+        ]
+    )
+    agent = OnboardingAgent(provider, [_echo_tool()], system="sys")
+    answer, _ = agent.ask("give me the link")
+    assert answer == "here is the build link"
+    assert provider.calls[-1]["tools"] is None  # the final turn ran without tools
+
+
+def test_blank_everywhere_yields_graceful_fallback_never_empty():
+    provider = ScriptedProvider([ChatResult(text=""), ChatResult(text="")])
+    agent = OnboardingAgent(provider, [_echo_tool()], system="sys")
+    answer, _ = agent.ask("q")
+    assert answer.strip() and "wasn't able to finish" in answer  # never a blank message
+
+
 def test_agent_runs_tools_then_answers():
     provider = ScriptedProvider(
         [
