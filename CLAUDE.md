@@ -754,6 +754,49 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   `QJ_UI_DIR` env → repo `frontend/dist` → legacy `api/static/index.html` fallback (kept for
   wheel installs without the built frontend). Docker builds the UI in a node:22 stage and sets
   `QJ_UI_DIR=/app/ui`.
+  **Knowledge-graph canvas — `components/GraphView.tsx` + `components/graph/` (rebuilt
+  2026-07-24):** the view used to snap an SVG `viewBox` straight into React state on every
+  wheel tick and pointer move, and node radii were **world** units — so interaction stepped
+  rather than moved, and any wide auto-fit (a 400-edge overview, or "expand neighbors" merging
+  a few hundred entities) painted the whole graph as one-pixel dust. Rebuilt on three pure
+  layers with one render loop:
+  · **`graph/camera.ts`** — a continuous `{x, y, k}` camera (screen = world·k + xy) that the
+  loop *eases* toward a target (`approach`, frame-rate-independent exponential; scale
+  interpolated **geometrically** because that's how zoom is perceived), with pointer-throw
+  **fling inertia** (`blendVelocity` while dragging → `decayVelocity` after release, so a
+  flick coasts and settles). Wheel/pinch zoom is **anchored on the cursor** (`zoomAround`).
+  **`markScale(k)`** is the fix for "everything becomes tiny": painted mark size follows
+  `k^0.35` clamped to [0.62, 1.85], returned as the world-space counter-scale each node
+  carries — so a mark is ~8–18px at *any* zoom instead of vanishing. Zoom-out is floored at
+  0.4× the everything-fits scale (`minZoom`), so the graph can't be lost in an empty field.
+  · **`graph/simulation.ts`** — a **persistent** d3-force layout (was one-shot: 300 ticks then
+  a frozen snapshot, so every merge teleported nodes). Node objects and velocities survive a
+  `setData`, new nodes are seeded on an already-placed **anchor neighbour** (golden-angle
+  spiral) so an expansion grows outward from what was expanded, and nodes are **draggable**
+  live (release un-pins and they rejoin the sim). Weak `forceX/forceY` instead of `forceCenter`
+  — this graph is mostly disconnected components and `forceCenter` translates the whole system
+  every tick. The loop ticks it; d3's own timer is never started.
+  · **`graph/lod.ts`** — map-tile level of detail (the answer to "too much data"): **cull** to
+  the visible world rect + half-screen overscan, **budget** by importance (pinned = selected /
+  its neighbours / path hops, then by degree), and **re-tile only when the camera lands on a
+  new quantised tile** — so panning and zooming are one transform write, not a re-render of
+  thousands of elements. What was elided is *stated* ("N in view" in the toolbar), never
+  silently dropped.
+  Consequently **React owns what exists** (which nodes/edges/labels, selection, filters) and
+  **the loop owns where it's drawn**: node transforms and edge endpoints are written
+  imperatively and never appear in JSX, so a re-render can't fight the animation. Edge widths
+  use `vector-effect="non-scaling-stroke"`; labels are a zoom band toggled with one CSS class
+  (`.graph-labels-on`, `LABEL_MIN_SCALE`) so they cross-fade with zero React work; the loop
+  stops itself when camera, fling and layout are all at rest (an idle graph costs no frames)
+  and every interaction calls `wake()`. Panels live in `graph/panels.tsx`, shared tokens in
+  `graph/theme.ts`. Two interaction bugs fixed in the same pass, both found in the browser:
+  (1) a press on a node used to pin+reheat the layout immediately, so the graph shifted
+  between the two clicks of a double-click — pinning now waits for `NODE_DRAG_SLOP` (4px), and
+  double-click expands the node the pointer was **pressed** on rather than `e.target` (a
+  dblclick is dispatched to the nearest common ancestor of its two clicks, which degrades to
+  the `<svg>` the moment anything moves); (2) the node inspector was a flex **sibling**, so
+  selecting a node shrank the canvas and lurched the whole graph sideways — it now floats over
+  the canvas (the minimap slides clear of it).
 - `quickjoiner/export.py` — markdown → md/html/csv/pptx (`--format` on `qj ask` / `qj brief`);
   SSE chat events: `thinking` / `delta` / `tool_call` / `candidates` / `answer` / `error` / `done`.
 - `quickjoiner/sessions.py` — `SessionManager`: persistent sessions + projects (catalog tables
@@ -1544,6 +1587,20 @@ Post-phase additions (2026-07-07, all tested — suite: **89 passed**):
   updated to assert the always-on cleanup job), 12 skipped, pre-existing eval-yaml failure unchanged.
   Browser-verified via Playwright (stage chip → send → attachment renders under the question with a
   download link; Uploads connector stays 0 docs) + live uvicorn (upload/download/410/isolation).
+- Knowledge-graph canvas rebuilt — smooth camera, live layout, map-tile LOD (2026-07-24, user
+  report: "it's like nothing", with a screenshot of the live AppRiver graph rendering as
+  one-pixel dust; and "when I zoom in, expand neighbours, then zoom out, everything becomes
+  disproportionately small"; follow-up ask: "some sort of caching / layered data rendering like
+  map tiles to manage too much data"). Root causes were all in the view, not the data: the SVG
+  `viewBox` was snapped into React state per event (so interaction stepped), node radii were in
+  **world** units (so any wide fit shrank them to nothing), and the layout was a one-shot
+  snapshot (so merges teleported). Full design in the frontend architecture bullet above.
+  Live-verified in Chrome via Playwright against the real workspace (24,168 docs / 634-entity
+  graph): mark size holds **7.8–18.5px across the entire zoom range** (was sub-pixel), a fling
+  drags 526px then coasts 44px/109px decelerating after release, LOD culls 634→112 drawn nodes
+  when zoomed in and the toolbar says "112 in view", zoom-out floors at content scale (0.116 vs
+  the old 0.05 void), double-click expand fits the new neighbourhood at k=1.25, and the console
+  is clean. No backend change; no API change. Frontend typecheck + build green.
 
 ## Next steps (agreed with user)
 
@@ -1576,8 +1633,9 @@ Post-phase additions (2026-07-07, all tested — suite: **89 passed**):
    ~~Phase B~~ DONE 2026-07-11: `graph_path` (undirected BFS, evidence per hop — catalog +
    agent tool + `GET /api/graph/path`); Jira issue docs assert ticket→part_of→project/epic,
    Octopus asserts service entities + service→deploys→environment; React "Knowledge" view
-   (`frontend/src/components/GraphView.tsx`: d3-force static layout, type-colored nodes via
-   CSS tokens, pan/zoom on viewBox, click → evidence panel with citation chips, alias search
+   (`frontend/src/components/GraphView.tsx` + `components/graph/` — see the frontend
+   architecture bullet: live force layout, eased camera with fling inertia, map-tile LOD,
+   type-colored nodes via CSS tokens, click → evidence panel with citation chips, alias search
    via `/api/graph?entity=`, TopBar Waypoints toggle) — **verified live in Chrome** incl. the
    consumer→package→provider picture and alias-focused search. Gotcha fixed there: a setState
    updater must never dereference a mutable ref (pointer-drag pan crashed the tree when

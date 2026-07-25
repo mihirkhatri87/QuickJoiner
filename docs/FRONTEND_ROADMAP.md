@@ -8,7 +8,10 @@ Inputs: `PRD.md` (W1/W2/W10 especially), `design/DESIGN_VISION.md`, `TEST_STRATE
 Shipped: Vite + React 18 + TS + Tailwind; "evidence ledger" design system in CSS tokens;
 hand-rolled markdown renderer (citations→ledger, mermaid lazy-loaded); SSE client; command
 pipeline (`commands.ts`: Flow interceptors → Command registry → agent chat); `/connect`
-wizard state machine; d3-force GraphView with evidence panel; artifact modal.
+wizard state machine; artifact modal; GraphView rebuilt on an eased camera + fling inertia, a
+persistent (draggable, reheating) d3-force layout and map-tile LOD — pure `camera.ts` /
+`simulation.ts` / `lod.ts` under `components/graph/`, with React owning *what* exists and one
+render loop owning *where* it is drawn (see `CLAUDE.md`).
 
 Debt, named:
 1. **Zero automated FE tests** (the pan-crash bug proved the cost).
@@ -17,7 +20,9 @@ Debt, named:
 3. No routing: views are booleans; graph entities/dossiers aren't linkable.
 4. Command turns (wizard, scrape, learn) aren't persisted to sessions — refresh loses them.
 5. Hand-rolled markdown is fine today but will strain (tables, nested lists).
-6. Graph is SVG — comfortable to ~1–2k nodes, not 20k.
+6. Graph is SVG. Viewport LOD (`graph/lod.ts`) bounds what is *drawn*, so the ceiling is now
+   how many nodes the layout and the merged client-side graph can hold, not how many are on
+   screen — still not 20k, and a WebGL renderer remains the F2 decision gate.
 7. No error boundaries, no web-vitals telemetry, no a11y audit, no Storybook.
 
 ## Phase F0 — Foundations (with R2 "Prove it")
@@ -37,13 +42,14 @@ Debt, named:
   the canvas must never blank the app again (learned that live).
 - **CI**: typecheck + lint (eslint@ts, prettier) + vitest + Playwright smoke on PR; build
   artifact uploaded.
-- **GraphView density budget**: `/api/graph?limit=400` divides its budget evenly across
-  distinct source entities, so a big graph renders as stubs — on the live AppRiver workspace
-  (1,571 source entities) that is a **5-edge cap per node, ~2.8% of 14,172 edges**, which
-  reads as "nothing is connected" on a graph that is in fact dense. Make the budget adaptive
-  (raise the default; scale the per-entity cap with viewport/zoom), say what was elided
-  ("showing 400 of 14,172 edges") rather than silently truncating, and lead with focus:
-  entity search returns a full neighbourhood, so make that the primary entry to the view.
+- **GraphView density budget — server half still open.** `/api/graph?limit=400` divides its
+  budget evenly across distinct source entities, so a big graph arrives as stubs: on the live
+  AppRiver workspace (1,571 source entities) that is a **5-edge cap per node, ~2.8% of 14,172
+  edges**, which reads as "nothing is connected" on a graph that is in fact dense. Still to do:
+  make the *API* budget adaptive (raise the default; scale the per-entity cap with
+  viewport/zoom) and say what the API elided ("showing 400 of 14,172 edges"). The client half
+  shipped 2026-07-24 — viewport LOD draws only what is in view and reports "N in view", and
+  entity search/expand already fetch a full neighbourhood and fit the camera to it.
 
 ## Phase F1 — Product hardening (with R3 "Team product")
 

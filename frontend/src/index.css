@@ -210,6 +210,20 @@ body {
   animation: graph-ripple 550ms ease-out forwards;
   pointer-events: none;
 }
+/* Labels are a zoom band, not a React condition: the render loop toggles
+   .graph-labels-on on the world group as the camera crosses LABEL_MIN_SCALE
+   (camera.ts), so they cross-fade with zero re-render. Nodes the user is
+   working with — hovered, selected, on a highlighted path — keep their label
+   at any zoom. */
+.graph-label {
+  opacity: 0;
+  transition: opacity 220ms ease;
+  pointer-events: none;
+}
+.graph-labels-on .graph-label,
+.graph-label-keep {
+  opacity: 1;
+}
 
 /* Shiki dual-theme output (components/GraphView.tsx FileViewModal): shiki emits
    the light theme's color inline plus a --shiki-dark custom property per span;

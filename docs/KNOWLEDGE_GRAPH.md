@@ -15,6 +15,11 @@ entities and service→deploys→environment from the dashboard); and the React
 "Knowledge" view (`frontend/src/components/GraphView.tsx`: d3-force layout,
 type-colored nodes, pan/zoom, click → evidence panel with citation chips,
 alias-resolving search, TopBar toggle) — verified live in Chrome.
+**Canvas rebuilt 2026-07-24** (`components/graph/`: eased camera + pointer-throw
+inertia, persistent/draggable force layout, map-tile viewport LOD, and node marks
+that hold a constant on-screen size at any zoom) — design in the frontend
+architecture bullet of `CLAUDE.md`. The graph *semantics* below are unchanged:
+this was a rendering and interaction change, not a data one.
 **Phase C SHIPPED 2026-07-11**: the compression/distill prompt emits a
 RELATIONSHIPS section (`type: name | relation | type: name`); `parse_triples`
 validates strictly against type/relation vocabularies (off-vocabulary lines are

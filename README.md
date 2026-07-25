@@ -329,7 +329,13 @@ A React app (Vite + TypeScript + Tailwind) with:
   links, and live mermaid diagrams).
 - **Projects and resumable conversations**, with automatic history compression.
 - **Knowledge gaps** — a badge in the rail opens the knowledge-debt backlog (below).
-- **Waypoints** — the interactive knowledge graph view.
+- **Waypoints** — the interactive knowledge graph view. Drag to pan (throw the pointer and it
+  coasts to a stop), scroll or pinch to zoom toward the cursor, drag any node and the layout
+  makes room for it live. Nodes stay a readable size at every zoom level, and only the part of
+  the graph you are looking at is drawn — on a large graph the toolbar tells you how many
+  entities are in view rather than quietly showing you a fraction. Double-click a node to pull
+  in its neighbours, click one to open its evidence panel, or use **Path finder** to ask how two
+  entities are related.
 - **⚙ Settings** — sign-in, roles & access (below), per-user connector sharing, add/test/sync/clean-up
   connectors, and tune workspace settings: LLM provider/model (incl. the
   **LiteLLM proxy URL + API-key env var**, with a **Test connection** button that pings the
