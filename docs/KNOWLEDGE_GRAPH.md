@@ -80,6 +80,8 @@ CREATE TABLE IF NOT EXISTS edges (
                                      -- | implemented_in | on_branch | belongs_to  (ADO dev-links, 2026-07-23)
                                      -- | from_branch | in_repo | synced_to_tfs     (GitLab MRs, 2026-07-23)
                                      -- | implements | for_ticket                   (org rule: ticket id in branch name)
+                                     -- | related_to                                (ADO Related links, 2026-07-26 —
+                                     --   part_of above is also what ADO's Hierarchy-Reverse now asserts)
     dst        TEXT NOT NULL,        -- entities.id
     evidence_doc_id TEXT NOT NULL DEFAULT '',  -- catalog documents.doc_id that proves it
     detail     TEXT NOT NULL DEFAULT '',       -- e.g. "3.2.0 via src/Api/Api.csproj"
@@ -157,6 +159,29 @@ Notes:
    a second, same-type pass) bridges the same branch under different repo spellings via the
    repo family (union-find over repo names + aliases), so the join holds even when GitLab and
    TFS name the repo differently.
+8. **ADO work-item hierarchy + Related links** (shipped 2026-07-26, `azure_devops.hierarchy_graph`,
+   AI_ROADMAP #26 — closes the asymmetry with Jira's `ticket --part_of--> project/epic`): reads
+   the SAME already-expanded `relations` array #6 reads, for `System.LinkTypes.Hierarchy-Reverse`
+   (this item's parent) and `System.LinkTypes.Related`. Emits `ticket --part_of--> ticket` (child
+   asserts the edge against its parent — same direction/rel as Jira, so a `graph_path`/
+   `graph_neighbors` query doesn't need to know which connector a ticket came from) and
+   `ticket --related_to--> ticket`. Entity type stays uniformly `ticket` — Epic vs. Feature vs.
+   Story vs. Task is a work-item-TYPE distinction carried in a separate per-document display-
+   metadata blob (`documents.metadata_json`, UI-only), not a graph-vocabulary one. The sync also
+   **walks both up and down** the hierarchy (bounded, `$expand=relations` batches — every fetched
+   item's relations already carry both directions, no extra API call): UP to ingest parent
+   Features/Epics as their own documents even when they sit outside any team's sprint window
+   (otherwise they'd never be pulled at all, and `part_of` would dangle), and DOWN from any
+   discovered Epic/Feature specifically to its real full child list (added 2026-07-26 after a live
+   re-sync showed a Feature with ~10 real children only picking up 3, and a Feature with none
+   recent enough missing entirely — walking up alone only ever found a container via ONE
+   descendant, never its full sibling set). Never walks down from a Story/Bug/Task — that would
+   reopen the flat-300k-item problem the sprint window exists to avoid. Backfills onto already-ingested,
+   content-unchanged work items via the existing `GRAPH_EXTRACTOR_VERSION` staleness mechanism
+   (v2→v3) — no new signature concept needed, same self-healing property #24's bridges and #6's
+   dev-links already have. The document browser's Epic/Feature/Story/Task tree view reads the
+   per-document metadata directly, not these graph edges (see `CLAUDE.md`'s `azure_devops.py`
+   bullet) — the edges are for the agent's multi-hop reasoning.
 
 ## Query surface
 

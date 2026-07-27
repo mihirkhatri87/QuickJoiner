@@ -41,6 +41,17 @@ functions"; learning stays explicit).
 > `extract_text` at the ingest/uploads seam — **no change to the extractors**. That covers embedded
 > images and scanned-PDF pages (the "possible follow-up" noted in §10), landing this plan's document
 > half without new plumbing. The two features are deliberately linked; keep this note in sync.
+>
+> **Extended 2026-07-24 (user request) — standalone images and OneDrive/SharePoint.** The seam
+> now also covers whole-file images, not just embedded ones: `extract.IMAGE_EXTENSIONS` names the
+> formats and `_extract_image` routes them to the same `ImageHandler`, raising a *specific*
+> "image files can't be read yet — vision support is on the roadmap" when none is wired in. The
+> **OneDrive/SharePoint connector** (shipped 2026-07-24) reports images as a **not yet**, distinct
+> from an unsupported type, in `skip_reason` — and its document store is exactly where photographed
+> whiteboards, pasted screenshots and scanned PDFs live, so it is the highest-value consumer of
+> this plan's vision half. Landing it: pass the handler through `OneDriveConnector._fetch_document`
+> and through `_extract_zip`'s member loop, then delete the image branch in `skip_reason`. Tracked
+> as **AI_ROADMAP #23.a**; the wording those code paths use today is a promise this plan keeps.
 
 ## 1. Architecture — one primitives layer, three surfaces
 

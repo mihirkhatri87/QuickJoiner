@@ -626,7 +626,7 @@ def test_patch_connector_edits_options_schedule_and_merges(client):
 # -- SSE chat ----------------------------------------------------------------
 
 def test_chat_streams_tool_calls_and_answer(client, monkeypatch):
-    def fake_build_agent(self, provider_override=None, model_override=None, extra_system=None, sources=None, user=None, role=None):
+    def fake_build_agent(self, provider_override=None, model_override=None, extra_system=None, sources=None, user=None, role=None, scope=None):
         from quickjoiner.agent.agent import OnboardingAgent
 
         provider = ScriptedProvider(
@@ -659,7 +659,7 @@ def test_chat_forwards_candidates_event(client, monkeypatch):
         "1. Weekly cadence | confidence=0.80 | sources: EchoDoc\n```"
     )
 
-    def fake_build_agent(self, provider_override=None, model_override=None, extra_system=None, sources=None, user=None, role=None):
+    def fake_build_agent(self, provider_override=None, model_override=None, extra_system=None, sources=None, user=None, role=None, scope=None):
         from quickjoiner.agent.agent import OnboardingAgent
 
         provider = ScriptedProvider([
@@ -687,7 +687,7 @@ def test_chat_forwards_candidates_event(client, monkeypatch):
 def test_chat_reuses_session_history(client, monkeypatch):
     providers: list[ScriptedProvider] = []
 
-    def fake_build_agent(self, provider_override=None, model_override=None, extra_system=None, sources=None, user=None, role=None):
+    def fake_build_agent(self, provider_override=None, model_override=None, extra_system=None, sources=None, user=None, role=None, scope=None):
         from quickjoiner.agent.agent import OnboardingAgent
 
         provider = ScriptedProvider([ChatResult(text=f"answer {len(providers)}")])
@@ -714,7 +714,7 @@ def test_chat_provider_failure_becomes_error_event(client, monkeypatch):
 
 
 def test_chat_session_persists_across_app_restarts(api_workspace, monkeypatch):
-    def fake_build_agent(self, provider_override=None, model_override=None, extra_system=None, sources=None, user=None, role=None):
+    def fake_build_agent(self, provider_override=None, model_override=None, extra_system=None, sources=None, user=None, role=None, scope=None):
         from quickjoiner.agent.agent import OnboardingAgent
 
         return OnboardingAgent(ScriptedProvider([ChatResult(text="persisted answer")]), [], system="sys")
@@ -739,7 +739,7 @@ def test_projects_and_sessions_endpoints(client, monkeypatch):
     ).json()
     assert project["id"] == "payments-ramp-up"
 
-    def fake_build_agent(self, provider_override=None, model_override=None, extra_system=None, sources=None, user=None, role=None):
+    def fake_build_agent(self, provider_override=None, model_override=None, extra_system=None, sources=None, user=None, role=None, scope=None):
         from quickjoiner.agent.agent import OnboardingAgent
 
         fake_build_agent.last_system = extra_system
@@ -758,7 +758,7 @@ def test_projects_and_sessions_endpoints(client, monkeypatch):
 
 
 def test_delete_sessions_endpoints(client, monkeypatch):
-    def fake_build_agent(self, provider_override=None, model_override=None, extra_system=None, sources=None, user=None, role=None):
+    def fake_build_agent(self, provider_override=None, model_override=None, extra_system=None, sources=None, user=None, role=None, scope=None):
         from quickjoiner.agent.agent import OnboardingAgent
 
         return OnboardingAgent(ScriptedProvider([ChatResult(text="ok")]), [], system="sys")
@@ -858,6 +858,64 @@ def test_verify_signature_schemes():
     assert verify_signature("s", body, {"x-qj-signature": digest})
     assert not verify_signature("s", body, {"x-qj-signature": "wrong"})
     assert not verify_signature("s", body, {})
+    # The query-token scheme — for a sender (Azure DevOps Service Hooks, Octopus
+    # subscriptions) that can only configure a bare callback URL, no custom headers.
+    assert verify_signature("s", body, {}, token="s")
+    assert not verify_signature("s", body, {}, token="wrong")
+
+
+def test_hook_query_token_scheme(client):
+    # No header at all — just the URL's ?token=, the scheme a sender with no signing
+    # capability falls back to.
+    body = json.dumps(ISSUE_PAYLOAD).encode()
+    resp = client.post("/hooks/ghrepo", content=body, params={"token": SECRET})
+    assert resp.status_code == 200
+
+
+def test_hook_git_push_triggers_a_resync_not_direct_ingest(tmp_path, monkeypatch):
+    # A git connector's push webhook carries commit metadata, never file contents — the
+    # only way to actually ingest what changed is a real sync() run (git pull + re-read),
+    # not the direct handle_event->ingest path every other connector uses.
+    from quickjoiner.sync_manager import SyncJob
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "config.yaml").write_text(
+        yaml.safe_dump({
+            "org": "acme",
+            "sources": [
+                {"name": "gitrepo", "type": "git",
+                 "options": {"url": "https://example.com/x.git", "branch": "main",
+                             "webhook_secret": SECRET}},
+            ],
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(app_module, "create_embedder", lambda cfg: FakeEmbedder())
+    started = []
+
+    def fake_start(self, source_name, clean=False):
+        started.append(source_name)
+        return SyncJob(id="sync-1-test", source_name=source_name, source_id=f"git:{source_name}")
+
+    monkeypatch.setattr("quickjoiner.sync_manager.SyncManager.start", fake_start)
+    hook_client = TestClient(create_app(ws))
+
+    body = json.dumps({"ref": "refs/heads/main"}).encode()
+    sig = hmac.new(SECRET.encode(), body, hashlib.sha256).hexdigest()
+    resp = hook_client.post("/hooks/gitrepo", content=body, headers={"X-QJ-Signature": sig})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["received"] is True and data["resync"] is True
+    assert started == ["gitrepo"]  # a real sync() was kicked off, not a direct-ingest call
+
+    # A push to a DIFFERENT branch is correctly ignored — no resync, no error either.
+    started.clear()
+    body2 = json.dumps({"ref": "refs/heads/other"}).encode()
+    sig2 = hmac.new(SECRET.encode(), body2, hashlib.sha256).hexdigest()
+    resp2 = hook_client.post("/hooks/gitrepo", content=body2, headers={"X-QJ-Signature": sig2})
+    assert resp2.status_code == 200 and "resync" not in resp2.json()
+    assert started == []
 
 
 # -- briefs --------------------------------------------------------------------
@@ -919,3 +977,64 @@ def test_sync_job_ingests_and_records_state(api_workspace):
         _sync_job(ctx, "does-not-exist")
     finally:
         ctx.catalog.close()
+
+
+# ------------------------------------------------------------ OneDrive / SharePoint
+# The connector's Graph behaviour is covered offline in tests/test_onedrive.py; these
+# pin the HTTP surface: what it refuses, and that it never leaks a token.
+
+def _make_onedrive(client, name="drive"):
+    return client.post("/api/connectors", json={
+        "name": name, "type": "onedrive",
+        "options": {"client_id": "00000000-0000-0000-0000-000000000000"},
+    })
+
+
+def test_onedrive_connector_can_be_created_before_signing_in(client):
+    # test() reports "not signed in" as ok on purpose: the token is keyed by source_id,
+    # so it cannot exist until the connector does. A failing test would deadlock that.
+    resp = _make_onedrive(client)
+    assert resp.status_code == 200, resp.text
+    assert "not signed in yet" in resp.json()["test"]["message"]
+
+
+def test_onedrive_oauth_status_reports_signed_out_and_never_returns_tokens(client):
+    _make_onedrive(client)
+    body = client.get("/api/connectors/drive/oauth/status").json()
+    assert body == {"signed_in": False, "account": "", "scopes": [], "learned": 0}
+    assert "token" not in json.dumps(body)
+
+
+def test_onedrive_oauth_start_returns_a_microsoft_authorize_url_with_pkce(client):
+    _make_onedrive(client)
+    body = client.post("/api/connectors/drive/oauth/start").json()
+    assert body["authorize_url"].startswith("https://login.microsoftonline.com/organizations")
+    assert "code_challenge=" in body["authorize_url"] and "code_challenge_method=S256" in body["authorize_url"]
+    assert body["redirect_uri"].endswith("/api/oauth/callback")
+    assert "offline_access" in body["authorize_url"]  # no refresh token without it
+
+
+def test_oauth_callback_rejects_an_unknown_state(client):
+    # The callback is unauthenticated by necessity (a browser redirect from Microsoft),
+    # so the single-use server-minted `state` is the whole guard.
+    resp = client.get("/api/oauth/callback", params={"state": "forged", "code": "x"})
+    assert resp.status_code == 400 and "single use" in resp.text
+
+
+def test_onedrive_learn_requires_targets_and_refuses_non_onedrive_connectors(client):
+    _make_onedrive(client)
+    assert client.post("/api/connectors/drive/onedrive/learn", json={"targets": []}).status_code == 400
+    # "handbook" is the files connector the fixture configures.
+    resp = client.post("/api/connectors/handbook/onedrive/learn", json={"targets": ["x"]})
+    assert resp.status_code == 400 and "not a OneDrive" in resp.json()["detail"]
+
+
+def test_deleting_a_onedrive_connector_removes_its_stored_refresh_token(client, api_workspace):
+    from quickjoiner.connectors.msgraph import TokenBundle, save_token, token_path
+
+    _make_onedrive(client, "gone")
+    save_token(api_workspace, "onedrive:gone", TokenBundle(refresh_token="live-token"))
+    assert token_path(api_workspace, "onedrive:gone").exists()
+    assert client.delete("/api/connectors/gone").status_code == 200
+    # A refresh token is redeemable on its own — it must not outlive its connector.
+    assert not token_path(api_workspace, "onedrive:gone").exists()

@@ -47,6 +47,13 @@ Workstreams (each is a PR-able epic):
 7. **DR/backup**: PITR on RDS, S3 versioning, weekly restore drill in CI (restore → run
    grounding smoke suite against the restored copy — *backups that answer questions*).
 8. **Knowledge scopes — the personal-layer union** (intake 2026-07-18; also PRD W9.3).
+   **Urgency raised 2026-07-24 by the OneDrive/SharePoint connector** (`PRIORITIES.md` #2):
+   it is per-user by construction — a delegated Microsoft 365 token reads exactly what that
+   person can read, *including files shared privately with them* — but everything it learns
+   lands in the one communal memory, so a private document becomes retrievable and citable
+   for every user of the workspace. The connector warns about this at connect time, in its
+   `test()` message and before every on-demand learn, but a warning is not a control. This
+   workstream is what turns it into one.
    Today ingested knowledge is one communal memory (documented in CLAUDE.md's auth bullet) —
    right for single-user/open mode, wrong at 5–200 users: a user's `/learn` notes and private
    scrapes pollute the org graph (entities, edges, corroboration counts, autocomplete),

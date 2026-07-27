@@ -166,6 +166,28 @@ function scrapeFollowupFlow(
   };
 }
 
+async function runIngest(ctx: CommandCtx, path: string, raw: string): Promise<void> {
+  ctx.pushUser(raw);
+  ctx.setBusy(true);
+  try {
+    const r = await api.ingestLocalPath(path);
+    if (r.ingested) {
+      ctx.say(`Learned **${r.title}** — ${r.result ?? "ingested"}. It's searchable memory now.`);
+      ctx.refresh();
+    } else {
+      // Honest about the difference between "failed" and "nothing readable in it".
+      ctx.sayError(
+        `Could not learn ${r.file || path}: ${r.reason ?? "no readable text in this file"}. ` +
+          "A picture-only or scanned document needs vision support, which isn't enabled yet.",
+      );
+    }
+  } catch (e) {
+    ctx.sayError(`Could not ingest ${path}: ${String((e as Error).message)}`);
+  } finally {
+    ctx.setBusy(false);
+  }
+}
+
 async function runScrape(ctx: CommandCtx, url: string, raw: string): Promise<void> {
   const depth = 4;
   const maxPages = 40;
@@ -233,6 +255,17 @@ export function buildCommands(ctx: CommandCtx): Command[] {
       name: "scrape",
       match: /^\/scrape\s+(\S+)/i,
       run: (m, raw) => runScrape(ctx, m[1], raw),
+    },
+    {
+      // Deterministic file ingestion. This exists because the agentic route kept failing:
+      // asked to "ingest C:\...\deck.pptx" the model replied "I can't read files directly
+      // from your computer" — it *can* (POST /api/uploads/local), it just didn't connect the
+      // request to the capability. A slash command is the house's deterministic fast path,
+      // and it cannot be talked out of doing its job. Quotes are stripped so a path pasted
+      // from Explorer ("Copy as path" wraps it in quotes) works as-is.
+      name: "ingest",
+      match: /^\/ingest\s+(.+)$/i,
+      run: (m, raw) => runIngest(ctx, m[1].trim().replace(/^["']|["']$/g, ""), raw),
     },
   ];
 }

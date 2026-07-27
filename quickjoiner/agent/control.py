@@ -168,7 +168,12 @@ def build_control_tools(ctx, user: str | None, role: str | None) -> list[AgentTo
                 name="qj_api",
                 description=(
                     "Control QuickJoiner itself by calling its OWN API in-process: connectors, "
-                    "syncs, settings, gaps, sessions, memory, users/roles. Pass method (GET/POST/"
+                    "syncs, settings, gaps, sessions, memory, users/roles, and **ingesting "
+                    "documents into memory**. You CAN read files from the machine QuickJoiner "
+                    "runs on: to learn a document the user names by path, POST /api/uploads/local "
+                    "with {\"path\": \"<the path they gave>\"} — never reply that you have no "
+                    "access to their files. To learn a file they ATTACHED to the message, POST "
+                    "/api/chat/attachments/<attachment id>/learn. Pass method (GET/POST/"
                     "PATCH/DELETE), path (e.g. /api/connectors), and body. ALWAYS discover first: "
                     "call qj_api_reference to see the endpoints you're allowed to use and the "
                     "connector field schema. For any mutation (POST/PATCH/DELETE) state what you'll "

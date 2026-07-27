@@ -10,5 +10,10 @@ get {
 
 docs {
   The catalog of connector types and each type's configurable fields (which are required,
-  which are secrets). Use this to fill `options` for the connector you create next.
+  which are secrets), plus each type's supported `modes`. Use this to fill `options` for the
+  connector you create next.
+
+  A type may also carry `next_step` — what you must do AFTER saving, for connectors that
+  aren't usable the moment they're created (OneDrive needs an interactive Microsoft 365
+  sign-in, which can only happen once the connector exists).
 }

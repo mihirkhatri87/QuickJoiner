@@ -16,19 +16,41 @@ when memory has nothing relevant.
 - **Multi-mode connectors** — pull APIs, push webhooks, live "read from source" agent tools,
   authenticated browser sessions with your own credentials, and scraping as a last resort.
   Types: files/URLs, git, GitHub, GitLab, Jira, Confluence, Azure DevOps (cloud **and**
-  on-prem Server/TFS), Octopus Deploy, Grafana, Datadog, Dynatrace, Elasticsearch, and a
-  generic web scraper.
+  on-prem Server/TFS), Octopus Deploy, **OneDrive for Business / SharePoint**, Grafana, Datadog,
+  Dynatrace, Elasticsearch, and a generic web scraper.
+- **OneDrive / SharePoint, with your own sign-in** — sign in with your Microsoft 365 account
+  (in the UI, or `qj onedrive login` for a terminal/Docker) and QuickJoiner can read exactly what
+  *you* can read, including documents other people shared with you. It **never crawls your drive**:
+  you point it at a document — paste any link you can open, or say
+  `/qj learn from this onedrive document <url>` in chat — and only that is learned. Word,
+  PowerPoint, Excel, PDF, CSV, Markdown, **zip archives** and many other text formats are all
+  extracted; a later sync keeps what you taught it up to date without going looking for more.
+  ⚠ Note: learned documents join the **shared** memory every user of that workspace can search
+  and cite — including a file that was shared privately with you. Per-user knowledge scopes are
+  the next thing on the roadmap.
 - **Ask about a file (per-question attachments)** — click 📎 or drag files onto the chat to attach
   **Word, PowerPoint, Excel, PDF, Markdown, text, JSON, HTML, or code** as *context for that
-  question*. The file's text is extracted and used to answer, and it shows up with a download link
+  question*. Slide decks are read properly — labels inside **grouped diagrams**, SmartArt and
+  chart titles all come through, not just top-level text boxes. The file's text is extracted and used to answer, and it shows up with a download link
   right under your question. These are **ephemeral and private to the conversation** — never added
   to learned memory — and are auto-deleted after 7 days (after which the history shows the filename
-  with a "deleted" warning instead of a link).
+  with a "deleted" warning instead of a link). Want to keep one? Flip the **"Learning permanently"**
+  toggle beside the staged file before sending (or just ask — "learn this document" works now), and
+  it is also ingested into memory as a cited, searchable document. To learn a file already on disk without attaching it, type **`/ingest <file path>`** — a deterministic command, no LLM involved.
 - **Document uploads into memory** — to teach QuickJoiner a document *permanently*, ingest it into
   the rolling **Uploads** connector — `POST /api/uploads`, or ask in chat (`/qj ingest C:\docs\spec.pdf`).
   Text is extracted at ingest and the file becomes cited memory. One continuously-growing connector,
-  no new connector per file, re-syncable and cleanable like any other. (Text-only today; reading
-  images/scanned pages inside documents is on the roadmap.)
+  no new connector per file, re-syncable and cleanable like any other. **Zip archives** are
+  expanded and their readable members ingested with their paths kept. (Text-only today; **images
+  are not read yet** — an image says so explicitly rather than being ignored, and reading
+  images/scanned pages is on the roadmap.)
+- **See what it learned, label it, and ask within it** — click any connected system to browse
+  the documents it actually ingested, grouped by folder. Tag a whole connector, a folder, or a
+  single document — a **folder tag covers files added to it later**, so you tag once. `aka`
+  gives something an alternate name ("the Zix roadmap"). Then use the scope chip beside the
+  composer to limit a question to one connector, a tag, or specific documents: the search is
+  filtered before it runs and connectors you excluded can't be queried at all, so answers come
+  back faster and with less ambiguity. Leave it on **All memory** and nothing changes.
 - **Honesty by design** — a grounding contract forces citations and refusals, every refusal is
   captured as a **knowledge gap** with one-click remediation, and a **knowledge graph** links
   repos, packages, tickets, services, environments, **message topics, and datastores** so you
@@ -291,6 +313,21 @@ qj connect azure_devops --name tfs --option server_url=https://tfs.company.com/t
 # project's releases only when it changed since last sync (dashboard/projects always refresh):
 qj connect octopus --name deploys --option server_url=https://octopus.acme.com --option api_key=env:OCTOPUS_API_KEY --option incremental=true
 
+# OneDrive for Business / SharePoint — YOUR sign-in, and nothing is crawled.
+# You need one value from your organisation's Azure app registration: the Application
+# (client) ID. Ask "may reach" for only what you need — my_drive needs Files.Read (usually
+# self-service), shared_with_me needs Files.Read.All, sharepoint needs Sites.Read.All
+# (usually admin consent).
+qj connect onedrive --name my-files --option client_id=00000000-0000-0000-0000-000000000000 --option access="my_drive,shared_with_me"
+qj onedrive login my-files      # device-code sign-in: type a short code at microsoft.com/devicelogin
+qj onedrive status my-files     # who it is signed in as, and how much it has learned
+# Learn specific documents — a link you can open, or a path in your own drive. A folder
+# learns the readable files under it. This is the ONLY way documents get in:
+qj onedrive learn my-files "https://contoso.sharepoint.com/:w:/r/sites/Eng/Shared%20Documents/design.docx"
+qj onedrive learn my-files "Projects/Alpha/notes.md" "Projects/Alpha/specs"
+# In chat you can say the same thing in words:  /qj learn from this onedrive document <url>
+# A later `qj sync my-files` refreshes those documents. It never goes looking for new ones.
+
 qj sync            # incremental pull from every source
 qj sync pay-jira   # or just one source
 qj resync pay-jira # purge that source (docs, vectors, graph) and re-sync from scratch
@@ -457,6 +494,9 @@ qj eval my-evals.yaml --calibrate      # recommend the best retrieval.min_score 
 qj eval my-evals.yaml --compare old.json  # delta table vs a past report; non-zero exit on a
                                           #   >2-point regression (use it as a CI merge gate)
 qj eval docs/evals/multi-hop-crosssource.yaml   # shipped multi-hop / cross-source eval set
+qj extract report.pptx                 # what can QuickJoiner actually read from this file?
+                                       #   per-slide character counts; --full for all text.
+                                       #   Needs no workspace and ingests nothing.
 qj browser login https://sso.acme.com  # persistent Playwright profile (install: pip install -e ".[browser]")
 ```
 
@@ -477,7 +517,8 @@ docker compose -f docker-compose.cloud.yml up -d   # app + pgvector
 
 ```
 connectors (files/url, git, GitHub, GitLab, Azure DevOps, Jira, Confluence,
-            Octopus, Grafana, Datadog, Dynatrace, Elastic, web_scrape)
+            Octopus, OneDrive/SharePoint, Grafana, Datadog, Dynatrace, Elastic,
+            web_scrape)
    ├─ sync() -> Documents          (pull; incremental via per-source sync state)
    ├─ handle_event(payload)        (push; POST /hooks/<source>, HMAC-verified)
    ├─ tools() -> live agent tools  (JQL, WIQL, code search, log queries, deploy status)

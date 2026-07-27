@@ -1,0 +1,23 @@
+meta {
+  name: Poll ingest progress
+  type: http
+  seq: 9
+}
+
+get {
+  url: {{baseUrl}}/api/ingest-progress/{{progressToken}}
+}
+
+docs {
+  Real chunk-embedding progress for an in-flight ad-hoc ingest — poll this in parallel with
+  a `Learn an attachment into memory` request that was sent with the same `progress_token`
+  query param. Embedding a large document (e.g. a whole zip's concatenated text) can take
+  minutes on a CPU-only machine, and this is what a UI polls instead of showing nothing.
+
+  204 (empty body) if the token is unknown: never started, already finished and aged out
+  (5 minutes), or nobody will ever start it. Not an error — the caller is racing this
+  against the POST that owns the token, so "nothing yet" is a normal answer.
+
+  200 body: `{"done": <chunks embedded>, "total": <chunks total>}`. `total` of 0 means
+  extraction/chunking hasn't finished yet — the count itself isn't known.
+}

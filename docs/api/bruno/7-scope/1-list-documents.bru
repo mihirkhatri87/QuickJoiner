@@ -1,0 +1,21 @@
+meta {
+  name: List a source's documents
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{baseUrl}}/api/sources/{{scopeSourceId}}/documents
+}
+
+docs {
+  What this connector actually learned: uri, title, chunk count, and the labels applying to
+  each document. Labels are prefix rules resolved at read time, so a folder tag shows on
+  files ingested long after it was set.
+
+  Each document also carries `metadata` — a small connector-supplied JSON blob for UI
+  display only, `{}` for every connector that doesn't set it. Azure DevOps stamps
+  work_item_type/state/team/sprint/parent_id/changed_date/closed_date there, which is what
+  the document browser uses to render TFS work items as an Epic/Feature/Story/Task tree
+  (sorted: ongoing items by last-updated desc, then completed items by closed-date desc).
+}

@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, streamChat } from "./api";
-import type { CandidateItem, ChatAttachment, GapsResponse, ProjectRow, SessionRow, SourceRow, Status, SyncJob } from "./types";
+import type { AskScope, CandidateItem, ChatAttachment, GapsResponse, ProjectRow, SessionRow, SourceRow, Status, SyncJob } from "./types";
 import { buildCommands, startConnectFlow, type CommandCtx, type Flow } from "./commands";
 import { ArtifactModal, type Artifact } from "./components/ArtifactModal";
 import { Chat, type Msg } from "./components/Chat";
 import { Composer } from "./components/Composer";
+import { DocumentsModal } from "./components/DocumentsModal";
+import { EMPTY_SCOPE, isScoped, ScopePicker } from "./components/ScopePicker";
 import { EmptyState } from "./components/EmptyState";
 import { GapsPanel } from "./components/GapsPanel";
 import { GraphView } from "./components/GraphView";
@@ -191,6 +193,19 @@ export default function App() {
   // On send they upload as ephemeral context (NOT the Uploads connector / memory) and render
   // beneath the question. Kept for the conversation, auto-deleted after the retention window.
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
+  // Upload feedback for the staged files above — null while nothing is uploading. "uploading"
+  // tracks real bytes sent; "processing" covers the gap between 100% sent and the response
+  // coming back (server-side text extraction), so a multi-second wait after the bar fills
+  // reads as "still working" instead of a frozen composer.
+  const [uploadStatus, setUploadStatus] = useState<{ phase: "uploading" | "processing"; pct: number } | null>(null);
+  // Opt-in: also ingest the staged attachments into permanent memory, not just use them
+  // as context for this one question. Resets after each send so it can't silently persist.
+  const [learnPending, setLearnPending] = useState(false);
+  // Which slice of memory questions use. Sticky across a conversation (you usually ask
+  // several things about the same source) and one click to clear. Empty = all of memory.
+  const [scope, setScope] = useState<AskScope>(EMPTY_SCOPE);
+  // The connector whose ingested documents are being browsed/labelled, if any.
+  const [browsing, setBrowsing] = useState<SourceRow | null>(null);
   const attachFiles = (files: File[]) => setPendingFiles((prev) => [...prev, ...files]);
   const removePending = (idx: number) => setPendingFiles((prev) => prev.filter((_, i) => i !== idx));
 
@@ -260,34 +275,88 @@ export default function App() {
     }
 
     // Stage 3: the agentic path — /api/chat tool-call loop.
-    // Upload any staged context files first (ephemeral, NOT memory), so their ids ride the turn
-    // and their metadata stamps the question. A failed upload aborts the send.
     const message = effective || "Please review the attached file(s) and tell me what they contain.";
-    let attachmentMeta: ChatAttachment[] = [];
-    let attachmentIds: string[] = [];
-    if (hasAttachments) {
-      setBusy(true);
-      try {
-        attachmentMeta = await api.uploadChatAttachments(pendingFiles);
-        attachmentIds = attachmentMeta.map((a) => a.id);
-      } catch (err) {
-        setBusy(false);
-        sayError("Could not attach files: " + String(err));
-        return;
-      }
-      setPendingFiles([]);
-    }
+    const userId = uid();
     const agentId = uid();
+    // Push the question + a placeholder immediately — attaching/learning a large file can
+    // take a while (see below), and it used to happen entirely before anything appeared in
+    // the conversation, reading as a frozen composer with no way to tell it was still working.
+    // The attachment chips and any learn-progress patch onto these same messages as work
+    // actually happens, rather than waiting to render everything at once at the end.
     setMessages((m) => [
       ...m,
-      { id: uid(), role: "user", text: message, attachments: attachmentMeta.length ? attachmentMeta : undefined, ts: now() },
+      { id: userId, role: "user", text: message, ts: now() },
       { id: agentId, role: "agent", streaming: true, ts: now() },
     ]);
     setBusy(true);
     const patch = (fn: (m: Msg) => Msg) =>
       setMessages((list) => list.map((x) => (x.id === agentId ? fn(x) : x)));
+    const patchUser = (fn: (m: Msg) => Msg) =>
+      setMessages((list) => list.map((x) => (x.id === userId ? fn(x) : x)));
+
+    // Upload any staged context files first (ephemeral, NOT memory), so their ids ride the turn
+    // and their metadata stamps the question. A failed upload aborts the send.
+    let attachmentMeta: ChatAttachment[] = [];
+    let attachmentIds: string[] = [];
+    if (hasAttachments) {
+      setUploadStatus({ phase: "uploading", pct: 0 });
+      try {
+        attachmentMeta = await api.uploadChatAttachments(pendingFiles, setUploadStatus);
+        attachmentIds = attachmentMeta.map((a) => a.id);
+        patchUser((m) => ({ ...m, attachments: attachmentMeta }));
+      } catch (err) {
+        setUploadStatus(null);
+        setBusy(false);
+        patch((m) => ({ ...m, role: "error", text: "Could not attach files: " + String(err), streaming: false }));
+        return;
+      } finally {
+        setUploadStatus(null);
+      }
+      // Tell the user immediately when a file yielded no text, rather than letting them infer
+      // it from a confused answer. This is the moment they can still do something about it.
+      const unreadable = attachmentMeta.filter((a) => a.extract_error);
+      if (unreadable.length) {
+        sayError(
+          unreadable.map((a) => `${a.filename}: ${a.extract_error}`).join("\n") +
+            "\nI'll still answer from learned memory, but I can't read that file's contents.",
+        );
+      }
+      // Opt-in "learn permanently": the same bytes are promoted into the Uploads connector,
+      // so the file both answers THIS question and becomes cited memory. Deliberately
+      // best-effort — a failed ingest must not lose the question the user just asked.
+      // Embedding a large file (e.g. everything inside a zip) is real, possibly slow CPU
+      // work — onProgress below gets REAL chunk-embedded/total counts (see
+      // api.learnChatAttachment), not a fake number, so a multi-minute wait shows exactly
+      // that instead of nothing.
+      if (learnPending) {
+        const label = `Learning ${attachmentMeta.map((a) => a.filename).join(", ")} permanently`;
+        patch((m) => ({ ...m, learning: { label, done: 0, total: 0 } }));
+        const failures: string[] = [];
+        for (const att of attachmentMeta) {
+          try {
+            await api.learnChatAttachment(att.id, (p) =>
+              patch((m) => (m.learning ? { ...m, learning: { ...m.learning, done: p.done, total: p.total } } : m)),
+            );
+          } catch (err) {
+            failures.push(`${att.filename}: ${String((err as Error).message)}`);
+          }
+        }
+        patch((m) => (m.learning ? { ...m, learning: { ...m.learning, complete: true } } : m));
+        if (failures.length) sayError("Could not learn: " + failures.join("; "));
+        loadStatus();
+        loadSources();
+      }
+      setPendingFiles([]);
+      setLearnPending(false);
+    }
     try {
-      await streamChat({ message, session_id: sessionId, project: currentProject || null, attachment_ids: attachmentIds }, (e) => {
+      await streamChat({
+        message, session_id: sessionId, project: currentProject || null,
+        attachment_ids: attachmentIds,
+        // Only send a scope when there is one — an empty object would still mean "all
+        // memory", but omitting it keeps the unscoped request byte-identical to before.
+        scope: isScoped(scope) ? scope : undefined,
+      }, (e) => {
         if (e.type === "thinking") patch((m) => ({ ...m, thinking: (m.thinking || "") + e.data }));
         else if (e.type === "tool_call") patch((m) => ({ ...m, tools: [...(m.tools || []), e.data] }));
         else if (e.type === "delta") patch((m) => ({ ...m, streamText: (m.streamText || "") + e.data }));
@@ -393,6 +462,10 @@ export default function App() {
           onOpenGaps={() => setGapsOpen(true)}
           syncJobs={notifications}
           onOpenSync={(name, clean) => openSync(name, clean)}
+          onBrowseSource={(src) => {
+            setRail(false);
+            setBrowsing(src);
+          }}
         />
         <section className="relative flex min-w-0 flex-1 flex-col">
           {view === "graph" ? (
@@ -432,6 +505,12 @@ export default function App() {
                 pending={pendingFiles.map((f) => f.name)}
                 onAttachFiles={attachFiles}
                 onRemovePending={removePending}
+                uploadStatus={uploadStatus}
+                learnPending={learnPending}
+                onToggleLearnPending={setLearnPending}
+                scopeControl={
+                  <ScopePicker scope={scope} onChange={setScope} sources={sources} />
+                }
               />
             </>
           )}
@@ -451,6 +530,15 @@ export default function App() {
         syncJobs={notifications}
         onOpenSync={openSync}
       />
+      {browsing && (
+        <DocumentsModal
+          sourceId={browsing.id}
+          sourceType={browsing.type}
+          label={browsing.type === "uploads" ? "Uploaded documents" : browsing.name}
+          onClose={() => setBrowsing(null)}
+          onLabelsChanged={loadSources}
+        />
+      )}
       {historyOpen && (
         <SyncHistoryModal
           onClose={() => setHistoryOpen(false)}

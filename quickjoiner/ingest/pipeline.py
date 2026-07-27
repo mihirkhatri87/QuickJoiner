@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
@@ -91,7 +92,9 @@ class IngestStats:
 # whose stored `graph_version` is below this rebuilds its graph edges WITHOUT re-embedding —
 # so a graph-only feature rolls out on the next ordinary sync instead of needing a clean
 # re-sync. History: v2 (2026-07-23) = ADO Development-link edges + GitLab MR/branch graph.
-GRAPH_EXTRACTOR_VERSION = 2
+# v3 (2026-07-26) = ADO Hierarchy (part_of)/Related (related_to) edges + per-doc display
+# metadata (work item type/state/team/sprint/parent id) for the document browser's tree view.
+GRAPH_EXTRACTOR_VERSION = 3
 
 
 def _doc_id(source_id: str, uri: str) -> str:
@@ -143,17 +146,26 @@ class IngestPipeline:
         self._triple_workers = max(1, triple_workers)
 
     def ingest(self, documents: Iterable[Document], source_id: str,
-               control: Any = None) -> IngestStats:
+               control: Any = None,
+               progress_cb: Callable[[int, int], None] | None = None) -> IngestStats:
         """`control` (optional) lets a caller pause/stop the deferred graph-extraction
         phase: any object with `proceed() -> bool` that blocks while paused and returns
         False once cancelled (see `sync_manager._PauseControl`). None = run to completion,
         the behaviour for the CLI, scheduler and tests. The document loop itself is gated
-        by whatever iterator is passed in (the sync manager wraps it)."""
+        by whatever iterator is passed in (the sync manager wraps it).
+
+        `progress_cb` (optional) reports (chunks embedded, total chunks) for the chunk/embed
+        step of a document that actually needs it (unchanged docs skip straight past it).
+        It exists for exactly one caller — the ad-hoc "learn this attachment now" API route,
+        where a single large document can take minutes to embed on a CPU-only machine and the
+        UI needs something honest to show — not for connector syncs, which report progress
+        through `SyncControl.stage()` instead. Only meaningful with ONE document; with several,
+        each document's progress simply overwrites the last (fine for its one real caller)."""
         stats = IngestStats()
         pending: list[tuple[str, list, list, list, str, str, str]] = []
         for doc in documents:
             try:
-                self._ingest_one(doc, source_id, stats, pending)
+                self._ingest_one(doc, source_id, stats, pending, progress_cb)
             except Exception as exc:  # keep syncing the rest of the source
                 stats.errors.append(f"{doc.uri}: {exc}")
         if pending:
@@ -181,7 +193,8 @@ class IngestPipeline:
                 maybe_compact()
         return stats
 
-    def _ingest_one(self, doc: Document, source_id: str, stats: IngestStats, pending: list) -> None:
+    def _ingest_one(self, doc: Document, source_id: str, stats: IngestStats, pending: list,
+                     progress_cb: Callable[[int, int], None] | None = None) -> None:
         doc_id = _doc_id(source_id, doc.uri)
         # Normalize before hashing so cosmetic variants (curly quotes, NBSP, CRLF)
         # of the same content dedupe instead of re-embedding.
@@ -203,6 +216,15 @@ class IngestPipeline:
             # with it off (the default) the refresh is purely deterministic and cheap.
             stats.skipped += 1
             self._sync_graph(doc, doc_id, source_id, text, pending)
+            # Display metadata (e.g. ADO team/sprint/state) backfills the same way the graph
+            # does: an unchanged document still carries whatever the connector freshly
+            # computed this pull, and this is a standalone UPDATE — no re-embed. Without it,
+            # team/sprint/state would stay blank on every already-ingested work item until
+            # its content next actually changes, the same staleness bug the graph refresh
+            # above exists to avoid, just for metadata instead of edges.
+            display = (doc.metadata or {}).get("display")
+            if display is not None:
+                self._catalog.update_document_metadata(doc_id, json.dumps(display))
             if stale_graph and not graph_pending:
                 # graph_pending docs get their version stamped when the pending drains;
                 # a pure version-refresh has no pending work, so stamp it now.
@@ -215,15 +237,33 @@ class IngestPipeline:
             crumb = breadcrumb(source_id, doc.title, doc.uri)
             if crumb:
                 chunks = [f"[{crumb}]\n{c}" for c in chunks]
-        written = self._store.upsert_document(
-            doc_id=doc_id,
-            source_id=source_id,
-            uri=doc.uri,
-            title=doc.title,
-            kind=doc.kind,
-            chunks=chunks,
-            updated_at=doc.updated_at or "",
-        )
+        # Batched, progress-reporting embed only when a caller actually wants it AND the
+        # store supports it (on-prem LanceDB only today — Postgres/pgvector falls back to
+        # the plain call below, same as ensure_ann_index/maybe_compact elsewhere in this
+        # pipeline). Every connector sync passes progress_cb=None, so this is the exact
+        # same call as before for the hot path.
+        upsert_with_progress = getattr(self._store, "upsert_document_with_progress", None)
+        if progress_cb is not None and upsert_with_progress is not None:
+            written = upsert_with_progress(
+                doc_id=doc_id,
+                source_id=source_id,
+                uri=doc.uri,
+                title=doc.title,
+                kind=doc.kind,
+                chunks=chunks,
+                updated_at=doc.updated_at or "",
+                on_progress=progress_cb,
+            )
+        else:
+            written = self._store.upsert_document(
+                doc_id=doc_id,
+                source_id=source_id,
+                uri=doc.uri,
+                title=doc.title,
+                kind=doc.kind,
+                chunks=chunks,
+                updated_at=doc.updated_at or "",
+            )
         self._catalog.upsert_document(
             doc_id=doc_id,
             source_id=source_id,
@@ -234,6 +274,7 @@ class IngestPipeline:
             updated_at=doc.updated_at,
             chunk_count=written,
             graph_version=GRAPH_EXTRACTOR_VERSION,  # freshly built with the current extractors
+            metadata_json=json.dumps((doc.metadata or {}).get("display") or {}),
         )
         self._sync_graph(doc, doc_id, source_id, text, pending)
         stats.chunks += written

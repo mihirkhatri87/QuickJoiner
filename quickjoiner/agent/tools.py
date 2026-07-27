@@ -44,7 +44,11 @@ def build_builtin_tools(
     retrieval: RetrievalConfig,
     gaps: GapsConfig | None = None,
     score_ledger: dict[str, float] | None = None,
+    scope=None,
 ) -> list[AgentTool]:
+    """`scope` (memory.store.SearchScope) narrows every memory read for this turn to the
+    connectors/documents the user picked — filtered inside the vector + FTS query, so a
+    scoped question does strictly less work and can't drift onto unrelated sources."""
     def _capture_gap(query: str) -> None:
         """Log a refusal as a knowledge gap. Fire-and-forget: any failure here must
         never change what search_memory returns to the agent."""
@@ -92,9 +96,18 @@ def build_builtin_tools(
                 search_q = expand_query(catalog, query)
             except Exception:  # expansion is best-effort; never break a search on it
                 search_q = query
-        hits = store.search(search_q, top_k=top_k or retrieval.top_k, min_score=retrieval.min_score)
+        hits = store.search(search_q, top_k=top_k or retrieval.top_k,
+                            min_score=retrieval.min_score, scope=scope)
         if not hits:
             _capture_gap(query)  # log the user's ORIGINAL query as the gap, not the expanded one
+            if scope is not None and not scope.is_empty():
+                # A scoped refusal is a different fact from a global one, and saying which is
+                # the difference between "we never learned this" and "not in what you picked".
+                return (
+                    "NO_RESULTS: nothing relevant in the sources this question is scoped to. "
+                    "Say so plainly and offer to look across all of memory — do NOT claim the "
+                    "organisation has never learned it, because you only searched a slice."
+                )
             return (
                 "NO_RESULTS: nothing relevant found in learned memory for this query. "
                 "Try a rephrased query, or tell the user you haven't learned this yet."

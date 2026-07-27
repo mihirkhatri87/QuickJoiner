@@ -1,12 +1,18 @@
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from quickjoiner.config import SourceConfig
 from quickjoiner.connectors.azure_devops import (
+    _merge_graphs,
+    _next_hierarchy_ids,
+    _team_is_dormant,
+    _workitem_id_from_url,
     build_map_document,
     builds_document,
     dev_link_graph,
+    hierarchy_graph,
     select_recent_iterations,
     work_item_document,
 )
@@ -376,6 +382,37 @@ def test_suggest_api_connector_returns_none_for_unknown_hosts():
     assert suggest_api_connector("not a url") is None
 
 
+def test_pushed_branch_reads_the_ref_field():
+    from quickjoiner.connectors.git_repo import pushed_branch
+
+    assert pushed_branch({"ref": "refs/heads/main"}) == "main"
+    assert pushed_branch({"ref": "refs/heads/feature/x"}) == "feature/x"
+    assert pushed_branch({"ref": "refs/tags/v1.0.0"}) is None  # a tag push, not a branch
+    assert pushed_branch({}) is None
+    assert pushed_branch({"ref": ""}) is None
+
+
+def test_git_connector_wants_resync_only_for_the_mapped_branch(tmp_path):
+    from quickjoiner.config import SourceConfig
+    from quickjoiner.connectors.registry import create_connector
+
+    mapped = create_connector(
+        SourceConfig(name="repo", type="git", options={"url": "https://x/y.git", "branch": "main"}),
+        tmp_path,
+    )
+    assert mapped.wants_resync({"ref": "refs/heads/main"}) is True
+    assert mapped.wants_resync({"ref": "refs/heads/other"}) is False
+    assert mapped.wants_resync({"ref": "refs/tags/v1"}) is False  # not a branch push at all
+    assert list(mapped.handle_event({"ref": "refs/heads/main"})) == []  # nothing yielded directly
+
+    # No branch configured -> the connector tracks the remote's default, so ANY branch push
+    # is potentially relevant (we can't know which branch is "default" from a webhook alone).
+    unmapped = create_connector(
+        SourceConfig(name="repo2", type="git", options={"url": "https://x/y.git"}), tmp_path,
+    )
+    assert unmapped.wants_resync({"ref": "refs/heads/whatever"}) is True
+
+
 def test_github_pr_document():
     pr = {
         "number": 42,
@@ -436,6 +473,82 @@ def test_jira_issue_document_with_adf_description():
     assert "In Progress" in doc.text and "Priya" in doc.text
     assert "Upgrade path notes." in doc.text
     assert "PAY-100" in doc.text
+    # Display metadata (the document browser's Epic/Story/Task tree reads this) — id/
+    # parent_id are Jira KEYS (strings), not numbers. team/sprint are intentionally blank:
+    # Jira's board/sprint data lives in a separate Agile API this connector doesn't speak.
+    assert doc.metadata["display"] == {
+        "id": "PAY-123", "work_item_type": "Story", "state": "In Progress",
+        "sprint": "", "team": "", "changed_date": "2026-07-01T08:00:00.000+0000",
+        "closed_date": "", "parent_id": "PAY-100", "assigned_to": "Priya", "tags": ["db"],
+    }
+
+
+def test_jira_issue_document_asserts_related_to_edges_from_issuelinks():
+    issue = {
+        "key": "PAY-1",
+        "fields": {
+            "summary": "S",
+            "issuelinks": [
+                {"type": {"name": "Relates", "outward": "relates to"},
+                 "outwardIssue": {"key": "PAY-2"}},
+                {"type": {"name": "Blocks", "inward": "is blocked by"},
+                 "inwardIssue": {"key": "PAY-3"}},
+                {"type": {"name": "Relates"}},  # malformed — neither issue ref — skipped
+            ],
+        },
+    }
+    doc = jira_issue_document("https://acme.atlassian.net", issue)
+    edges = {(s, r, d) for s, r, d, _ in doc.metadata["graph"]["edges"]}
+    assert ("ticket:pay-1", "related_to", "ticket:pay-2") in edges
+    assert ("ticket:pay-1", "related_to", "ticket:pay-3") in edges
+    assert len(edges) == 3  # part_of->project + the 2 related_to (no edge for the malformed link)
+
+
+def test_jira_sync_walks_up_to_fetch_a_missing_parent(tmp_path, monkeypatch):
+    # PAY-1 was recently updated and points at parent PAY-100, which was NOT — without a
+    # walk-up, PAY-100 (and the part_of edge pointing at it) would never reach memory.
+    calls = []
+
+    def fake_get_json(url, **kw):
+        params = kw.get("params", {})
+        calls.append(params.get("jql", ""))
+        if "key in" in params.get("jql", ""):
+            assert "PAY-100" in params["jql"]
+            return {"issues": [{"key": "PAY-100", "fields": {"summary": "Epic"}}]}
+        return {"issues": [{"key": "PAY-1", "fields": {"summary": "S", "parent": {"key": "PAY-100"}}}],
+                "total": 1}
+
+    monkeypatch.setattr("quickjoiner.connectors.jira.get_json", fake_get_json)
+    conn = create_connector(SourceConfig(name="j", type="jira", options={"base_url": "https://x"}), tmp_path)
+    docs = list(conn.sync({}))
+    keys = {d.uri.rsplit("/", 1)[-1] for d in docs}
+    assert keys == {"PAY-1", "PAY-100"}
+    assert any("key in" in c for c in calls)  # the walk-up actually happened
+
+
+def test_jira_get_issue_tool_returns_full_detail_with_links_and_comments(tmp_path, monkeypatch):
+    def fake_get_json(url, **kw):
+        assert url.endswith("/rest/api/2/issue/PAY-1")
+        return {"fields": {
+            "summary": "Migrate ledger", "status": {"name": "In Progress"},
+            "assignee": {"displayName": "Priya"}, "issuetype": {"name": "Story"},
+            "priority": {"name": "High"}, "labels": ["db"], "parent": {"key": "PAY-100"},
+            "description": "Plain text description.",
+            "issuelinks": [
+                {"type": {"name": "Blocks", "outward": "blocks"}, "outwardIssue": {
+                    "key": "PAY-2", "fields": {"summary": "Downstream job"}}},
+            ],
+            "comment": {"comments": [{"author": {"displayName": "Chen"}, "body": "LGTM"}]},
+        }}
+
+    monkeypatch.setattr("quickjoiner.connectors.jira.get_json", fake_get_json)
+    conn = create_connector(SourceConfig(name="j", type="jira", options={"base_url": "https://x"}), tmp_path)
+    tool = next(t for t in conn.tools() if t.spec.name.startswith("jira_get_issue"))
+    out = tool.fn(issue_key="PAY-1")
+    assert "Migrate ledger" in out and "Priya" in out and "High" in out and "PAY-100" in out
+    assert "Plain text description." in out
+    assert "blocks: PAY-2 - Downstream job" in out
+    assert "Chen: LGTM" in out
 
 
 def test_adf_flattening_nested_lists():
@@ -467,11 +580,41 @@ def test_azure_devops_documents():
             "System.Description": "<div>Job exceeds <b>30m</b> budget.</div>",
         },
     }
-    doc = work_item_document("https://dev.azure.com/acme", item)
+    doc = work_item_document("https://dev.azure.com/acme", item, team="Payments")
     assert doc.kind == "ticket"
     assert "Nightly settlement job times out" in doc.title
     assert "Chen" in doc.text and "30m" in doc.text and "<div>" not in doc.text
-    assert not doc.metadata.get("graph")  # no relations -> no dev-link graph
+    assert not doc.metadata.get("graph")  # no relations -> no dev-link/hierarchy graph
+    # Display metadata (the document browser's tree view reads this, not the graph) is
+    # always attached for a ticket doc, independent of whether it has any relations.
+    assert doc.metadata["display"] == {
+        "id": 1001, "work_item_type": "Bug", "state": "Active", "team": "Payments",
+        "sprint": "Sprint 42", "changed_date": "2026-07-04T00:00:00Z",
+        "closed_date": "", "parent_id": None,
+        "assigned_to": "Chen", "tags": ["prod"],
+    }
+
+
+def test_azure_devops_document_splits_multiple_tags_and_defaults_unassigned():
+    item = {
+        "id": 2002,
+        "fields": {
+            "System.WorkItemType": "Task",
+            "System.Title": "T",
+            "System.Tags": "prod; security ; needs-review",
+        },
+    }
+    doc = work_item_document("https://dev.azure.com/acme", item)
+    assert doc.metadata["display"]["tags"] == ["prod", "security", "needs-review"]
+    assert doc.metadata["display"]["assigned_to"] == "unassigned"
+
+
+def test_azure_devops_document_team_defaults_blank_for_walked_up_parents():
+    # A Feature/Epic reached only by walking up the hierarchy has no single owning team
+    # from that pull — must be left blank, never guessed.
+    doc = work_item_document("https://dev.azure.com/acme",
+                              {"id": 2, "fields": {"System.Title": "Parent feature"}})
+    assert doc.metadata["display"]["team"] == ""
 
 
 def test_ado_dev_link_graph_links_ticket_to_repo_and_branch():
@@ -532,6 +675,107 @@ def test_ado_work_item_document_attaches_dev_link_graph():
     assert any(e[1] == "implemented_in" for e in doc.metadata["graph"]["edges"])
 
 
+def test_workitem_id_from_url_parses_the_trailing_id():
+    assert _workitem_id_from_url("https://dev.azure.com/acme/_apis/wit/workItems/12345") == 12345
+    assert _workitem_id_from_url("https://dev.azure.com/acme/_apis/wit/workItems/12345/") == 12345
+    assert _workitem_id_from_url("vstfs:///Git/Ref/p%2Fg1%2FGBmain") is None  # not a workItems url
+    assert _workitem_id_from_url("") is None
+
+
+def test_next_hierarchy_ids_walks_up_always_and_down_only_for_containers():
+    # A Feature/Epic's real child list is what a completed one otherwise loses entirely —
+    # walking down from it is what fixes that (reported live: a Feature with ~10 real
+    # children only showed the 3 that independently happened to still be in a recent
+    # sprint; another Feature with none recent enough was entirely absent).
+    feature = {
+        "id": 100,
+        "fields": {"System.WorkItemType": "Feature"},
+        "relations": [
+            {"rel": "System.LinkTypes.Hierarchy-Reverse",
+             "url": "https://dev.azure.com/acme/_apis/wit/workItems/1"},  # its Epic
+            {"rel": "System.LinkTypes.Hierarchy-Forward",
+             "url": "https://dev.azure.com/acme/_apis/wit/workItems/101"},  # a child story
+            {"rel": "System.LinkTypes.Hierarchy-Forward",
+             "url": "https://dev.azure.com/acme/_apis/wit/workItems/102"},  # another
+        ],
+    }
+    assert _next_hierarchy_ids(feature, seen=set()) == {1, 101, 102}
+
+    # Already-seen ids are never re-requested.
+    assert _next_hierarchy_ids(feature, seen={1, 101}) == {102}
+
+    # A Story/Bug/Task is NOT walked down — only its parent matters. Walking down from
+    # every leaf would reopen the flat-300k-item problem the sprint window exists to avoid.
+    story = {
+        "id": 200,
+        "fields": {"System.WorkItemType": "Product Backlog Item"},
+        "relations": [
+            {"rel": "System.LinkTypes.Hierarchy-Reverse",
+             "url": "https://dev.azure.com/acme/_apis/wit/workItems/100"},
+            {"rel": "System.LinkTypes.Hierarchy-Forward",
+             "url": "https://dev.azure.com/acme/_apis/wit/workItems/201"},  # a task — ignored
+        ],
+    }
+    assert _next_hierarchy_ids(story, seen=set()) == {100}
+
+
+def test_hierarchy_graph_asserts_part_of_and_related_to():
+    item = {
+        "id": 500,
+        "relations": [
+            {"rel": "System.LinkTypes.Hierarchy-Reverse",  # this item's PARENT
+             "url": "https://dev.azure.com/acme/_apis/wit/workItems/400",
+             "attributes": {"name": "Parent"}},
+            {"rel": "System.LinkTypes.Related",
+             "url": "https://dev.azure.com/acme/_apis/wit/workItems/501"},
+            {"rel": "ArtifactLink",  # dev-link — not this function's concern
+             "url": "vstfs:///Git/Ref/p%2Fg1%2FGBmain"},
+        ],
+    }
+    g = hierarchy_graph(item)
+    edges = {(s, r, d) for s, r, d, _ in g["edges"]}
+    assert ("ticket:#500", "part_of", "ticket:#400") in edges
+    assert ("ticket:#500", "related_to", "ticket:#501") in edges
+    types = {e[0]: e[2] for e in g["entities"]}
+    assert types["ticket:#500"] == types["ticket:#400"] == "ticket"  # uniform entity type
+
+
+def test_hierarchy_graph_empty_without_hierarchy_or_related_links():
+    assert hierarchy_graph({"id": 1, "relations": []}) == {}
+    assert hierarchy_graph({"id": 1}) == {}
+    # a lone ArtifactLink (dev-link) relation isn't this function's concern either
+    assert hierarchy_graph({"id": 1, "relations": [{"rel": "ArtifactLink", "url": "vstfs:///Git/Ref/x"}]}) == {}
+
+
+def test_merge_graphs_dedupes_entities_and_concatenates_edges():
+    a = {"entities": [("ticket:#1", "#1", "ticket"), ("repo:x", "x", "repo")],
+         "aliases": [], "edges": [("ticket:#1", "implemented_in", "repo:x", "d1")]}
+    b = {"entities": [("ticket:#1", "#1", "ticket"), ("ticket:#2", "#2", "ticket")],
+         "aliases": [], "edges": [("ticket:#1", "part_of", "ticket:#2", "d2")]}
+    merged = _merge_graphs(a, b, {})
+    assert len(merged["entities"]) == 3  # ticket:#1 deduped, not doubled
+    assert len(merged["edges"]) == 2
+    assert _merge_graphs({}, {}) == {}
+
+
+def test_ado_work_item_document_merges_dev_link_and_hierarchy_graphs():
+    # A work item can have BOTH a Development link and a hierarchy parent — both must
+    # survive onto the document's single "graph" metadata block.
+    item = {
+        "id": 900, "fields": {"System.Title": "T"},
+        "relations": [
+            {"rel": "ArtifactLink", "url": "vstfs:///Git/Ref/p%2Fg1%2FGBmain"},
+            {"rel": "System.LinkTypes.Hierarchy-Reverse",
+             "url": "https://dev.azure.com/acme/_apis/wit/workItems/800"},
+        ],
+    }
+    doc = work_item_document("https://dev.azure.com/acme", item, {"g1": "Widgets"})
+    edges = {(s, r, d) for s, r, d, _ in doc.metadata["graph"]["edges"]}
+    assert ("ticket:#900", "implemented_in", "repo:widgets") in edges
+    assert ("ticket:#900", "part_of", "ticket:#800") in edges
+    assert doc.metadata["display"]["parent_id"] == 800
+
+
 def test_ado_select_recent_iterations_takes_last_started_sprints():
     iters = [
         {"id": "1", "name": "Sprint 1", "attributes": {"startDate": "2026-01-01T00:00:00Z", "timeFrame": "past"}},
@@ -544,6 +788,21 @@ def test_ado_select_recent_iterations_takes_last_started_sprints():
     # last 2 that have started (future Sprint 4 excluded, backlog excluded), in order
     assert [it["name"] for it in picked] == ["Sprint 2", "Sprint 3"]
     assert [it["name"] for it in select_recent_iterations(iters, 0)] == ["Sprint 1", "Sprint 2", "Sprint 3"]
+
+
+def test_team_is_dormant_when_the_checked_window_is_old():
+    now = datetime(2026, 7, 26, tzinfo=timezone.utc)
+    old_sprint = {"attributes": {"finishDate": "2025-01-15T00:00:00Z"}}  # well over a year back
+    recent_sprint = {"attributes": {"finishDate": "2026-07-01T00:00:00Z"}}  # just a quiet sprint
+
+    assert _team_is_dormant(old_sprint, 365, now) is True
+    assert _team_is_dormant(recent_sprint, 365, now) is False
+    # No iteration to judge from, or the check disabled -> never labelled dormant.
+    assert _team_is_dormant(None, 365, now) is False
+    assert _team_is_dormant(old_sprint, 0, now) is False
+    # A malformed/missing finish date is treated as "can't tell", not "assume dormant".
+    assert _team_is_dormant({"attributes": {}}, 365, now) is False
+    assert _team_is_dormant({"attributes": {"finishDate": "not-a-date"}}, 365, now) is False
 
 
 def test_ado_build_map_document_links_pipelines_to_repos():

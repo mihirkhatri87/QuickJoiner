@@ -206,6 +206,18 @@ def test_agent_eval_flags_false_refusal_and_missing_keywords(learned_ctx, evalse
     assert summary["refusal_accuracy"] == 0.0
 
 
+def test_is_refusal_matches_typographic_apostrophe():
+    # Live models (observed against a real gpt-oss broker) render the mandated
+    # refusal phrase with a mix of straight and curly apostrophes even within
+    # one eval run — the harness must not undercount real refusals over a
+    # punctuation glyph.
+    from quickjoiner.evals.harness import is_refusal
+
+    assert is_refusal("I haven’t learned that yet.")
+    assert is_refusal("I haven't learned that information yet.")
+    assert not is_refusal("Deploys happen weekly.")
+
+
 # -- threshold calibration -------------------------------------------------------
 
 def _answerable(cid, hit_score):

@@ -54,6 +54,11 @@ class FakeCatalog:
     def set_sync_state(self, sid, k, v):
         self.calls.append("set_sync_state")
 
+    def set_sync_state_many(self, sid, state):
+        # Connector-authored watermark keys (e.g. a Graph deltaLink) — written before
+        # `since` so a stale loaded value can't clobber the new one.
+        self.calls.append("set_sync_state_many")
+
     def delete_documents_for_source(self, sid):
         self.calls.append("delete_documents_for_source")
         return 7

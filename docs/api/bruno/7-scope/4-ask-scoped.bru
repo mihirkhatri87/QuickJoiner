@@ -1,0 +1,27 @@
+meta {
+  name: Ask a scoped question
+  type: http
+  seq: 4
+}
+
+post {
+  url: {{baseUrl}}/api/chat
+  body: json
+}
+
+body:json {
+  {
+    "message": "{{askQuestion}}",
+    "scope": { "source_ids": [], "doc_ids": [], "tags": ["{{scopeTag}}"] }
+  }
+}
+
+docs {
+  Server-Sent Events, like the unscoped ask. The scope is resolved once, before any search,
+  into a filter applied inside both the vector and full-text queries — so this genuinely
+  searches less rather than discarding results afterwards. Live tools for connectors outside
+  the scope are not offered on this turn, which is where the saved round-trips come from.
+
+  A scoped "no results" is reported as "not in the sources you scoped to", never as "the
+  organisation never learned this" — the model is told it only searched a slice.
+}

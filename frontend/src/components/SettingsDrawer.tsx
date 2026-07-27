@@ -13,9 +13,9 @@ import {
   Users,
   X,
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, token } from "../api";
-import type { AuthStatus, ConnectorRow, ConnectorType, SettingDefaults, Settings, SyncJob, UserRow } from "../types";
+import type { AuthStatus, ConnectorRow, ConnectorType, OAuthStatus, SettingDefaults, Settings, SyncJob, UserRow } from "../types";
 import { EditConnectorModal } from "./EditConnectorModal";
 import { Button, cn, Field, IconButton, schedLabel, Select, SYNC_OPTIONS, TextInput } from "./ui";
 
@@ -927,7 +927,13 @@ function Connectors({
         canShare={auth.enabled && !!auth.user}
         onBack={() => setAdding("pick")}
         onCreated={(name) => {
-          onFlash(`Connected ${name}. Sync it to start learning.`);
+          // "Sync it to start learning" is wrong for a connector that must be signed in
+          // first — and for OneDrive, syncing is not how documents get in at all.
+          onFlash(
+            adding.next_step
+              ? `Connected ${name}. ${adding.next_step.replace(/\*\*/g, "")}`
+              : `Connected ${name}. Sync it to start learning.`,
+          );
           setAdding(null);
           load();
           onChanged();
@@ -1124,6 +1130,157 @@ function UploadsPlate({
   );
 }
 
+/** The OneDrive/SharePoint half of a connector plate: who it is signed in as, and the
+ * on-demand "learn this document" box.
+ *
+ * This connector deliberately has no crawl, so the plate's Sync button only refreshes
+ * what was already learned — the box below is the actual way documents get in. Sign-in
+ * opens Microsoft in a new tab (the authorization-code + PKCE flow); we poll status
+ * while that tab is open rather than trying to observe it, because a cross-origin tab
+ * tells us nothing and the user may take a while over MFA. */
+function OneDrivePanel({ c }: { c: ConnectorRow }) {
+  const [status, setStatus] = useState<OAuthStatus | null>(null);
+  const [targets, setTargets] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [ok, setOk] = useState(true);
+  const [notes, setNotes] = useState<string[]>([]);
+  const pollRef = useRef<number | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      setStatus(await api.oauthStatus(c.name));
+    } catch {
+      setStatus(null);
+    }
+  }, [c.name]);
+
+  useEffect(() => {
+    refresh();
+    return () => {
+      if (pollRef.current) window.clearInterval(pollRef.current);
+    };
+  }, [refresh]);
+
+  const signIn = async () => {
+    setMsg("");
+    try {
+      const { authorize_url } = await api.oauthStart(c.name);
+      window.open(authorize_url, "_blank", "noopener,noreferrer");
+      setMsg("Finish signing in on the Microsoft tab…");
+      setOk(true);
+      // Poll until the callback lands, then stop. Bounded so a cancelled sign-in
+      // doesn't leave a timer running for the life of the page.
+      let ticks = 0;
+      if (pollRef.current) window.clearInterval(pollRef.current);
+      pollRef.current = window.setInterval(async () => {
+        ticks += 1;
+        const s = await api.oauthStatus(c.name).catch(() => null);
+        if (s?.signed_in || ticks > 60) {
+          if (pollRef.current) window.clearInterval(pollRef.current);
+          pollRef.current = null;
+          setStatus(s);
+          if (s?.signed_in) setMsg(`Signed in as ${s.account}`);
+        }
+      }, 3000);
+    } catch (e) {
+      setMsg(String((e as Error).message));
+      setOk(false);
+    }
+  };
+
+  const learn = async () => {
+    const list = targets
+      .split("\n")
+      .map((t) => t.trim())
+      .filter(Boolean);
+    if (!list.length) return;
+    setBusy(true);
+    setNotes([]);
+    setMsg("reading…");
+    setOk(true);
+    try {
+      const r = await api.onedriveLearn(c.name, list);
+      setNotes(r.notes || []);
+      setOk(r.learned > 0);
+      setMsg(
+        r.learned > 0
+          ? `Learned ${r.learned} document(s) — ${r.ingested ?? ""}`
+          : "Nothing could be learned",
+      );
+      if (r.learned > 0) setTargets("");
+      refresh();
+    } catch (e) {
+      setMsg(String((e as Error).message));
+      setOk(false);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="mt-3 rounded-md bg-fill2 p-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <span
+          className={cn(
+            "rounded-full px-2.5 py-1 font-mono text-[9px] uppercase tracking-[0.12em]",
+            status?.signed_in ? "bg-accent-soft text-accent" : "bg-gold-soft text-gold",
+          )}
+        >
+          {status?.signed_in ? `signed in · ${status.account || "microsoft 365"}` : "not signed in"}
+        </span>
+        {status?.signed_in && (
+          <span className="font-mono text-[10px] text-faint">{status.learned} learned</span>
+        )}
+        {c.can_manage && (
+          <button
+            onClick={status?.signed_in ? () => api.oauthSignOut(c.name).then(refresh) : signIn}
+            className="ml-auto rounded-full bg-fill px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.12em] text-ink hover:bg-raised2"
+          >
+            {status?.signed_in ? "Sign out" : "Sign in with Microsoft"}
+          </button>
+        )}
+      </div>
+      {status?.signed_in && (
+        <div className="mt-2.5">
+          <textarea
+            value={targets}
+            onChange={(e) => setTargets(e.target.value)}
+            rows={2}
+            placeholder={"Paste a OneDrive/SharePoint link, or a path in your drive — one per line"}
+            className="w-full rounded-md bg-fill px-3 py-2 text-[12.5px] text-ink outline-none placeholder:text-faint"
+          />
+          <div className="mt-1.5 flex items-center gap-2">
+            <button
+              onClick={learn}
+              disabled={busy || !targets.trim()}
+              className="rounded-full bg-accent-soft px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.12em] text-accent hover:brightness-125 disabled:opacity-40"
+            >
+              {busy ? "Learning…" : "Learn these documents"}
+            </button>
+            <span className="font-mono text-[9.5px] text-faint">
+              nothing is crawled — only what you list here
+            </span>
+          </div>
+        </div>
+      )}
+      {msg && (
+        <div className={cn("mt-2 text-[11.5px]", ok ? "text-muted" : "text-danger")}>{msg}</div>
+      )}
+      {/* What was NOT learned, and why — shown rather than swallowed. */}
+      {notes.length > 0 && (
+        <ul className="mt-1.5 space-y-0.5">
+          {notes.map((n, i) => (
+            <li key={i} className="font-mono text-[10px] text-gold">
+              · {n}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 function ConnectorPlate({
   c,
   types,
@@ -1153,6 +1310,7 @@ function ConnectorPlate({
   const ctype = types.find((t) => t.type === c.type);
   const label = ctype?.label ?? c.type;
   const isRepo = c.type === "git" || c.type === "files";
+  const isOneDrive = c.type === "onedrive";
   const flash = (m: string, ok = true) => {
     setPmsg(m);
     setPok(ok);
@@ -1260,6 +1418,7 @@ function ConnectorPlate({
           </span>
         ))}
       </div>
+      {isOneDrive && <OneDrivePanel c={c} />}
       <div className="mt-3 flex flex-wrap items-center gap-1">
         <IconButton
           title="Test connection"
@@ -1388,6 +1547,15 @@ function ConnectorPlate({
   );
 }
 
+/** Renders `**bold**` spans in a connector's next_step text. Deliberately not the full
+ * markdown renderer: this is one short sentence naming a button, and pulling the whole
+ * renderer (and its citation/mermaid machinery) into a settings form would be absurd. */
+function boldParts(text: string) {
+  return text.split(/\*\*(.+?)\*\*/g).map((part, i) =>
+    i % 2 === 1 ? <strong key={i}>{part}</strong> : <span key={i}>{part}</span>,
+  );
+}
+
 function ConnectorForm({
   type,
   canShare,
@@ -1441,6 +1609,14 @@ function ConnectorForm({
   return (
     <div>
       <Crumb onClick={onBack}>Pick another system</Crumb>
+      {/* Some connectors need a step this form can't perform — OneDrive's sign-in only
+          becomes possible once the connector exists. Say so here rather than leaving
+          someone looking for a button that isn't on this screen yet. */}
+      {type.next_step && (
+        <div className="mb-3 rounded-md bg-accent-soft px-3 py-2.5 text-[12px] leading-snug text-accent">
+          {boldParts(type.next_step)}
+        </div>
+      )}
       <Field label="Name *" hint="How this connector appears everywhere — pick something recognizable.">
         <TextInput value={name} placeholder={`e.g. ${type.type}-main`} onChange={(e) => setName(e.target.value)} />
       </Field>

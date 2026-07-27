@@ -25,6 +25,8 @@ from pathlib import Path
 
 import yaml
 
+from quickjoiner.ingest.normalize import normalize_query
+
 # The system prompt mandates this phrasing for ungrounded questions.
 REFUSAL_MARKERS = ("haven't learned", "have not learned", "not learned that yet")
 
@@ -282,7 +284,12 @@ def compare_reports(old: dict, new: dict) -> dict:
 # -- agent layer -----------------------------------------------------------------
 
 def is_refusal(answer: str) -> bool:
-    lowered = answer.lower()
+    # Models render the mandated refusal phrase with a mix of straight and
+    # typographic apostrophes ("haven't" vs "haven't") even within the same
+    # session — fold to ASCII before matching so real refusals aren't scored
+    # as false answers over a punctuation glyph. Uses the same char-fold table
+    # ingestion normalizes doc text with.
+    lowered = normalize_query(answer).lower()
     return any(marker in lowered for marker in REFUSAL_MARKERS)
 
 

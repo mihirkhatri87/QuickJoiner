@@ -1,0 +1,25 @@
+meta {
+  name: Tag a folder
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/api/labels
+  body: json
+}
+
+body:json {
+  {
+    "source_id": "{{scopeSourceId}}",
+    "uri_prefix": "{{scopeFolderPrefix}}",
+    "kind": "tag",
+    "value": "{{scopeTag}}"
+  }
+}
+
+docs {
+  Set `uri_prefix` to '' to tag the whole connector, a folder prefix to tag that folder
+  (files ingested into it later inherit the tag), or a full document uri for one document.
+  `kind` is "tag" or "aka".
+}

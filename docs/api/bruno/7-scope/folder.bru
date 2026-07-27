@@ -1,0 +1,19 @@
+meta {
+  name: 7-scope
+  seq: 8
+}
+
+docs {
+  # Document browser, labels, and scoped questions
+
+  Three related things:
+
+  1. **See what a connector ingested** — `GET /api/sources/{id}/documents`, each document with
+     the labels that apply to it (including ones inherited from its folder or the connector).
+  2. **Label it** — a `tag` scopes questions; an `aka` gives content an alternate name.
+     `uri_prefix` picks the granularity: `''` = the whole connector, a folder path = that
+     folder **and files ingested into it later**, a full document uri = just that document.
+  3. **Ask a scoped question** — `POST /api/chat` with a `scope`. It is resolved server-side
+     into a real pre-filter on both retrieval legs, AND live tools for connectors outside the
+     scope are withheld for that turn. Omit `scope` for the usual all-of-memory behaviour.
+}

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from datetime import datetime, timezone
 from typing import Any, Iterator
 from urllib.parse import quote
 
@@ -16,6 +17,19 @@ WORK_ITEM_BATCH = 200
 DEFAULT_SPRINTS = 10       # per team, most recent N iterations that have started
 TEAM_PAGE = 100            # teams list page size
 MAX_WORK_ITEMS = 8000      # safety cap across all teams' recent sprints
+MAX_HIERARCHY_DEPTH = 8    # walk-up bound fetching parent Features/Epics — generous over
+                           # the ~3-4 real levels a process template ever has
+# A large org's "every team" list often includes teams that haven't shipped anything in
+# a year or more (observed live: "a lot of teams that don't have anything in this year or
+# last year" on the org's own ADO Teams page). Their most-recent-N-sprints window is
+# already empty today — nothing wrong gets ingested — but that ran silently, with no way
+# to tell "genuinely inactive team" apart from "a transient API hiccup". This is purely a
+# visibility threshold: a dormant team is reported and skipped, never guessed into having
+# data it doesn't. Live tools (ado_query_work_items/ado_get_work_item) are NOT scoped to
+# ingested teams at all — they run WIQL/by-id lookups against the whole project — so a
+# question about a skipped team still gets a live, current answer; it just isn't
+# pre-loaded into grounded memory.
+DEFAULT_STALE_AFTER_DAYS = 365
 
 
 def _decode_git_artifact(url: str) -> tuple[str, str, str] | None:
@@ -90,9 +104,135 @@ def dev_link_graph(item: dict[str, Any], repo_names: dict[str, str]) -> dict:
     return {"entities": list(entities.values()), "aliases": [], "edges": list(edges.values())}
 
 
+def _workitem_id_from_url(url: str) -> int | None:
+    """Parse the trailing numeric id from a Hierarchy/Related relation's REST url
+    (".../_apis/wit/workItems/12345"). A materially different shape from
+    `_decode_git_artifact`'s `vstfs:///Git/...` artifact URIs — Hierarchy and Related
+    relations point at another work item via a plain REST url, not an artifact scheme."""
+    tail = (url or "").rstrip("/").rsplit("/", 1)[-1]
+    return int(tail) if tail.isdigit() else None
+
+
+def _relation_target_ids(item: dict[str, Any], rel_type: str) -> list[int]:
+    """Every relation target id of a given `rel` type on a work item's `relations`."""
+    out = []
+    for rel in item.get("relations", []) or []:
+        if rel.get("rel") == rel_type:
+            wid = _workitem_id_from_url(rel.get("url", ""))
+            if wid is not None:
+                out.append(wid)
+    return out
+
+
+_HIERARCHY_PARENT_REL = "System.LinkTypes.Hierarchy-Reverse"
+_HIERARCHY_CHILD_REL = "System.LinkTypes.Hierarchy-Forward"
+# Only Epic/Feature-typed items get their CHILDREN walked (not Story/Bug/Task) — walking
+# down from every leaf would reopen the flat-300k-item problem the sprint window exists to
+# avoid. Case-insensitive: process templates vary (Agile/Scrum/CMMI all use these two names;
+# Basic has no "Feature" tier at all, which is fine — nothing to walk down from there).
+_HIERARCHY_CONTAINER_TYPES = {"epic", "feature"}
+
+
+def _next_hierarchy_ids(item: dict[str, Any], seen: set[int]) -> set[int]:
+    """Ids still worth fetching to make this item's hierarchy neighborhood complete in
+    memory, not just whatever a team's recent-sprint pull happened to touch:
+
+    - this item's PARENT, always (so a leaf story's Feature/Epic reaches memory even when
+      neither carries a sprint iteration of its own — the walk UP);
+    - for an Epic or Feature specifically, its CHILDREN too (the walk DOWN). Without this,
+      a Feature/Epic is only ever discovered via one of its descendants happening to still
+      be in a team's last-N-sprints window, and even then only THAT ONE descendant's path
+      is known — every sibling Story/Bug that isn't independently in-window stays invisible.
+      Observed live: a completed "Tech Debt" Feature was entirely absent (none of its
+      children were recent enough to be pulled by anything), and a "Provisioning" Feature
+      that WAS discovered only showed 3 of its ~10 real children for the same reason.
+
+    Both directions read relations already present on the fetched item — `$expand=relations`
+    returns EVERY relation type, not just the one being filtered for, so this costs no extra
+    API call beyond fetching the ids it turns up."""
+    ids: set[int] = set(
+        pid for pid in _relation_target_ids(item, _HIERARCHY_PARENT_REL) if pid not in seen
+    )
+    wi_type = (item.get("fields", {}).get("System.WorkItemType") or "").strip().lower()
+    if wi_type in _HIERARCHY_CONTAINER_TYPES:
+        ids.update(
+            cid for cid in _relation_target_ids(item, _HIERARCHY_CHILD_REL) if cid not in seen
+        )
+    return ids
+
+
+def hierarchy_graph(item: dict[str, Any]) -> dict:
+    """Knowledge-graph assertions from a work item's Hierarchy/Related links — the piece
+    `dev_link_graph` deliberately doesn't touch (it only reads `ArtifactLink` relations).
+
+    Same return shape as `dev_link_graph` (an `{entities, aliases, edges}` dict consumed by
+    `IngestPipeline._sync_graph`), asserted deterministically from TFS's own relations:
+      `ticket:#N --part_of--> ticket:#parent` (`System.LinkTypes.Hierarchy-Reverse` — this
+        item's parent; the child asserts the edge, matching the Jira connector's
+        `ticket --part_of--> epic` convention so both connectors' hierarchy edges read the
+        same way to the agent),
+      `ticket:#N --related_to--> ticket:#M` (`System.LinkTypes.Related`).
+    Entity type stays "ticket" uniformly (not "epic"/"feature"/etc.) — Epic vs. Feature vs.
+    Story vs. Task is a work-item-TYPE distinction, not a graph-vocabulary one, and keeping
+    one type here is what lets these ids keep matching Jira's own `ticket:` entities and the
+    dev-link edges' `ticket:#N` ids for the SAME work item. Returns {} when there's neither
+    relation type present (matches `dev_link_graph`'s contract)."""
+    wid = item.get("id")
+    if wid is None:
+        return {}
+    ticket_id = f"ticket:#{wid}"
+    entities: dict[str, tuple[str, str, str]] = {}
+    edges: dict[tuple[str, str, str], tuple[str, str, str, str]] = {}
+
+    parent_ids = _relation_target_ids(item, _HIERARCHY_PARENT_REL)
+    if parent_ids:
+        entities[ticket_id] = (ticket_id, f"#{wid}", "ticket")
+        for pid in parent_ids:
+            parent = f"ticket:#{pid}"
+            entities[parent] = (parent, f"#{pid}", "ticket")
+            edges[(ticket_id, "part_of", parent)] = (ticket_id, "part_of", parent, "parent work item")
+
+    related_ids = _relation_target_ids(item, "System.LinkTypes.Related")
+    if related_ids:
+        entities[ticket_id] = (ticket_id, f"#{wid}", "ticket")
+        for rid_num in related_ids:
+            related = f"ticket:#{rid_num}"
+            entities[related] = (related, f"#{rid_num}", "ticket")
+            edges[(ticket_id, "related_to", related)] = (
+                ticket_id, "related_to", related, "related work item")
+
+    if not edges:
+        return {}
+    return {"entities": list(entities.values()), "aliases": [], "edges": list(edges.values())}
+
+
+def _merge_graphs(*graphs: dict) -> dict:
+    """Combine multiple `{entities, aliases, edges}` graph dicts (the shape both
+    `dev_link_graph` and `hierarchy_graph` return) into one, deduping entities by id.
+    Returns {} if nothing had any edges — same "attach no graph metadata" contract as
+    the individual extractors."""
+    entities: dict[str, tuple[str, str, str]] = {}
+    aliases: list[tuple[str, str]] = []
+    edges: list[tuple[str, str, str, str]] = []
+    for g in graphs:
+        if not g:
+            continue
+        for e in g.get("entities", []):
+            entities[e[0]] = e
+        aliases.extend(g.get("aliases", []))
+        edges.extend(g.get("edges", []))
+    if not edges:
+        return {}
+    return {"entities": list(entities.values()), "aliases": aliases, "edges": edges}
+
+
 def work_item_document(
-    org_url: str, item: dict[str, Any], repo_names: dict[str, str] | None = None
+    org_url: str, item: dict[str, Any], repo_names: dict[str, str] | None = None,
+    team: str | None = None,
 ) -> Document:
+    """`team` (optional) is the team whose sprint pull surfaced this item — None for a
+    parent Epic/Feature reached only by walking up the hierarchy (see `sync()`), which
+    genuinely has no single owning team from this pull; left blank rather than guessed."""
     f = item.get("fields", {})
     assignee = (f.get("System.AssignedTo") or {})
     assignee_name = assignee.get("displayName", "unassigned") if isinstance(assignee, dict) else str(assignee)
@@ -103,14 +243,36 @@ def work_item_document(
         f"Tags: {f.get('System.Tags', 'none')} | Updated: {f.get('System.ChangedDate', '')}\n\n"
         f"{_strip_html(f.get('System.Description') or '(no description)')}"
     )
-    graph = dev_link_graph(item, repo_names or {})
+    graph = _merge_graphs(dev_link_graph(item, repo_names or {}), hierarchy_graph(item))
+    parent_ids = _relation_target_ids(item, _HIERARCHY_PARENT_REL)
+    metadata: dict[str, Any] = {
+        # UI-display-only, distinct from "graph" above — see the document-browser's
+        # Epic/Feature/Story/Task tree, which reads this rather than querying graph edges.
+        "display": {
+            "id": item.get("id"),
+            "work_item_type": f.get("System.WorkItemType", ""),
+            "state": f.get("System.State", ""),
+            "team": team or "",
+            "sprint": f.get("System.IterationPath", ""),
+            "changed_date": f.get("System.ChangedDate", ""),
+            "closed_date": f.get("Microsoft.VSTS.Common.ClosedDate", ""),
+            "parent_id": parent_ids[0] if parent_ids else None,
+            "assigned_to": assignee_name,
+            # ADO's own field is one semicolon-separated string ("prod; security") — split
+            # into a real list so the document browser can filter by an exact tag, not a
+            # substring match on the raw field.
+            "tags": [t.strip() for t in (f.get("System.Tags") or "").split(";") if t.strip()],
+        },
+    }
+    if graph:
+        metadata["graph"] = graph
     return Document(
         uri=f"{org_url}/_workitems/edit/{item['id']}",
         title=f"#{item['id']}: {f.get('System.Title', '')}",
         text=text,
         kind="ticket",
         updated_at=f.get("System.ChangedDate"),
-        metadata={"graph": graph} if graph else {},
+        metadata=metadata,
     )
 
 
@@ -127,6 +289,25 @@ def select_recent_iterations(iterations: list[dict[str, Any]], count: int) -> li
     pool = started or dated  # fall back to all dated if the server omits timeFrame
     pool.sort(key=lambda it: it["attributes"]["startDate"])
     return pool[-count:] if count and count > 0 else pool
+
+
+def _team_is_dormant(latest_checked_iteration: dict[str, Any] | None, stale_after_days: int,
+                      now: datetime) -> bool:
+    """True when a team's most-recent checked sprint (already found to have zero work
+    items — see `sync()`) itself ended more than `stale_after_days` ago: the team hasn't
+    just had one quiet sprint, its whole checked window is old. `stale_after_days <= 0`
+    disables the check (every empty-window team is just reported as "no items this
+    window", never labelled dormant)."""
+    if latest_checked_iteration is None or stale_after_days <= 0:
+        return False
+    finish = (latest_checked_iteration.get("attributes") or {}).get("finishDate")
+    if not finish:
+        return False
+    try:
+        finish_dt = datetime.fromisoformat(finish.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return (now - finish_dt).days > stale_after_days
 
 
 def build_map_document(org_url: str, project: str, definitions: list[dict[str, Any]]) -> Document:
@@ -304,6 +485,7 @@ class AzureDevOpsConnector(Connector):
         org_url, project, headers = self._org_url(), self._project(), self._headers()
         api, verify = self._api(), self._verify()
         sprints = int(self.options.get("sprints") or DEFAULT_SPRINTS)
+        stale_after_days = int(self.options.get("stale_after_days") or DEFAULT_STALE_AFTER_DAYS)
 
         # -- Build pipelines -> repositories (TFS↔GitLab bridge) --------------
         # Emitted FIRST: this is cheap (a couple of calls) but carries the high-value
@@ -346,6 +528,7 @@ class AzureDevOpsConnector(Connector):
         # that means documents (and progress) start flowing early and the sync stays
         # interruptible, instead of a long silent, unstoppable enumeration up front.
         seen: set[int] = set()
+        item_team: dict[int, str] = {}  # id -> the team whose sprint pull first claimed it
         total = 0
         # Repo GUID→name map (one call) so work-item Development links can name the repo
         # they point at — the ticket→implemented_in→repo→(GitLab repo) chain.
@@ -366,8 +549,9 @@ class AzureDevOpsConnector(Connector):
                 ).get("value", [])
             except Exception:
                 continue  # team has no iteration settings, or no access — skip
+            picked_iterations = select_recent_iterations(iters, sprints)
             team_ids: list[int] = []
-            for it in select_recent_iterations(iters, sprints):
+            for it in picked_iterations:
                 self._checkpoint()  # each sprint is a separate HTTP call — stop between them
                 try:
                     rels = get_json(
@@ -381,6 +565,20 @@ class AzureDevOpsConnector(Connector):
                     if tid and tid not in seen:
                         seen.add(tid)
                         team_ids.append(tid)
+                        item_team[tid] = team
+            # A large "sync every team" project routinely includes teams that haven't
+            # shipped anything in a year or more — their recent-sprint window is correctly
+            # empty (nothing wrong gets ingested), but that happened silently before,
+            # indistinguishable from a transient API hiccup. Report it plainly instead.
+            if not team_ids and picked_iterations:
+                newest = picked_iterations[-1]  # select_recent_iterations returns oldest..newest
+                if _team_is_dormant(newest, stale_after_days, datetime.now(timezone.utc)):
+                    self._stage(
+                        f"work items · {team[:40]} — no activity in over {stale_after_days}d, skipped",
+                        ti, len(teams),
+                    )
+                else:
+                    self._stage(f"work items · {team[:40]} — nothing in this window", ti, len(teams))
             # Fetch this team's work items in id-batches, prefetching the NEXT batch while the
             # current one is parsed+embedded — the batch fetches were a serial per-team gap.
             batches = [team_ids[i : i + WORK_ITEM_BATCH]
@@ -399,10 +597,45 @@ class AzureDevOpsConnector(Connector):
                     ).get("value", [])
                     return items, (idx + 1 if idx + 1 < len(batches) else None)
 
+                hierarchy_ids: set[int] = set()  # unresolved parent/container-child ids this team's batch referenced
                 for items in prefetch_pages(fetch_batch, 0, self._checkpoint):
                     for item in items:
-                        yield work_item_document(org_url, item, repo_names)
+                        yield work_item_document(org_url, item, repo_names, team=item_team.get(item.get("id")))
                         total += 1
+                        hierarchy_ids.update(_next_hierarchy_ids(item, seen))
+
+                # Walk the hierarchy so it reaches memory COMPLETE, not just whichever
+                # slice a team's recent-sprint pull happened to touch: UP to a leaf's
+                # Feature/Epic (which carry no sprint iteration of their own and would
+                # otherwise never be returned above), and DOWN from any Epic/Feature to
+                # its real full child list (`_next_hierarchy_ids`) — without this second
+                # direction, a Feature/Epic whose children are mostly old/completed only
+                # ever showed the handful still recent enough to independently qualify
+                # (observed live: a Feature with ~10 real children showed 3; a Feature
+                # with NONE recent was entirely absent). Bounded + chunked (never
+                # truncated — don't silently drop any id even if a round is large).
+                depth = 0
+                while hierarchy_ids and depth < MAX_HIERARCHY_DEPTH:
+                    seen.update(hierarchy_ids)
+                    id_list = list(hierarchy_ids)
+                    next_ids: set[int] = set()
+                    for i in range(0, len(id_list), WORK_ITEM_BATCH):
+                        self._checkpoint()
+                        chunk = id_list[i : i + WORK_ITEM_BATCH]
+                        fetched = get_json(
+                            f"{org_url}/{project}/_apis/wit/workitems?{api}",
+                            headers=headers,
+                            params={"ids": ",".join(map(str, chunk)), "$expand": "relations"},
+                            verify=verify,
+                        ).get("value", [])
+                        for item in fetched:
+                            # No single owning team — an item reached only by walking the
+                            # hierarchy can span many teams; left blank, not guessed.
+                            yield work_item_document(org_url, item, repo_names, team=None)
+                            total += 1
+                            next_ids.update(_next_hierarchy_ids(item, seen))
+                    hierarchy_ids = next_ids
+                    depth += 1
             if total >= MAX_WORK_ITEMS:
                 break
 

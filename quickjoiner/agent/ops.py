@@ -119,6 +119,7 @@ def build_ops_tools(ctx) -> list[AgentTool]:
         state = {} if clean else ctx.catalog.get_sync_state(connector.source_id)
         started = datetime.now(timezone.utc).isoformat()
         stats = ctx.pipeline.ingest(connector.sync(state), connector.source_id)
+        ctx.catalog.set_sync_state_many(connector.source_id, state)
         ctx.catalog.set_sync_state(connector.source_id, "since", started)
         errors = f" Errors: {'; '.join(stats.errors[:3])}" if stats.errors else ""
         from quickjoiner.agent.repo_docs import maybe_autogenerate

@@ -33,6 +33,7 @@ def _load_builtin_connectors() -> None:
         gitlab,
         jira,
         octopus,
+        onedrive,
         self_connector,
         uploads,
     )

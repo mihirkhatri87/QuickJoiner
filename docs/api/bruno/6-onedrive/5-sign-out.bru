@@ -1,0 +1,14 @@
+meta {
+  name: Sign out
+  type: http
+  seq: 5
+}
+
+delete {
+  url: {{baseUrl}}/api/connectors/{{onedriveConnector}}/oauth
+}
+
+docs {
+  Deletes this connector's stored Microsoft 365 refresh token. Deleting the connector itself
+  does the same thing automatically — a live refresh token must not outlive its connector.
+}

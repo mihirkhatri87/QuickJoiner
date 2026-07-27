@@ -23,6 +23,7 @@ def _sync_job(ctx: AppContext, source_name: str) -> None:
         state = ctx.catalog.get_sync_state(connector.source_id)
         started = datetime.now(timezone.utc).isoformat()
         stats = ctx.pipeline.ingest(connector.sync(state), connector.source_id)
+        ctx.catalog.set_sync_state_many(connector.source_id, state)
         ctx.catalog.set_sync_state(connector.source_id, "since", started)
         log.info("scheduled sync %s: %s", source_name, stats.summary())
         from quickjoiner.agent.repo_docs import maybe_autogenerate

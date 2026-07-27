@@ -1,0 +1,28 @@
+meta {
+  name: Create OneDrive connector
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/api/connectors
+  body: json
+}
+
+body:json {
+  {
+    "name": "{{onedriveConnector}}",
+    "type": "onedrive",
+    "options": {
+      "client_id": "{{onedriveClientId}}",
+      "access": "my_drive,shared_with_me"
+    }
+  }
+}
+
+docs {
+  `access` asks for only the delegated Graph scopes you need: my_drive -> Files.Read,
+  shared_with_me -> Files.Read.All, sharepoint -> Sites.Read.All (usually admin consent).
+
+  The response's `test.message` will say "not signed in yet" — that is expected and OK.
+}

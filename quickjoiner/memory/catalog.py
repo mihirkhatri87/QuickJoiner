@@ -97,8 +97,24 @@ _SCHEMA_STATEMENTS = [
     """CREATE TABLE IF NOT EXISTS context_attachments (
         id TEXT PRIMARY KEY, session_id TEXT, filename TEXT NOT NULL,
         content_type TEXT NOT NULL DEFAULT '', size_bytes INTEGER NOT NULL DEFAULT 0,
-        char_count INTEGER NOT NULL DEFAULT 0, uploaded_at TEXT NOT NULL, deleted_at TEXT)""",
+        char_count INTEGER NOT NULL DEFAULT 0, uploaded_at TEXT NOT NULL, deleted_at TEXT,
+        extract_error TEXT NOT NULL DEFAULT '')""",
     "CREATE INDEX IF NOT EXISTS idx_context_attachments_uploaded ON context_attachments(uploaded_at)",
+    # User-declared labels over ingested documents (2026-07-25). ONE table covers all three
+    # granularities via `uri_prefix`, which is why folders behave the way people expect:
+    #   ''            -> the whole connector
+    #   'file:///d/docs/arch/'  -> that folder — documents ingested LATER inherit it, because
+    #                     the label is a prefix RULE resolved at query time, not a snapshot
+    #                     copied onto the rows that happened to exist when you tagged
+    #   a full uri    -> exactly one document
+    # `kind` splits the two jobs: 'tag' is a filter/scoping label; 'aka' is an alternate name
+    # that feeds the existing alias query-expansion path (memory/expansion.py), so calling a
+    # deck "the Zix roadmap" finds it without the words appearing in the file.
+    """CREATE TABLE IF NOT EXISTS doc_labels (
+        source_id TEXT NOT NULL, uri_prefix TEXT NOT NULL DEFAULT '',
+        kind TEXT NOT NULL DEFAULT 'tag', value TEXT NOT NULL, created_at TEXT NOT NULL,
+        PRIMARY KEY (source_id, uri_prefix, kind, value))""",
+    "CREATE INDEX IF NOT EXISTS idx_doc_labels_source ON doc_labels(source_id)",
 ]
 
 # Columns added to tables that already exist in the wild. Applied best-effort on every
@@ -118,11 +134,38 @@ _MIGRATION_STATEMENTS = [
     # didn't — without re-embedding. Existing docs default 0 (< current) so the next sync
     # that re-provides them refreshes their graph once, then settles.
     "ALTER TABLE documents ADD COLUMN graph_version INTEGER NOT NULL DEFAULT 0",
+    # Why an attachment yielded no text (image-only deck, missing parser, corrupt file).
+    # Without it a file that extracted to nothing was invisible to the agent, which then
+    # flailed instead of telling the user plainly that it could not read their file.
+    "ALTER TABLE context_attachments ADD COLUMN extract_error TEXT NOT NULL DEFAULT ''",
+    # Small connector-supplied JSON blob for UI display only (e.g. ADO work-item type/state/
+    # team/sprint/parent id) — deliberately separate from graph metadata (which becomes
+    # entities/edges, not stored raw). Default '{}' so every pre-existing document and every
+    # connector that never sets Document.metadata["display"] reads as an empty dict, not null.
+    "ALTER TABLE documents ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'",
 ]
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def label_applies(uri: str, uri_prefix: str) -> bool:
+    """Whether a label attached at `uri_prefix` covers a document at `uri` (pure).
+
+    An empty prefix is the whole connector. This is what makes a folder label live: it is
+    evaluated against each document's uri at query time, so files ingested after the label
+    was created are covered without anyone re-tagging anything.
+    """
+    return not uri_prefix or uri.startswith(uri_prefix)
+
+
+def _like_prefix(prefix: str) -> str:
+    """`prefix` as a SQL LIKE pattern, with the wildcards a real path may contain escaped —
+    a Windows path or a URL can legitimately hold `%` or `_`, which would otherwise silently
+    widen the match."""
+    escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return escaped + "%"
 
 
 class _SqlCatalog:
@@ -298,19 +341,114 @@ class _SqlCatalog:
             "SELECT * FROM documents WHERE source_id = ? ORDER BY uri", (source_id,)
         )
 
-    def upsert_document(self, doc_id, source_id, uri, title, kind, content_hash,
-                        updated_at, chunk_count, graph_version: int = 0) -> None:
+    def document_source(self, doc_id: str) -> str | None:
+        row = self._read_one("SELECT source_id FROM documents WHERE doc_id = ?", (doc_id,))
+        return row["source_id"] if row else None
+
+    # -- labels (tags / aka) over ingested documents --------------------------
+
+    def set_label(self, source_id: str, uri_prefix: str, kind: str, value: str) -> None:
+        """Attach a label to a connector (`uri_prefix=''`), a folder (a uri prefix), or one
+        document (its full uri). Idempotent."""
         self._write(
-            """INSERT INTO documents (doc_id, source_id, uri, title, kind, content_hash, updated_at, chunk_count, graph_version)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO doc_labels (source_id, uri_prefix, kind, value, created_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(source_id, uri_prefix, kind, value) DO NOTHING",
+            (source_id, uri_prefix, kind, value.strip(), _now()),
+        )
+
+    def remove_label(self, source_id: str, uri_prefix: str, kind: str, value: str) -> None:
+        self._write(
+            "DELETE FROM doc_labels WHERE source_id = ? AND uri_prefix = ? "
+            "AND kind = ? AND value = ?",
+            (source_id, uri_prefix, kind, value.strip()),
+        )
+
+    def labels_for_source(self, source_id: str) -> list[dict]:
+        return self._read_all(
+            "SELECT * FROM doc_labels WHERE source_id = ? ORDER BY uri_prefix, kind, value",
+            (source_id,),
+        )
+
+    def all_labels(self) -> list[dict]:
+        """Every label in the workspace — what the scope picker offers."""
+        return self._read_all("SELECT * FROM doc_labels ORDER BY kind, value, source_id")
+
+    def delete_labels_for_source(self, source_id: str) -> None:
+        self._write("DELETE FROM doc_labels WHERE source_id = ?", (source_id,))
+
+    def resolve_scope(
+        self,
+        source_ids: list[str] | None = None,
+        tags: list[str] | None = None,
+        doc_ids: list[str] | None = None,
+    ) -> tuple[list[str], list[str]]:
+        """Turn a user-facing scope selection into `(source_ids, doc_ids)` the stores can filter on.
+
+        A tag on a whole connector resolves to that **source_id**, not to an enumeration of its
+        documents — so the common case stays a cheap `source_id IN (...)` predicate however many
+        documents the connector holds. Only folder/document-scoped labels enumerate doc ids, and
+        those sets are small by construction.
+        """
+        out_sources = list(dict.fromkeys(source_ids or []))
+        out_docs = list(dict.fromkeys(doc_ids or []))
+        for tag in tags or []:
+            for row in self._read_all(
+                "SELECT source_id, uri_prefix FROM doc_labels WHERE kind = 'tag' AND value = ?",
+                (tag.strip(),),
+            ):
+                prefix = row.get("uri_prefix") or ""
+                if not prefix:
+                    if row["source_id"] not in out_sources:
+                        out_sources.append(row["source_id"])
+                    continue
+                for doc in self._read_all(
+                    "SELECT doc_id FROM documents WHERE source_id = ? AND uri LIKE ? ESCAPE '\\'",
+                    (row["source_id"], _like_prefix(prefix)),
+                ):
+                    if doc["doc_id"] not in out_docs:
+                        out_docs.append(doc["doc_id"])
+        return out_sources, out_docs
+
+    def aka_terms_for_documents(self, doc_ids: list[str]) -> list[str]:
+        """`aka` values that apply to any of these documents — the alternate names a user
+        declared, surfaced so an answer can explain why a document matched a loose query."""
+        terms: list[str] = []
+        for doc_id in doc_ids[:50]:
+            row = self._read_one(
+                "SELECT source_id, uri FROM documents WHERE doc_id = ?", (doc_id,))
+            if row is None:
+                continue
+            for label in self.labels_for_source(row["source_id"]):
+                if label.get("kind") != "aka":
+                    continue
+                if label_applies(row.get("uri") or "", label.get("uri_prefix") or ""):
+                    if label["value"] not in terms:
+                        terms.append(label["value"])
+        return terms
+
+    def upsert_document(self, doc_id, source_id, uri, title, kind, content_hash,
+                        updated_at, chunk_count, graph_version: int = 0,
+                        metadata_json: str = "{}") -> None:
+        self._write(
+            """INSERT INTO documents (doc_id, source_id, uri, title, kind, content_hash, updated_at, chunk_count, graph_version, metadata_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(doc_id) DO UPDATE SET
                    source_id=excluded.source_id, uri=excluded.uri, title=excluded.title,
                    kind=excluded.kind, content_hash=excluded.content_hash,
                    updated_at=excluded.updated_at, chunk_count=excluded.chunk_count,
-                   graph_version=excluded.graph_version""",
+                   graph_version=excluded.graph_version, metadata_json=excluded.metadata_json""",
             (doc_id, source_id, uri, title, kind, content_hash, updated_at or _now(),
-             chunk_count, graph_version),
+             chunk_count, graph_version, metadata_json),
         )
+
+    def update_document_metadata(self, doc_id: str, metadata_json: str) -> None:
+        """Cheap standalone update of a document's display metadata (see
+        `Document.metadata["display"]`) with no other side effects — the backfill path for
+        an unchanged document whose connector-supplied metadata changed (e.g. a work item's
+        team/sprint/state), used alongside the graph-version staleness refresh so both
+        self-heal on the next ordinary sync without a re-embed."""
+        self._write("UPDATE documents SET metadata_json = ? WHERE doc_id = ?", (metadata_json, doc_id))
 
     def delete_document(self, doc_id: str) -> None:
         self._write("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
@@ -501,11 +639,12 @@ class _SqlCatalog:
     # -- per-question chat attachments (context files, NOT memory) -------------
     def add_context_attachment(self, att_id: str, filename: str, content_type: str,
                                size_bytes: int, char_count: int, uploaded_at: str,
-                               session_id: str | None = None) -> None:
+                               session_id: str | None = None, extract_error: str = "") -> None:
         self._write(
             "INSERT INTO context_attachments (id, session_id, filename, content_type, "
-            "size_bytes, char_count, uploaded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (att_id, session_id, filename, content_type, size_bytes, char_count, uploaded_at),
+            "size_bytes, char_count, uploaded_at, extract_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (att_id, session_id, filename, content_type, size_bytes, char_count, uploaded_at,
+             extract_error),
         )
 
     def get_context_attachment(self, att_id: str) -> dict | None:
@@ -1062,6 +1201,21 @@ class _SqlCatalog:
             "ON CONFLICT(source_id, key) DO UPDATE SET value=excluded.value",
             (source_id, key, value),
         )
+
+    def set_sync_state_many(self, source_id: str, state: dict[str, str]) -> None:
+        """Persist every key a connector wrote back into the state dict it was handed.
+
+        Until OneDrive, the only watermark any connector needed was the caller-set
+        `since` timestamp. Microsoft Graph is different: its incremental contract is an
+        opaque **deltaLink** that the *connector* receives and must hand back next time.
+        So `sync(state)` may now mutate its `state` dict, and callers commit the result
+        alongside `since` — only after a fully successful run, so a failed or stopped
+        sync can never advance a delta cursor past documents it did not ingest.
+        `clear_sync_state` (clean re-sync) drops these with everything else.
+        """
+        for key, value in state.items():
+            if value is not None:
+                self.set_sync_state(source_id, key, str(value))
 
 
 class Catalog(_SqlCatalog):

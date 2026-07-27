@@ -6,26 +6,128 @@
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
-    { "key": "baseUrl", "value": "http://localhost:8787", "type": "string" },
-    { "key": "token", "value": "", "type": "string" },
-    { "key": "username", "value": "admin", "type": "string" },
-    { "key": "password", "value": "change-me", "type": "string" },
-    { "key": "connectorName", "value": "handbook", "type": "string" },
-    { "key": "connectorType", "value": "files", "type": "string" },
-    { "key": "connectorPath", "value": "/absolute/path/to/a/docs/folder", "type": "string" },
-    { "key": "uploadPath", "value": "/absolute/path/to/a/document.pdf", "type": "string" },
-    { "key": "askQuestion", "value": "How do we deploy and roll back?", "type": "string" },
-    { "key": "searchQuery", "value": "how do we deploy", "type": "string" },
-    { "key": "suggestPrefix", "value": "where", "type": "string" },
-    { "key": "entityA", "value": "repo:connector", "type": "string" },
-    { "key": "entityB", "value": "service:stevedore", "type": "string" },
-    { "key": "targetUser", "value": "teammate", "type": "string" },
-    { "key": "sessionId", "value": "", "type": "string" },
-    { "key": "attachmentId", "value": "", "type": "string" }
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8787",
+      "type": "string"
+    },
+    {
+      "key": "token",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "username",
+      "value": "admin",
+      "type": "string"
+    },
+    {
+      "key": "password",
+      "value": "change-me",
+      "type": "string"
+    },
+    {
+      "key": "connectorName",
+      "value": "handbook",
+      "type": "string"
+    },
+    {
+      "key": "connectorType",
+      "value": "files",
+      "type": "string"
+    },
+    {
+      "key": "connectorPath",
+      "value": "/absolute/path/to/a/docs/folder",
+      "type": "string"
+    },
+    {
+      "key": "uploadPath",
+      "value": "/absolute/path/to/a/document.pdf",
+      "type": "string"
+    },
+    {
+      "key": "askQuestion",
+      "value": "How do we deploy and roll back?",
+      "type": "string"
+    },
+    {
+      "key": "searchQuery",
+      "value": "how do we deploy",
+      "type": "string"
+    },
+    {
+      "key": "suggestPrefix",
+      "value": "where",
+      "type": "string"
+    },
+    {
+      "key": "entityA",
+      "value": "repo:connector",
+      "type": "string"
+    },
+    {
+      "key": "entityB",
+      "value": "service:stevedore",
+      "type": "string"
+    },
+    {
+      "key": "targetUser",
+      "value": "teammate",
+      "type": "string"
+    },
+    {
+      "key": "sessionId",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "attachmentId",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "onedriveConnector",
+      "value": "my-onedrive"
+    },
+    {
+      "key": "onedriveClientId",
+      "value": "00000000-0000-0000-0000-000000000000"
+    },
+    {
+      "key": "onedriveTarget",
+      "value": "https://contoso.sharepoint.com/:w:/r/sites/Eng/Shared%20Documents/design.docx"
+    },
+    {
+      "key": "scopeSourceId",
+      "value": "files:handbook"
+    },
+    {
+      "key": "scopeFolderPrefix",
+      "value": "file:///absolute/path/to/a/docs/folder/"
+    },
+    {
+      "key": "scopeTag",
+      "value": "architecture"
+    },
+    {
+      "key": "scopeDocId",
+      "value": "0123456789abcdef"
+    },
+    {
+      "key": "progressToken",
+      "value": "demo-progress-token"
+    }
   ],
   "auth": {
     "type": "bearer",
-    "bearer": [{ "key": "token", "value": "{{token}}", "type": "string" }]
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{token}}",
+        "type": "string"
+      }
+    ]
   },
   "item": [
     {
@@ -33,16 +135,30 @@
       "item": [
         {
           "name": "Health",
-          "request": { "method": "GET", "url": "{{baseUrl}}/health" }
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/health"
+          }
         },
         {
           "name": "Workspace status",
-          "event": [{ "listen": "test", "script": { "exec": [
-            "pm.test('reachable', () => pm.response.code === 200);",
-            "const s = pm.response.json();",
-            "console.log('org:', s.org, '| model:', s.llm.model, '| docs:', s.stats.documents);"
-          ], "type": "text/javascript" } }],
-          "request": { "method": "GET", "url": "{{baseUrl}}/api/status" }
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('reachable', () => pm.response.code === 200);",
+                  "const s = pm.response.json();",
+                  "console.log('org:', s.org, '| model:', s.llm.model, '| docs:', s.stats.documents);"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/status"
+          }
         }
       ]
     },
@@ -52,28 +168,55 @@
       "item": [
         {
           "name": "Auth status",
-          "request": { "method": "GET", "url": "{{baseUrl}}/api/auth/status" }
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/auth/status"
+          }
         },
         {
           "name": "Create first user (turns auth ON)",
           "request": {
             "method": "POST",
-            "header": [{ "key": "Content-Type", "value": "application/json" }],
-            "body": { "mode": "raw", "raw": "{\n  \"username\": \"{{username}}\",\n  \"password\": \"{{password}}\"\n}" },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"{{username}}\",\n  \"password\": \"{{password}}\"\n}"
+            },
             "url": "{{baseUrl}}/api/auth/users"
           }
         },
         {
           "name": "Login → capture token",
-          "event": [{ "listen": "test", "script": { "exec": [
-            "pm.test('logged in', () => pm.response.code === 200);",
-            "const t = pm.response.json().token;",
-            "if (t) { pm.collectionVariables.set('token', t); console.log('token captured'); }"
-          ], "type": "text/javascript" } }],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('logged in', () => pm.response.code === 200);",
+                  "const t = pm.response.json().token;",
+                  "if (t) { pm.collectionVariables.set('token', t); console.log('token captured'); }"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "method": "POST",
-            "header": [{ "key": "Content-Type", "value": "application/json" }],
-            "body": { "mode": "raw", "raw": "{\n  \"username\": \"{{username}}\",\n  \"password\": \"{{password}}\"\n}" },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"{{username}}\",\n  \"password\": \"{{password}}\"\n}"
+            },
             "url": "{{baseUrl}}/api/auth/login"
           }
         },
@@ -90,8 +233,16 @@
           "request": {
             "method": "PATCH",
             "description": "Set {{targetUser}}'s role to admin | editor | viewer. Admin only. Roles gate the whole API: viewers read/ask, editors also connect/sync/teach, admins additionally manage settings, reset memory, and administer users.",
-            "header": [{ "key": "Content-Type", "value": "application/json" }],
-            "body": { "mode": "raw", "raw": "{\n  \"role\": \"editor\"\n}" },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"role\": \"editor\"\n}"
+            },
             "url": "{{baseUrl}}/api/auth/users/{{targetUser}}"
           }
         }
@@ -102,34 +253,65 @@
       "item": [
         {
           "name": "List connector types",
-          "request": { "method": "GET", "url": "{{baseUrl}}/api/connectors/types" }
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/connectors/types"
+          },
+          "description": "The catalog of connector types and each type's configurable fields (required / secret flags) plus supported `modes`. Use it to fill `options` on the next request. A type may also carry `next_step` — what to do AFTER saving, for connectors that aren't usable the moment they're created (OneDrive needs an interactive Microsoft 365 sign-in, which can only happen once the connector exists)."
         },
         {
           "name": "Create a 'files' connector",
           "description": "Point `connectorPath` at a real folder first. Swap type/options for git/github/jira/etc. — see the connector types response for each type's fields.",
-          "event": [{ "listen": "test", "script": { "exec": [
-            "pm.test('created', () => pm.response.code === 200);",
-            "const c = pm.response.json();",
-            "if (c.name) pm.collectionVariables.set('connectorName', c.name);"
-          ], "type": "text/javascript" } }],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('created', () => pm.response.code === 200);",
+                  "const c = pm.response.json();",
+                  "if (c.name) pm.collectionVariables.set('connectorName', c.name);"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "method": "POST",
-            "header": [{ "key": "Content-Type", "value": "application/json" }],
-            "body": { "mode": "raw", "raw": "{\n  \"name\": \"{{connectorName}}\",\n  \"type\": \"{{connectorType}}\",\n  \"options\": { \"path\": \"{{connectorPath}}\" },\n  \"shared\": true\n}" },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"{{connectorName}}\",\n  \"type\": \"{{connectorType}}\",\n  \"options\": { \"path\": \"{{connectorPath}}\" },\n  \"shared\": true\n}"
+            },
             "url": "{{baseUrl}}/api/connectors"
           }
         },
         {
           "name": "Test the connector",
-          "request": { "method": "POST", "url": "{{baseUrl}}/api/connectors/{{connectorName}}/test" }
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/api/connectors/{{connectorName}}/test"
+          }
         },
         {
           "name": "Rename connector (before first sync)",
           "description": "Rename — allowed ONLY before the first sync (0 documents), since the name keys every document/vector/graph node/watermark it would ingest. 409 once it has learned anything (clean it up first) or if the new name is taken. Same endpoint patches options/sharing/schedule.",
           "request": {
             "method": "PATCH",
-            "header": [{ "key": "Content-Type", "value": "application/json" }],
-            "body": { "mode": "raw", "raw": "{\n  \"name\": \"{{connectorName}}-renamed\"\n}" },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"{{connectorName}}-renamed\"\n}"
+            },
             "url": "{{baseUrl}}/api/connectors/{{connectorName}}"
           }
         }
@@ -140,46 +322,90 @@
       "item": [
         {
           "name": "Start sync",
-          "request": { "method": "POST", "url": "{{baseUrl}}/api/sync/{{connectorName}}" }
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/api/sync/{{connectorName}}"
+          }
         },
         {
           "name": "Poll sync jobs (re-send until done)",
           "description": "Re-send until the job for your connector reads done/error/stopped. Shows current stage + percent while running. In the Collection Runner add an iteration delay, or use the logs SSE stream instead.",
-          "event": [{ "listen": "test", "script": { "exec": [
-            "const name = pm.collectionVariables.get('connectorName');",
-            "const job = pm.response.json().syncs.find(s => s.source === name);",
-            "if (job) console.log(`state=${job.state} phase=${job.phase||''} percent=${job.percent==null?'-':job.percent}`);",
-            "pm.test('has a job for the connector', () => !!job);"
-          ], "type": "text/javascript" } }],
-          "request": { "method": "GET", "url": "{{baseUrl}}/api/syncs" }
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const name = pm.collectionVariables.get('connectorName');",
+                  "const job = pm.response.json().syncs.find(s => s.source === name);",
+                  "if (job) console.log(`state=${job.state} phase=${job.phase||''} percent=${job.percent==null?'-':job.percent}`);",
+                  "pm.test('has a job for the connector', () => !!job);"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/syncs"
+          }
         },
         {
           "name": "Pause sync",
-          "request": { "method": "POST", "url": "{{baseUrl}}/api/sync/{{connectorName}}/pause" }
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/api/sync/{{connectorName}}/pause"
+          }
         },
         {
           "name": "Resume sync",
-          "request": { "method": "POST", "url": "{{baseUrl}}/api/sync/{{connectorName}}/resume" }
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/api/sync/{{connectorName}}/resume"
+          }
         },
         {
           "name": "Stop sync (keep partial)",
-          "request": { "method": "POST", "url": "{{baseUrl}}/api/sync/{{connectorName}}/stop" }
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/api/sync/{{connectorName}}/stop"
+          }
         },
         {
           "name": "Stream live logs (SSE)",
           "description": "Server-Sent Events. Postman renders the raw stream — read `data:` lines until `done`.",
-          "request": { "method": "GET", "header": [{ "key": "Accept", "value": "text/event-stream" }], "url": "{{baseUrl}}/api/sync/{{connectorName}}/logs" }
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "text/event-stream"
+              }
+            ],
+            "url": "{{baseUrl}}/api/sync/{{connectorName}}/logs"
+          }
         },
         {
           "name": "Activity feed (24h history)",
-          "request": { "method": "GET", "url": "{{baseUrl}}/api/notifications?hours=24" }
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/notifications?hours=24"
+          }
         },
         {
           "name": "Upload a document (Word/PPT/Excel/PDF/…)",
           "description": "multipart/form-data — pick one or more files under the `files` key. Each is extracted and ingested into the rolling Uploads connector. Do not set Content-Type by hand; Postman adds the multipart boundary.",
           "request": {
             "method": "POST",
-            "body": { "mode": "formdata", "formdata": [{ "key": "files", "type": "file", "src": [] }] },
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "files",
+                  "type": "file",
+                  "src": []
+                }
+              ]
+            },
             "url": "{{baseUrl}}/api/uploads"
           }
         },
@@ -188,8 +414,16 @@
           "description": "The /qj-friendly variant: ingest a file the server can read (copied into the uploads folder). Set `uploadPath` to an absolute path on the server host.",
           "request": {
             "method": "POST",
-            "header": [{ "key": "Content-Type", "value": "application/json" }],
-            "body": { "mode": "raw", "raw": "{\n  \"path\": \"{{uploadPath}}\"\n}" },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"path\": \"{{uploadPath}}\"\n}"
+            },
             "url": "{{baseUrl}}/api/uploads/local"
           }
         }
@@ -200,15 +434,30 @@
       "item": [
         {
           "name": "Search (keyword + semantic)",
-          "request": { "method": "GET", "url": "{{baseUrl}}/api/search?q={{searchQuery}}&top_k=8" }
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/search?q={{searchQuery}}&top_k=8"
+          }
         },
         {
           "name": "Ask a grounded question (SSE)",
           "description": "Streams SSE events: thinking / delta / tool_call / candidates / answer / done. `project` and `session_id` are optional; if a session id comes back on the stream, capture it for the next call.",
           "request": {
             "method": "POST",
-            "header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "Accept", "value": "text/event-stream" }],
-            "body": { "mode": "raw", "raw": "{\n  \"message\": \"{{askQuestion}}\",\n  \"session_id\": \"{{sessionId}}\"\n}" },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "text/event-stream"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"message\": \"{{askQuestion}}\",\n  \"session_id\": \"{{sessionId}}\"\n}"
+            },
             "url": "{{baseUrl}}/api/chat"
           }
         },
@@ -216,31 +465,108 @@
           "name": "Teach a fact",
           "request": {
             "method": "POST",
-            "header": [{ "key": "Content-Type", "value": "application/json" }],
-            "body": { "mode": "raw", "raw": "{\n  \"fact\": \"Deployments run through Octopus on Fridays.\"\n}" },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"fact\": \"Deployments run through Octopus on Fridays.\"\n}"
+            },
             "url": "{{baseUrl}}/api/learn"
           }
         },
         {
           "name": "Attach a file to a question (context, not memory)",
           "description": "multipart/form-data — pick file(s) under `files`. Returns attachment ids to pass as `attachment_ids` on the chat request. These are per-question context (extracted to text, injected into the turn), NOT ingested into memory, and auto-deleted after the retention window. Capture an id into `attachmentId` to try the download below.",
-          "event": [{ "listen": "test", "script": { "exec": [
-            "try { pm.collectionVariables.set('attachmentId', pm.response.json().attachments[0].id); } catch (e) {}"
-          ], "type": "text/javascript" } }],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "try { pm.collectionVariables.set('attachmentId', pm.response.json().attachments[0].id); } catch (e) {}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "method": "POST",
-            "body": { "mode": "formdata", "formdata": [{ "key": "files", "type": "file", "src": [] }] },
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "files",
+                  "type": "file",
+                  "src": []
+                }
+              ]
+            },
             "url": "{{baseUrl}}/api/chat/attachments"
           }
         },
         {
           "name": "Download a chat attachment (410 once expired)",
           "description": "Streams the original attached file. Returns 410 Gone once the retention sweep has deleted it (the chat history still shows the name + deletion date).",
-          "request": { "method": "GET", "url": "{{baseUrl}}/api/chat/attachments/{{attachmentId}}/download" }
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/chat/attachments/{{attachmentId}}/download"
+          }
         },
         {
           "name": "Autocomplete suggestions",
-          "request": { "method": "GET", "url": "{{baseUrl}}/api/suggest?q={{suggestPrefix}}&limit=6" }
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/suggest?q={{suggestPrefix}}&limit=6"
+          }
+        },
+        {
+          "name": "Learn an attachment into memory",
+          "description": "Promote a per-question chat attachment into PERMANENT memory: the already-uploaded file is ingested into the rolling Uploads connector (chunked, embedded, graphed, citable). Attaching is context for one question by design; this is the explicit opt-in that makes it memory — the \"Learning permanently\" toggle in the UI. 410 once the retention sweep has deleted the bytes, 404 for an unknown id. `progress_token` is optional (client-minted) — pass one to make this request's real chunk-embedding progress readable via the next request while it's still running; omit it for the plain behaviour the CLI/agent's qj_api tool use.",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/chat/attachments/{{attachmentId}}/learn?progress_token={{progressToken}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "chat",
+                "attachments",
+                "{{attachmentId}}",
+                "learn"
+              ],
+              "query": [
+                {
+                  "key": "progress_token",
+                  "value": "{{progressToken}}"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Poll ingest progress",
+          "description": "Real chunk-embedding progress for an in-flight ad-hoc ingest — poll this in parallel with a \"Learn an attachment into memory\" request sent with the same progress_token. Embedding a large document (e.g. a whole zip's concatenated text) can take minutes on a CPU-only machine; this is what a UI polls instead of showing nothing. 204 (empty body) if the token is unknown: never started, already finished and aged out (5 minutes), or nobody will ever start it — not an error. 200 body: {\"done\": <chunks embedded>, \"total\": <chunks total>}; total of 0 means extraction/chunking hasn't finished yet.",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/ingest-progress/{{progressToken}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "ingest-progress",
+                "{{progressToken}}"
+              ]
+            }
+          }
         }
       ]
     },
@@ -249,41 +575,342 @@
       "item": [
         {
           "name": "Graph snapshot",
-          "request": { "method": "GET", "url": "{{baseUrl}}/api/graph?limit=200" }
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/graph?limit=200"
+          }
         },
         {
           "name": "Entity search",
-          "request": { "method": "GET", "url": "{{baseUrl}}/api/graph/search?q={{entityA}}&limit=8" }
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/graph/search?q={{entityA}}&limit=8"
+          }
         },
         {
           "name": "Path between two entities",
-          "request": { "method": "GET", "url": "{{baseUrl}}/api/graph/path?a={{entityA}}&b={{entityB}}&max_hops=4" }
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/graph/path?a={{entityA}}&b={{entityB}}&max_hops=4"
+          }
         },
         {
           "name": "Cross-source bridges",
-          "request": { "method": "GET", "url": "{{baseUrl}}/api/graph/bridges?limit=20" }
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/graph/bridges?limit=20"
+          }
         },
         {
           "name": "Knowledge gaps",
-          "request": { "method": "GET", "url": "{{baseUrl}}/api/gaps" }
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/gaps"
+          }
         }
       ]
     },
     {
-      "name": "6 · Lifecycle & cleanup",
+      "name": "6 · OneDrive / SharePoint (per-user, on demand)",
+      "description": "This connector authenticates as a **person**, not with a static secret, and it never crawls: it ingests exactly the documents you point it at.\n\n1. Create it with your Azure app registration's Application (client) ID — it saves even though it is not signed in yet, because the token is keyed to the connector.\n2. Sign in: `Start sign-in` returns an `authorize_url`; open it in a browser and complete Microsoft sign-in (the redirect to `/api/oauth/callback` stores the token). In a terminal or container use `qj onedrive login <name>` (device code) instead — no redirect needed.\n3. Learn specific documents by link or drive path. A folder learns the readable files under it.\n\nSet `onedriveConnector`, `onedriveClientId` and `onedriveTarget` in the collection variables.",
+      "item": [
+        {
+          "name": "Create OneDrive connector",
+          "description": "`access` requests only the delegated Graph scopes you need: my_drive → Files.Read, shared_with_me → Files.Read.All, sharepoint → Sites.Read.All (usually admin consent). The response's `test.message` says \"not signed in yet\" — expected.",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/connectors",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "connectors"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"{{onedriveConnector}}\",\n  \"type\": \"onedrive\",\n  \"options\": {\n    \"client_id\": \"{{onedriveClientId}}\",\n    \"access\": \"my_drive,shared_with_me\"\n  }\n}"
+            }
+          }
+        },
+        {
+          "name": "Start sign-in (authorization code + PKCE)",
+          "description": "Returns `authorize_url`. Open it in a browser; the redirect to `/api/oauth/callback` stores the token server-side. `qj onedrive login <name>` is the no-browser alternative.",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/connectors/{{onedriveConnector}}/oauth/start",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "connectors",
+                "{{onedriveConnector}}",
+                "oauth",
+                "start"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Sign-in status",
+          "description": "Who the connector acts as and how many documents it has learned. Never returns the tokens.",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/connectors/{{onedriveConnector}}/oauth/status",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "connectors",
+                "{{onedriveConnector}}",
+                "oauth",
+                "status"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Learn documents on demand",
+          "description": "Resolves each target with the signed-in user's own access, extracts text and ingests it. `notes` lists everything NOT learned and why (unsupported type, too large, or an image — images need vision support, which is on the roadmap). `warning` restates that learned documents join the workspace's shared memory.",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/connectors/{{onedriveConnector}}/onedrive/learn",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "connectors",
+                "{{onedriveConnector}}",
+                "onedrive",
+                "learn"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"targets\": [\n    \"{{onedriveTarget}}\"\n  ]\n}"
+            }
+          }
+        },
+        {
+          "name": "Sign out",
+          "description": "Deletes the stored Microsoft 365 refresh token. Deleting the connector does this automatically — a live refresh token must not outlive its connector.",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/connectors/{{onedriveConnector}}/oauth",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "connectors",
+                "{{onedriveConnector}}",
+                "oauth"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "7 · Documents, labels & scoped questions",
+      "description": "See what a connector ingested, label it, and ask a question limited to that slice.\n\n`uri_prefix` picks the label granularity: '' = whole connector, a folder path = that folder AND files ingested into it later, a full document uri = one document. A scope on `POST /api/chat` is resolved server-side into a real pre-filter on both retrieval legs, and live tools for connectors outside the scope are withheld for that turn.",
+      "item": [
+        {
+          "name": "List a source's documents",
+          "description": "Each document with the labels that apply to it, including ones inherited from its folder or the connector — resolved at read time, so folder tags cover later files. Each document also carries `metadata` — a small connector-supplied JSON blob for UI display only, `{}` for every connector that doesn't set it. Azure DevOps stamps work_item_type/state/team/sprint/parent_id/changed_date/closed_date there, which is what the document browser uses to render TFS work items as an Epic/Feature/Story/Task tree.",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/sources/{{scopeSourceId}}/documents",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "sources",
+                "{{scopeSourceId}}",
+                "documents"
+              ]
+            }
+          }
+        },
+        {
+          "name": "List an archive's contents",
+          "description": "A .zip ingests as ONE document (its members' text concatenated — see ingest/extract._extract_zip), so the listing above shows it as one opaque row. This recovers the member list — and any files it skipped, and why — from the document's own extracted text (there's no separate column for it). `doc_id` is one of the doc_id values from the request above. Returns {\"members\": [...], \"notes\": [...]} — empty lists (not an error) for a document that isn't an archive.",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/sources/{{scopeSourceId}}/documents/archive?doc_id={{scopeDocId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "sources",
+                "{{scopeSourceId}}",
+                "documents",
+                "archive"
+              ],
+              "query": [
+                {
+                  "key": "doc_id",
+                  "value": "{{scopeDocId}}"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Tag a folder",
+          "description": "Files ingested into this folder later inherit the tag automatically. Use uri_prefix '' for the whole connector, or a full document uri for just one document.",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/labels",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "labels"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"source_id\": \"{{scopeSourceId}}\",\n  \"uri_prefix\": \"{{scopeFolderPrefix}}\",\n  \"kind\": \"tag\",\n  \"value\": \"{{scopeTag}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "List all labels",
+          "description": "Every tag/aka in the workspace — what the UI's question-scope picker offers.",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/labels",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "labels"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Ask a scoped question",
+          "description": "SSE, like the unscoped ask. Searches strictly less rather than filtering afterwards. A scoped 'no results' is reported as 'not in the sources you scoped to', never as 'never learned' — the model is told it only searched a slice.",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/chat",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "chat"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"message\": \"{{askQuestion}}\",\n  \"scope\": {\n    \"source_ids\": [],\n    \"doc_ids\": [],\n    \"tags\": [\n      \"{{scopeTag}}\"\n    ]\n  }\n}"
+            }
+          }
+        },
+        {
+          "name": "Remove a label",
+          "description": "Removing a folder/connector label removes it from every document it covered.",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/labels",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "labels"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"source_id\": \"{{scopeSourceId}}\",\n  \"uri_prefix\": \"{{scopeFolderPrefix}}\",\n  \"kind\": \"tag\",\n  \"value\": \"{{scopeTag}}\"\n}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "8 · Lifecycle & cleanup",
       "item": [
         {
           "name": "Clean up one connector (keep config)",
-          "request": { "method": "POST", "url": "{{baseUrl}}/api/connectors/{{connectorName}}/cleanup" }
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/api/connectors/{{connectorName}}/cleanup"
+          }
         },
         {
           "name": "Delete connector (purges its data)",
-          "request": { "method": "DELETE", "url": "{{baseUrl}}/api/connectors/{{connectorName}}" }
+          "request": {
+            "method": "DELETE",
+            "url": "{{baseUrl}}/api/connectors/{{connectorName}}"
+          }
         },
         {
           "name": "Reset ALL memory (keep connectors)",
           "description": "DANGER — wipes every ingested document, vector and graph edge across the whole workspace. Runs as a background job (returns {job}, source 'all memory') — watch it via the sync logs stream (source `all memory`) or the activity feed. Refuses (409) while any sync runs.",
-          "request": { "method": "POST", "url": "{{baseUrl}}/api/memory/reset" }
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/api/memory/reset"
+          }
         }
       ]
     }

@@ -1,0 +1,16 @@
+meta {
+  name: Start sign-in
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/api/connectors/{{onedriveConnector}}/oauth/start
+}
+
+docs {
+  Returns `authorize_url` (authorization code + PKCE). Open it in a browser and complete
+  Microsoft sign-in; the redirect to `/api/oauth/callback` stores the token server-side.
+
+  The CLI alternative needs no browser redirect at all: `qj onedrive login <name>`.
+}

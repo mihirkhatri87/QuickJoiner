@@ -1,0 +1,26 @@
+meta {
+  name: Learn an attachment into memory
+  type: http
+  seq: 8
+}
+
+post {
+  url: {{baseUrl}}/api/chat/attachments/{{attachmentId}}/learn?progress_token={{progressToken}}
+}
+
+docs {
+  Promote a per-question chat attachment into **permanent** memory: the already-uploaded file
+  is ingested into the rolling Uploads connector, so it becomes chunked, embedded, graphed and
+  citable like any other document.
+
+  Attaching a file is context for ONE question by design; this is the explicit opt-in that
+  makes it memory. In the UI it is the "Learning permanently" toggle beside the staged files,
+  and the agent can call it when you ask it to learn an attached document.
+
+  The attachment itself is untouched and stays downloadable. 410 if the retention sweep has
+  already deleted the bytes (re-attach it), 404 if the id is unknown.
+
+  `progress_token` is optional — omit the query param entirely for the plain behaviour (what
+  the CLI/agent's `qj_api` tool use). Pass one to make this request's real chunk-embedding
+  progress readable via `Poll ingest progress` while it's still running.
+}

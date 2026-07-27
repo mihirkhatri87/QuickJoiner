@@ -126,20 +126,39 @@ class PgVectorStore:
         with self._pool.connection() as conn:
             conn.execute("DELETE FROM chunks")
 
-    def search(self, query: str, top_k: int = 8, min_score: float = 0.0) -> list[SearchHit]:
+    @staticmethod
+    def _scope_sql(scope) -> tuple[str, list]:
+        """`(sql_fragment, params)` restricting a query to a scope — the pgvector twin of
+        KnowledgeStore's predicate, so both backends filter identically (and before ranking,
+        not after)."""
+        if scope is None or scope.is_empty():
+            return "", []
+        parts, params = [], []
+        if scope.source_ids:
+            parts.append("source_id = ANY(%s)")
+            params.append(list(scope.source_ids))
+        if scope.doc_ids:
+            parts.append("doc_id = ANY(%s)")
+            params.append(list(scope.doc_ids))
+        return "(" + " OR ".join(parts) + ")", params
+
+    def search(self, query: str, top_k: int = 8, min_score: float = 0.0,
+               scope=None) -> list[SearchHit]:
         query = normalize_query(query)
         r = self._retrieval
         vector = self._vec(self._embedder.embed_query(query))
         hybrid = r.hybrid
         fetch = max(top_k * r.candidate_multiplier, top_k) if hybrid else top_k
+        scope_sql, scope_params = self._scope_sql(scope)
 
         with self._pool.connection() as conn:
             # dense leg — rows keyed by chunk id, score = cosine similarity
             rows = conn.execute(
                 "SELECT id, text, doc_id, source_id, uri, title, kind, "
-                "1 - (vector <=> %s::vector) AS score "
-                "FROM chunks ORDER BY vector <=> %s::vector LIMIT %s",
-                (vector, vector, fetch),
+                "1 - (vector <=> %s::vector) AS score FROM chunks "
+                + (f"WHERE {scope_sql} " if scope_sql else "")
+                + "ORDER BY vector <=> %s::vector LIMIT %s",
+                (vector, *scope_params, vector, fetch),
             ).fetchall()
             by_id = {row["id"]: dict(row) for row in rows}
             dense_ids = [row["id"] for row in rows]
@@ -155,8 +174,9 @@ class PgVectorStore:
                         "SELECT id, text, doc_id, source_id, uri, title, kind, "
                         "ts_rank(tsv, to_tsquery('english', %s)) AS rank "
                         "FROM chunks WHERE tsv @@ to_tsquery('english', %s) "
-                        "ORDER BY rank DESC LIMIT %s",
-                        (tsq, tsq, fetch),
+                        + (f"AND {scope_sql} " if scope_sql else "")
+                        + "ORDER BY rank DESC LIMIT %s",
+                        (tsq, tsq, *scope_params, fetch),
                     ).fetchall()
                     for row in sparse_rows:
                         sparse_ids.append(row["id"])

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import typer
 from rich.console import Console
@@ -362,7 +362,7 @@ def sessions_distill(
 
 @app.command()
 def connect(
-    type: str = typer.Argument(..., help="Connector type: files | git | github | gitlab | jira | confluence | azure_devops | octopus | grafana | datadog | dynatrace | elastic | web_scrape"),
+    type: str = typer.Argument(..., help="Connector type: files | git | github | gitlab | jira | confluence | azure_devops | octopus | onedrive | grafana | datadog | dynatrace | elastic | web_scrape"),
     name: str = typer.Option(..., "--name", "-n", help="Unique source name"),
     option: list[str] = typer.Option([], "--option", "-o", help="Connector option key=value (repeatable). Secrets can use env indirection: token=env:GITHUB_TOKEN"),
     skip_test: bool = typer.Option(False, help="Save without testing the connection"),
@@ -483,6 +483,7 @@ def sync(
         except Exception as exc:
             console.print(f"[red]Sync failed for {source.name}: {exc}[/red]")
             continue
+        ctx.catalog.set_sync_state_many(connector.source_id, state)
         ctx.catalog.set_sync_state(connector.source_id, "since", started)
         console.print(f"[green]{source.name}:[/green] {stats.summary()}")
         for err in stats.errors[:5]:
@@ -854,6 +855,189 @@ def eval_cmd(
             console.print("[red]Regression: a watched metric dropped by more than 2 points.[/red]")
             raise typer.Exit(1)
         console.print("[green]No watched metric regressed beyond tolerance.[/green]")
+
+
+@app.command()
+def extract(
+    path: Path = typer.Argument(..., help="A document to run the text extractor over"),
+    full: bool = typer.Option(False, "--full", help="Print all extracted text, not a preview"),
+    out: Optional[Path] = typer.Option(None, "--out", "-o", help="Write the extracted text to a file"),
+):
+    """Show exactly what QuickJoiner can read out of a file — no workspace, no ingestion.
+
+    The answer to "it has plenty of text, why did nothing get learned?". Reports the
+    characters extracted (per slide for a deck) so you can tell a parser gap from a
+    genuinely picture-only document — the two look identical from the chat window.
+    """
+    from quickjoiner.ingest.extract import ExtractionError, extract_text, is_image, supported_extension
+
+    if not path.is_file():
+        console.print(f"[red]Not a readable file:[/red] {path}")
+        raise typer.Exit(1)
+    if is_image(path.name):
+        console.print("[yellow]This is an image.[/yellow] Reading images needs vision support, "
+                      "which isn't enabled yet.")
+        raise typer.Exit(1)
+    if not supported_extension(path.name):
+        console.print(f"[yellow]Unsupported file type:[/yellow] {path.suffix or '(none)'}")
+        raise typer.Exit(1)
+    try:
+        text = extract_text(path.read_bytes(), path.name)
+    except ExtractionError as exc:
+        console.print(f"[red]Could not extract text:[/red] {exc}")
+        raise typer.Exit(1)
+
+    console.print(f"[bold]{path.name}[/bold] — [green]{len(text)}[/green] characters extracted")
+    slides = [s for s in text.split("\n\n") if s.startswith("Slide ")]
+    if slides:
+        table = Table(title="Per slide")
+        table.add_column("slide")
+        table.add_column("chars", justify="right")
+        table.add_column("first line")
+        for slide in slides:
+            head, _, body = slide.partition("\n")
+            first = (body.splitlines() or [""])[0]
+            table.add_row(head.rstrip(":"), str(len(body)),
+                          first[:60] + ("…" if len(first) > 60 else ""))
+        console.print(table)
+    if out:
+        out.write_text(text, encoding="utf-8")
+        console.print(f"[green]Written:[/green] {out}")
+    elif not text.strip():
+        console.print("[yellow]No text at all.[/yellow] This looks like a picture-only or scanned "
+                      "document — reading it needs vision support, which isn't enabled yet.")
+    else:
+        console.print(text if full else text[:2000] + ("\n[dim]…(--full for all)[/dim]" if len(text) > 2000 else ""))
+
+
+onedrive_app = typer.Typer(help="OneDrive / SharePoint: sign in with your own Microsoft 365 account and learn documents on demand.")
+app.add_typer(onedrive_app, name="onedrive")
+
+
+def _onedrive_source(ctx, name: str):
+    """Resolve a configured OneDrive connector by name, or exit with a useful message."""
+    from quickjoiner.connectors.onedrive import OneDriveConnector
+    from quickjoiner.connectors.registry import create_connector
+
+    source = next((s for s in ctx.config.sources if s.name == name), None)
+    if source is None:
+        known = ", ".join(s.name for s in ctx.config.sources if s.type == "onedrive") or "(none)"
+        console.print(f"[red]No connector named {name!r}.[/red] OneDrive connectors: {known}")
+        raise typer.Exit(1)
+    connector = create_connector(source, ctx.workspace)
+    if not isinstance(connector, OneDriveConnector):
+        console.print(f"[red]{name!r} is a {source.type} connector, not OneDrive/SharePoint.[/red]")
+        raise typer.Exit(1)
+    return source, connector
+
+
+@onedrive_app.command("login")
+def onedrive_login(
+    name: str = typer.Argument(..., help="Name of the OneDrive connector to sign in"),
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """Sign in to Microsoft 365 with the device-code flow.
+
+    Prints a short code to type at microsoft.com/devicelogin. This is the flow that
+    works everywhere QuickJoiner runs — a terminal over SSH, a Docker container, a
+    machine with no browser — because nothing has to redirect back to this process.
+    """
+    from quickjoiner.connectors import msgraph
+
+    ctx = _context(workspace)
+    _source, connector = _onedrive_source(ctx, name)
+    if not connector.client_id:
+        console.print("[red]This connector has no Application (client) ID.[/red] "
+                      "Set it first: qj connect onedrive --name … -o client_id=…")
+        raise typer.Exit(1)
+    try:
+        flow = msgraph.begin_device_code(connector.tenant, connector.client_id, connector.scopes)
+    except msgraph.GraphError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    console.print(f"\n[bold]{flow.get('message', '')}[/bold]\n")
+    console.print("[dim]Waiting for you to finish signing in…[/dim]")
+    try:
+        bundle = msgraph.poll_device_code(
+            connector.tenant, connector.client_id, flow["device_code"],
+            interval=int(flow.get("interval", 5)), expires_in=int(flow.get("expires_in", 900)),
+        )
+    except msgraph.GraphError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    bundle.tenant, bundle.client_id = connector.tenant, connector.client_id
+    msgraph.save_token(ctx.workspace, connector.source_id, bundle)
+    try:
+        me = msgraph.GraphClient(ctx.workspace, connector.source_id, connector.scopes).whoami()
+        bundle.account = me.get("userPrincipalName") or me.get("displayName") or ""
+        msgraph.save_token(ctx.workspace, connector.source_id, bundle)
+    except msgraph.GraphError:
+        pass  # signed in fine; we just couldn't put a name to the account
+    console.print(f"[green]Signed in{' as ' + bundle.account if bundle.account else ''}.[/green]")
+    console.print("[dim]Nothing is synced automatically. Learn a document with:\n"
+                  f"  qj onedrive learn {name} <url-or-path>[/dim]")
+
+
+@onedrive_app.command("status")
+def onedrive_status(
+    name: str = typer.Argument(..., help="Name of the OneDrive connector"),
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """Show who this connector is signed in as, and what it has learned."""
+    ctx = _context(workspace)
+    _source, connector = _onedrive_source(ctx, name)
+    result = connector.test()
+    console.print(f"[{'green' if result.ok else 'red'}]{result.message}[/]")
+
+
+@onedrive_app.command("logout")
+def onedrive_logout(
+    name: str = typer.Argument(..., help="Name of the OneDrive connector"),
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """Delete this connector's stored Microsoft 365 refresh token."""
+    from quickjoiner.connectors import msgraph
+
+    ctx = _context(workspace)
+    _source, connector = _onedrive_source(ctx, name)
+    removed = msgraph.delete_token(ctx.workspace, connector.source_id)
+    console.print("[green]Signed out.[/green]" if removed else "[yellow]Was not signed in.[/yellow]")
+
+
+@onedrive_app.command("learn")
+def onedrive_learn_cmd(
+    name: str = typer.Argument(..., help="Name of the OneDrive connector"),
+    targets: List[str] = typer.Argument(..., help="Shared links, or paths inside your own OneDrive"),
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """Learn specific documents on demand — the CLI twin of
+    `/qj learn from this onedrive document <url>`.
+
+    Accepts any OneDrive/SharePoint link you can open, or a path in your own drive. A
+    folder learns the readable files beneath it. Nothing else is touched: this
+    connector never crawls.
+    """
+    from quickjoiner.connectors.msgraph import GraphError
+    from quickjoiner.connectors.onedrive import is_communal_memory_warning
+
+    ctx = _context(workspace)
+    source, connector = _onedrive_source(ctx, name)
+    console.print(f"[yellow]Note:[/yellow] {is_communal_memory_warning()}")
+    try:
+        documents, notes = connector.learn(list(targets))
+    except GraphError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    for note in notes:
+        console.print(f"[yellow]skipped:[/yellow] {note}")
+    if not documents:
+        console.print("[red]Nothing was learned.[/red]")
+        raise typer.Exit(1)
+    ctx.catalog.upsert_source(connector.source_id, source.name, source.type, source.options)
+    stats = ctx.pipeline.ingest(documents, connector.source_id)
+    for doc in documents:
+        console.print(f"[green]learned:[/green] {doc.title}")
+    console.print(f"[green]{name}:[/green] {stats.summary()}")
 
 
 browser_app = typer.Typer(help="Persistent browser profile for user-credential fallback (SSO/MFA logins).")

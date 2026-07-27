@@ -8,9 +8,11 @@ releases only for projects that had an Octopus event since the last sync, while 
 project list and the dashboard (current deploy state) always refresh.
 
 Push mode (true real-time, no polling): create an Octopus Subscription (webhook)
-pointing at POST /hooks/<source> with the generic X-QJ-Signature scheme (Octopus
-can't sign, so front it with a proxy that adds the header, or use a secret URL path
-via the source name).
+pointing at POST /hooks/<source>?token=<webhook_secret> — Octopus's subscription
+webhook action can only configure a bare callback URL, with no way to compute a
+per-request signature, so the `token` query-param scheme (a plain shared secret in the
+URL itself) is the one verification method it can actually satisfy; see
+`api/hooks.py`'s module docstring for the other schemes other systems support.
 """
 
 from __future__ import annotations

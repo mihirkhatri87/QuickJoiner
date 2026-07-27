@@ -1,0 +1,21 @@
+meta {
+  name: List an archive's contents
+  type: http
+  seq: 6
+}
+
+get {
+  url: {{baseUrl}}/api/sources/{{scopeSourceId}}/documents/archive?doc_id={{scopeDocId}}
+}
+
+docs {
+  A `.zip` ingests as ONE document (its members' text concatenated — see
+  `ingest/extract._extract_zip`), so `List a source's documents` otherwise shows it as one
+  opaque row. This recovers the member list — and any files it skipped, and why — from the
+  document's own extracted text (there's no separate column for it), for the document
+  browser's expand-to-see-contents view.
+
+  `doc_id` is one of the `doc_id` values from `List a source's documents`'s response. Returns
+  `{"members": [...], "notes": [...]}` — empty lists (not an error) for a document that isn't
+  an archive.
+}

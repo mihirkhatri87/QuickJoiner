@@ -4,6 +4,11 @@ Field keys mirror exactly what each connector reads from `options` — keep in
 sync when a connector gains an option. `secret` fields support env indirection
 (value `env:VAR_NAME`); `env` names the conventional variable.
 
+A type may also carry `next_step`: what the user must do AFTER saving, for connectors that
+aren't usable the moment they're created (OneDrive needs an interactive Microsoft 365 sign-in
+that can't happen before the connector exists). The whole spec dict is spread into
+`connector_catalog()`, so the web form picks a new key like this up with no API change.
+
 Each type also carries `suggests`: seed questions the connector contributes to
 question autocomplete (`quickjoiner/suggest.py`). They surface as soon as a source
 of that type is configured — so **adding a connector here automatically teaches the
@@ -125,6 +130,34 @@ FORM_SPECS: dict[str, dict] = {
             _f("spaces", "Space keys", list_=True, placeholder="ENG, ARCH"),
         ],
     },
+    "onedrive": {
+        "label": "OneDrive / SharePoint",
+        "blurb": "Learn individual OneDrive, SharePoint or Teams documents on demand, using "
+                 "your own Microsoft 365 sign-in. Nothing is crawled: it ingests exactly the "
+                 "files you point it at.",
+        # Shown in the create form and after saving. Some connectors aren't usable the moment
+        # they're saved — this one needs an interactive sign-in that can't happen earlier,
+        # because the token is keyed to the connector and the connector doesn't exist yet.
+        # Saying so on the form beats leaving someone hunting for a button that isn't there.
+        "next_step": "Save this first, then press **Sign in with Microsoft** on the connector "
+                     "to authorise it with your own Microsoft 365 account. After that, paste "
+                     "document links to learn them — nothing is crawled.",
+        "suggests": ["What does the design document say?",
+                     "Summarise the documents I've learned from OneDrive."],
+        "fields": [
+            _f("client_id", "Application (client) ID", required=True,
+               placeholder="00000000-0000-0000-0000-000000000000",
+               help="From your organisation's Azure app registration (a public client with "
+                    "delegated Microsoft Graph permissions). Not a secret."),
+            _f("tenant", "Directory (tenant) ID or domain", placeholder="organizations",
+               help="Your tenant GUID or domain for a single-tenant app registration. "
+                    "Leave blank to accept any work or school account."),
+            _f("access", "May reach", list_=True, placeholder="my_drive, shared_with_me",
+               help="Which delegated permissions to request: my_drive (Files.Read), "
+                    "shared_with_me (Files.Read.All), sharepoint (Sites.Read.All — usually "
+                    "needs admin consent). Ask only for what you need."),
+        ],
+    },
     "azure_devops": {
         "label": "Azure DevOps",
         "blurb": "Work items by team over recent sprints, build pipelines, live code search + WIQL. "
@@ -151,6 +184,11 @@ FORM_SPECS: dict[str, dict] = {
             _f("sprints", "Recent sprints per team", placeholder="10",
                help="How many of each team's most recent sprints to ingest work items from (default 10). "
                     "Anything outside this slice is answered live via the WIQL tool."),
+            _f("stale_after_days", "Report inactive teams after (days)", placeholder="365",
+               help="When a team's recent-sprint window has zero work items AND its most recent "
+                    "checked sprint ended more than this many days ago, the sync log reports it as "
+                    "inactive rather than staying silent (default 365). Doesn't change what's "
+                    "ingested — an empty window was already skipped — only whether it's explained."),
         ],
     },
     "octopus": {

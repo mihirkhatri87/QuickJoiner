@@ -103,6 +103,15 @@ _ROUTES: list[tuple[str, str, str, Optional[str]]] = [
     ("POST", "/api/connectors/{name}/test", "connectors:write", "name"),
     ("POST", "/api/connectors/{name}/cleanup", "sync:run", "name"),
     ("DELETE", "/api/connectors/{name}", "connectors:delete", "name"),
+    # OneDrive / Microsoft 365 sign-in and on-demand learning. The OAuth callback is
+    # PUBLIC because it is a browser redirect from Microsoft that cannot carry a bearer
+    # token; it is guarded instead by the unguessable `state` this server minted and
+    # holds in memory for one pending flow.
+    ("POST", "/api/connectors/{name}/oauth/start", "connectors:write", "name"),
+    ("GET", "/api/connectors/{name}/oauth/status", "connectors:read", "name"),
+    ("DELETE", "/api/connectors/{name}/oauth", "connectors:write", "name"),
+    ("GET", "/api/oauth/callback", PUBLIC, None),
+    ("POST", "/api/connectors/{name}/onedrive/learn", "memory:write", "name"),
     # Sync & ingestion
     ("POST", "/api/sync/{source_name}", "sync:run", "source_name"),
     ("POST", "/api/sync/{source_name}/stop", "sync:run", "source_name"),
@@ -113,8 +122,18 @@ _ROUTES: list[tuple[str, str, str, Optional[str]]] = [
     ("POST", "/api/learn", "memory:write", None),
     ("POST", "/api/uploads", "memory:write", None),
     ("POST", "/api/uploads/local", "memory:write", None),
+    # Promote a per-question chat attachment into permanent memory. memory:write, not
+    # chat:use — attaching a file is a chat action, but *learning* it is a memory mutation.
+    ("POST", "/api/chat/attachments/{att_id}/learn", "memory:write", None),
+    ("GET", "/api/ingest-progress/{token}", "chat:use", None),
     # Ask & search
     ("GET", "/api/search", "search:read", None),
+    # Document browser + the tag/aka labels that drive question scoping.
+    ("GET", "/api/sources/{source_id}/documents", "search:read", None),
+    ("GET", "/api/sources/{source_id}/documents/archive", "search:read", None),
+    ("GET", "/api/labels", "search:read", None),
+    ("POST", "/api/labels", "memory:write", None),
+    ("DELETE", "/api/labels", "memory:write", None),
     ("GET", "/api/suggest", "search:read", None),
     ("GET", "/api/documents/{doc_id}/file", "search:read", None),
     ("POST", "/api/scrape", "scrape:run", None),

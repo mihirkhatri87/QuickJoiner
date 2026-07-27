@@ -51,6 +51,16 @@ How each works is documented in `CLAUDE.md` — the source of truth for current 
   `graph_path`/`graph_expand`; scored as its own lowest-tier `name-bridge` confidence
   class. Deliberately a bridge, not a merge. Fuzzy identity remains with the plan-06
   adjudicator.
+- **#26 ADO/TFS work-item hierarchy + link graph** — `hierarchy_graph`/`_merge_graphs` in
+  `azure_devops.py` + a bounded hierarchy walk-up + per-document display metadata with a
+  version-triggered backfill (2026-07-26). Closes the Jira/ADO asymmetry: `part_of`
+  (Epic→Feature→Story/Bug→Task) and `related_to` edges, deterministic from TFS's own
+  `System.LinkTypes.Hierarchy-Reverse`/`Related` relations. Also shipped in the same change,
+  beyond the original item's scope: a document-browser tree view rendering the hierarchy with
+  Team/Sprint metadata and ongoing-then-completed sort ordering. Full detail in `CLAUDE.md`'s
+  `azure_devops.py` architecture bullet. (The original item's "graph-assertion signature"
+  design was superseded by the simpler, already-existing `GRAPH_EXTRACTOR_VERSION` staleness
+  mechanism — no new signature concept was needed.)
 
 ### Tier 1 — highest leverage, low risk
 2. **AST-aware code chunking** (tree-sitter) — *adopt*. Functions/classes as chunk units
@@ -90,52 +100,6 @@ How each works is documented in `CLAUDE.md` — the source of truth for current 
     lower-confidence signal for plan-06 scoring. Pure function, tiny effort, no schema change.
     This is the full extent of "ontology" we adopt eagerly — see the §5.2 intake-rejection
     note for what we deliberately do NOT build.
-26. **ADO/TFS work-item hierarchy + link graph** — *adopt*. Today the Azure DevOps sync
-    ingests each recent-sprint work item as a **flat** document (`azure_devops.py:21-38` —
-    title/state/assignee/area/iteration/description only) with **no `$expand=relations`**, so:
-    (a) the parent **Features/Epics** are lost — they carry no sprint iteration, so the
-    `/iterations/{id}/workitems` pull (`:279`) never even returns them, and the code discards
-    the `rel`/`source` of the relations it does get (`:285-289`); (b) every **work-item link**
-    is lost — parent/child, Related, Predecessor/Successor, and the **development links** to
-    PRs/commits/branches; (c) the pipeline's ticket-key regex matches Jira `PROJ-123` keys, not
-    ADO `#id`, so ADO items get **no graph edges at all** — an asymmetry with the Jira connector,
-    which asserts `ticket → part_of → project/epic`. So we hold ~sprint-scoped leaf stories with
-    zero fabric between them or up to the features/epics they served. Fix, connector-local +
-    deterministic:
-    - fetch work items with `$expand=relations`;
-    - walk **up** the hierarchy and ingest parent Features/Epics as their own documents (even
-      though they sit outside the sprint window) so epic/feature context is in memory, not just
-      leaf stories;
-    - emit edges: `story --part_of--> feature`, `feature --part_of--> epic`,
-      `story --references--> repo|pull_request|branch` (development links — strengthens the
-      existing GitLab↔TFS build-map bridge), `story --related_to--> story`;
-    - store the extra fields (parent id, story points, priority, acceptance criteria).
-
-    **Incremental update / dedup — the load-bearing half (how already-synced stories gain the
-    new edges without re-embedding).** The pipeline dedups on the document's *content* hash
-    (`pipeline.py:170-176`): an unchanged story is `skipped` and its `_sync_graph` never re-runs,
-    so shipping the extraction alone would leave every already-ingested story **edgeless** until
-    its text next changes. Split the two concerns: keep `content_hash` gating chunk/embed
-    (unchanged), and add a **graph-assertion signature** per document (hash of the computed
-    entities+edges + an extractor-version stamp) so a doc whose *content* is unchanged but whose
-    *graph output* differs re-runs only `_persist_graph` — cheap, no embedding, and
-    `replace_doc_edges` is already idempotent per evidence doc. Then, on the first re-sync after
-    this ships, every in-window story is re-yielded *with* relations, its content hash matches,
-    its graph signature doesn't → **edges backfill with zero re-embedding**. Stories aged out of
-    the recent-sprint window are re-hydrated by the **#25 drain pass** (re-reads stored chunks, no
-    connector round-trip) rather than re-pulled — this item and #25 compose. Parent Feature/Epic
-    docs are added once; their child `part_of` edges are re-asserted from each child's evidence
-    doc every sync, so the hierarchy self-heals if a child moves. The extractor-version stamp is
-    the general mechanism for *any* future connector whose graph extraction improves: bump it and
-    the derived layer rebuilds on the next sync/drain without a re-embed. Optional refinement
-    (ties to the ingest-vs-live-query balance): **skeleton-ingest + live-hydrate** — ingest only
-    the cheap hierarchy skeleton (ids + parent links + titles) for correlation/graph and leave
-    full per-field detail to the live `ado_query_work_items` tool, indexing the fabric without
-    pulling every field of every item.
-
-    Gate: connector unit tests (relations→edges, up-hierarchy walk, graph-signature backfill
-    without re-embed), no `qj eval --compare` regression. Closes the Jira/ADO asymmetry and turns
-    the sprint snapshot into a genuine feature→epic→story→PR fabric.
 29. **Architectural-layer classification** — *adopt* (validated by **Understand-Anything**,
     which auto-groups nodes into API/Service/Data/UI/Utility). A deterministic pass tags each
     repo/module/symbol entity with an architectural **layer** (API / Service / Data / UI /
@@ -205,6 +169,20 @@ How each works is documented in `CLAUDE.md` — the source of truth for current 
     threads an optional `ImageHandler` that enumerates embedded images — so the *document* half of
     this item (embedded images, scanned PDFs) becomes wiring-only: build the handler from `vision.py`
     and pass it into `extract_text`. See plan 07 §0's shipped-seam note.
+    **23.a — cover OneDrive/SharePoint images when vision lands (added 2026-07-24, user request).**
+    The OneDrive connector reaches a document store that is full of images — whiteboard photos,
+    screenshots pasted into a folder, scanned signed PDFs, exported diagrams. Today it refuses
+    them *specifically* rather than generically: `extract.IMAGE_EXTENSIONS` names the formats,
+    `extract_text` raises "image files can't be read yet — vision support is on the roadmap",
+    and the connector's `skip_reason` reports them as a **not yet**, distinct from an
+    unsupported type. That wording is a promise this item has to keep. Work when vision ships:
+    (a) pass the vision `ImageHandler` through `OneDriveConnector._fetch_document`, so a
+    standalone image learns like any other document; (b) same for images inside a learned
+    `.zip` (`_extract_zip` already routes members back through `extract_text` and notes each
+    skipped image); (c) drop the image branch in `skip_reason`; (d) re-learn is enough to pick
+    them up — no schema change. Gate: an image learned via `/qj learn from this onedrive
+    document <url>` produces a cited, confidence-discounted description, and refuses when the
+    vision model returns nothing rather than ingesting an empty document.
 27. **Blast-radius / diff-impact analysis** — *adopt* (Understand-Anything's `/understand-diff`:
     "which parts of the system your changes affect before you commit"). "What does this change
     touch?" We already store the edges (`defines`/`imports`/`publishes_to`/`subscribes_to`/

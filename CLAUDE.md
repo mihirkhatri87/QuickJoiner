@@ -29,8 +29,8 @@ with citations — or says "I haven't learned that yet."
 qj init <org> [--provider anthropic|ollama|litellm]  # create workspace (~/.quickjoiner/<org>)
 qj learn <path|url|"free text fact">          # ad-hoc ingestion / taught notes
 qj connect <type> --name N -o key=value ...   # register a source (types: files git github gitlab
-    [--share | --private]                     #   jira confluence azure_devops octopus grafana
-                                              #   datadog dynatrace elastic web_scrape).
+    [--share | --private]                     #   jira confluence azure_devops octopus onedrive
+                                              #   grafana datadog dynatrace elastic web_scrape).
                                               #   --private (signed-in default) keeps it to you;
                                               #   --share exposes it to everyone.
 qj users add|list / qj login / qj logout / qj whoami  # auth: first `users add` turns auth ON;
@@ -42,6 +42,14 @@ qj projects create|list                        # purposeful conversation groups 
 qj sessions list|distill <id>                  # inspect sessions / extract facts into memory
 qj serve / qj status / qj sources
 qj brief <architecture|week1|roadmap|quick-wins>  # cited onboarding brief from memory
+qj extract <file> [--full] [--out F]          # show exactly what the text extractor reads out of
+                                              #   a file (per-slide for a deck). No workspace, no
+                                              #   ingestion — tells a parser gap from a genuinely
+                                              #   picture-only document.
+qj onedrive login|status|logout <name>        # Microsoft 365 device-code sign-in for a OneDrive
+qj onedrive learn <name> <url-or-path>...     #   connector; `learn` ingests ONLY what you point
+                                              #   at (nothing is crawled). Web UI: Sign in with
+                                              #   Microsoft on the connector plate.
 qj browser login <url> / qj browser status    # Playwright profile for user-credential fallback
 qj eval <set.yaml> [--init] [--agent]         # grounding evals: retrieval metrics always
                                               #   (recall@k, MRR, threshold, refusal accuracy);
@@ -250,7 +258,64 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   `extract_text(bytes, filename) -> str` turns any supported file into plain text — Word (`.docx`),
   PowerPoint (`.pptx`), Excel (`.xlsx`) and PDF (`.pdf`) via lazy office/PDF parsers
   (python-docx/python-pptx/openpyxl/pypdf), plus Markdown/text/JSON/CSV/code decoded directly and
-  HTML stripped to text (keeping `<img alt>` captions). Every ingestion surface funnels through it:
+  HTML stripped to text (keeping `<img alt>` captions). **Office shape-tree recursion
+  (2026-07-24, user-reported):** `slide.shapes` yields only TOP-LEVEL shapes, so every label
+  inside a **grouped** diagram was dropped — silently, with the extraction still reporting
+  success. A PowerPoint architecture diagram is precisely a group of labelled boxes, so an
+  attached architecture deck extracted to ~nothing and the agent (correctly) said it had no
+  content; that is what the user hit. `_pptx_walk` now recurses into groups (depth-capped,
+  order-preserving, deduped) and `_pptx_chart_lines` reads embedded chart titles/series/categories
+  (chart text lives in a chart part, not the shape).
+  **The object model alone is not enough (2026-07-24, second report — "there's lots of text in
+  this file but the parser is missing everything", and they were right).** Read from the source:
+  `pptx/oxml/shapes/groupshape.py::iter_shape_elms` yields only children whose tag is in a
+  hard-coded whitelist — `p:sp`, `p:grpSp`, `p:graphicFrame`, `p:cxnSp`, `p:pic`, `p:contentPart`.
+  **`mc:AlternateContent` is not in it**, and PowerPoint wraps a shape in that whenever it uses a
+  feature needing a legacy fallback (icons, 3D, ink, newer effects, much SmartArt) — so those
+  shapes, and all their text, are **invisible to python-pptx** and were lost silently. Reproduced:
+  a 2-shape slide where `len(slide.shapes) == 1`. Extraction is therefore now **three passes,
+  merged and deduped**: (1) the object model, where it is richest (knows a table from a text box,
+  reads charts, visual order); (2) `_drawingml_lines` — a raw sweep of the slide XML for every
+  `a:p`, which cannot miss a shape type because it does not know about shape types. It descends
+  into exactly ONE branch of an `mc:AlternateContent` (Choice, else Fallback) since both carry the
+  SAME content and taking both duplicates every line, and it emits `a:tbl` rows joined `a | b | c`
+  to match the structured pass so the two dedupe instead of yielding a joined row *and* its loose
+  cells; (3) `_pptx_related_texts` — parts the slide only *references*: **SmartArt**
+  (`diagramData`), **charts** (DrawingML runs + non-numeric cached `c:v` series/category names),
+  and **embedded workbooks/documents** (a pasted Excel table is a whole xlsx package, parsed by
+  recursing into the same extractor). Pass 2 is appended rather than interleaved — exact visual
+  position is unrecoverable there, and completeness beats ordering for retrieval.
+  **Damaged packages (2026-07-24, live failure on the user's real deck):** `qj extract` on it
+  died with `Bad CRC-32 for file 'ppt/media/image7.png'` — Office files are zips, and
+  python-pptx/python-docx refuse to open the WHOLE package when one member is corrupt, so a
+  single damaged image cost every slide's text although text and images share nothing but the
+  container (PowerPoint itself opens such files fine, so the deck looks perfect to whoever sent
+  it). `_zip_text_members` reads members individually, skips unrecoverable ones, and retries a
+  needed member with CRC verification disabled (a checksum mismatch does not mean the bytes are
+  useless); `_salvage_pptx`/`_salvage_docx` then run the raw DrawingML/WordML sweep over
+  `ppt/slides/*`, notes, diagrams and charts — never touching `ppt/media/*`. Wired as a fallback
+  when the library raises: salvaged text wins, and a genuinely unreadable file still raises
+  `ExtractionError` as before. Reproduced end-to-end in tests (a deck whose `Presentation()` load
+  raises still yields both slides' text, with slide structure preserved).
+  Same class of loss fixed in Word: `_docx_textbox_texts` harvests
+  `w:txbxContent` (text boxes/shapes are invisible to `document.paragraphs`) and headers/footers
+  are read per section (document titles, classification markings, version stamps live there).
+  Verified end-to-end, not just at the extractor: a grouped-diagram deck ingested via
+  `POST /api/uploads/local` and its labels retrieved at 0.63–0.77, well clear of the 0.55 gate.
+  Also **zip archives expanded in place**
+  (2026-07-24: `ARCHIVE_EXTENSIONS`/`_extract_zip` — members route back through `extract_text`,
+  so a .docx inside a .zip is parsed as a .docx, each under a `--- path ---` header that keeps
+  its provenance; hard-bounded by member count / total uncompressed bytes / per-member size as
+  the decompression-bomb guard, **nested archives listed but never opened** since depth is where
+  bombs live, and every skip appended as an "archive notes" block rather than silently dropped),
+  and a much wider text/code set (transcripts `.vtt`/`.srt`, `.adoc`/`.org`/`.tex`, `.ipynb`,
+  `.proto`/`.graphql`, `.kt`/`.swift`/`.scala`/`.vue`/`.dart`/…). **Images are a named
+  *not-yet*, not an unknown**: `IMAGE_EXTENSIONS` + `is_image()` + `_extract_image` route whole
+  images to the same `ImageHandler` seam, raising a specific "image files can't be read yet —
+  vision support is on the roadmap" when none is wired in, so an ingested image is reported
+  honestly instead of landing as an empty document (AI_ROADMAP **#23.a** covers OneDrive images
+  when vision ships). `supported_extension` excludes images deliberately — callers use it to
+  decide whether to spend a read at all. Every ingestion surface funnels through it:
   the `files`/`git` connectors, the rolling `uploads` connector, and the upload endpoints. Defensive
   — a missing parser or corrupt/encrypted/image-only file raises `ExtractionError` (caller skips that
   one file, never fails a sync); size caps bound work. **Vision seam (text-first today, multimodal
@@ -378,6 +443,70 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   the API connector, or prints the ready-to-run command non-interactively. The web wizard consumes the
   same helper (planned — see the connector-forms note). Tests: `tests/test_connectors.py`
   (`suggest_api_connector` github/gitlab/enterprise/scp + None for unknown hosts).
+  **Push-triggered re-sync** (2026-07-26, `Mode.PUSH` added): a push webhook to the mapped
+  `branch` option (or ANY branch, when unset — the clone then just tracks the remote's own
+  default, so a push there is always relevant) re-syncs within seconds instead of waiting for
+  the scheduled pull. Structurally different from every other PUSH connector: a push payload
+  carries commit metadata, never file contents, so there's nothing `handle_event` could turn
+  into a document directly — `wants_resync(payload)` (reads the `ref` field GitHub's and
+  GitLab's push events both use) returns `True` instead, and `handle_event` yields nothing; see
+  the `api/hooks.py` bullet above for how the router acts on that. `pushed_branch` (pure) parses
+  the ref, returning `None` for a tag push or unrecognized shape rather than guessing. Point the
+  git host's push webhook at `POST /hooks/<source>` same as any other connector. Tests:
+  `tests/test_connectors.py` (`pushed_branch`, `wants_resync` mapped/unmapped/tag-push),
+  `tests/test_api.py` (a matching-branch push starts a real `SyncManager` job, not a
+  direct-ingest call; a different-branch push is silently ignored).
+  **`onedrive.py` + `msgraph.py` — OneDrive for Business / SharePoint, per user, ON DEMAND
+  (2026-07-24):** the first connector authenticated as a **person** rather than with a static
+  secret. `msgraph.py` owns Microsoft identity: **two** interactive sign-in flows because
+  QuickJoiner runs in two places — **device code** (`qj onedrive login <name>`; no redirect URI,
+  no client secret, so it works over SSH/in Docker/headless) and **authorization code + PKCE**
+  (`POST /api/connectors/{name}/oauth/start` → Microsoft → `GET /api/oauth/callback`, the
+  browser path). Both end in a `TokenBundle` persisted to `<workspace>/oauth/<source>.json` —
+  the **filesystem, not the catalog**, because `create_connector(source, workspace)` hands a
+  connector no catalog, so a file is the only store reachable from every path that builds one
+  (CLI, API, scheduler, sync manager); it sits beside `browser_profile/` and `uploads/` for the
+  same reason. `GraphClient` owns the access-token lifecycle and **persists the rotated refresh
+  token** (Microsoft rotates on every redemption — dropping it works for the rest of the process
+  then fails on the next sync), retries 401 once after a forced refresh, and honours
+  **`Retry-After`** (Graph throttles hard and ignoring the header gets you throttled harder).
+  `bundle_from_response` keeps the previous refresh token when a response omits one.
+  `GraphAuthError` is its own type so a dead token says "sign in again" instead of surfacing a
+  raw 401 — and so `is_transient_network_error` correctly classifies it as **not** worth
+  retrying. **Delegated scopes only** (`scopes_for` composes least-privilege from the configured
+  `access`: my_drive→`Files.Read`, shared_with_me→`Files.Read.All`, sharepoint→`Sites.Read.All`,
+  always `offline_access User.Read`) — the connector can see exactly what the signed-in person
+  can see, including files shared *with* them, and there is no application-permission path at
+  all. **On demand, not a crawl** (user requirement): `sync()` deliberately discovers nothing —
+  it re-reads the items in a per-connector **learned-item manifest**
+  (`<workspace>/onedrive/<source>.json`) so scheduled syncs keep what you taught it current.
+  Documents get in one way: `connector.learn(targets)` → `POST /api/connectors/{name}/onedrive/
+  learn` (the `/qj learn from this onedrive document <url>` path) or `qj onedrive learn`.
+  `sharing_token` (pure) encodes any pasted OneDrive/SharePoint URL as a Graph `u!` sharing token
+  so `/shares/{token}/driveItem` resolves it under the caller's own permissions — that is what
+  makes "paste any link you can open" work; a bare path resolves against `/me/drive/root:/`. A
+  folder target expands to the readable files beneath it (bounded `MAX_LEARN_ITEMS`=250,
+  reported). `learn` returns `(documents, notes)` and **every skip is a note** — the API, CLI and
+  UI all show what was NOT learned rather than implying success. `item_ref` follows `remoteItem`
+  (shared entries and search hits are shortcuts; using their own ids 404s on download — the
+  classic first bug with those endpoints), and `item_document` uses the item's **webUrl** as the
+  uri so citations render as clickable links back into OneDrive. LIVE tools
+  (`onedrive_search` over Microsoft Search, `onedrive_read_file`) are **GET-only** per the plan-09
+  rule and say so in their descriptions — finding a file never ingests it, which also stops a
+  model deciding on its own to put someone's OneDrive into communal memory. PUSH: `handle_event`
+  refreshes **only** items already in the manifest, so a webhook can never widen what is ingested
+  (Graph change notifications also need a publicly reachable HTTPS callback, so PUSH is
+  deployment-gated). `test()` reports "not signed in yet" as **ok** on purpose — the token is
+  keyed by source_id so it cannot exist before the connector does, and a failing test blocks
+  creation; the two would deadlock. New base-class hook **`Connector.on_deleted()`** (default
+  no-op) releases workspace-side state on delete — OneDrive drops its refresh token and manifest,
+  because a live token left on disk after its connector is gone is still redeemable.
+  ⚠ **Communal-memory caveat, stated in three places** (`test()`, the connect form, and before
+  every learn): ingested content joins QuickJoiner's ONE communal memory, so a privately-shared
+  file becomes answerable and citable for every workspace user. Per-user knowledge scopes are
+  **PRIORITIES #2** (raised from #14 by this connector). Tests: `tests/test_onedrive.py` (34 —
+  pure converters, PKCE/token lifecycle, MockTransport round trips, on-demand learn, manifest,
+  folder expansion, webhook narrowing, tool consolidation) + 6 API tests in `test_api.py`.
   `uploads.py` — **the rolling Uploads connector** (2026-07-22): one permanent, continuously-growing
   document drop-box instead of a connector-per-file. Everything a user adds ad-hoc — a chat
   drag-drop, a `/qj` "ingest this file", the `POST /api/uploads[/local]` endpoints — lands in one
@@ -394,6 +523,54 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   the same doc uri/id — no duplicates. `is_uploads_source()` is what the API guards check. Tests:
   `tests/test_uploads.py` (folder read, save collisions/traversal, seeded+permanent, endpoint
   ingest + idempotent re-sync, unreadable-file reporting).
+  `jira.py` pulls issues via JQL (`projects`/custom `jql` options compose with a watermark
+  `updated >= since` clause for incremental syncs; the first sync has no watermark, so it's
+  effectively "most recently updated, capped at `MAX_ISSUES`=1000"), paginated with a prefetch
+  overlap (`prefetch_pages`) like the other connectors. **Hierarchy + related-issue graph**
+  (`issue_document`, extended 2026-07-26 for parity with the ADO connector's dev-link/hierarchy
+  work): `ticket --part_of--> project` always; `ticket --part_of--> ticket:parent` when
+  `fields.parent` is set (Jira's own Epic-link/subtask-parent field); and, new,
+  `ticket --related_to--> ticket` from `fields.issuelinks` (`_linked_issue_keys`, pure) —
+  flattened to one relation regardless of link type (Relates/Blocks/Duplicates/…), matching how
+  the ADO connector treats `System.LinkTypes.Related` as a single undirected `related_to` rather
+  than a typed taxonomy. **Walk-up for missing parents** (`sync()`): the JQL/incremental pull only
+  ever returns issues that were THEMSELVES recently updated, so an Epic that hasn't been touched
+  would never reach memory at all — the exact gap ADO's hierarchy walk-up closed for TFS. After
+  each page, any `parent` key not yet seen is queued; a bounded (`MAX_PARENT_DEPTH`=8) follow-up
+  pass fetches them via a batched `key in (...)` JQL clause (not one call per id) and recurses on
+  THEIR parents. Jira's real hierarchy is normally just 2 levels (Epic > Story/Task, no
+  grandparents), so the bound is generous headroom, not an expected depth. **Display metadata**
+  (`Document.metadata["display"]`, same shape and same document-browser consumer as ADO's): `id`/
+  `parent_id` are Jira **keys** (strings like `"PROJ-123"`, not numbers) — deliberately so, since
+  the frontend tree (`DocumentsModal.tsx`) keys everything by `String(id)` uniformly so one
+  implementation serves both connectors. `team`/`sprint` are intentionally left blank: Jira's
+  board/sprint data lives in a separate Agile REST API (`/rest/agile/1.0/...`) this connector
+  doesn't speak, a deliberately deferred, genuinely-different-platform gap (not just an unported
+  feature) — the tree/filter UI already renders fine with those fields absent. `assigned_to`/
+  `tags` map directly from `fields.assignee`/`fields.labels` (Jira's `labels` is already a real
+  array, unlike ADO's semicolon-joined `System.Tags` string). **`jira_get_issue` live tool**
+  (new, mirrors `ado_get_work_item`'s role): `jira_search` only ever returns
+  summary/status/assignee for a LIST of matches — there was no way to pull one issue's full
+  description, linked issues, or recent comments live. Registered alongside `jira_search` in
+  `tools()`. Tests in `tests/test_connectors.py`: `_linked_issue_keys`/related_to edges, display
+  metadata shape, the walk-up (monkeypatched `get_json`, asserts the batched `key in (...)` call
+  actually fires and the missing parent is yielded), `jira_get_issue` (full detail + links +
+  comments). **Document-browser tree generalized to both connectors** (`DocumentsModal.tsx`):
+  `AdoMeta`/`adoMetaOf` renamed to `WorkItemMeta`/`workItemMetaOf`, id/parent_id typed
+  `string | number` throughout `buildWorkItemTree`/`collectAncestorIds` (Map/Set keys are always
+  `String(id)`), and the render gate is now `WORK_ITEM_TREE_SOURCE_TYPES = {"azure_devops",
+  "jira"}` instead of a single ADO check — so a Jira source gets the same Epic/Story/Task tree,
+  iteration/assignee/tag filters, and ongoing-then-completed sort as ADO, with zero UI-specific
+  Jira code (this was the point of keeping the tree logic generic from the start). This also
+  incidentally fixes a pre-existing Jira document-browser bug: a Jira issue's uri
+  (`.../browse/PROJ-123`) has no trailing path structure, so the generic folder grouping
+  (`groupByFolder`) gave every issue its own one-item "folder" — the same class of bug Confluence
+  had before its space-grouping fix — which the tree view replaces entirely for Jira sources.
+  **Deliberately not done here** (flagged, not silently skipped): sprint/board windowing (the
+  genuinely-different-platform item above) and an unrelated bug noticed while comparing —
+  the ADO connector's OWN webhook handler (`handle_event`) calls `work_item_document` with no
+  `repo_names`/`team`, so a push-ingested work item gets no dev-link graph and a blank team; not
+  fixed in this pass since it's an ADO-side gap, not a Jira-parity one.
   `azure_devops.py` works against **both** cloud (`dev.azure.com/{organization}`) and **on-prem
   Azure DevOps Server / TFS**: set `server_url` (host up to `/tfs`) + `collection` instead of
   `organization` and the base URL becomes `{server_url}/{collection}`; code search drops the
@@ -448,6 +625,66 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   `select_recent_iterations` future-exclusion; `build_map_document` builds-edges; `builds_document`
   source-branch; 4-tool name list; `dev_link_graph` ref/commit/PR edges + unknown-GUID skip +
   `work_item_document` graph attach).
+  **Work-item HIERARCHY (Epic→Feature→Story/Bug→Task) + Related links** (`hierarchy_graph`,
+  2026-07-26, AI_ROADMAP #26 — the piece `dev_link_graph` above deliberately doesn't touch, since
+  it only reads `ArtifactLink` relations): `hierarchy_graph(item)` reads the SAME already-expanded
+  `relations` array for `System.LinkTypes.Hierarchy-Reverse` (this item's parent) and
+  `System.LinkTypes.Related`, emitting `ticket:#N --part_of--> ticket:#parent` (matching the Jira
+  connector's own `part_of` convention so both read the same way to the agent) and
+  `ticket:#N --related_to--> ticket:#M`. `_merge_graphs` combines this with `dev_link_graph`'s
+  output into one `metadata["graph"]` per document — entity type stays uniformly `"ticket"` (Epic
+  vs. Feature vs. Story vs. Task is a work-item-TYPE distinction, not a graph-vocabulary one).
+  **Walks the hierarchy both UP and DOWN** (`sync()`, `_next_hierarchy_ids`, bounded
+  `MAX_HIERARCHY_DEPTH=8`, chunked in `WORK_ITEM_BATCH`-sized `$expand=relations` calls — every
+  fetched item's relations already include BOTH directions, so this costs no extra API call
+  beyond fetching the ids it turns up): a parent Feature/Epic carries no sprint iteration of its
+  own, so the existing team/iteration pull would never return it — after each team's batch
+  yields, unresolved Hierarchy-Reverse **parent** ids are collected and fetched (and THEIR
+  parents, recursively, bounded) so Epics/Features reach memory even from outside any sprint
+  window. **DOWN, added 2026-07-26 after live re-sync verification** (`_next_hierarchy_ids`):
+  for an Epic or Feature specifically (never a Story/Bug/Task — that would reopen the flat-300k-
+  item problem the sprint window exists to avoid), its Hierarchy-Forward **children** are ALSO
+  collected and fetched. Without this a Feature/Epic was only ever discovered via one descendant
+  happening to still be in-window, and even then showed only THAT one child — verified live
+  against the real AppRiver workspace: a "CRSB Phase 2 - Tech Debt" Feature was entirely absent
+  (none of its children were recent enough for anything to find it), and a sibling "Provisioning"
+  Feature that WAS discovered showed only 3 of its ~10 real children. Both directions share one
+  bounded walk loop and one `seen` set. **Per-document display metadata** (`work_item_document(..., team=)`,
+  `Document.metadata["display"]` — deliberately separate from `["graph"]`, which becomes graph
+  rows, not stored raw): `work_item_type`/`state`/`team`/`sprint`/`changed_date`/`closed_date`/
+  `parent_id`, persisted via a new `documents.metadata_json` column (`catalog.upsert_document`
+  gained the param; `catalog.update_document_metadata` is a standalone cheap-UPDATE backfill path
+  wired into `pipeline._ingest_one`'s existing stale-graph-refresh branch, riding the SAME
+  `GRAPH_EXTRACTOR_VERSION` bump — v2→**v3** — so team/sprint/state self-heal onto
+  already-ingested-but-unchanged work items on the next ordinary sync, exactly like the edges do,
+  with no re-embed). `team` is the team whose sprint pull surfaced the item; blank (never guessed)
+  for anything reached only by walking the hierarchy (up or down), which can span many teams.
+  **Document browser tree view** (`frontend/src/components/DocumentsModal.tsx`): for
+  `sourceType === "azure_devops"`, `buildWorkItemTree` builds the Epic/Feature/Story/Task tree
+  ENTIRELY client-side from each document's own `metadata.id`/`metadata.parent_id` — not by
+  querying graph edges (those exist for the agent's multi-hop reasoning; the tree is a simpler,
+  separate read of the same hierarchy for display). A doc whose `parent_id` doesn't resolve to
+  another doc in the source becomes a root — covers a real Epic and an orphan (parent outside the
+  walk-up depth bound, or in another project) without special-casing either; orphans are flagged
+  ("parent not ingested"), never silently shown as a top-level Epic. **Sort** (`sortSiblings`,
+  applied recursively at every level): not-yet-completed siblings first (most recently updated
+  first — `changed_date` desc), then completed siblings (most recently completed first —
+  `closed_date` desc, falling back to `changed_date`). "Completed" is a state-NAME heuristic
+  (Closed/Done/Resolved/Removed/Completed, case-insensitive) — no extra ADO API call, covers
+  Agile/Scrum/CMMI/Basic; a heavily customized process template with unusual state names could
+  misclassify an item for ordering purposes only, never for grounding. Search-filtering in tree
+  mode keeps every ancestor of a match (`collectAncestorIds`) so a matched deep child stays in
+  visible context — a pruned tree, not a flat list. Every other connector type is unaffected
+  (`metadata` is `{}` unless a connector sets it; the folder/Confluence-space grouping is
+  untouched). Tests: `tests/test_connectors.py` (`hierarchy_graph`/`_merge_graphs`/
+  `_workitem_id_from_url`, team defaulting, merged dev-link+hierarchy graph),
+  `tests/test_catalog.py` (`metadata_json` round-trip, `update_document_metadata` backfill),
+  `tests/test_pipeline.py` (stale-graph refresh also backfills metadata without re-embed),
+  `tests/test_chat_attachments.py` (documents endpoint carries `metadata`). Frontend: no dedicated
+  test suite per this repo's practice — `buildWorkItemTree`/`sortSiblings`/`isCompleted` kept as
+  small, readable, exported pure functions for exactly that reason. **Live-verification pending a
+  real ADO re-sync** — the walk-up/backfill logic only fires on a genuine sync, which needs the
+  user's connector to actually run one; not yet observed against a real hierarchy in the browser.
   `octopus.py` **paginates** every list endpoint via `_paged` (follows `Links["Page.Next"]`) — a
   space with >100 projects previously truncated at the `take=100` first page. Pull is a full refresh
   (idempotent via hash dedupe); opt-in `incremental=true` fetches per-project releases only for
@@ -536,6 +773,15 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
 - `quickjoiner/connectors/specs.py` — `FORM_SPECS` per-type field catalog (label/required/secret/
   env/list) + `connector_catalog()` (adds supported `modes`) driving the web-UI connector forms
   and capability stamps. **Keep field keys in sync with what each connector reads from `options`.**
+  A type may also carry **`next_step`** (2026-07-24): what the user must do AFTER saving, for a
+  connector that isn't usable the moment it's created. OneDrive needs an interactive Microsoft 365
+  sign-in that *cannot* happen earlier (the token is keyed by source_id, so the connector must
+  exist first) — the create form is field-driven, so without this the user is left hunting for a
+  Sign in with Microsoft button that only appears on the saved connector's plate (reported live).
+  `connector_catalog()` spreads the whole spec dict, so a key like this reaches the UI with no API
+  change; the form renders it as an accent note above the fields and it replaces the generic
+  "Sync it to start learning" post-create flash (which is actively wrong for OneDrive — syncing is
+  not how documents get in).
   Each type also carries `suggests` (seed questions the type contributes to autocomplete —
   `suggest.py` reads them for configured source types); add them when you add a connector.
 - `quickjoiner/agent/` — grounded system prompt (`prompts.py`), built-in tools
@@ -621,6 +867,39 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   Rich can't crash rendering a brief/answer containing block/box-drawing/emoji glyphs on a legacy
   cp1252 Windows console (the save+ingest already completed before the render — this stops the
   cosmetic exit-1 crash it caused for `qj agents-md`/`qj brief`).
+- **Document labels + scoped questions (2026-07-25, user request).** Three connected pieces:
+  **(1) See it** — `GET /api/sources/{source_id}/documents` lists what a connector actually
+  ingested (uri/title/chunks/updated), each row carrying the labels that apply to it; the
+  **`DocumentsModal`** renders it grouped by folder, opened by clicking a Connected-systems row
+  in the Rail. **(2) Label it** — ONE catalog table `doc_labels(source_id, uri_prefix, kind,
+  value)` covers all three granularities through `uri_prefix`: `''` = the whole connector, a
+  folder path = that folder, a full uri = one document. A folder label is a **prefix RULE
+  resolved at query time** (`label_applies`, pure), not a snapshot copied onto the rows that
+  existed when you tagged — which is what makes documents ingested *later* inherit it with no
+  re-tagging (the behaviour the user asked for, and the reason this isn't a join table).
+  `kind` splits the two jobs: `tag` is a scoping label; `aka` is an alternate name, and a
+  **connector-wide** aka is additionally registered as a source-entity alias so it feeds the
+  existing `resolve_entity`/query-expansion path (folder/document akas are NOT — they name a
+  document, not the source entity, and claiming otherwise would misdirect the graph).
+  `_like_prefix` escapes `%`/`_` because a real Windows path or URL can contain them and an
+  unescaped LIKE would silently widen the match. **(3) Ask within it** —
+  `memory.store.SearchScope(source_ids, doc_ids)` threads into **both hybrid legs of both
+  backends**: LanceDB `where(..., prefilter=True)` (so the predicate runs BEFORE the ANN
+  search — genuinely less work, not over-fetch-and-discard), the FTS5 sidecar's `WHERE` over
+  its UNINDEXED `source_id`/`doc_id` columns, and pgvector's `WHERE`/`= ANY` on both legs.
+  `catalog.resolve_scope` turns a user's picks into those ids **once, server-side**, so no LLM
+  round-trip is spent working out what "the Zix deck" means — and a whole-connector tag
+  resolves to a *source_id* rather than enumerating documents, keeping the predicate O(1) in
+  corpus size. `build_agent(scope=…)` additionally **withholds live connector tools for
+  sources outside the scope** (`_scoped_sources`), which is where the saved round-trips
+  actually come from: the model cannot call into a system the user excluded. A scoped refusal
+  is deliberately worded differently from a global one ("not in the sources you scoped to",
+  never "the organisation never learned this") — it only searched a slice, and saying
+  otherwise would be a false claim. UI: **`ScopePicker`** chip in the composer (default "All
+  memory", sticky across a conversation, one click to clear), offering connectors with
+  documents plus every tag. `POST /api/chat` takes an optional `scope`; omitting it is
+  byte-identical to the old request. Tests: `tests/test_scoping.py` (17). NB this is also the
+  filtering machinery per-user knowledge scopes (PRIORITIES #2) needs.
 - `quickjoiner/auth.py` — opt-in local auth. `Auth` over the catalog: PBKDF2 password hashing,
   bearer tokens (sha256-hashed at rest in `auth_tokens`), `users` table (with a **`role`
   column**). **Open mode until the first user exists** (no login, everything shared = pre-auth
@@ -687,7 +966,17 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   config models** (never the saved config, or every field would read as default forever), so the
   Settings drawer can mark which fields are still stock without hardcoding the values; `POST /api/llm/test` probes the provider with a one-token round-trip, accepting
   optional unsaved `llm` overrides so the Settings drawer can verify a proxy/model before saving,
-  never persisting) + `hooks.py` (HMAC-verified `POST /hooks/{source}` push ingestion). Bearer token via
+  never persisting) + `hooks.py` (verified `POST /hooks/{source}` push ingestion — 2026-07-26:
+  gained a `?token=<webhook_secret>` query-param scheme alongside the header-based ones, for a
+  sender that can only configure a bare callback URL with no custom headers or signing at all —
+  Azure DevOps Service Hooks and Octopus subscriptions both fall in that bucket, and it's the
+  only scheme either can actually satisfy; see the module docstring for all four schemes.
+  `receive_hook` also now checks `connector.wants_resync(payload)` before the normal
+  handle_event→ingest path: a connector whose webhook can't carry the actual content it needs
+  to learn — the git-clone connector's push events carry commit metadata, never file contents —
+  returns `True` there instead, and the router kicks off a real background `sync()` job via the
+  same `SyncManager.start()` "Sync now" already uses, rather than trying to force a webhook
+  payload into `handle_event`). Bearer token via
   `Authorization` header → `_user()`; secret option values masked (`MASKED`) in responses, and a
   PATCH sending the mask back keeps the stored secret. Live connector tools in chat are scoped to
   `ctx.visible_sources(user)`.
@@ -834,6 +1123,14 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
 - `quickjoiner/evals/harness.py` — YAML eval sets; deterministic retrieval layer (no LLM) +
   agent layer (refusal phrasing via `REFUSAL_MARKERS`, citations, keywords). Reports saved to
   `<workspace>/evals/*.json` for before/after comparison when tuning threshold/embedding/chunking.
+  **`is_refusal` normalizes typographic apostrophes before matching (2026-07-27):** found running
+  the plan-05 agent-layer matrix live against the AppRiver corpus (gpt-oss-120b via litellm) — the
+  model renders the mandated refusal phrase with a mix of straight and curly apostrophes (`haven't`
+  vs `haven't`) even within one eval run, and the old exact-substring check silently miscounted 3 of
+  4 refusal cases as false answers. Now reuses `ingest.normalize.normalize_query`'s char-fold table
+  (same fix pattern as doc-text normalization) before matching. This also unmasked two genuine
+  false-refusal cases that had been hiding behind the bug (see the plan-05 status note below).
+  Regression-tested (`test_is_refusal_matches_typographic_apostrophe`).
   **Threshold calibration** (`calibrate(results, floor=0.90)`, `qj eval SET --calibrate [--apply]`):
   sweeps `min_score` t ∈ [0.30, 0.80] and reports the value that best separates grounded answers
   from refusals — maximizes `(grounded_recall + refusal_accuracy)/2` subject to `refusal_accuracy
@@ -850,7 +1147,23 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   per-question chat attachments past `chat.context_retention_days`. Now **always** returns a running
   scheduler (the cleanup must run even with no interval-synced sources).
 - `quickjoiner/chat_attachments.py` — per-question chat file attachments: **context for one
-  question, NOT learned memory** (never embedded/indexed/graphed, and never folded into the Uploads
+  question, NOT learned memory by default — with an explicit opt-in to make it memory**
+  (2026-07-24, user request). `POST /api/chat/attachments/{id}/learn` promotes an
+  already-uploaded attachment into the rolling Uploads connector (re-saves the stored bytes
+  via `save_upload` + the shared `_ingest_upload_path`), so the same file both answers THIS
+  question and becomes cited memory; the attachment stays downloadable. 410 (not 404) once
+  the retention sweep removed the bytes — "it existed and is gone, re-attach it". Reached
+  two ways: the composer's **Learning permanently** toggle beside the staged chips (default
+  "Ask only", resets after every send so it can never silently persist), and by **asking** —
+  `build_context_block` now emits each file's attachment id and tells the agent to call
+  `qj_api POST /api/chat/attachments/<id>/learn` when the user asks to learn/remember/save
+  it. Both were reported live: an attached deck + "learn from this document" got "I'll need
+  the content", and `ingest <local path>` got "I don't have direct access to files on your
+  computer" — the latter because `qj_api`'s description listed connectors/syncs/settings but
+  never mentioned **ingesting documents**, so the model never connected the request to an API
+  it already had. That description now names both `/api/uploads/local` and the attachment
+  learn path explicitly, and says never to claim it cannot read the machine's files.
+  The default is unchanged: nothing is ingested unless asked (never embedded/indexed/graphed, and never folded into the Uploads
   connector unless the user explicitly asks). `store_attachment` extracts text (via `ingest/extract`)
   to `<workspace>/context/<id>/`, `build_context_block` injects it into a chat turn's system prompt
   (cited as `[file: <name>]`), `resolve_message_attachments` overlays a stored message's attachments
@@ -1587,6 +1900,92 @@ Post-phase additions (2026-07-07, all tested — suite: **89 passed**):
   updated to assert the always-on cleanup job), 12 skipped, pre-existing eval-yaml failure unchanged.
   Browser-verified via Playwright (stage chip → send → attachment renders under the question with a
   download link; Uploads connector stays 0 docs) + live uvicorn (upload/download/410/isolation).
+- Document browser, labels, and scoped questions (2026-07-25, user request: "visualize
+  everything the uploads connector has ingested… provide aka and tags… scope my question to a
+  specific connector/document so not too many LLM calls are spent searching and there's less
+  ambiguity"). Design decisions taken with the user first: a **deterministic picker** rather
+  than natural-language scoping (resolving it with the model would cost the very round-trip
+  scoping exists to save), folder tags **inherit automatically**, and a scoped turn also
+  **drops live tools for excluded connectors**. Full design in the architecture bullet above.
+  Suite: **676 passed** (+17). Verified end-to-end in Chrome against a real synced workspace:
+  the browser groups 13 documents by folder, a folder tag shows as inherited on both its
+  files, a document tag added through the UI appears in the picker, and the chosen scope
+  reaches `POST /api/chat` as `{"tags": ["architecture"]}`. Retrieval filtering measured
+  directly: "leave policy days" returns `leave.md` at 0.78 unscoped and is **absent** when
+  scoped to `#architecture`, while an in-scope question keeps its full 0.79 score. (The
+  chat-level assertion needs a live LLM; that scratch workspace had no Ollama model pulled,
+  so the store-level numbers are the evidence for filtering.)
+- Corrupt-package salvage (2026-07-24): the user's real deck turned out not to be a text
+  problem at all — it failed to open, `Bad CRC-32` on one embedded PNG, taking every slide's
+  text with it. Extraction now salvages text straight from the package XML when the library
+  cannot open the file. Suite: **659 passed** (+3). Detail in the `ingest/extract.py` bullet.
+- PowerPoint extraction rebuilt on three passes after a user challenge (2026-07-24): "why don't
+  you research how to build a perfect powerpoint reader/extractor? I think there's lots of text in
+  this file but the parser is missing everything." They were right, and the earlier group-recursion
+  fix was necessary but not sufficient. Researching python-pptx's source found the hard-coded
+  six-tag whitelist in `iter_shape_elms` that excludes `mc:AlternateContent`, making those shapes
+  wholly invisible to the object model; reproduced, then fixed by merging a raw DrawingML sweep and
+  a referenced-parts sweep with the structured pass. Design in the `ingest/extract.py` bullet. Also
+  added **`qj extract <file>`**, a workspace-free diagnostic that prints exactly what the extractor
+  reads (per slide) — so "parser gap or picture-only deck?" is answerable in one command instead of
+  inferred from a chat reply. Suite: **656 passed** (+3).
+- Unreadable attachments are named, not hidden — and `/ingest` is deterministic (2026-07-24,
+  user-reported, third round on the same flow). Two remaining holes after the previous fix:
+  (1) when a file extracted to NO text, `build_context_block` returned an empty string, so the
+  agent was told nothing at all — not the filename, not the id, not that a file existed — and
+  flailed, asking the user to "paste the attachment IDs" it had never been shown. Now every
+  attachment reaches the model either as usable text or as a named UNREADABLE entry carrying
+  its id and the recorded reason, with an explicit instruction not to ask for ids or re-uploads.
+  The reason is persisted (`context_attachments.extract_error`, migration-added) at upload time
+  by `store_attachment`, returned by the upload endpoint, and shown to the user in chat the
+  moment it happens rather than being inferred from a confused answer. (2) `ingest <path>` kept
+  failing agentically ("I can't read files directly from your computer") even after the tool
+  description was corrected — so it now has a **deterministic** `/ingest <path>` slash command
+  (`commands.ts` → `POST /api/uploads/local`, quotes stripped so a "Copy as path" paste works),
+  matching the house rule that slash commands are the deterministic fast path and cannot be
+  talked out of doing their job. Listed in the composer's command hint. Suite: **653 passed**
+  (+2). Browser-verified: `/ingest "<path>"` → `uploads:uploads` 0→1 with a confirmation in
+  chat, and an unreadable file reports why instead of appearing to succeed.
+- Attachments can now be learned, and the agent knows it can read files (2026-07-24, user
+  request + two live reports). Attaching a file in chat stays per-question context by default —
+  the separation the user asked for originally — but "here's a document, learn it" is the obvious
+  next thing to want, and there was no route to it: `POST /api/chat/attachments/{id}/learn` +
+  a **Learning permanently** toggle in the composer + agent guidance now provide one. The
+  companion bug: `ingest <local path>` was answered with "I don't have direct access to files on
+  your computer", because `qj_api`'s tool description never mentioned document ingestion — the
+  capability existed, the model just had no cue it did. Details in the `chat_attachments.py`
+  bullet. Suite: **651 passed** (+4). Browser-verified end to end against a scratch workspace:
+  staged chip → default "Ask only" → toggle → send → `uploads:uploads` 0→1 → the deck's
+  grouped-diagram labels retrieved at 0.69–0.77, and the toggle resets after the send.
+- PowerPoint/Word shape-tree extraction fix (2026-07-24, user-reported): an architecture deck
+  attached in chat produced no context at all — the agent replied "I'll need the content". Root
+  cause proven by reproduction, not guessed: `slide.shapes` walks only top-level shapes, so
+  grouped diagram labels were lost silently. Fixed with group recursion + chart + SmartArt +
+  Word text-box/header coverage; details in the `ingest/extract.py` bullet. This affected EVERY
+  ingestion surface (chat attachments, Uploads, files/git, OneDrive learn), not just chat.
+  Suite: **647 passed** (+3). NB the related UX point: attaching a file in chat is deliberately
+  **per-question context, not memory** — permanently learning a document is `/qj ingest <path>`
+  or `POST /api/uploads`.
+- OneDrive / SharePoint connector — per user, on demand (2026-07-24, user request). Design
+  decisions taken with the user before building: **communal memory accepted for now** (with the
+  leak stated at connect time and per-user knowledge scopes raised to PRIORITIES #2), **both**
+  sign-in flows (device code for CLI/Docker, auth-code+PKCE for the web UI), and all three access
+  scopes. Then re-scoped mid-build on the user's instruction from a crawler to a **credentialed
+  on-demand reader**: `/qj learn from this onedrive document <url>` ingests exactly what you
+  point at, `sync` only refreshes what you already taught it. Full design in the connectors
+  bullet above. Also in this change: **zip archives** and a wider text/code format set at the
+  extraction choke point, images made an explicit *not-yet* wired to the vision seam, and a new
+  `Connector.on_deleted()` hook. One core change was needed to support it — `sync(state)` may now
+  write back into its state dict (`catalog.set_sync_state_many`, committed **before** `since` so
+  a stale loaded value can't rewind the watermark, and only after a fully successful run), which
+  is how a connector persists an opaque cursor of its own. Suite: **644 passed** (+46: 34
+  `tests/test_onedrive.py`, 6 API, 6 extract), 12 skipped. Browser-verified via Playwright against
+  a scratch workspace: the connector form renders all fields, the plate shows signed-out →
+  Sign in with Microsoft → signed-in-as with the on-demand learn box, and a learn against a real
+  Microsoft endpoint surfaces the genuine `invalid_grant` sign-in error to the user rather than
+  failing silently. **Not verified: any real tenant** — no Microsoft 365 app registration or
+  account is available on this machine, so the Graph request/response shapes are covered by
+  MockTransport round trips against the documented contracts, not by a live drive.
 - Knowledge-graph canvas rebuilt — smooth camera, live layout, map-tile LOD (2026-07-24, user
   report: "it's like nothing", with a screenshot of the live AppRiver graph rendering as
   one-pixel dust; and "when I zoom in, expand neighbours, then zoom out, everything becomes
@@ -1601,6 +2000,149 @@ Post-phase additions (2026-07-07, all tested — suite: **89 passed**):
   when zoomed in and the toolbar says "112 in view", zoom-out floors at content scale (0.116 vs
   the old 0.05 void), double-click expand fits the new neighbourhood at k=1.25, and the console
   is clean. No backend change; no API change. Frontend typecheck + build green.
+
+- Connector-row browsing, zip upload, and real ingest progress (2026-07-26, three user reports
+  in one session). **(1) Connected-systems row permanently reopened the sync log instead of
+  ever browsing documents again**, on any connector that had synced at least once: `Rail.tsx`'s
+  `watchable` gate read `job?.live`, which means "the in-memory `SyncManager` still owns this
+  job id" — and finished jobs are never evicted from that map, so it stayed true forever after
+  a connector's first sync/cleanup. Fixed to require the job actually be in flight (`syncing`,
+  the same running/paused/stopping/retrying check already computed) — matches the code's own
+  stated intent ("a system that is syncing right now… clicking it re-opens the live log").
+  **(2) The composer's file picker couldn't select a `.zip`**, or dozens of other now-supported
+  extensions — `UPLOAD_ACCEPT` was a stale, partial hand-copy of `ingest/extract.py`'s real
+  support (drag-and-drop bypassed it, which is how the user got one attached at all). Rebuilt
+  from `DOC_EXTENSIONS ∪ ARCHIVE_EXTENSIONS ∪ TEXT_EXTENSIONS`. **(3) A several-MB attachment
+  froze the whole server for seconds**, not just the uploading tab: `POST /api/chat/attachments`
+  and `POST /api/uploads` are `async def` FastAPI routes that called text extraction/ingestion
+  *synchronously* — CPU/IO work running directly on an `async def` handler blocks the entire
+  event loop, so every other request/SSE stream on the server stalled for that long too. Fixed
+  with `run_in_threadpool` (existing `def` routes like `upload_local`/`learn_attachment` were
+  already safe — Starlette auto-threads plain `def` handlers, only `async def` needed it).
+  **(4) Even threaded, "Learning permanently" a large file (e.g. a whole zip, concatenated) can
+  take real minutes to embed on a CPU-only machine, and the chat gave no sign anything was
+  happening** — reported as "it just stayed there… then after a couple of mins it posted".
+  Real (not fake) progress needed the embed step itself instrumented: `KnowledgeStore.
+  upsert_document_with_progress` (new, deliberately a SEPARATE method from `upsert_document` —
+  the hot path every connector sync calls, left untouched) embeds in small batches and reports
+  `(chunks done, chunks total)` between them; `pipeline.ingest`/`_ingest_one` gained an optional
+  `progress_cb` (`None` for every ordinary sync, unaffected); `ingest_progress.py` is a tiny
+  in-memory registry keyed by a token the FRONTEND mints (so it can start polling
+  `GET /api/ingest-progress/{token}` in parallel with the `POST …/learn?progress_token=…` that
+  owns it — an HTTP response can't be sent twice, so the token must exist before the slow work
+  starts). `Msg.learning` (`Chat.tsx`) renders a real progress bar in the SAME agent bubble that
+  goes on to stream the reply, and `App.tsx` now pushes the user message + that bubble
+  **immediately** on send rather than after attach+learn finish, so nothing is silent while
+  ingestion or embedding runs. Postgres/pgvector has no equivalent method — falls back to the
+  plain call via `getattr`, same pattern as `ensure_ann_index`/`maybe_compact`.
+  Also this session: the **document browser groups Confluence pages by space**
+  (`DocumentsModal.tsx`) — a Confluence page uri is `{base}/spaces/{KEY}/pages/{id}/{title}`,
+  and the page id makes every page's own path segment unique, so the generic folder-prefix
+  grouping gave each page its own one-document "folder" (reported: "for all the pages under AR
+  there's 1 individual entry with no parent as space"). Grouped instead by the prefix through
+  the space key — still a real uri prefix, so it stays valid as the `uri_prefix` a folder label
+  is stored against, no backend change needed. And **an ingested `.zip`'s contents are listed in
+  the document browser** rather than showing as one opaque row: new `GET /api/sources/{id}/
+  documents/archive?doc_id=` (`ingest.extract.parse_archive_manifest`, pure) re-derives the
+  member list by re-reading the same `--- path ---` headers `_extract_zip` wrote into the
+  document's own text — chunks are the only place that text lives, so no new schema column.
+  Suite: **685 passed** (+9), 12 skipped, pre-existing eval-yaml failure unchanged; frontend
+  typecheck + build green. NOT yet live-verified in the browser against a real multi-minute
+  embed (would need a genuinely large corpus on this machine to observe end-to-end) — the
+  progress math itself is unit-tested (`test_pipeline.py`, `test_chat_attachments.py`) and the
+  wiring was traced by hand through every layer.
+
+- ADO/TFS work-item hierarchy graph + document-browser tree view shipped (2026-07-26,
+  AI_ROADMAP #26 / PRIORITIES #20 — closes the Jira/ADO relationship asymmetry the roadmap had
+  flagged; user asked "have we implemented harvesting TFS relationships — epic → feature →
+  story/bug → task/pipelines/development work/other related stories?", answer was no, then asked
+  to build it plus a hierarchical explorer). Full design in the `azure_devops.py` architecture
+  bullet above (`hierarchy_graph`/`_merge_graphs`, the bounded hierarchy walk-up, per-document
+  display metadata + its version-triggered backfill, and the document browser's
+  `buildWorkItemTree`/`sortSiblings`). Plan reviewed and approved with the user before
+  implementation (`~/.claude/plans/smooth-humming-forest.md`); two design choices confirmed with
+  them directly: "completed" is a state-name heuristic (not an extra ADO API call), and completed
+  items sort by closed-date-falling-back-to-last-updated. Suite: **695 passed** (+10), 12 skipped,
+  pre-existing eval-yaml failure unchanged; frontend typecheck + build green. Scoped to Azure
+  DevOps only per the request — Jira already has `part_of` edges and could adopt the same tree
+  view later without rework, but that's still just a note, not built. **Live-verification pending
+  a real ADO re-sync**, same caveat as the ingest-progress entry above — the hierarchy walk-up and
+  metadata backfill only exercise for real against a genuine sync.
+- Hierarchy walk gained a DOWN direction (2026-07-26, same-day follow-up): the user re-synced and
+  asked "why did the connector pull only partial data for features and epics?" with a screenshot
+  of the real ADO hierarchy for comparison. Verified directly against the live catalog rather than
+  guessing (queried `catalog.db` for the Epic/Feature in question) — confirmed a whole Feature
+  ("Tech Debt") was missing entirely and a discovered one ("Provisioning") had only 3 of its ~10
+  real children. Root cause: the walk only ever went UP from a leaf still inside a team's recent-
+  sprint window, so a Feature/Epic whose children were mostly old/completed was either never
+  discovered or only shown through whichever single descendant happened to still qualify. Fixed by
+  also walking DOWN (Hierarchy-Forward) from any discovered Epic/Feature specifically — full detail
+  in the `azure_devops.py` architecture bullet's "Walks the hierarchy both UP and DOWN" note. Suite:
+  **696 passed** (+1), 12 skipped. Still pending: watching the NEXT re-sync actually pull the
+  previously-missing items (this fix ships the code; it hasn't been observed live yet).
+- Document-browser filters for TFS work items (2026-07-26, same-day follow-up — a proposed
+  bundled "detailed per-team sprint config + filters" change was rejected first; this is the
+  filter half only, re-requested on its own). `work_item_document`'s `display` metadata
+  (`azure_devops.py`) gained `assigned_to` and `tags` (ADO's `System.Tags` is one
+  semicolon-separated string — split into a real list so filtering matches an exact tag, not a
+  substring of the raw field). The document browser's Epic/Feature/Story/Task tree
+  (`DocumentsModal.tsx`) gained three filter dropdowns for `sourceType === "azure_devops"` —
+  iteration, assignee, tag — populated only with values actually present (never hardcoded),
+  ANDed with each other and with the existing free-text name search. Reuses the exact
+  ancestor-preservation logic the text filter already had (a matched deep child keeps its
+  ancestor chain visible, so filtering to one tag doesn't orphan a Story from its Feature/Epic).
+  No new endpoint or schema change — everything needed already rides the `metadata` blob
+  `/api/sources/{id}/documents` returns. Suite: **697 passed** (+1), 12 skipped; frontend
+  typecheck + build green.
+- Dormant-team visibility for a project synced with `teams` left broad (2026-07-26, same-day
+  follow-up): the user noticed ADO's own Teams page lists plenty of teams with nothing shipped
+  in a year or more, and asked how the recent-sprint window behaves for them — and separately
+  confirmed the live tools' scope. Answered directly first: `ado_query_work_items` (WIQL) and
+  `ado_get_work_item` run project-wide, unscoped to `teams`/ingestion state, so a question about
+  a never-ingested (or skipped-as-dormant) team still gets a live, current answer — verified by
+  reading both tool bodies, not assumed. And a genuinely dormant team's recent-N-sprints window
+  was already correctly empty (nothing wrong was being ingested) — the real gap was silence:
+  indistinguishable from a transient API hiccup. Fixed with a pure visibility change, no
+  ingestion behavior change: `_team_is_dormant(latest_checked_iteration, stale_after_days, now)`
+  in `azure_devops.py` — when a team's checked window has zero items AND its most-recently-
+  checked sprint ended more than `stale_after_days` (new option, default 365) ago, `sync()`
+  reports it plainly via `self._stage(...)` ("no activity in over Nd, skipped") instead of
+  silently moving on; an empty-but-recent window (a team just between sprints) gets a milder
+  "nothing in this window" note instead of the dormant label. Suite: **698 passed** (+1), 12
+  skipped; no frontend change (backend-only, no new metadata surfaced to the UI).
+- Jira brought toward parity with the ADO connector's hierarchy/relationship work (2026-07-26,
+  same-day follow-up): the user asked for a gap analysis between the two "similar nature"
+  backlog connectors, then asked to implement the cheap/high-value items identified. Shipped:
+  `related_to` edges from Jira's `issuelinks` (previously not even fetched), a bounded walk-up
+  for parent Epics the incremental JQL pull would otherwise never reach, the same `display`
+  metadata block ADO's document-browser tree reads (id/parent_id as Jira KEYS — strings, not
+  numbers), and a `jira_get_issue` live tool (full description/links/comments — `jira_search`
+  only returns summary lines). The document-browser Epic/Story/Task tree in `DocumentsModal.tsx`
+  was generalized from ADO-only to a small source-type set, with zero Jira-specific UI code —
+  this incidentally fixed a pre-existing bug where every Jira issue rendered as its own one-item
+  "folder" (same class of bug Confluence had before its space-grouping fix). Full detail in the
+  new `jira.py` architecture bullet above (added in the same change — jira.py had no dedicated
+  bullet before this). Deliberately NOT done: Jira sprint/board windowing (a genuinely different
+  API surface — the Agile REST API, not the base one this connector speaks — flagged as an open
+  question in the analysis, not an assumed gap) and a bonus finding unrelated to Jira
+  (`azure_devops.py`'s own webhook handler drops `repo_names`/`team` on push-ingested items).
+  Suite: **701 passed** (+4), 12 skipped; frontend typecheck + build green.
+- Webhooks made actually usable for systems that can't sign, + git push-triggered re-sync
+  (2026-07-26, same-day follow-up to the "what purpose do hooks play, are they pre-configured"
+  / "what functionality do webhooks bring" questions). Investigating the pre-configured question
+  surfaced a real code gap, not just a docs one: `octopus.py`'s own docstring already admitted
+  "Octopus can't sign, so front it with a proxy... or use a secret URL path via the source name"
+  — but `hooks.py` never actually implemented that fallback, so Octopus's push mode (and, almost
+  certainly, Azure DevOps Service Hooks, which has no native per-request signing either) had no
+  real way to authenticate at all. Fixed with a fourth verification scheme in `verify_signature`:
+  `POST /hooks/{source}?token=<webhook_secret>` — a plain shared secret in the URL itself, for a
+  sender that can only configure a bare callback URL with no custom headers. Also shipped: the
+  git connector's push-triggered re-sync (see its architecture bullet above) — asked for in the
+  same message. Both land through the same `receive_hook`, which now takes a `syncs`
+  (`SyncManager`) argument so a connector's `wants_resync` can kick off a real background sync
+  job instead of always assuming a direct handle_event→ingest. Suite: **705 passed** (+4), 12
+  skipped. A step-by-step setup guide for TFS/GitLab/Octopus was published as a Claude Artifact
+  rather than embedded here (living reference material, not architecture).
 
 ## Next steps (agreed with user)
 

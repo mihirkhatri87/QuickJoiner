@@ -1,0 +1,25 @@
+meta {
+  name: 6-onedrive
+  seq: 7
+}
+
+docs {
+  # OneDrive / SharePoint — per-user sign-in and on-demand learning
+
+  This connector authenticates as a **person**, not with a static secret, and it never crawls:
+  it ingests exactly the documents you point it at.
+
+  Order:
+  1. **Create** it with your Azure app registration's Application (client) ID. It saves even
+     though it is not signed in yet — the token is keyed to the connector, so the connector has
+     to exist first.
+  2. **Sign in.** In a terminal that is `qj onedrive login <name>` (device code). Over HTTP,
+     `Start sign-in` returns an `authorize_url`; open it in a browser, complete Microsoft
+     sign-in, and the redirect lands on `/api/oauth/callback` which stores the token.
+  3. **Learn** specific documents: any OneDrive/SharePoint link you can open, or a path inside
+     your own drive. A folder learns the readable files beneath it.
+  4. `Sign-in status` shows who it acts as and how many documents it has learned. It never
+     returns the tokens themselves.
+
+  Set `onedriveConnector`, `onedriveClientId` and `onedriveTarget` in the Local environment.
+}

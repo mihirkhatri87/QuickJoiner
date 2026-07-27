@@ -15,13 +15,16 @@ from quickjoiner.connectors.base import ConnectionStatus, Connector, Document, M
 from quickjoiner.connectors.deps import SKIP_DIRS, dependency_document  # noqa: F401 — SKIP_DIRS re-exported
 from quickjoiner.connectors.registry import register
 from quickjoiner.ingest.extract import (  # noqa: F401 — extension sets re-exported
+    ARCHIVE_EXTENSIONS,
     CODE_EXTENSIONS,
     DOC_EXTENSIONS,
+    IMAGE_EXTENSIONS,
     NAMED_TEXT_FILES,
     TEXT_EXTENSIONS,
     ExtractionError,
     document_kind,
     extract_text,
+    is_extractable,
 )
 
 # Plain-text files are read whole and small; office/PDF files (parsed via extract.py) are
@@ -93,20 +96,21 @@ def read_documents_parallel(
 def read_file_document(path: Path, root: Path) -> Document | None:
     """Read one file into a Document if we can extract text from it; None otherwise.
 
-    Plain-text/code/markdown/json/html are decoded directly; Word/PowerPoint/Excel/PDF are
-    parsed via `ingest.extract` (office/PDF get the roomier size cap). A file we can't parse
-    (missing optional library, corrupt/encrypted, or an image-only doc with no text layer)
-    is skipped, not fatal. Shared by the files, git_repo and uploads connectors.
+    Plain-text/code/markdown/json/html are decoded directly; Word/PowerPoint/Excel/PDF and
+    zip archives are parsed via `ingest.extract` (which get the roomier size cap — an archive
+    expands to its readable members). A file we can't parse (missing optional library,
+    corrupt/encrypted, an image with no vision handler wired yet) is skipped, not fatal.
+    Shared by the files, git_repo and uploads connectors.
     """
     suffix = path.suffix.lower()
     name = path.name.lower()
     stem = path.stem.lower()
-    is_doc = suffix in DOC_EXTENSIONS
+    is_binary = is_extractable(path.name)  # office/PDF/archive: real parser, roomier cap
     is_text = suffix in TEXT_EXTENSIONS or name in NAMED_TEXT_FILES or stem in NAMED_TEXT_FILES
-    if not is_doc and not is_text:
+    if not is_binary and not is_text:
         return None
     try:
-        if path.stat().st_size > (MAX_DOC_BYTES if is_doc else MAX_FILE_BYTES):
+        if path.stat().st_size > (MAX_DOC_BYTES if is_binary else MAX_FILE_BYTES):
             return None
         raw = path.read_bytes()
     except OSError:

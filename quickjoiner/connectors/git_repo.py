@@ -1,5 +1,11 @@
 """Git repository connector: clone/pull any git remote (GitHub/GitLab/Azure DevOps/etc.)
-and index its files plus recent commit history. Works with a plain git URL + token."""
+and index its files plus recent commit history. Works with a plain git URL + token.
+
+Push mode triggers a real re-sync (git pull + re-read files), not direct document
+ingestion: point the remote's push webhook at POST /hooks/<source> and set the
+source's webhook_secret. A push to the mapped `branch` option (or the remote's default
+branch, when unset) re-syncs within seconds instead of waiting for the next scheduled
+pull — see `wants_resync`/`pushed_branch`."""
 
 from __future__ import annotations
 
@@ -59,10 +65,21 @@ def suggest_api_connector(git_url: str) -> dict | None:
     return None
 
 
+def pushed_branch(payload: dict) -> str | None:
+    """The branch a push webhook targeted, from the `ref` field GitHub's and GitLab's push
+    events both use (`"ref": "refs/heads/<branch>"`) — the two hosts this codebase's other
+    connectors actually speak natively, and a plain-git remote can be either. Returns None
+    for a tag push (`refs/tags/...`) or a payload shape we don't recognize — never guessed,
+    since guessing wrong here would trigger (or skip) a resync for the wrong reason."""
+    ref = str(payload.get("ref") or "")
+    prefix = "refs/heads/"
+    return ref[len(prefix):] if ref.startswith(prefix) else None
+
+
 @register
 class GitRepoConnector(Connector):
     type_name = "git"
-    modes = Mode.PULL
+    modes = Mode.PULL | Mode.PUSH
 
     def _remote(self) -> str:
         url = str(self.options.get("url", ""))
@@ -94,6 +111,24 @@ class GitRepoConnector(Connector):
         if result.returncode != 0:
             return ConnectionStatus(False, f"git ls-remote failed: {result.stderr.strip()[:300]}")
         return ConnectionStatus(True, "Remote reachable")
+
+    def wants_resync(self, payload: dict) -> bool:
+        """A push webhook to the mapped `branch` (or ANY branch, when none is configured
+        — the connector then just tracks the remote's default branch, so a push to
+        whichever branch that is is always relevant) means new commits exist that
+        `sync()` needs to actually `git pull` and re-read — a webhook payload carries
+        commit metadata, never file contents, so there is nothing `handle_event` could
+        yield directly (see its override below)."""
+        branch = pushed_branch(payload)
+        if branch is None:
+            return False
+        configured = str(self.options.get("branch") or "").strip()
+        return not configured or branch == configured
+
+    def handle_event(self, payload: dict) -> Iterator[Document]:
+        # Nothing to yield directly for a git push — see wants_resync. The hooks router
+        # checks that FIRST and triggers a real sync() instead of calling this.
+        return iter(())
 
     def sync(self, state: dict[str, str]) -> Iterator[Document]:
         clone_dir = self._clone_dir()

@@ -128,7 +128,7 @@ than a connector per file.
 |---|---|---|
 | **Chat & messaging** | Slack (G,O,D,U) · Microsoft Teams (G,O,D) · Google Chat (G) · Discord (O) · Zulip (O) · Discourse (O) · Mattermost | **Critical.** Slack/Teams hold the tribal knowledge onboarding lives on. Our single biggest gap. |
 | **Email & calendar** | Gmail (G,O,D) · Outlook / Exchange Online (G,D) · Google Calendar (G) · Outlook Calendar (G) | Medium — high privacy sensitivity; per-user consent design needed before we touch it. |
-| **Drives & file storage** | Google Drive (G,O,D) · SharePoint (G,O,D) · OneDrive (G,O) · Box (G,D) · Dropbox (G,O,D) · Egnyte (G,O) · Google Sites (G,O) · SMB/network shares | **High.** Design docs and runbooks live here; SharePoint alone unlocks most Microsoft shops. |
+| **Drives & file storage** | ~~SharePoint~~ · ~~OneDrive~~ **(SHIPPED 2026-07-24)** · Google Drive (G,O,D) · Box (G,D) · Dropbox (G,O,D) · Egnyte (G,O) · Google Sites (G,O) · SMB/network shares | **Closed for Microsoft shops.** OneDrive for Business + SharePoint ship as a **per-user, on-demand** connector: delegated Microsoft 365 sign-in reads exactly what that person can (incl. files shared *with* them) and ingests only the documents they point it at — a deliberate contrast to competitors' bulk drive crawls. Google Drive is now the top remaining gap in this row. |
 | **Wikis & notes** (beyond Confluence) | Notion (G,O,D,U) · Guru (G,O,D) · Slab (O,D) · Coda (G,D) · Quip (G) · BookStack (O) · Document360 (O) · GitBook · MediaWiki (O) · Slite · Tettra · Nuclino · Highspot (G,O) · Seismic (G) · Simpplr (G) · LumApps (G) · Staffbase (G) | **High** for Notion/Guru/Slab/GitBook (startup-to-midmarket wikis); Low for the intranet/sales-enablement tail. |
 | **Project & issue tracking** (beyond Jira/ADO) | Linear (G,O,D,U) · Asana (G,O,D) · Trello (G,D) · Monday.com (G,D) · ClickUp (G,O,D) · Shortcut · Basecamp · Airtable (G,O,D) · Smartsheet (G) · Wrike (G) · Productboard (G,O) · Aha! (G) · Jira Service Management (G) | **High** for Linear (dominant in modern eng orgs); Medium for Asana/ClickUp; Low for the PM-suite tail. |
 | **Code & dev knowledge** (beyond git/GH/GL/ADO) | Bitbucket (G,O,D,U) · Gerrit · Stack Overflow for Teams (G,D,U) · Gitea · object stores as doc sources: S3 / GCS / Azure Blob / R2 / OCI (O) | **High** — Bitbucket completes the big-four code hosts; SO-for-Teams is exactly our persona's Q&A corpus. |
@@ -153,8 +153,8 @@ their catalogs are thinnest: the engineering operations stack.
 
 ### Strategy conclusion (don't chase 275)
 
-1. **The persona needs ~15, not 275.** Priority build order: **Slack** → Google Drive +
-   SharePoint/OneDrive → Notion → Bitbucket → Linear → Stack Overflow for Teams →
+1. **The persona needs ~15, not 275.** Priority build order: **Slack** → Google Drive
+   (SharePoint/OneDrive **shipped 2026-07-24**) → Notion → Bitbucket → Linear → Stack Overflow for Teams →
    PagerDuty → Sentry → Microsoft Teams → one CI (Jenkins or CircleCI) → Backstage
    (service catalog: nobody serves it well, perfect graph fit) → Zendesk → Zoom/Gong.
 2. **Modes over count**: each addition ships the full ladder (pull/push/live/browser/

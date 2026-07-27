@@ -19,6 +19,13 @@ export interface Msg {
   thinking?: string;
   tools?: string[];
   attachments?: ChatAttachment[]; // per-question context files shown beneath the question
+  /** Real progress for an in-flight "learn this permanently" ingest (chunks embedded / total)
+   * — a large document can take minutes to embed on a CPU-only machine, so this replaces a
+   * silent wait with an honest, live number. Renders above thinking/tools/answer in the same
+   * bubble; `complete` marks it done and settled (kept visible, not removed, as a record of
+   * what happened this turn). `total` of 0 means "still extracting/chunking — count not
+   * known yet", shown as an indeterminate bar rather than a fake 0%. */
+  learning?: { label: string; done: number; total: number; complete?: boolean };
   ts?: string;
 }
 
@@ -364,6 +371,40 @@ function Message({
         {m.ts && <span className="font-mono text-[10px] tabular-nums text-faint">{m.ts}</span>}
       </div>
 
+      {m.learning && (
+        <div className="mb-3 rounded-sm bg-fill px-3.5 py-2.5">
+          <div className="mb-1.5 flex items-center gap-2 text-[11.5px] text-muted">
+            {m.learning.complete ? (
+              <Check size={12} className="flex-shrink-0 text-accent" />
+            ) : (
+              <Loader2 size={12} className="flex-shrink-0 animate-spin text-accent" />
+            )}
+            <span className="truncate">{m.learning.label}</span>
+            <span className="ml-auto flex-shrink-0 font-mono text-[10.5px] tabular-nums text-faint">
+              {m.learning.complete
+                ? "done"
+                : m.learning.total > 0
+                  ? `${m.learning.done} / ${m.learning.total} chunks`
+                  : "extracting…"}
+            </span>
+          </div>
+          <div className="h-[4px] w-full overflow-hidden rounded-full bg-fill2">
+            <div
+              className={cn(
+                "h-full rounded-full bg-accent transition-[width] duration-200 ease-out",
+                (m.learning.total === 0 && !m.learning.complete) && "animate-pulse2",
+              )}
+              style={{
+                width: m.learning.complete
+                  ? "100%"
+                  : m.learning.total > 0
+                    ? `${Math.round((m.learning.done / m.learning.total) * 100)}%`
+                    : "35%",
+              }}
+            />
+          </div>
+        </div>
+      )}
       {m.thinking && (
         <details className="mb-3 overflow-hidden rounded-sm bg-fill" open={m.streaming}>
           <summary className="cursor-pointer px-3.5 py-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-muted transition hover:text-ink">

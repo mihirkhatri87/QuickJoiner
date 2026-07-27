@@ -12,8 +12,9 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, File, Header, HTTPException, UploadFile
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -117,6 +118,14 @@ _OPENAPI_TAGS = [
 ]
 
 
+class ScopeRequest(BaseModel):
+    """Which slice of memory a question may use. All three are OR-ed and resolved
+    server-side into (source_ids, doc_ids) before any search runs."""
+    source_ids: list[str] = []
+    doc_ids: list[str] = []
+    tags: list[str] = []
+
+
 class ChatRequest(BaseModel):
     message: str
     session_id: str | None = None
@@ -126,6 +135,10 @@ class ChatRequest(BaseModel):
     # Per-question context files (from POST /api/chat/attachments). Their text is injected into
     # THIS turn only and their metadata is stamped on the user message — NOT ingested into memory.
     attachment_ids: list[str] = []
+    # Narrow this question to chosen connectors/documents/tags. Empty = all of memory
+    # (unchanged behaviour). Filters retrieval AND withholds live tools for sources
+    # outside the scope, so a scoped question can't spend calls on what you excluded.
+    scope: ScopeRequest | None = None
 
 
 class ProjectRequest(BaseModel):
@@ -150,6 +163,38 @@ class LearnRequest(BaseModel):
 
 class UploadLocalRequest(BaseModel):
     path: str  # a file path on the server, ingested into the rolling uploads connector
+
+
+def _oauth_page(heading: str, detail: str) -> str:
+    """The tiny page Microsoft's redirect lands on. Self-contained (no assets, no JS)
+    because it renders in whatever browser did the sign-in, which may not be the one
+    QuickJoiner is open in."""
+    import html as _html
+
+    return (
+        "<!doctype html><meta charset='utf-8'>"
+        "<title>QuickJoiner · Microsoft 365</title>"
+        "<style>body{font:16px/1.6 system-ui,sans-serif;margin:0;display:grid;"
+        "place-items:center;min-height:100vh;background:#0f1115;color:#e6e8ee}"
+        "div{max-width:32rem;padding:2rem;text-align:center}"
+        "h1{font-size:1.25rem;margin:0 0 .5rem}p{margin:0;opacity:.75}</style>"
+        f"<div><h1>{_html.escape(heading)}</h1><p>{_html.escape(detail)}</p></div>"
+    )
+
+
+class LabelRequest(BaseModel):
+    source_id: str
+    #: '' = the whole connector · a folder path = that folder AND anything ingested into it
+    #: later · a full document uri = just that document.
+    uri_prefix: str = ""
+    kind: str = "tag"  # 'tag' (scoping label) | 'aka' (alternate name)
+    value: str = ""
+
+
+class OneDriveLearnRequest(BaseModel):
+    #: Shared links (any OneDrive/SharePoint URL the signed-in user can open) and/or
+    #: paths inside their own drive. A folder learns the supported files beneath it.
+    targets: list[str] = []
 
 
 class ScrapeRequest(BaseModel):
@@ -293,7 +338,7 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
     # server restarted), so the user can resume them — they re-pull from the watermark.
     if revive:
         syncs.revive_paused()
-    api.include_router(build_hooks_router(ctx))
+    api.include_router(build_hooks_router(ctx, syncs))
 
     def _user(authorization: str | None) -> str | None:
         """Acting username. An in-process control call injects the user via the trusted
@@ -573,6 +618,8 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
         questions and occupies the knowledge graph. Cleanup therefore runs automatically
         as a background job. `keep_memory=true` keeps the documents (the old behaviour) —
         for deliberately retiring a source while keeping what it taught."""
+        from quickjoiner.connectors.registry import create_connector
+
         user = _user(authorization)
         _require_user(user)
         _guard_not_control(name, "deleted")
@@ -589,12 +636,165 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
             )
         ctx.config.sources = [s for s in ctx.config.sources if s.name != name]
         ctx.catalog.save_config(ctx.config)  # reconciles: removes this source's row
+        # Release workspace-side state the source config doesn't carry — OneDrive's
+        # stored Microsoft 365 refresh token would otherwise stay redeemable on disk
+        # after the connector that owned it is gone. Best effort: never block a delete.
+        try:
+            create_connector(source, ctx.workspace).on_deleted()
+        except Exception:  # noqa: BLE001 - deletion must succeed regardless
+            pass
         if keep_memory:
             ctx.catalog.delete_source(source_id)
             return {"removed": name, "job": None}
         # The job drops the catalog row itself, after the documents/vectors/graph are gone.
         job = syncs.start_cleanup(name, source_id)
         return {"removed": name, "job": job.summary()}
+
+    # ---------------------------------------------------------------- Microsoft 365
+    # Sign-in for the OneDrive/SharePoint connector. Two flows exist because
+    # QuickJoiner runs in two places: this is the browser one (authorization code +
+    # PKCE); the CLI uses device code (`qj onedrive login`), which needs no server
+    # route at all. Pending flows are held in memory keyed by an unguessable state —
+    # a restart mid-flow just means starting again, which is why nothing is persisted.
+    _pending_oauth: dict[str, dict] = {}
+
+    def _onedrive_connector(name: str, user: str | None):
+        from quickjoiner.connectors.onedrive import OneDriveConnector
+        from quickjoiner.connectors.registry import create_connector
+
+        source = _find_source(name, user)
+        connector = create_connector(source, ctx.workspace)
+        if not isinstance(connector, OneDriveConnector):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{name!r} is a {source.type} connector, not a OneDrive/SharePoint one",
+            )
+        return source, connector
+
+    @api.post("/api/connectors/{name}/oauth/start", tags=["Connectors"], summary="Begin Microsoft 365 sign-in for a OneDrive connector; returns the URL to send the browser to.")
+    def oauth_start(name: str, request: Request, authorization: str | None = Header(default=None)):
+        from quickjoiner.connectors import msgraph
+
+        user = _user(authorization)
+        _require_user(user)
+        _source, connector = _onedrive_connector(name, user)
+        _require("connectors:write", user)
+        if not can_manage(_source, user, auth.enabled):
+            raise HTTPException(status_code=403, detail="Only the owner can sign this connector in")
+        if not connector.client_id:
+            raise HTTPException(status_code=400, detail="Set the Application (client) ID first")
+        verifier, challenge = msgraph.pkce_pair()
+        state = secrets.token_urlsafe(24)
+        redirect_uri = str(request.base_url).rstrip("/") + "/api/oauth/callback"
+        _pending_oauth[state] = {
+            "source_id": connector.source_id, "verifier": verifier,
+            "redirect_uri": redirect_uri, "tenant": connector.tenant,
+            "client_id": connector.client_id, "scopes": connector.scopes,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        }
+        return {
+            "authorize_url": msgraph.authorize_url(
+                connector.tenant, connector.client_id, redirect_uri,
+                connector.scopes, state, challenge),
+            "state": state,
+            "redirect_uri": redirect_uri,
+        }
+
+    @api.get("/api/oauth/callback", response_class=HTMLResponse, tags=["Connectors"], summary="OAuth redirect target for Microsoft 365 sign-in — exchanges the code and stores the connector's token.")
+    def oauth_callback(state: str = "", code: str = "", error: str = "",
+                       error_description: str = ""):
+        """Public by necessity: this is Microsoft redirecting a browser, which cannot
+        carry a bearer token. The guard is `state` — minted here, unguessable, single
+        use — so a caller who did not start the flow cannot complete one."""
+        from quickjoiner.connectors import msgraph
+
+        pending = _pending_oauth.pop(state, None)
+        if error:
+            return HTMLResponse(_oauth_page("Sign-in cancelled", error_description or error), 400)
+        if pending is None:
+            return HTMLResponse(
+                _oauth_page("Sign-in expired",
+                            "Start the sign-in again from Settings — this link is single use."), 400)
+        try:
+            bundle = msgraph.exchange_code(
+                pending["tenant"], pending["client_id"], code, pending["redirect_uri"],
+                pending["verifier"], pending["scopes"])
+            client = msgraph.GraphClient(ctx.workspace, pending["source_id"], pending["scopes"])
+            msgraph.save_token(ctx.workspace, pending["source_id"], bundle)
+            me = client.whoami()
+            bundle.account = me.get("userPrincipalName") or me.get("displayName") or ""
+            bundle.tenant, bundle.client_id = pending["tenant"], pending["client_id"]
+            msgraph.save_token(ctx.workspace, pending["source_id"], bundle)
+        except msgraph.GraphError as exc:
+            return HTMLResponse(_oauth_page("Sign-in failed", str(exc)), 400)
+        return HTMLResponse(_oauth_page(
+            f"Signed in as {bundle.account}",
+            "You can close this tab and return to QuickJoiner."))
+
+    @api.get("/api/connectors/{name}/oauth/status", tags=["Connectors"], summary="Whether a OneDrive connector is signed in to Microsoft 365, and as whom.")
+    def oauth_status(name: str, authorization: str | None = Header(default=None)):
+        from quickjoiner.connectors import msgraph
+
+        user = _user(authorization)
+        _source, connector = _onedrive_connector(name, user)
+        _require("connectors:read", user)
+        bundle = msgraph.load_token(ctx.workspace, connector.source_id)
+        if bundle is None:
+            return {"signed_in": False, "account": "", "scopes": [], "learned": 0}
+        from quickjoiner.connectors.onedrive import load_manifest
+
+        # Deliberately never returns the tokens themselves — only who and what.
+        return {
+            "signed_in": True, "account": bundle.account, "scopes": bundle.scopes,
+            "expires_at": bundle.expires_at,
+            "learned": len(load_manifest(ctx.workspace, connector.source_id)),
+        }
+
+    @api.delete("/api/connectors/{name}/oauth", tags=["Connectors"], summary="Sign a OneDrive connector out of Microsoft 365 (deletes its stored refresh token).")
+    def oauth_signout(name: str, authorization: str | None = Header(default=None)):
+        from quickjoiner.connectors import msgraph
+
+        user = _user(authorization)
+        _require_user(user)
+        source, connector = _onedrive_connector(name, user)
+        _require("connectors:write", user)
+        if not can_manage(source, user, auth.enabled):
+            raise HTTPException(status_code=403, detail="Only the owner can sign this connector out")
+        return {"signed_out": msgraph.delete_token(ctx.workspace, connector.source_id)}
+
+    @api.post("/api/connectors/{name}/onedrive/learn", tags=["Sync & ingestion"], summary="Learn specific OneDrive/SharePoint documents on demand — resolves each URL or path with the connector's own sign-in, extracts the text and ingests it into memory.")
+    def onedrive_learn(name: str, req: OneDriveLearnRequest,
+                       authorization: str | None = Header(default=None)):
+        """The on-demand counterpart to a crawl: this connector ingests only what it is
+        pointed at. `targets` accepts shared links (any OneDrive/SharePoint URL the
+        signed-in user can open) and paths inside their own drive; a folder learns the
+        supported files beneath it, bounded and reported."""
+        from quickjoiner.connectors.msgraph import GraphError
+        from quickjoiner.connectors.onedrive import is_communal_memory_warning
+
+        user = _user(authorization)
+        _require_user(user)
+        source, connector = _onedrive_connector(name, user)
+        _require("memory:write", user)
+        targets = [t for t in (req.targets or []) if t and t.strip()]
+        if not targets:
+            raise HTTPException(status_code=400, detail="Give at least one URL or path to learn")
+        try:
+            documents, notes = connector.learn(targets)
+        except GraphError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        if not documents:
+            return {"learned": 0, "documents": [], "notes": notes or ["Nothing could be learned"],
+                    "warning": is_communal_memory_warning()}
+        ctx.catalog.upsert_source(connector.source_id, source.name, source.type, source.options)
+        stats = ctx.pipeline.ingest(documents, connector.source_id)
+        return {
+            "learned": len(documents),
+            "documents": [{"title": d.title, "uri": d.uri} for d in documents],
+            "ingested": stats.summary(),
+            "notes": notes,
+            "warning": is_communal_memory_warning(),
+        }
 
     @api.post("/api/connectors/{name}/test", tags=["Connectors"], summary="Test a connector's credentials / reachability without ingesting anything.")
     def test_connector(name: str, authorization: str | None = Header(default=None)):
@@ -739,6 +939,159 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
             )
         return rows
 
+    def _resolve_scope(req_scope):
+        """`ScopeRequest` -> `(SearchScope | None, prompt_note)`.
+
+        The note matters as much as the filter: a model that doesn't know it is looking at a
+        slice will report "not learned" as if it had searched everything. Telling it the
+        scope is what keeps a scoped refusal honest.
+        """
+        from quickjoiner.memory.store import SearchScope
+
+        if req_scope is None:
+            return None, ""
+        source_ids, doc_ids = ctx.catalog.resolve_scope(
+            req_scope.source_ids, req_scope.tags, req_scope.doc_ids)
+        scope = SearchScope(source_ids=source_ids, doc_ids=doc_ids)
+        if scope.is_empty():
+            return None, ""
+        described = ", ".join(
+            [*(s.split(":", 1)[-1] for s in source_ids),
+             *(f"tag '{t}'" for t in req_scope.tags),
+             *([f"{len(doc_ids)} selected document(s)"] if doc_ids else [])]
+        )
+        note = (
+            f"SCOPED QUESTION — the user restricted this question to: {described}. "
+            "Memory search is already filtered to it, and live tools for other systems are "
+            "not available this turn. If the answer isn't in this slice, say it isn't in the "
+            "sources they scoped to and offer to search everything — do NOT say the "
+            "organisation never learned it, because you only looked at part of memory."
+        )
+        return scope, note
+
+    def _source_visible(source_id: str, user: str | None) -> bool:
+        """A source_id (`type:name`) is readable if it isn't a configured connector (an
+        ingestion bucket is commons) or its config says this user may see it."""
+        name = source_id.split(":", 1)[-1]
+        cfg = next((s for s in ctx.config.sources if f"{s.type}:{s.name}" == source_id
+                    or s.name == name), None)
+        return cfg is None or visible(cfg, user, auth.enabled)
+
+    def _labelled(source_id: str, rows: list[dict]) -> list[dict]:
+        """Attach each document's applicable labels. Labels are prefix RULES, so they are
+        resolved against every document's uri here rather than stored per document — which
+        is what lets a folder label cover files ingested after it was created."""
+        from quickjoiner.memory.catalog import label_applies
+
+        labels = ctx.catalog.labels_for_source(source_id)
+        out = []
+        for row in rows:
+            uri = row.get("uri") or ""
+            applies = [
+                {"kind": lb["kind"], "value": lb["value"], "uri_prefix": lb.get("uri_prefix") or ""}
+                for lb in labels if label_applies(uri, lb.get("uri_prefix") or "")
+            ]
+            try:
+                metadata = json.loads(row.get("metadata_json") or "{}")
+            except (TypeError, ValueError):
+                metadata = {}  # tolerate a malformed blob rather than 500ing the whole list
+            out.append({
+                "doc_id": row["doc_id"], "uri": uri, "title": row.get("title") or "",
+                "kind": row.get("kind") or "doc", "chunks": row.get("chunk_count") or 0,
+                "updated_at": row.get("updated_at"), "labels": applies,
+                # Connector-supplied display metadata (e.g. ADO work-item type/state/team/
+                # sprint/parent id) — {} for every connector that doesn't set it.
+                "metadata": metadata,
+            })
+        return out
+
+    @api.get("/api/sources/{source_id:path}/documents", tags=["Ask & search"], summary="List the documents a source has ingested, each with the tags/aka labels that apply to it and any connector-supplied display metadata.")
+    def source_documents(source_id: str, authorization: str | None = Header(default=None)):
+        """What this connector actually learned — the answer to "what's in there?".
+
+        Labels are resolved per document at read time (see `_labelled`), so a folder tag
+        shows up on files that were ingested long after it was set. `metadata` is a small
+        connector-supplied JSON blob for UI display only — e.g. the Azure DevOps connector
+        stamps work-item type/state/team/sprint/parent id there, which is what the document
+        browser uses to render TFS work items as an Epic/Feature/Story/Task tree. `{}` for
+        every connector that doesn't set it."""
+        user = _user(authorization)
+        _require("search:read", user)
+        if not _source_visible(source_id, user):
+            raise HTTPException(status_code=404, detail=f"No source {source_id!r}")
+        rows = ctx.catalog.documents_for_source(source_id)
+        return {"source_id": source_id, "documents": _labelled(source_id, rows),
+                "labels": ctx.catalog.labels_for_source(source_id)}
+
+    @api.get("/api/sources/{source_id:path}/documents/archive", tags=["Ask & search"], summary="List the member files inside an ingested archive (.zip) document, recovered from its extracted text.")
+    def document_archive(source_id: str, doc_id: str, authorization: str | None = Header(default=None)):
+        """A .zip ingests as ONE document (its members' text concatenated — see
+        `ingest/extract._extract_zip`), so the document browser otherwise shows it as one
+        opaque row. There's no separate column for the member list (chunks are the only
+        place a document's text lives), so this re-derives it from the same `--- path ---`
+        headers extraction wrote, via `parse_archive_manifest`. Empty members/notes for a
+        non-archive document — that's a normal answer, not an error."""
+        from quickjoiner.ingest.extract import parse_archive_manifest
+
+        user = _user(authorization)
+        _require("search:read", user)
+        if not _source_visible(source_id, user):
+            raise HTTPException(status_code=404, detail=f"No source {source_id!r}")
+        rows = ctx.catalog.documents_for_source(source_id)
+        if not any(r["doc_id"] == doc_id for r in rows):
+            raise HTTPException(status_code=404, detail="No such document in this source")
+        text = "\n\n".join(ctx.store.get_document_chunks(doc_id))
+        return parse_archive_manifest(text)
+
+    @api.get("/api/labels", tags=["Ask & search"], summary="Every tag/aka label in the workspace — what the question-scope picker offers.")
+    def list_labels(authorization: str | None = Header(default=None)):
+        user = _user(authorization)
+        _require("search:read", user)
+        rows = [lb for lb in ctx.catalog.all_labels() if _source_visible(lb["source_id"], user)]
+        return {"labels": rows}
+
+    @api.post("/api/labels", tags=["Ask & search"], summary="Tag a connector, a folder, or a single document (a folder tag covers files ingested later).")
+    def add_label(req: LabelRequest, authorization: str | None = Header(default=None)):
+        """`uri_prefix` chooses the granularity: '' = the whole connector, a folder path =
+        that folder and anything ingested into it later, a full document uri = just that one.
+        `kind` is 'tag' (scoping label) or 'aka' (an alternate name, which also feeds alias
+        query expansion so a loose question can find the document)."""
+        user = _user(authorization)
+        _require_user(user)
+        _require("memory:write", user)
+        if req.kind not in ("tag", "aka"):
+            raise HTTPException(status_code=400, detail="kind must be 'tag' or 'aka'")
+        if not req.value.strip():
+            raise HTTPException(status_code=400, detail="value cannot be empty")
+        if not _source_visible(req.source_id, user):
+            raise HTTPException(status_code=404, detail=f"No source {req.source_id!r}")
+        ctx.catalog.set_label(req.source_id, req.uri_prefix, req.kind, req.value)
+        if req.kind == "aka" and not req.uri_prefix:
+            # A whole-connector 'aka' is exactly what the connector `aka` option already
+            # declares, so route it through the same machinery: an alias on the source
+            # entity, which feeds resolve_entity + alias query expansion + autocomplete.
+            # Folder/document-level akas are NOT registered this way — they name a document,
+            # not the source entity, and claiming otherwise would misdirect the graph.
+            try:
+                from quickjoiner.ingest.pipeline import source_entity
+
+                eid, ename, kind = source_entity(req.source_id)
+                ctx.catalog.upsert_entity(eid, ename, kind, req.source_id)
+                ctx.catalog.add_entity_alias(req.value.strip(), eid)
+            except Exception:  # noqa: BLE001 — the label is saved either way
+                pass
+        return {"ok": True, "labels": ctx.catalog.labels_for_source(req.source_id)}
+
+    @api.delete("/api/labels", tags=["Ask & search"], summary="Remove a tag/aka label from a connector, folder, or document.")
+    def remove_label(req: LabelRequest, authorization: str | None = Header(default=None)):
+        user = _user(authorization)
+        _require_user(user)
+        _require("memory:write", user)
+        if not _source_visible(req.source_id, user):
+            raise HTTPException(status_code=404, detail=f"No source {req.source_id!r}")
+        ctx.catalog.remove_label(req.source_id, req.uri_prefix, req.kind, req.value)
+        return {"ok": True, "labels": ctx.catalog.labels_for_source(req.source_id)}
+
     @api.post("/api/sync/{source_name}", tags=["Sync & ingestion"], summary="Start a background sync job for a source. clean=true purges the source first for a from-scratch re-pull. Returns immediately with the job.")
     def sync_source(source_name: str, clean: bool = False,
                     authorization: str | None = Header(default=None)):
@@ -870,10 +1223,14 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
             raise HTTPException(status_code=400, detail="Nothing to learn: empty fact")
         return {"result": teach_fact(ctx.catalog, ctx.pipeline, fact, req.topic)}
 
-    def _ingest_upload_path(path: Path) -> dict:
+    def _ingest_upload_path(path: Path, progress_cb=None) -> dict:
         """Ingest one file that already lives in the uploads folder into the rolling uploads
         source. Uses the SAME reader (and thus the same doc uri/id) a folder sync would, so a
-        later `sync uploads` is idempotent. Returns a per-file result row."""
+        later `sync uploads` is idempotent. Returns a per-file result row.
+
+        `progress_cb(done, total)` (optional) is threaded straight to `pipeline.ingest` — see
+        its doc comment. Only `learn_attachment` below passes one; every other caller is
+        unaffected."""
         from quickjoiner.connectors.files import read_file_document
         from quickjoiner.connectors.uploads import UPLOADS_NAME, UPLOADS_SOURCE_ID, UPLOADS_TYPE, uploads_dir
 
@@ -882,7 +1239,7 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
         if doc is None:
             return {"file": path.name, "ingested": False,
                     "reason": "unsupported type, empty, or no extractable text (image-only?)"}
-        stats = ctx.pipeline.ingest([doc], UPLOADS_SOURCE_ID)
+        stats = ctx.pipeline.ingest([doc], UPLOADS_SOURCE_ID, progress_cb=progress_cb)
         return {"file": path.name, "title": doc.title, "ingested": True, "result": stats.summary()}
 
     @api.post("/api/uploads", tags=["Sync & ingestion"], summary="Upload one or more documents (Word, PowerPoint, Excel, PDF, Markdown, text, JSON, HTML, code) straight into memory via the rolling Uploads connector. Text is extracted at ingest.")
@@ -905,8 +1262,13 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
             if not data:
                 results.append({"file": f.filename or "?", "ingested": False, "reason": "empty file"})
                 continue
-            path = save_upload(ctx.workspace, f.filename or "upload", data)
-            results.append(_ingest_upload_path(path))
+            # save_upload + _ingest_upload_path are synchronous and, for a large office doc or
+            # archive, slow (extraction, chunking, embedding) — off the event loop via a thread
+            # pool so one big upload doesn't stall every other request/SSE stream on the server
+            # for the duration (an `async def` handler blocks the loop for anything it awaits
+            # directly; only run_in_threadpool actually frees it up).
+            path = await run_in_threadpool(save_upload, ctx.workspace, f.filename or "upload", data)
+            results.append(await run_in_threadpool(_ingest_upload_path, path))
         return {"uploaded": results, "ingested": sum(1 for r in results if r.get("ingested"))}
 
     @api.post("/api/uploads/local", tags=["Sync & ingestion"], summary="Ingest a document from a server-side file path into the rolling Uploads connector (the /qj-friendly path — the file is copied into the uploads folder).")
@@ -928,6 +1290,62 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
             raise HTTPException(status_code=400, detail=f"Could not read {src}: {exc}")
         path = save_upload(ctx.workspace, src.name, data)
         return _ingest_upload_path(path)
+
+    @api.post("/api/chat/attachments/{att_id}/learn", tags=["Sync & ingestion"], summary="Promote a chat attachment into permanent memory — ingests the already-uploaded file into the rolling Uploads connector.")
+    def learn_attachment(
+        att_id: str, progress_token: str | None = None, authorization: str | None = Header(default=None)
+    ):
+        """Turn a per-question attachment into learned memory, deliberately as a separate,
+        explicit action.
+
+        Attaching a file in chat is *context for one question* and nothing more — that
+        separation is on purpose. But "here's a document, learn it" is the obvious thing to
+        want once you've attached one, and before this the only route was re-uploading the
+        same bytes through a different endpoint. This promotes what is already on disk: no
+        re-upload, and the attachment stays a downloadable attachment as well.
+
+        `progress_token` (optional, minted by the frontend) makes this request's real chunk-
+        embedding progress readable via `GET /api/ingest-progress/{token}` while this call is
+        still in flight — see `ingest_progress.py`. Omit it and this behaves exactly as before
+        (used by the CLI/agent's `qj_api` tool, which just wants the final result).
+        """
+        from quickjoiner import chat_attachments, ingest_progress
+        from quickjoiner.connectors.uploads import save_upload
+
+        user = _user(authorization)
+        _require_user(user)
+        _require("memory:write", user)
+        row = ctx.catalog.get_context_attachment(att_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="No such attachment")
+        src = chat_attachments.attachment_original_path(ctx, att_id)
+        if src is None:
+            # The retention sweep removes the bytes but keeps the row, so history can still
+            # show the filename — 410 says "it existed and is gone", which 404 would not.
+            raise HTTPException(
+                status_code=410,
+                detail=f"{row['filename']} has expired and its file was deleted — re-attach it to learn it.")
+        path = save_upload(ctx.workspace, row["filename"], src.read_bytes())
+        progress_cb = None
+        if progress_token:
+            ingest_progress.start(progress_token)
+            progress_cb = lambda done, total: ingest_progress.update(progress_token, done, total)  # noqa: E731
+        return _ingest_upload_path(path, progress_cb=progress_cb)
+
+    @api.get("/api/ingest-progress/{token}", tags=["Sync & ingestion"], summary="Poll real chunk-embedding progress for an in-flight ad-hoc ingest started with that progress_token.")
+    def ingest_progress_status(token: str, authorization: str | None = Header(default=None)):
+        """204 (no body) if the token is unknown — never started, already finished and aged
+        out, or nobody ever will start it. The frontend treats that as "nothing to show yet",
+        not an error; it's racing this against the POST that owns the token."""
+        from quickjoiner import ingest_progress
+
+        user = _user(authorization)
+        _require_user(user)
+        _require("chat:use", user)
+        row = ingest_progress.get(token)
+        if row is None:
+            return Response(status_code=204)
+        return row
 
     @api.get("/api/gaps", tags=["Knowledge gaps"], summary="Clusters of questions the system could not answer (the knowledge-debt backlog), with suggested connectors/actions to close them.")
     def list_gaps(authorization: str | None = Header(default=None)):
@@ -1236,8 +1654,14 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
             data = await f.read()
             if not data:
                 continue
-            out.append(chat_attachments.store_attachment(
-                ctx, f.filename or "attachment", data, f.content_type or ""))
+            # store_attachment is synchronous — extracting a multi-MB office doc or expanding a
+            # zip archive can take several seconds of real CPU/IO work, and an `async def`
+            # handler calling it directly blocks the whole event loop for that long (every other
+            # request and SSE stream on the server stalls too, not just this one). Reported live
+            # as "the system freezes for a few seconds" on a 4-5MB attachment — run_in_threadpool
+            # is what actually frees the loop up while it runs.
+            out.append(await run_in_threadpool(
+                chat_attachments.store_attachment, ctx, f.filename or "attachment", data, f.content_type or ""))
         if not out:
             raise HTTPException(status_code=400, detail="No non-empty files uploaded")
         return {"attachments": out}
@@ -1283,13 +1707,18 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
                 # Per-question attachments (context for THIS turn only, never memory): their text
                 # rides the system prompt, their metadata is stamped on the user message.
                 att_block, att_meta = chat_attachments.build_context_block(ctx, req.attachment_ids)
-                extra = "\n\n".join(s for s in (manager.system_context(session), att_block) if s)
+                # Resolve the picked scope (connectors / documents / tags) into the concrete
+                # ids the stores filter on. Done once, server-side, before any search — the
+                # model is never asked to work out what "the Zix deck" means.
+                search_scope, scope_note = _resolve_scope(req.scope)
+                extra = "\n\n".join(
+                    s for s in (manager.system_context(session), att_block, scope_note) if s)
                 # Built inside the worker so provider setup errors (e.g. missing
                 # ANTHROPIC_API_KEY) surface as SSE error events, not a 500.
                 # Live connector tools are scoped to sources this user may see.
                 agent = ctx.build_agent(
                     req.provider, req.model, extra_system=extra or None,
-                    sources=ctx.visible_sources(user), user=user,
+                    sources=ctx.visible_sources(user), user=user, scope=search_scope,
                 )
                 turn_index = len(history)
                 answer, new_history = agent.ask(

@@ -1,0 +1,14 @@
+meta {
+  name: Sign-in status
+  type: http
+  seq: 3
+}
+
+get {
+  url: {{baseUrl}}/api/connectors/{{onedriveConnector}}/oauth/status
+}
+
+docs {
+  Who this connector is signed in as, and how many documents it has been taught on demand.
+  Deliberately never returns the access or refresh token.
+}

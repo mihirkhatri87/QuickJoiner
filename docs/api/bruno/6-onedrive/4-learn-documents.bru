@@ -1,0 +1,26 @@
+meta {
+  name: Learn documents on demand
+  type: http
+  seq: 4
+}
+
+post {
+  url: {{baseUrl}}/api/connectors/{{onedriveConnector}}/onedrive/learn
+  body: json
+}
+
+body:json {
+  {
+    "targets": ["{{onedriveTarget}}"]
+  }
+}
+
+docs {
+  Resolves each target with the signed-in user's own access, extracts its text and ingests it.
+  Targets can be shared links (any OneDrive/SharePoint URL you can open) or paths inside your
+  own drive; a folder learns the readable files beneath it.
+
+  `notes` lists everything that was NOT learned and why (unsupported type, too large, an image
+  — images need vision support, which is on the roadmap). `warning` restates that learned
+  documents join the workspace's shared memory.
+}

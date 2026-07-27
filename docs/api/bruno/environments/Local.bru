@@ -15,6 +15,14 @@ vars {
   ~token:
   ~sessionId:
   ~attachmentId:
+  ~onedriveConnector: my-onedrive
+  ~onedriveClientId: 00000000-0000-0000-0000-000000000000
+  ~scopeSourceId: files:handbook
+  ~scopeFolderPrefix: file:///absolute/path/to/a/docs/folder/
+  ~scopeTag: architecture
+  ~scopeDocId: 0123456789abcdef
+  ~progressToken: demo-progress-token
+  ~onedriveTarget: https://contoso.sharepoint.com/:w:/r/sites/Eng/Shared%20Documents/design.docx
 }
 
 vars:secret [
@@ -33,6 +41,15 @@ docs {
     Swap type/path for git/github/jira/etc. (see `GET /api/connectors/types` for each type's fields).
   - **askQuestion / searchQuery / suggestPrefix** — the queries used in folder `4-query`.
   - **entityA / entityB** — the two graph nodes for the path request in `5-graph`.
+  - **scopeSourceId / scopeFolderPrefix / scopeTag / scopeDocId** — folder `7-scope`: which
+    source to browse and label, the folder prefix to tag (trailing slash), the tag name used
+    when asking a scoped question, and a `doc_id` from that source's document list (copy one
+    from the `List a source's documents` response) for the archive-contents request.
+  - **progressToken** — folder `4-query`: any string you pick, passed as `progress_token`
+    when learning an attachment, then polled to watch real chunk-embedding progress.
+  - **onedriveConnector / onedriveClientId / onedriveTarget** — folder `7-onedrive`: the
+    connector name, your Azure app registration's Application (client) ID, and one document
+    link or drive path to learn. Nothing is crawled; only the target is ingested.
 
   **token** and **sessionId** are filled in automatically at runtime (login captures the token;
   the chat stream can surface a session id) — leave them blank.

@@ -93,3 +93,29 @@ def test_prune_never_drops_an_unfinished_paused_run(catalog):
     unfinished = catalog.list_unfinished_syncs()
     assert [r["id"] for r in unfinished] == ["sync-paused-old"]
     assert unfinished[0]["state"] == "paused"
+
+
+def test_document_metadata_json_round_trips_and_defaults_empty(catalog):
+    # A document upserted with no metadata_json (every non-ADO connector) reads back as an
+    # empty dict, not null — callers do metadata_json.get(...) without a None check.
+    catalog.upsert_document("d1", "git:repo", "u::a", "A", "code", "h1", "2026-07-01", 2)
+    row = catalog.documents_for_source("git:repo")[0]
+    assert json.loads(row["metadata_json"]) == {}
+
+    meta = {"work_item_type": "Story", "state": "Active", "team": "Payments", "parent_id": 12}
+    catalog.upsert_document("d2", "azure_devops:tfs", "u::b", "B", "ticket", "h2", "2026-07-01", 1,
+                            metadata_json=json.dumps(meta))
+    row2 = next(r for r in catalog.documents_for_source("azure_devops:tfs") if r["doc_id"] == "d2")
+    assert json.loads(row2["metadata_json"]) == meta
+
+
+def test_update_document_metadata_is_a_standalone_backfill(catalog):
+    # The path an unchanged document's team/sprint/state refresh through — no hash/chunk
+    # change, just the metadata blob, matching the graph-version staleness refresh it rides
+    # alongside (see pipeline.py's stale_graph branch).
+    catalog.upsert_document("d1", "azure_devops:tfs", "u::a", "A", "ticket", "h1", "2026-07-01", 2,
+                            metadata_json=json.dumps({"state": "Active"}))
+    catalog.update_document_metadata("d1", json.dumps({"state": "Closed", "team": "Payments"}))
+    row = catalog.documents_for_source("azure_devops:tfs")[0]
+    assert json.loads(row["metadata_json"]) == {"state": "Closed", "team": "Payments"}
+    assert row["content_hash"] == "h1"  # untouched — this is a metadata-only update

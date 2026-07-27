@@ -85,3 +85,23 @@ class Connector(ABC):
     def handle_event(self, payload: dict[str, Any]) -> Iterator[Document]:
         """Turn a pushed webhook event into documents. Override for PUSH mode."""
         return iter(())
+
+    def wants_resync(self, payload: dict[str, Any]) -> bool:
+        """True if this push event should trigger a full `sync()` run instead of (or as
+        well as) `handle_event`'s yielded documents. Most PUSH connectors don't need
+        this — GitHub/GitLab/Jira/etc. can turn the payload directly into documents. A
+        connector that only knows how to read its content by re-fetching a whole
+        resource (the git-clone connector: a push webhook carries commit metadata, never
+        file contents) overrides this instead, and `handle_event` there yields nothing."""
+        return False
+
+    def on_deleted(self) -> None:
+        """Release anything this connector stored OUTSIDE the catalog when it is deleted.
+
+        Most connectors need nothing: their credentials live in the source's options,
+        which `save_config` removes with the source. Override when a connector holds
+        workspace-side state that would otherwise outlive it — OneDrive keeps a
+        Microsoft 365 refresh token on disk, and a live token left behind after its
+        connector is gone is still redeemable. Best-effort: raising here must never
+        block a deletion."""
+        return None

@@ -22,6 +22,11 @@ import type {
   SyncJob,
   UploadResult,
   UserRow,
+  AskScope,
+  DocLabel,
+  SourceDocuments,
+  OAuthStatus,
+  OneDriveLearnResult,
 } from "./types";
 
 const TOKEN_KEY = "qj_token";
@@ -119,13 +124,92 @@ export const api = {
   // Attach file(s) as per-question CONTEXT for a chat message. Extracted to text and injected
   // into that turn only — NOT ingested into memory or the Uploads connector, and auto-deleted
   // after the retention window. Returns metadata to pass as attachment_ids on streamChat.
-  uploadChatAttachments: async (files: File[]): Promise<ChatAttachment[]> => {
-    const form = new FormData();
-    for (const f of files) form.append("files", f);
-    const resp = await fetch("/api/chat/attachments", { method: "POST", headers: { ...authHeaders() }, body: form });
-    const data = resp.status === 204 ? null : await resp.json().catch(() => null);
-    if (!resp.ok) throw new Error((data && (data as { detail?: string }).detail) || `${resp.status}`);
-    return (data as { attachments: ChatAttachment[] }).attachments;
+  //
+  // Uses XMLHttpRequest (not fetch) specifically for `xhr.upload.onprogress` — a several-MB
+  // file with nothing rendering while it sends read as a frozen UI (reported live). Reports two
+  // distinct phases: "uploading" tracks real bytes sent, then "processing" once every byte has
+  // left the browser but the response hasn't arrived yet — text extraction (unzipping an
+  // archive, parsing a large office doc) happens server-side inside that same request, so a
+  // multi-second gap AFTER 100% is expected, not a stall. onProgress is best-effort; a caller
+  // that doesn't pass one gets the exact same request with no observable difference.
+  uploadChatAttachments: (
+    files: File[],
+    onProgress?: (state: { phase: "uploading" | "processing"; pct: number }) => void,
+  ): Promise<ChatAttachment[]> =>
+    new Promise((resolve, reject) => {
+      const form = new FormData();
+      for (const f of files) form.append("files", f);
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", "/api/chat/attachments");
+      for (const [k, v] of Object.entries(authHeaders())) xhr.setRequestHeader(k, v);
+      xhr.upload.onprogress = (e) => {
+        if (!onProgress || !e.lengthComputable) return;
+        onProgress({ phase: "uploading", pct: Math.round((e.loaded / e.total) * 100) });
+      };
+      xhr.upload.onload = () => onProgress?.({ phase: "processing", pct: 100 });
+      xhr.onload = () => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any -- matches req()'s error-body handling below
+        let data: any = null;
+        try {
+          data = xhr.responseText ? JSON.parse(xhr.responseText) : null;
+        } catch {
+          /* non-JSON error body (e.g. a proxy error page) — status check below still fires */
+        }
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve((data as { attachments: ChatAttachment[] }).attachments);
+        } else {
+          reject(new Error((data && (data as { detail?: string }).detail) || `${xhr.status}`));
+        }
+      };
+      xhr.onerror = () => reject(new Error("Network error while uploading"));
+      xhr.send(form);
+    }),
+  // Ingest a file by PATH on the machine QuickJoiner runs on, straight into the rolling
+  // Uploads connector. Deterministic twin of asking the agent to do it — the /ingest command
+  // uses this so a model that declines ("I can't read your files") can't block the user.
+  ingestLocalPath: (path: string) =>
+    req<{ file: string; title: string; ingested: boolean; result?: string; reason?: string }>(
+      "/api/uploads/local",
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path }) },
+    ),
+  // Promote an already-uploaded chat attachment into permanent memory (the rolling Uploads
+  // connector). Separate from uploadChatAttachments on purpose: attaching is per-question
+  // context, learning is a memory mutation the user opts into.
+  //
+  // Embedding a large document (e.g. a whole zip's concatenated text) is real CPU work that
+  // can run minutes on a machine with no GPU — reported live as the chat composer "just
+  // sitting there" with the request looking hung. onProgress, when passed, gets REAL
+  // (chunks embedded, chunks total) counts: this mints a token, starts polling
+  // GET /api/ingest-progress/{token} in parallel with the POST, and stops polling once the
+  // POST settles either way. Omit onProgress and this is byte-identical to a plain POST.
+  learnChatAttachment: async (
+    id: string,
+    onProgress?: (state: { done: number; total: number }) => void,
+  ): Promise<{ file: string; title: string; ingested: boolean; result?: string; reason?: string }> => {
+    if (!onProgress) {
+      return req(`/api/chat/attachments/${encodeURIComponent(id)}/learn`, { method: "POST" });
+    }
+    const token = crypto.randomUUID ? crypto.randomUUID() : `p${Date.now()}-${Math.random()}`;
+    const poll = setInterval(async () => {
+      try {
+        const resp = await fetch(`/api/ingest-progress/${token}`, { headers: { ...authHeaders() } });
+        if (resp.status === 200) {
+          const row = await resp.json();
+          onProgress({ done: row.done, total: row.total });
+        }
+      } catch {
+        /* a missed poll just means one stale UI tick — the next one (or the final POST
+           result) catches up, so failures here are silently ignored rather than surfaced */
+      }
+    }, 600);
+    try {
+      return await req(
+        `/api/chat/attachments/${encodeURIComponent(id)}/learn?progress_token=${token}`,
+        { method: "POST" },
+      );
+    } finally {
+      clearInterval(poll);
+    }
   },
   // Download a chat context file via an auth'd fetch → blob (a plain <a href> can't send the
   // bearer token). Throws a friendly message on 410 (the file expired and was deleted).
@@ -145,6 +229,30 @@ export const api = {
   },
 
   sources: () => req<SourceRow[]>("/api/sources"),
+  // What a connector has actually ingested, each document with the labels that apply to
+  // it (including ones inherited from its folder or the connector itself).
+  sourceDocuments: (sourceId: string) =>
+    req<SourceDocuments>(`/api/sources/${encodeURIComponent(sourceId)}/documents`),
+  // What's inside an ingested .zip — recovered from the document's own extracted text
+  // (there's no separate member-list column), for the document browser's expand-to-see-
+  // contents view.
+  documentArchive: (sourceId: string, docId: string) =>
+    req<{ members: string[]; notes: string[] }>(
+      `/api/sources/${encodeURIComponent(sourceId)}/documents/archive?doc_id=${encodeURIComponent(docId)}`,
+    ),
+  labels: () => req<{ labels: DocLabel[] }>("/api/labels"),
+  addLabel: (body: DocLabel) =>
+    req<{ ok: boolean; labels: DocLabel[] }>("/api/labels", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  removeLabel: (body: DocLabel) =>
+    req<{ ok: boolean; labels: DocLabel[] }>("/api/labels", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
   connectorTypes: () => req<ConnectorType[]>("/api/connectors/types"),
   connectors: () => req<ConnectorRow[]>("/api/connectors"),
   createConnector: (body: Record<string, unknown>) =>
@@ -174,6 +282,28 @@ export const api = {
       `/api/connectors/${encodeURIComponent(name)}/test`,
       { method: "POST" },
     ),
+  // --- OneDrive / SharePoint: per-user Microsoft 365 sign-in + on-demand learning.
+  // The status response deliberately never carries the tokens themselves, only who
+  // the connector is signed in as and how much it has been taught.
+  oauthStatus: (name: string) =>
+    req<OAuthStatus>(`/api/connectors/${encodeURIComponent(name)}/oauth/status`),
+  oauthStart: (name: string) =>
+    req<{ authorize_url: string; state: string; redirect_uri: string }>(
+      `/api/connectors/${encodeURIComponent(name)}/oauth/start`,
+      { method: "POST" },
+    ),
+  oauthSignOut: (name: string) =>
+    req<{ signed_out: boolean }>(`/api/connectors/${encodeURIComponent(name)}/oauth`, {
+      method: "DELETE",
+    }),
+  // Ingest specific documents on demand. This connector never crawls: `targets` are
+  // shared links or paths, and a folder learns the readable files beneath it.
+  onedriveLearn: (name: string, targets: string[]) =>
+    req<OneDriveLearnResult>(`/api/connectors/${encodeURIComponent(name)}/onedrive/learn`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ targets }),
+    }),
   // Start an async sync job (optionally a clean/purge-first resync). Different sources
   // can run at once; watch a job with streamSyncLogs and halt it with stopSync.
   startSync: (name: string, clean = false) =>
@@ -322,7 +452,14 @@ async function streamGetSSE<E>(path: string, onEvent: (e: E) => void): Promise<v
 
 /** Stream a chat turn. Calls onEvent for each SSE event; resolves when done. */
 export function streamChat(
-  body: { message: string; session_id: string | null; project: string | null; attachment_ids?: string[] },
+  body: {
+    message: string;
+    session_id: string | null;
+    project: string | null;
+    attachment_ids?: string[];
+    // Narrow this question to chosen connectors/documents/tags. Omitted = all memory.
+    scope?: AskScope;
+  },
   onEvent: (e: ChatEvent) => void,
 ): Promise<void> {
   return streamSSE("/api/chat", body, onEvent);

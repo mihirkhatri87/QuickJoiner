@@ -523,7 +523,10 @@ class SyncManager:
                 stats = self.ctx.pipeline.ingest(
                     self._tracked(job, control, connector.sync(state)), job.source_id, control=control,
                 )
-                return stats
+                # The state dict comes back too: a connector may have written an opaque
+                # cursor into it (OneDrive's learned-item bookkeeping, Graph deltaLinks),
+                # and only the caller knows the run finished cleanly enough to commit it.
+                return stats, state
             except SyncStopped:
                 raise  # manual stop — not a network failure
             except Exception as exc:  # noqa: BLE001
@@ -586,12 +589,13 @@ class SyncManager:
             # Timestamp the watermark from before the FIRST attempt so a run that spanned an
             # outage + retries can't miss items created while the network was down.
             started = _now()
-            stats = self._pull_with_auto_retry(job, connector, control)
+            stats, pulled_state = self._pull_with_auto_retry(job, connector, control)
 
             # A stop that arrived exactly as the pull finished (no SyncStopped raised) is
             # still a stop — the watermark must not advance on a partial run.
             if job.cancel.is_set():
                 raise SyncStopped()
+            self.ctx.catalog.set_sync_state_many(job.source_id, pulled_state)
             self.ctx.catalog.set_sync_state(job.source_id, "since", started)
             job.stats = {"added": stats.added, "updated": stats.updated,
                          "skipped": stats.skipped, "chunks": stats.chunks,

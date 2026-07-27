@@ -1,0 +1,23 @@
+meta {
+  name: Remove a label
+  type: http
+  seq: 5
+}
+
+delete {
+  url: {{baseUrl}}/api/labels
+  body: json
+}
+
+body:json {
+  {
+    "source_id": "{{scopeSourceId}}",
+    "uri_prefix": "{{scopeFolderPrefix}}",
+    "kind": "tag",
+    "value": "{{scopeTag}}"
+  }
+}
+
+docs {
+  Removing a folder/connector label removes it from every document it covered.
+}

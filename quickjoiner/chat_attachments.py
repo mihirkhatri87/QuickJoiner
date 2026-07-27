@@ -17,7 +17,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from quickjoiner.ingest.extract import ExtractionError, extract_text
+from quickjoiner.ingest.extract import ExtractionError, _ext, extract_text, is_image
 
 
 def context_root(workspace: Path | str) -> Path:
@@ -44,17 +44,27 @@ def store_attachment(ctx, filename: str, data: bytes, content_type: str = "") ->
     folder.mkdir(parents=True, exist_ok=True)
     name = _safe_name(filename)
     (folder / name).write_bytes(data)
+    # Why a file produced no text is as important as the text itself: an attachment that
+    # extracts to nothing used to vanish from the agent's view entirely, so it could only
+    # flail instead of telling the user "I can see your file but I can't read it".
+    error = ""
     try:
         text = extract_text(data, name)
-    except ExtractionError:
-        text = ""
+        if not text.strip():
+            error = ("no readable text — this looks like a scanned or picture-only file "
+                     "(reading images needs vision support, which isn't enabled yet)"
+                     if is_image(name) or _ext(name) in (".pdf", ".pptx", ".docx")
+                     else "no readable text in this file")
+    except ExtractionError as exc:
+        text, error = "", str(exc)
     if text.strip():
         (folder / "text.txt").write_text(text, encoding="utf-8")
     uploaded_at = datetime.now(timezone.utc).isoformat()
     ctx.catalog.add_context_attachment(
-        att_id, name, content_type, len(data), len(text), uploaded_at)
+        att_id, name, content_type, len(data), len(text), uploaded_at, extract_error=error)
     return {"id": att_id, "filename": name, "content_type": content_type,
-            "size": len(data), "char_count": len(text), "uploaded_at": uploaded_at}
+            "size": len(data), "char_count": len(text), "uploaded_at": uploaded_at,
+            "extract_error": error}
 
 
 def attachment_original_path(ctx, att_id: str) -> Path | None:
@@ -90,6 +100,7 @@ def build_context_block(ctx, attachment_ids: list[str]) -> tuple[str, list[dict]
     cap = ctx.config.chat.attachment_context_max_chars
     meta: list[dict] = []
     parts: list[str] = []
+    unreadable: list[str] = []
     used = 0
     for att_id in attachment_ids:
         row = ctx.catalog.get_context_attachment(att_id)
@@ -102,23 +113,53 @@ def build_context_block(ctx, attachment_ids: list[str]) -> tuple[str, list[dict]
             continue
         text = _attachment_text(ctx, att_id)
         if not text.strip():
+            # Named, not hidden. A file we could not read must still reach the model, or it
+            # has no way to tell the user what happened and starts inventing next steps
+            # (observed live: it asked the user to paste "the attachment IDs").
+            reason = (row.get("extract_error") or "no readable text in this file")
+            unreadable.append(f"- {row['filename']} (attachment id: {att_id}) — {reason}")
             continue
         take = text[: max(0, cap - used)]
         used += len(take)
-        parts.append(f"--- FILE: {row['filename']} ---\n{take}"
+        # The id rides along so the agent can act on THIS file when asked to learn it —
+        # without it, "remember this document" has nothing to point at and the model can
+        # only apologise (observed live).
+        parts.append(f"--- FILE: {row['filename']} (attachment id: {att_id}) ---\n{take}"
                      + ("\n…[truncated]" if len(take) < len(text) else ""))
-    if not parts:
+    if not parts and not unreadable:
         block = ""
+    elif not parts:
+        # Every attached file failed to yield text. Say exactly that, name them, and stop the
+        # model guessing: it must not ask for ids it was never shown, or claim it has no access
+        # to a file the user plainly attached.
+        block = (
+            "ATTACHED FILES — the user attached the following file(s), but NO text could be "
+            "extracted from them:\n" + "\n".join(unreadable) + "\n\n"
+            "You already have these files; do NOT ask the user for attachment ids, to paste the "
+            "content, or to re-upload. Tell them plainly which file you could not read and why "
+            "(the reason above), and that a picture-only or scanned document needs vision "
+            "support, which is not enabled yet. Then answer whatever you can from learned "
+            "memory with search_memory, or say you haven't learned it."
+        )
     else:
         block = (
             "ATTACHED FILES — the user attached the following file(s) as context for THIS "
             "question. Treat their content as valid evidence you may quote and reason over to "
             "answer, exactly as if retrieved from memory; you do NOT need search_memory to use "
             "them. Cite them as [file: <name>]. They are per-question context, NOT long-term "
-            "memory — never claim they were 'learned' or suggest connecting/ingesting them, and "
-            "do not save them anywhere unless the user explicitly asks. If the question needs org "
-            "knowledge beyond these files, still search_memory and combine.\n\n"
+            "memory — never claim they were 'learned' or suggest connecting/ingesting them on "
+            "your own initiative.\n"
+            "BUT if the user DOES ask you to learn / remember / save / ingest an attached file "
+            "permanently, you can and should do it: call qj_api with method POST and path "
+            "/api/chat/attachments/<attachment id>/learn (the id is given with each file below). "
+            "Confirm what you ingested afterwards. Do not ask them to paste the content or a URL "
+            "— you already have the file.\n"
+            "If the question needs org knowledge beyond these files, still search_memory and "
+            "combine.\n\n"
             + "\n\n".join(parts)
+            + ("\n\nAttached but UNREADABLE (no text could be extracted — say so plainly if "
+               "the user asks about them, and never pretend you read them):\n"
+               + "\n".join(unreadable) if unreadable else "")
         )
     return block, meta
 

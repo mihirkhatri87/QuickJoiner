@@ -11,6 +11,58 @@ def _docs():
     ]
 
 
+def test_ingest_reports_real_chunk_progress_for_one_document(store, catalog):
+    # The ad-hoc "learn this attachment now" API route passes progress_cb so a large
+    # document's embed step (which can run minutes on a CPU-only machine) has something
+    # honest to show — this is the seam that call goes through.
+    pipeline = IngestPipeline(store, catalog)
+    big = Document(uri="repo://big", title="big",
+                    text="\n\n".join(f"Paragraph {i}: " + ("word " * 60) for i in range(60)))
+    calls: list[tuple[int, int]] = []
+    stats = pipeline.ingest([big], "test:src", progress_cb=lambda done, total: calls.append((done, total)))
+    assert stats.added == 1
+    assert calls, "progress_cb should fire at least once for a document with chunks"
+    total = calls[0][1]
+    assert total > 0
+    assert all(t == total for _, t in calls)  # total is stable across calls
+    assert [d for d, _ in calls] == sorted(d for d, _ in calls)  # done is non-decreasing
+    assert calls[-1][0] == total  # the last call reports completion
+
+    # An unchanged document on a later sync skips straight past chunk/embed — progress_cb
+    # must not fire for work that never happened.
+    calls.clear()
+    pipeline.ingest([big], "test:src", progress_cb=lambda done, total: calls.append((done, total)))
+    assert calls == []
+
+
+def test_ingest_without_progress_cb_is_unaffected(store, catalog):
+    # Every ordinary connector sync calls ingest() with no progress_cb — must be byte-identical
+    # to before this feature existed.
+    pipeline = IngestPipeline(store, catalog)
+    stats = pipeline.ingest(_docs(), "test:src")
+    assert stats.added == 2 and stats.chunks >= 2
+
+
+def test_store_upsert_with_progress_matches_plain_upsert(store):
+    # upsert_document_with_progress deliberately duplicates upsert_document's row-building
+    # logic (see its doc comment) rather than sharing it — this pins that the two stay
+    # equivalent: same chunk count written, same text retrievable, real batched progress.
+    chunks = [f"chunk number {i} has some words in it" for i in range(30)]
+    plain_written = store.upsert_document(
+        doc_id="doc-plain", source_id="test:src", uri="repo://plain", title="plain",
+        kind="doc", chunks=chunks,
+    )
+    calls: list[tuple[int, int]] = []
+    progress_written = store.upsert_document_with_progress(
+        doc_id="doc-progress", source_id="test:src", uri="repo://progress", title="progress",
+        kind="doc", chunks=chunks, on_progress=lambda d, t: calls.append((d, t)), batch_size=8,
+    )
+    assert progress_written == plain_written == len(chunks)
+    assert store.get_document_chunks("doc-progress") == chunks
+    # 30 chunks at batch_size 8 -> batches of 8,8,8,6
+    assert calls == [(8, 30), (16, 30), (24, 30), (30, 30)]
+
+
 def test_ingest_is_idempotent(store, catalog):
     pipeline = IngestPipeline(store, catalog)
 
@@ -52,6 +104,29 @@ def test_stale_graph_version_refreshes_edges_without_reembedding(store, catalog)
     # now current — the next identical sync skips it entirely (no repeated refresh)
     again = pipeline.ingest([enriched], "test:src")
     assert again.skipped == 1 and again.graph_refreshed == 0
+
+
+def test_stale_graph_refresh_also_backfills_display_metadata_without_reembed(store, catalog):
+    # Team/sprint/state must self-heal the same way graph edges do: an unchanged document
+    # whose connector now supplies display metadata (e.g. after the ADO hierarchy feature
+    # ships) gets it via the SAME version-triggered refresh pass, no re-embed.
+    import json
+
+    from quickjoiner.ingest.pipeline import _doc_id
+
+    pipeline = IngestPipeline(store, catalog)
+    plain = Document(uri="repo://ticket1", title="t", text="hello world")
+    pipeline.ingest([plain], "test:src")
+    doc_id = _doc_id("test:src", "repo://ticket1")
+    catalog.set_document_graph_version(doc_id, 0)  # force the staleness branch to fire
+
+    enriched = Document(uri="repo://ticket1", title="t", text="hello world",
+                        metadata={"display": {"team": "Payments", "state": "Active"}})
+    stats = pipeline.ingest([enriched], "test:src")
+    assert stats.chunks == 0 and stats.added == 0 and stats.updated == 0  # not re-embedded
+
+    row = catalog.documents_for_source("test:src")[0]
+    assert json.loads(row["metadata_json"]) == {"team": "Payments", "state": "Active"}
 
 
 def test_changed_document_is_updated(store, catalog):

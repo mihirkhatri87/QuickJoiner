@@ -56,6 +56,16 @@ login request stores the bearer token so every later request sends `Authorizatio
    Word/PowerPoint/Excel/PDF/Markdown/… into memory via the rolling Uploads connector.
 5. **4 · Query** — search, ask a grounded question (SSE), teach a fact, autocomplete, and attach a
    file to a question (per-question context — extracted to text, injected into the turn, NOT memory;
-   auto-deleted after the retention window) + download it.
+   auto-deleted after the retention window) + download it. **Learn an attachment** promotes one of
+   those files into permanent memory when you actually want it kept.
 6. **5 · Graph** — snapshot, entity search, path between two entities, bridges, gaps.
-7. **6 · Lifecycle** — clean up one connector, delete a connector, or reset all memory.
+7. **6 · OneDrive / SharePoint** — create the connector, sign in to Microsoft 365
+   (authorization code + PKCE; `qj onedrive login <name>` is the no-browser alternative),
+   check who it acts as, learn specific documents **on demand**, and sign out. This connector
+   never crawls — it ingests exactly the links/paths you give it.
+8. **7 · Documents, labels & scoped questions** — list what a connector ingested (each
+   document's `metadata` is what powers the Azure DevOps Epic/Feature/Story/Task tree in the
+   document browser), see what's inside an ingested `.zip`, tag a connector/folder/document (a
+   folder tag covers files ingested later), and ask a question limited to that slice. The scope
+   becomes a real pre-filter on both retrieval legs.
+9. **8 · Lifecycle** — clean up one connector, delete a connector, or reset all memory.

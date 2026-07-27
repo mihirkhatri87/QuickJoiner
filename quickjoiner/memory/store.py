@@ -20,9 +20,10 @@ from __future__ import annotations
 import re
 import sqlite3
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
+from typing import Callable
 
 import lancedb
 
@@ -55,6 +56,37 @@ class SearchHit:
     uri: str
     title: str
     kind: str
+
+
+@dataclass
+class SearchScope:
+    """Which slice of memory a search may look at.
+
+    Both legs of the hybrid search filter on this **before** ranking, so a scoped question
+    genuinely does less work rather than retrieving everything and discarding most of it.
+    Empty (the default) means the whole corpus — the unscoped behaviour, untouched.
+
+    `source_ids` and `doc_ids` are OR-ed: "this connector, plus these specific documents".
+    A tag is resolved to those two by `catalog.resolve_scope` before it reaches a store, so
+    stores never need to know what a label is.
+    """
+
+    source_ids: list[str] = field(default_factory=list)
+    doc_ids: list[str] = field(default_factory=list)
+
+    def is_empty(self) -> bool:
+        return not self.source_ids and not self.doc_ids
+
+    def matches(self, source_id: str, doc_id: str) -> bool:
+        """Python-side twin of the SQL predicate — used by the FTS leg's safety net and by
+        tests, so both engines and both legs agree on one definition of 'in scope'."""
+        return self.is_empty() or source_id in self.source_ids or doc_id in self.doc_ids
+
+
+def _sql_list(values: list[str]) -> str:
+    """Quote a list for a LanceDB SQL `IN (...)`. Source ids embed a user-chosen connector
+    name, so a stray quote must be escaped rather than trusted into the predicate."""
+    return ", ".join("'" + str(v).replace("'", "''") + "'" for v in values)
 
 
 class KnowledgeStore:
@@ -158,6 +190,69 @@ class KnowledgeStore:
         if not chunks:
             return 0
         vectors = self._embedder.embed(chunks)
+        rows = [
+            {
+                "id": f"{doc_id}#{i}",
+                "doc_id": doc_id,
+                "source_id": source_id,
+                "uri": uri,
+                "title": title or "",
+                "kind": kind,
+                "updated_at": updated_at,
+                "chunk_index": i,
+                "text": chunk,
+                "vector": vec,
+            }
+            for i, (chunk, vec) in enumerate(zip(chunks, vectors))
+        ]
+        if table is None:
+            self._db.create_table(_TABLE, data=rows)
+        else:
+            table.add(rows)
+        if self._fts is not None:
+            with self._fts_lock:
+                self._fts.executemany(
+                    "INSERT INTO chunks_fts (title, text, id, doc_id, source_id, uri, kind, updated_at) "
+                    "VALUES (:title, :text, :id, :doc_id, :source_id, :uri, :kind, :updated_at)",
+                    rows,
+                )
+                self._fts.commit()
+        return len(rows)
+
+    def upsert_document_with_progress(
+        self,
+        doc_id: str,
+        source_id: str,
+        uri: str,
+        title: str,
+        kind: str,
+        chunks: list[str],
+        updated_at: str = "",
+        on_progress: Callable[[int, int], None] | None = None,
+        batch_size: int = 16,
+    ) -> int:
+        """Same contract and result as `upsert_document`, but embeds in small batches and
+        calls `on_progress(chunks_done, chunks_total)` after each — for the one caller that
+        needs a real, honest number instead of "working…" for however long an unbatched
+        `embedder.embed(all_chunks)` call takes (a several-hundred-chunk document on a
+        CPU-only embedding model can run minutes; see `ingest/pipeline.py`'s `progress_cb`
+        doc comment for why this is a SEPARATE method rather than a parameter added to the
+        hot path every connector sync calls). Deliberately duplicates `upsert_document`'s
+        small amount of row-building/write logic rather than sharing it, so that method's
+        well-exercised path is untouched by this — keep the two in sync if that logic
+        changes."""
+        table = self._table()
+        if table is not None:
+            table.delete(f'doc_id = "{doc_id}"')
+        self._fts_write("DELETE FROM chunks_fts WHERE doc_id = ?", (doc_id,))
+        if not chunks:
+            return 0
+        total = len(chunks)
+        vectors: list[list[float]] = []
+        for i in range(0, total, batch_size):
+            vectors.extend(self._embedder.embed(chunks[i : i + batch_size]))
+            if on_progress is not None:
+                on_progress(len(vectors), total)
         rows = [
             {
                 "id": f"{doc_id}#{i}",
@@ -300,14 +395,27 @@ class KnowledgeStore:
             pass
 
     # ----------------------------------------------------------------- search
-    def _dense(self, table, vector, limit: int, id_filter: list[str] | None = None) -> list[dict]:
+    def _dense(self, table, vector, limit: int, id_filter: list[str] | None = None,
+               scope: "SearchScope | None" = None) -> list[dict]:
         q = table.search(vector, vector_column_name="vector").metric("cosine")
+        clauses = []
         if id_filter:
-            ids = ", ".join(f"'{i}'" for i in id_filter)
-            q = q.where(f"id IN ({ids})", prefilter=True)
+            clauses.append(f"id IN ({_sql_list(id_filter)})")
+        if scope is not None and not scope.is_empty():
+            parts = []
+            if scope.source_ids:
+                parts.append(f"source_id IN ({_sql_list(scope.source_ids)})")
+            if scope.doc_ids:
+                parts.append(f"doc_id IN ({_sql_list(scope.doc_ids)})")
+            clauses.append("(" + " OR ".join(parts) + ")")
+        if clauses:
+            # prefilter=True: the predicate runs BEFORE the ANN search, so a scoped question
+            # searches a smaller space rather than retrieving broadly and discarding.
+            q = q.where(" AND ".join(clauses), prefilter=True)
         return q.limit(limit).to_list()
 
-    def search(self, query: str, top_k: int = 8, min_score: float = 0.0) -> list[SearchHit]:
+    def search(self, query: str, top_k: int = 8, min_score: float = 0.0,
+               scope: "SearchScope | None" = None) -> list[SearchHit]:
         table = self._table()
         if table is None:
             return []
@@ -321,7 +429,7 @@ class KnowledgeStore:
         # dense leg — rows keyed by chunk id, score = cosine similarity
         by_id: dict[str, dict] = {}
         dense_ids: list[str] = []
-        for row in self._dense(table, vector, fetch):
+        for row in self._dense(table, vector, fetch, scope=scope):
             row["_score"] = 1.0 - float(row.get("_distance", 1.0))
             by_id[row["id"]] = row
             dense_ids.append(row["id"])
@@ -333,13 +441,25 @@ class KnowledgeStore:
             sparse_ids: list[str] = []
             match = self._fts_match(query)
             if match:
+                # `source_id`/`doc_id` are UNINDEXED FTS5 columns — not searchable via MATCH,
+                # but perfectly usable in WHERE, which is exactly what scoping needs.
+                sql = ("SELECT title, text, id, doc_id, source_id, uri, kind, "
+                       "bm25(chunks_fts, 2.0, 1.0) AS rank FROM chunks_fts "
+                       "WHERE chunks_fts MATCH ?")
+                params: list = [match]
+                if scope is not None and not scope.is_empty():
+                    parts = []
+                    if scope.source_ids:
+                        parts.append(f"source_id IN ({','.join('?' * len(scope.source_ids))})")
+                        params.extend(scope.source_ids)
+                    if scope.doc_ids:
+                        parts.append(f"doc_id IN ({','.join('?' * len(scope.doc_ids))})")
+                        params.extend(scope.doc_ids)
+                    sql += " AND (" + " OR ".join(parts) + ")"
+                sql += " ORDER BY rank LIMIT ?"
+                params.append(fetch)
                 with self._fts_lock:
-                    fts_rows = self._fts.execute(
-                        "SELECT title, text, id, doc_id, source_id, uri, kind, "
-                        "bm25(chunks_fts, 2.0, 1.0) AS rank FROM chunks_fts "
-                        "WHERE chunks_fts MATCH ? ORDER BY rank LIMIT ?",
-                        (match, fetch),
-                    ).fetchall()
+                    fts_rows = self._fts.execute(sql, tuple(params)).fetchall()
                 for title, text, id_, doc_id, source_id, uri, kind, _rank in fts_rows:
                     sparse_ids.append(id_)
                     by_id.setdefault(
@@ -353,7 +473,7 @@ class KnowledgeStore:
             # gate is always dense) — one targeted, prefiltered vector lookup
             missing = [i for i in ordered if "_score" not in by_id[i]]
             if missing:
-                for row in self._dense(table, vector, len(missing), id_filter=missing):
+                for row in self._dense(table, vector, len(missing), id_filter=missing, scope=scope):
                     by_id[row["id"]]["_score"] = 1.0 - float(row.get("_distance", 1.0))
 
         # optional second-stage ranking over the fused head

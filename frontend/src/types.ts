@@ -107,6 +107,25 @@ export interface ConnectorRow {
   modes: string[];
 }
 
+/** OneDrive/SharePoint sign-in state. Never carries the tokens themselves — only who
+ * the connector acts as and how many documents it has been taught on demand. */
+export interface OAuthStatus {
+  signed_in: boolean;
+  account: string;
+  scopes: string[];
+  expires_at?: string;
+  learned: number;
+}
+
+export interface OneDriveLearnResult {
+  learned: number;
+  documents: { title: string; uri: string }[];
+  ingested?: string;
+  /** Everything that was NOT learned, and why — shown rather than swallowed. */
+  notes: string[];
+  warning: string;
+}
+
 export interface ConnectorField {
   key: string;
   label: string;
@@ -126,6 +145,50 @@ export interface ConnectorType {
   blurb: string;
   modes: string[];
   fields: ConnectorField[];
+  /** What the user must do AFTER saving, for connectors that aren't usable the moment
+   * they're created (OneDrive needs an interactive Microsoft 365 sign-in, which can't
+   * happen before the connector exists). Rendered on the create form and echoed as the
+   * post-create flash. Markdown-lite: **bold** only. */
+  next_step?: string;
+}
+
+/** A user-declared label over ingested content. `uri_prefix` is the granularity:
+ * '' = the whole connector · a folder path = that folder AND files ingested into it later
+ * · a full document uri = just that document. */
+export interface DocLabel {
+  source_id: string;
+  uri_prefix: string;
+  kind: "tag" | "aka";
+  value: string;
+}
+
+export interface IngestedDoc {
+  doc_id: string;
+  uri: string;
+  title: string;
+  kind: string;
+  chunks: number;
+  updated_at: string | null;
+  /** Labels that apply to THIS document, including ones inherited from its folder
+   * or its connector — resolved server-side at read time. */
+  labels: { kind: "tag" | "aka"; value: string; uri_prefix: string }[];
+  /** Connector-supplied, display-only metadata — {} for every connector that doesn't set
+   * it. Azure DevOps stamps work_item_type/state/team/sprint/parent_id/changed_date/
+   * closed_date here (see DocumentsModal.tsx's work-item tree, the only current reader). */
+  metadata: Record<string, unknown>;
+}
+
+export interface SourceDocuments {
+  source_id: string;
+  documents: IngestedDoc[];
+  labels: DocLabel[];
+}
+
+/** What a question is restricted to. Empty in every field = all of memory. */
+export interface AskScope {
+  source_ids: string[];
+  doc_ids: string[];
+  tags: string[];
 }
 
 export interface ProjectRow {
@@ -151,6 +214,9 @@ export interface ChatAttachment {
   // Set once the retention sweep deleted the file — the UI then shows a warning, not a link.
   // Also carries "gone" if the row itself vanished.
   deleted_at?: string | null;
+  /** Why no text could be read out of this file (picture-only deck, missing parser, corrupt).
+   * Surfaced immediately so "the model ignored my file" is never the user's conclusion. */
+  extract_error?: string;
 }
 
 export interface SessionDetail extends SessionRow {

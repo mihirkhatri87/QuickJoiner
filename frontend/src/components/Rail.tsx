@@ -46,6 +46,7 @@ export function Rail({
   onOpenGaps,
   syncJobs,
   onOpenSync,
+  onBrowseSource,
 }: {
   open: boolean;
   collapsed: boolean; // md+ only; mobile uses `open`
@@ -69,6 +70,8 @@ export function Rail({
   onOpenGaps: () => void;
   syncJobs: SyncJob[];
   onOpenSync: (source: string, clean: boolean) => void;
+  /** Open the ingested-document browser for a source (also where it's labelled). */
+  onBrowseSource?: (source: SourceRow) => void;
 }) {
   const [newProj, setNewProj] = useState("");
   const [addingProj, setAddingProj] = useState(false);
@@ -97,14 +100,25 @@ export function Rail({
     const paused = job?.state === "paused";
     const retrying = job?.state === "retrying";
     const syncing = job?.state === "running" || job?.state === "stopping" || paused || retrying;
-    const watchable = Boolean(job?.live);
-    const Row = watchable ? "button" : "div";
+    // Only steal the click for the log viewer while a job is actually in flight. `job?.live`
+    // looks tempting here but means something different (the in-memory SyncManager still owns
+    // this job id, which stays true forever once a job has run — nothing evicts a finished job
+    // from that map) — using it made a connector's row permanently reopen its last log instead
+    // of ever browsing documents again after its first sync/cleanup.
+    const watchable = syncing;
+    const browsable = !watchable && !!onBrowseSource && s.documents > 0;
+    const Row = watchable || browsable ? "button" : "div";
     return (
       <Row
         key={s.id}
         {...(watchable
           ? { onClick: () => onOpenSync(s.name, job!.clean), title: "Open the live sync log" }
-          : { title: `${s.type} · ${s.documents} docs` })}
+          : browsable
+            ? {
+                onClick: () => onBrowseSource!(s),
+                title: `${s.type} · ${s.documents} docs — see what it learned and tag it`,
+              }
+            : { title: `${s.type} · ${s.documents} docs` })}
         className={cn(
           "flex w-full flex-shrink-0 items-center gap-2.5 rounded-xs py-1.5 text-left transition hover:bg-fill",
           nested ? "pl-8 pr-3" : "px-3",

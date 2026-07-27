@@ -47,7 +47,14 @@ class AppContext:
         sources: list | None = None,
         user: str | None = None,
         role: str | None = None,
+        scope=None,
     ) -> OnboardingAgent:
+        """`scope` (memory.store.SearchScope) narrows this turn to chosen connectors/documents.
+
+        It does two things, and the second is what actually saves round-trips: memory reads
+        are filtered inside the query, AND live connector tools for sources outside the scope
+        are not offered at all — the model cannot spend a call on a system the user excluded.
+        """
         from quickjoiner.agent.control import build_control_tools
         from quickjoiner.agent.ops import build_ops_tools
 
@@ -58,10 +65,10 @@ class AppContext:
         ledger: dict[str, float] = {}
         tools = build_builtin_tools(
             self.store, self.catalog, self.pipeline, self.config.retrieval, self.config.gaps,
-            score_ledger=ledger,
+            score_ledger=ledger, scope=scope,
         )
         tools.extend(build_ops_tools(self))
-        tools.extend(self.connector_tools(sources))
+        tools.extend(self.connector_tools(self._scoped_sources(sources, scope)))
         # Self-control tools (plan 08): full API control from chat, gated by the acting user's
         # RBAC role (derived from role_of when not given). Scoped, confirmed, and permission-checked.
         tools.extend(build_control_tools(self, user, role))
@@ -71,6 +78,24 @@ class AppContext:
             tool_result_max_chars=self.config.chat.live_tool_result_max_chars,
             score_ledger=ledger,
         )
+
+    def _scoped_sources(self, sources: list | None, scope) -> list | None:
+        """The sources whose live tools this turn may use.
+
+        Scoping to specific documents still leaves their OWN connector's live tools available
+        (asking about one GitLab doc may reasonably need a current-state lookup in that
+        project) — it only removes the connectors the user did not pick. An empty scope is
+        unchanged behaviour: every visible source contributes its tools.
+        """
+        if scope is None or scope.is_empty():
+            return sources
+        allowed = set(scope.source_ids)
+        for doc_id in scope.doc_ids:
+            row = self.catalog.document_source(doc_id)
+            if row:
+                allowed.add(row)
+        pool = sources if sources is not None else list(self.config.sources)
+        return [s for s in pool if f"{s.type}:{s.name}" in allowed]
 
     def connector_tools(self, sources: list | None = None):
         """Live read-from-source tools contributed by configured connectors.

@@ -1,12 +1,28 @@
-import { ArrowUp, Paperclip, Sparkles, X } from "lucide-react";
+import { ArrowUp, BookmarkPlus, Paperclip, Sparkles, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { api } from "../api";
 
-// Extensions the rolling Uploads connector can ingest (mirrors ingest/extract.py). Used only
-// to hint the file picker + validate a drop; the server is the source of truth.
+// Extensions the rolling Uploads connector can ingest — DOC_EXTENSIONS + ARCHIVE_EXTENSIONS +
+// TEXT_EXTENSIONS from ingest/extract.py (IMAGE_EXTENSIONS deliberately excluded: those aren't
+// readable yet, see the vision seam there). This only hints the OS file-picker dialog's filter —
+// drag-and-drop is unaffected by it, and the server is the source of truth either way. Keep in
+// sync with extract.py when its extension sets change, or a type it already supports (like the
+// .zip archive expansion) silently can't be *picked*, only dropped.
 const UPLOAD_ACCEPT =
-  ".pdf,.docx,.pptx,.xlsx,.md,.markdown,.txt,.text,.rst,.log,.json,.jsonl,.csv,.tsv,.html,.htm," +
-  ".xml,.yaml,.yml,.toml,.ini,.cfg,.py,.js,.ts,.tsx,.jsx,.java,.cs,.go,.rb,.php,.rs,.c,.h,.cpp,.sql,.sh,.ps1";
+  // office / PDF + archives
+  ".pdf,.docx,.pptx,.xlsx,.zip," +
+  // plain text / markup / data
+  ".md,.markdown,.txt,.text,.rst,.log,.json,.jsonl,.ndjson,.csv,.tsv,.html,.htm,.xml,.css," +
+  ".yaml,.yml,.toml,.ini,.cfg,.conf,.env,.editorconfig,.lock,.properties,.tfvars,.hcl,.tf," +
+  // dependency manifests
+  ".csproj,.vbproj,.fsproj,.sln,.props,.targets,.nuspec,.config,.mod,.kts,.gradle," +
+  // docs-in-other-markup, transcripts, notebooks
+  ".adoc,.asciidoc,.org,.tex,.bib,.vtt,.srt,.ipynb," +
+  // code
+  ".py,.js,.ts,.tsx,.jsx,.java,.cs,.go,.rb,.php,.rs,.c,.h,.cpp,.hpp,.sql,.proto,.graphql," +
+  ".vue,.svelte,.scala,.kt,.swift,.r,.jl,.pl,.lua,.groovy,.dart,.ex,.exs,.erl,.clj,.fs,.vb,.m,.mm," +
+  // shell / build scripts
+  ".sh,.bash,.zsh,.fish,.ps1,.psm1,.bat,.cmd,.make,.cmake,.dockerfile";
 
 export function Composer({
   value,
@@ -16,6 +32,10 @@ export function Composer({
   pending,
   onAttachFiles,
   onRemovePending,
+  uploadStatus,
+  learnPending,
+  onToggleLearnPending,
+  scopeControl,
 }: {
   value: string;
   onChange: (v: string) => void;
@@ -25,6 +45,19 @@ export function Composer({
   pending?: string[];
   onAttachFiles?: (files: File[]) => void;
   onRemovePending?: (idx: number) => void;
+  /** Set while the staged files above are in flight — null the rest of the time. One request
+   * covers every staged file, so all chips share the same phase/percent; there's no per-file
+   * granularity to show without one request per file. "processing" means every byte has been
+   * sent but the server is still extracting text, which is the multi-second gap users actually
+   * hit on a several-MB file — see the api.uploadChatAttachments doc comment. */
+  uploadStatus?: { phase: "uploading" | "processing"; pct: number } | null;
+  /** "Also learn permanently": attachments are context for ONE question by design, so
+   * ingesting them into memory stays an explicit, visible opt-in rather than a surprise. */
+  learnPending?: boolean;
+  onToggleLearnPending?: (next: boolean) => void;
+  /** The scope chip (ScopePicker). Passed in rather than built here so the composer stays
+   * a dumb input and App owns which slice of memory the conversation is asking about. */
+  scopeControl?: React.ReactNode;
 }) {
   const ref = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -136,7 +169,7 @@ export function Composer({
             onSend();
           }}
           onDragOver={(e) => {
-            if (!onAttachFiles) return;
+            if (!onAttachFiles || uploadStatus) return;
             e.preventDefault();
             setDragOver(true);
           }}
@@ -145,7 +178,7 @@ export function Composer({
             setDragOver(false);
           }}
           onDrop={(e) => {
-            if (!onAttachFiles) return;
+            if (!onAttachFiles || uploadStatus) return;
             e.preventDefault();
             setDragOver(false);
             pickFiles(e.dataTransfer.files);
@@ -155,26 +188,73 @@ export function Composer({
             (dragOver ? "shadow-[0_0_0_2px_var(--accent)]" : "")
           }
         >
+          {scopeControl && <div className="flex flex-wrap gap-1.5 px-1.5 pt-0.5">{scopeControl}</div>}
           {/* Staged per-question context files — upload on send, shown beneath the question after. */}
           {pending && pending.length > 0 && (
             <div className="flex flex-wrap gap-1.5 px-1.5 pt-0.5">
-              {pending.map((name, i) => (
-                <span
-                  key={`${name}-${i}`}
-                  className="inline-flex max-w-[240px] items-center gap-1.5 rounded-full bg-fill2 py-1 pl-2.5 pr-1.5 text-[12px] text-muted"
-                >
-                  <Paperclip size={12} className="flex-shrink-0" />
-                  <span className="truncate">{name}</span>
-                  <button
-                    type="button"
-                    aria-label={`Remove ${name}`}
-                    onClick={() => onRemovePending?.(i)}
-                    className="flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-full text-faint transition hover:bg-fill hover:text-ink"
+              {pending.map((name, i) => {
+                const busy = Boolean(uploadStatus);
+                const barPct = uploadStatus?.phase === "processing" ? 100 : uploadStatus?.pct ?? 0;
+                return (
+                  <span
+                    key={`${name}-${i}`}
+                    className="flex max-w-[240px] flex-col gap-1 rounded-2xl bg-fill2 py-1 pl-2.5 pr-1.5 text-[12px] text-muted"
                   >
-                    <X size={12} />
-                  </button>
-                </span>
-              ))}
+                    <span className="flex items-center gap-1.5">
+                      <Paperclip size={12} className="flex-shrink-0" />
+                      <span className="min-w-0 flex-1 truncate">{name}</span>
+                      {busy ? (
+                        <span
+                          className="flex-shrink-0 whitespace-nowrap font-mono text-[10px] tabular-nums text-faint"
+                          aria-live="polite"
+                        >
+                          {uploadStatus!.phase === "processing" ? "processing…" : `${uploadStatus!.pct}%`}
+                        </span>
+                      ) : (
+                        <button
+                          type="button"
+                          aria-label={`Remove ${name}`}
+                          onClick={() => onRemovePending?.(i)}
+                          className="flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-full text-faint transition hover:bg-fill hover:text-ink"
+                        >
+                          <X size={12} />
+                        </button>
+                      )}
+                    </span>
+                    {busy && (
+                      <span className="block h-[3px] w-full overflow-hidden rounded-full bg-fill">
+                        <span
+                          className={
+                            "block h-full rounded-full bg-accent transition-[width] duration-200 ease-out " +
+                            (uploadStatus!.phase === "processing" ? "animate-pulse" : "")
+                          }
+                          style={{ width: `${barPct}%` }}
+                        />
+                      </span>
+                    )}
+                  </span>
+                );
+              })}
+              {onToggleLearnPending && (
+                <button
+                  type="button"
+                  onClick={() => onToggleLearnPending(!learnPending)}
+                  title={
+                    learnPending
+                      ? "These files will be added to learned memory permanently, as well as answering this question."
+                      : "Attachments are context for this question only. Turn this on to also add them to memory permanently."
+                  }
+                  className={
+                    "inline-flex items-center gap-1.5 rounded-full py-1 pl-2 pr-2.5 text-[11.5px] transition " +
+                    (learnPending
+                      ? "bg-accent-soft text-accent"
+                      : "bg-fill2 text-faint hover:text-muted")
+                  }
+                >
+                  <BookmarkPlus size={12} className="flex-shrink-0" />
+                  {learnPending ? "Learning permanently" : "Ask only"}
+                </button>
+              )}
             </div>
           )}
           <div className="flex items-end gap-2.5">
@@ -194,9 +274,14 @@ export function Composer({
               <button
                 type="button"
                 aria-label="Attach files as context"
-                title="Attach files as context for your question (Word, PowerPoint, Excel, PDF, Markdown, …). Kept for this conversation only, not added to memory."
+                title={
+                  uploadStatus
+                    ? "Uploading the current attachment(s)…"
+                    : "Attach files as context for your question (Word, PowerPoint, Excel, PDF, Markdown, …). Kept for this conversation only, not added to memory."
+                }
+                disabled={Boolean(uploadStatus)}
                 onClick={() => fileRef.current?.click()}
-                className="flex h-11 w-11 flex-shrink-0 items-center justify-center rounded-full text-muted transition hover:bg-fill2 hover:text-ink"
+                className="flex h-11 w-11 flex-shrink-0 items-center justify-center rounded-full text-muted transition hover:bg-fill2 hover:text-ink disabled:pointer-events-none disabled:opacity-40"
               >
                 <Paperclip size={19} strokeWidth={2} />
               </button>
@@ -266,6 +351,7 @@ export function Composer({
         Answers are grounded in learned memory and <b className="font-semibold text-gold">cite their sources</b> — or
         say what hasn't been learned yet. Commands:{" "}
         <code className="font-mono text-[10.5px] text-gold">/qj &lt;control QuickJoiner in words&gt;</code>,{" "}
+        <code className="font-mono text-[10.5px] text-gold">/ingest &lt;file path&gt;</code>,{" "}
         <code className="font-mono text-[10.5px] text-gold">/scrape &lt;url&gt;</code>.
       </p>
     </div>

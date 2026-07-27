@@ -13,6 +13,11 @@ persistent (draggable, reheating) d3-force layout and map-tile LOD — pure `cam
 `simulation.ts` / `lod.ts` under `components/graph/`, with React owning *what* exists and one
 render loop owning *where* it is drawn (see `CLAUDE.md`).
 
+Also shipped (2026-07-25): a per-connector **document browser** with inline tag/aka
+labelling (`DocumentsModal`), and a **scope chip** in the composer (`ScopePicker`) that
+limits a question to chosen connectors/tags/documents — resolved client-side into ids so
+scoping costs no LLM round-trip.
+
 Debt, named:
 1. **Zero automated FE tests** (the pan-crash bug proved the cost).
 2. All server state is hand-rolled `useState` + fetch in `App.tsx` (~450 lines) — no cache,
