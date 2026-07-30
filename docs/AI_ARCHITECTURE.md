@@ -15,17 +15,24 @@ filter: *does this make an org-specific claim more provably right, or more hones
 refused?* This yields three architectural invariants that must survive every future
 enhancement:
 
-- **I1 — The refusal gate is calibrated and conservative.** Today: cosine ≥ 0.55 on the
-  dense leg, empirically tuned per embedding model — and now **fittable per workspace** via
+- **I1 — The refusal gate is calibrated and conservative.** Today: cosine ≥ 0.64 on the
+  dense leg (retuned 2026-07-29; the previous 0.55 was calibrated against scores an IVF_PQ
+  index was distorting — see limitation 1) and **fittable per workspace** via
   `qj eval --calibrate` (max-margin midpoint over the org's eval pack). Hybrid fusion, rerankers,
   graph hops, alias expansion — all may change *what surfaces and in what order*, never *whether
-  we claim knowledge*.
+  we claim knowledge*. The invariant is the *shape* of the gate, not the number: what must
+  survive is that one dense cosine, measured on un-quantized vectors, decides grounded-vs-refuse.
 - **I2 — Evidence is a first-class object.** Chunks carry uri/title/source; graph edges
   carry `evidence_doc_id`; conversation-extracted facts cite their conversation. Anything
   that can't name its evidence doesn't enter the answer path.
 - **I3 — Deterministic before generative.** If structure is parseable (manifests, ticket
   keys, deploy dashboards), parse it. LLMs propose; validators dispose (see the triple
-  vocabulary gate). Generative extraction is allowed only behind strict shape validation.
+  vocabulary gate). Generative extraction is allowed only behind strict shape validation —
+  since 2026-07-30 that gate is two-layer: the controlled type/relation vocabulary **and**
+  per-relation domain/range signatures, so a proposal whose three words are each legal but
+  whose combination is a category error (`environment: prod | owns | person: bob`) is dropped
+  like any other invalid line. The deterministic extractors satisfy those signatures by
+  construction — validators constrain what the LLM may add, never what structure already proves.
 
 ## 2. The stack as built (and why)
 
@@ -81,9 +88,23 @@ Key defended choices:
 
 Each maps to a pending item in `docs/AI_ROADMAP.md` (noted in parentheses).
 
-1. Single embedding model (bge-small). The threshold is no longer only hand-tuned —
-   `qj eval --calibrate` now fits it per corpus — but the 0.523-vs-0.55 refusal margin is
-   still thin on large corpora until a calibration set is authored and applied (X1, X2, #14).
+1. Single embedding model (bge-small), and **it cannot cleanly separate refusals from
+   answers by score alone**. Measured 2026-07-29 on a 32-case pack against a real org corpus
+   (12 refusal cases, exact cosines): topically-adjacent non-answers score 0.62–0.78 while
+   true hits score 0.66–0.87 — the ranges *overlap*, so no threshold is simultaneously
+   refusal-safe and recall-safe. `qj eval --calibrate` fits the best available compromise
+   (0.72 max-margin; 0.64 shipped as the recall-preserving choice), but the overlap itself is
+   the limitation, and it is now the load-bearing argument for an embedding change rather than
+   the recall argument that preceded it (#9, X1, X2, #14). Historical note: an earlier version
+   of this list cited a "0.523-vs-0.55" margin and a specific sub-gate case as the signal —
+   both were artifacts of the IVF_PQ defect (LanceDB's default index is product-quantized),
+   fixed 2026-07-29 via `retrieval.ann_refine_factor`. Re-measured on the live corpus
+   2026-07-30, that defect has two faces — distorted scores on the right chunk (observed
+   2026-07-28) and, on another index instance, the right chunks missing entirely
+   (recall@5 45% → 100% with the fix). Both are fixed; the overlap is real and is what
+   remains. **Caveat on this whole line of work:** a changed default in `config.py` does not
+   reach an existing workspace (`save_config` materializes every field), so the retuned
+   threshold applies only to workspaces created after it — see PRIORITIES #3.
 2. Chunking is format-aware but not *meaning*-aware; no doc-level context in chunks; code
    chunking is line-based, not AST-based (#2, #10).
 3. No temporal model: stale evidence ranks equal to fresh; no as-of queries (#11, #5).

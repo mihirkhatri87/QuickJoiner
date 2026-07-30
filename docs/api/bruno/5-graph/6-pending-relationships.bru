@@ -1,0 +1,15 @@
+meta {
+  name: Unmined relationships (queue)
+  type: http
+  seq: 6
+}
+
+get {
+  url: {{baseUrl}}/api/graph/pending
+}
+
+docs {
+  Documents that were ingested but whose relationship extraction never resolved.
+  A connector that pulls a moving window (recent sprints) never re-provides them,
+  so no sync will retry it on its own — `POST /api/graph/drain` finishes them.
+}

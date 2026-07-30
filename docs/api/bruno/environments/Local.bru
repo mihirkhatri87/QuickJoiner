@@ -23,6 +23,7 @@ vars {
   ~scopeDocId: 0123456789abcdef
   ~progressToken: demo-progress-token
   ~onedriveTarget: https://contoso.sharepoint.com/:w:/r/sites/Eng/Shared%20Documents/design.docx
+  ~scrapeConnector: Plumber
 }
 
 vars:secret [
@@ -47,6 +48,9 @@ docs {
     from the `List a source's documents` response) for the archive-contents request.
   - **progressToken** — folder `4-query`: any string you pick, passed as `progress_token`
     when learning an attachment, then polled to watch real chunk-embedding progress.
+  - **scrapeConnector** — folder `2-connect`: a `web_scrape` connector with
+    `use_browser=true`, i.e. a site behind a login. Used by the two gated-site requests
+    (check the browser session / open a sign-in window on the QuickJoiner host).
   - **onedriveConnector / onedriveClientId / onedriveTarget** — folder `7-onedrive`: the
     connector name, your Azure app registration's Application (client) ID, and one document
     link or drive path to learn. Nothing is crawled; only the target is ingested.

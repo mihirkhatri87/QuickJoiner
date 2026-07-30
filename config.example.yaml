@@ -13,8 +13,9 @@ embedding:
 
 retrieval:
   top_k: 8
-  min_score: 0.55            # below this, the agent answers "I haven't learned that yet"
-                             # (tuned for bge-small; retune if you change embedding models)
+  min_score: 0.64            # below this, the agent answers "I haven't learned that yet"
+                             # (tuned for bge-small w/ the ANN refine_factor fix; retune via
+                             # `qj eval --calibrate` if you change embedding models)
 
 # Connected sources (Phase 2+ adds git/github/jira/confluence/azure_devops/... types)
 sources: []

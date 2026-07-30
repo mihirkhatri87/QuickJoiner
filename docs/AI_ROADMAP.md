@@ -51,6 +51,36 @@ How each works is documented in `CLAUDE.md` — the source of truth for current 
   `graph_path`/`graph_expand`; scored as its own lowest-tier `name-bridge` confidence
   class. Deliberately a bridge, not a merge. Fuzzy identity remains with the plan-06
   adjudicator.
+- **#25 Drain stale deferred graph work** — `IngestPipeline.drain_pending_graph` +
+  `SyncManager.start_drain` + `GET /api/graph/pending` / `POST /api/graph/drain` +
+  `qj drain-graph` (2026-07-30). Documents queued for LLM relationship extraction were only
+  retried by a sync that re-yields them, which a moving-window connector never does — so they
+  kept their chunks and citations and had **no edges at all** (`_sync_graph` defers a
+  qualifying document's whole graph, deterministic assertions included). The drain re-reads
+  the text actually indexed for them and finishes the job in place. Two honesty properties
+  came out of building it: `graph_pending.graph_json` now carries the deterministic payload so
+  a drain is a *faithful* rebuild rather than a re-derivation, and rows predating that column
+  are counted and reported separately instead of inside a total that would read as full
+  recovery. Full detail in `CLAUDE.md`'s pipeline + sync-manager bullets.
+- **#21 Relation signatures (ontology-lite domain/range validation)** —
+  `RELATION_SIGNATURES`/`signature_allows` in `ingest/triples.py`, enforced in
+  `parse_triples` (2026-07-30). Each relation declares which entity types may stand on
+  its left and right, so an LLM line whose three words are each in-vocabulary but whose
+  combination is a category error (`environment: prod | owns | person: bob`) is dropped
+  like any other off-vocabulary line. Deliberately permissive (rejects impossible shapes,
+  not arguable ones) and rendered into both extraction prompts from the same table.
+  `references` is explicitly unsigned — it asserts co-occurrence, not a typed link.
+  **Calibrated against the live 109k-edge graph rather than authored from taste** — the
+  reusable lesson: the first cut rejected 13.6% of in-vocabulary edges and **43% of those
+  rejections were legitimate statements**; measuring showed genuine errors are overwhelmingly
+  *domain* (wrong subject) errors, so subjects are constrained tightly and objects loosely.
+  Final table rejects 8.3%, effectively all real category errors. A signature table is only
+  honest if it is checked against a real corpus.
+  The roadmap's secondary note ("signature-violating deterministic edges become a
+  lower-confidence signal") turned out to be **inert by construction**: the deterministic
+  extractors build their edges from structure, so every shape they emit conforms — pinned
+  by a test rather than given a scoring penalty that could never fire. This is the full
+  extent of ontology adopted eagerly; X7 remains the induction spike.
 - **#26 ADO/TFS work-item hierarchy + link graph** — `hierarchy_graph`/`_merge_graphs` in
   `azure_devops.py` + a bounded hierarchy walk-up + per-document display metadata with a
   version-triggered backfill (2026-07-26). Closes the Jira/ADO asymmetry: `part_of`
@@ -83,23 +113,6 @@ How each works is documented in `CLAUDE.md` — the source of truth for current 
     live graph literally contains `#{azureusername}` placeholders today). Same conservative
     direction rules; per-environment variable scoping can carry the environment entity as
     detail. Extension of the same mechanism: Terraform state/vars, k8s ConfigMaps.
-25. **Drain stale deferred graph work** — *adopt*. `graph_pending` rows are only retried when
-    a later sync **re-yields that document** (`pipeline.py:158`). For connectors that ingest a
-    moving window this never happens: the live workspace has **1,331 TFS documents** queued
-    for LLM triple extraction whose work items have aged out of the per-team recent-sprint
-    slice, so their relationships are permanently unmined. Add a pending-drain pass (a job on
-    the `SyncManager` surface, so it streams logs + lands in the activity feed) that re-reads
-    those documents' stored chunks and resolves their triples without a connector round-trip.
-    Cheap, and it converts already-paid-for ingest into graph edges.
-21. **Relation signatures (ontology-lite domain/range validation)** — *adapt*. A signature
-    table over the existing triple vocab (`deploys: service|project → environment`,
-    `owns: team|person → repo|service|project`, …) enforced in `parse_triples` alongside the
-    type/rel checks — today the checks are independent, so a semantically impossible triple
-    like `environment: prod | owns | person: bob` validates. Closes that hole (strengthens
-    I3), and signature-violating edges from the deterministic extractors become a
-    lower-confidence signal for plan-06 scoring. Pure function, tiny effort, no schema change.
-    This is the full extent of "ontology" we adopt eagerly — see the §5.2 intake-rejection
-    note for what we deliberately do NOT build.
 29. **Architectural-layer classification** — *adopt* (validated by **Understand-Anything**,
     which auto-groups nodes into API/Service/Data/UI/Utility). A deterministic pass tags each
     repo/module/symbol entity with an architectural **layer** (API / Service / Data / UI /
@@ -433,9 +446,9 @@ Scan log: *(dated one-liners appended here by each scan)*
 - 2026-07-17 — user-driven vocab curation (the manual fast-path of X7): types `topic` +
   `datastore`, rels `publishes_to`/`subscribes_to`/`stores_in` added to `triples.py` —
   runtime coupling (pub/sub, data residence) that manifests can't see. Shipped same day
-  with lockstep prompt interpolation. When #21 lands, their signatures:
-  `publishes_to/subscribes_to: service|project|repo → topic`,
-  `stores_in: service|project|repo → datastore`.
+  with lockstep prompt interpolation. Their #21 signatures shipped 2026-07-30 as designed
+  (with `package` added to each domain): `publishes_to`/`subscribes_to`:
+  `package|project|repo|service → topic`; `stores_in`: `package|project|repo|service → datastore`.
 - 2026-07-17 — follow-up shipped: **deterministic pub/sub + datastore extractor**
   (`ingest/pubsub.py`) — per-language Service Bus SDK patterns (C#/Python/JS/Java/Go), app
   config incl. Spring, connection strings, CFN/SAM/serverless templates; literals only,

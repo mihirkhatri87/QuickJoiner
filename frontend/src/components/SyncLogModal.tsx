@@ -29,7 +29,7 @@ export function SyncLogModal({
   autoStart: boolean;
   /** Which job to start when autoStart is set; also picks the panel's title. Watching an
    * existing job streams the same per-source log endpoint either way. */
-  kind?: "sync" | "cleanup";
+  kind?: "sync" | "cleanup" | "drain";
   onClose: () => void;
   onJobChange?: () => void;
 }) {
@@ -133,7 +133,24 @@ export function SyncLogModal({
   const jobKind = job?.kind ?? kind;
   // Cleanup and reset are short, all-or-nothing purges — neither is pausable or stoppable.
   const isPurge = jobKind === "cleanup" || jobKind === "reset";
+  // A drain pauses and stops like a sync, but there is no partial data to clean up on stop:
+  // whatever it didn't get to simply stays queued for the next run.
+  const isDrain = jobKind === "drain";
   const canPause = !isPurge && job?.state === "running";
+  // The connector logs this line via _stage when a crawl hits auth walls (scraper.py).
+  const needsSignIn = !active && lines.some((l) => l.includes("returned a sign-in page"));
+  const onSignIn = async () => {
+    try {
+      await api.browserLoginStart(name);
+    } catch (e) {
+      setLines((l) => [...l, "✗ " + String((e as Error).message)]);
+      return;
+    }
+    setLines((l) => [
+      ...l,
+      "▸ a sign-in window is opening on the QuickJoiner host — sign in, then close it and re-sync.",
+    ]);
+  };
 
   const doStop = async (cleanup: boolean) => {
     setStopping(true);
@@ -183,9 +200,11 @@ export function SyncLogModal({
               ? "Memory reset"
               : jobKind === "cleanup"
                 ? "Cleanup"
-                : (job?.clean ?? clean)
-                  ? "Clean re-sync"
-                  : "Sync"}{" "}
+                : jobKind === "drain"
+                  ? "Mining relationships"
+                  : (job?.clean ?? clean)
+                    ? "Clean re-sync"
+                    : "Sync"}{" "}
             · {name}
           </div>
           <div className="ml-auto flex-shrink-0 font-mono text-[10px] uppercase tracking-[0.12em] text-faint">
@@ -247,8 +266,34 @@ export function SyncLogModal({
           )}
         </div>
 
+        {/* A credential-gated site answers 200 with a login page, so a lapsed session
+            reads as "0 documents" rather than an error. The connector reports the count;
+            surface it here with the fix attached, since this is where the user is looking
+            when a sync mysteriously finds nothing. */}
+        {needsSignIn && (
+          <div className="flex flex-wrap items-center gap-2 border-t border-fill2 bg-gold-soft/30 px-5 py-2.5">
+            <span className="text-[12px] text-gold">
+              Pages returned a sign-in page — this connector's browser session has expired or was
+              never captured.
+            </span>
+            <button
+              onClick={onSignIn}
+              className="ml-auto rounded-full bg-fill px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.12em] text-ink hover:bg-raised2"
+            >
+              Sign in to this site
+            </button>
+          </div>
+        )}
+
         <div className="flex flex-wrap items-center gap-2 border-t border-fill2 px-5 py-3">
-          {job?.stats && (
+          {job?.stats && "documents" in job.stats && (
+            <div className="font-mono text-[11px] tabular-nums text-faint">
+              {job.stats.documents} mined · {job.stats.faithful} in full
+              {job.stats.text_only ? ` · ${job.stats.text_only} from stored text` : ""}
+              {job.stats.missing_text ? ` · ${job.stats.missing_text} still queued` : ""}
+            </div>
+          )}
+          {job?.stats && "added" in job.stats && (
             <div className="font-mono text-[11px] tabular-nums text-faint">
               {job.stats.added} added · {job.stats.updated} updated · {job.stats.skipped} unchanged ·{" "}
               {job.stats.chunks} chunks{job.stats.errors ? ` · ${job.stats.errors} errors` : ""}
@@ -264,7 +309,11 @@ export function SyncLogModal({
                   <Button onClick={doPauseResume}>{paused ? "Resume" : "Pause"}</Button>
                 )}
                 {!isPurge && (
-                  <Button variant="danger" onClick={() => setConfirmStop(true)} disabled={stopping}>
+                  <Button
+                    variant="danger"
+                    onClick={() => (isDrain ? doStop(false) : setConfirmStop(true))}
+                    disabled={stopping}
+                  >
                     Stop
                   </Button>
                 )}

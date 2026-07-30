@@ -3,9 +3,19 @@
 > **STATUS: ◐ CODE SHIPPED (2026-07-17), verification + related-work open.** All four phases
 > A→D→B→C landed: `graph_path_candidates` + ambiguity text, `entity_evidence`-driven adjudicator,
 > `confidence.py` (`score_edge`/`score_chain`), `candidates.py` + SSE event + `CandidateCarousel`.
-> **Open:** AC #7 / §1.D live check (`resolve_entity('webroot connector')` merging fires at ingest
-> time — awaiting the next clean Connector + Confluence re-sync; code + fixtures done) and the §4
-> related work (repo-graph refresh, connect Nautical↔Stevedore). When these close, graduate the
+> **Open — and every remaining item needs the live org, not more code** (re-checked 2026-07-30):
+> AC #1 (the worked example answered correctly against the real Connector/Nautical/Stevedore
+> graph), AC #7 / §1.D (`resolve_entity('webroot connector')` merging, which only fires at
+> ingest time), and the §4 related work (repo-graph refresh, connect Nautical↔Stevedore
+> directly). None is reproducible on a dev machine — they need the user's credentials and a
+> real sync — so the plan stays open until they run there. Code + fixtures are done and green.
+>
+> **The bar for AC #7 is lower than this plan assumed.** `GRAPH_EXTRACTOR_VERSION` +
+> `documents.graph_version` (shipped 2026-07-23, after this plan was written) mean an
+> **ordinary** sync re-runs `_sync_graph` → `_persist_graph` → the entity resolver for any
+> re-provided document whose stored version is below the current one — no clean re-sync
+> needed, no re-embed. Only documents already stamped at the current version still require a
+> clean re-sync (or a version bump) to re-run resolution. When these close, graduate the
 > substance into the architecture docs and **delete this plan** (CLAUDE.md house rule). See
 > [STATUS.md](STATUS.md).
 

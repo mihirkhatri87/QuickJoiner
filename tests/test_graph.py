@@ -28,6 +28,26 @@ def test_catalog_entity_alias_resolution(catalog):
     assert catalog.resolve_entity("does-not-exist") is None
 
 
+def test_upsert_entity_keeps_incumbent_name_over_worse_cased_variant(catalog):
+    # Regression (plan 05 C4 leg, 2026-07-28): a deterministic extractor names a node
+    # once ('Nautical'); a later LLM-proposed triple for the SAME entity id must not
+    # silently downgrade the display name to a lowercase guess ('nautical').
+    catalog.upsert_entity("repo:nautical", "Nautical", "repo", "git:nautical")
+    catalog.upsert_entity("repo:nautical", "nautical", "repo", "git:nautical")
+    assert catalog.resolve_entity("repo:nautical")["name"] == "Nautical"
+
+    # A better-cased variant than the incumbent DOES win.
+    catalog.upsert_entity("repo:stevedore", "stevedore", "repo", "git:stevedore")
+    catalog.upsert_entity("repo:stevedore", "Stevedore", "repo", "git:stevedore")
+    assert catalog.resolve_entity("repo:stevedore")["name"] == "Stevedore"
+
+    # A genuinely different name (not just a casing variant) still replaces — a real
+    # rename/correction must not be blocked by this guard.
+    catalog.upsert_entity("repo:renamed", "Old Name", "repo", "git:renamed")
+    catalog.upsert_entity("repo:renamed", "New Name", "repo", "git:renamed")
+    assert catalog.resolve_entity("repo:renamed")["name"] == "New Name"
+
+
 def test_graph_snapshot_balances_across_types_not_one_numerous_type(catalog):
     # Regression: after a GitLab sync the many `branch:` entities (sorting before every other
     # type) monopolized the whole-graph snapshot budget, rendering it as branches+tickets only

@@ -503,6 +503,47 @@ def resync(
     sync(name=name, clean=True, workspace=workspace)
 
 
+@app.command("drain-graph")
+def drain_graph(
+    name: Optional[str] = typer.Argument(None, help="Source name to scope the drain to (default: every source)"),
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """Mine relationships for documents whose deferred graph work never landed.
+
+    LLM relationship extraction is deferred at ingest and normally retried by the next
+    sync that re-provides the document — which never comes for a connector that ingests a
+    moving window (recent sprints), so those documents keep their chunks and citations but
+    never get any edges. This re-reads the text already indexed for them and finishes the
+    job in place, with no connector round-trip. One LLM call per document, so it can take
+    a while; Ctrl-C is safe — anything undrained stays queued for next time."""
+    from quickjoiner.connectors.registry import create_connector
+
+    ctx = _context(workspace)
+    if not ctx.pipeline.extracts_triples:
+        console.print("[yellow]LLM relationship extraction is off — set graph.extract_triples "
+                      "(Settings → Knowledge graph) before draining.[/yellow]")
+        raise typer.Exit(1)
+    source_id = None
+    if name is not None:
+        source = next((s for s in ctx.visible_sources(_session_user(ctx)) if s.name == name), None)
+        if source is None:
+            console.print(f"[red]No configured source named {name!r}[/red]")
+            raise typer.Exit(1)
+        source_id = create_connector(source, ctx.workspace).source_id
+    queued = ctx.catalog.count_graph_pending(source_id)
+    if not queued:
+        console.print("[green]Nothing queued — every ingested document has had its "
+                      "relationships mined.[/green]")
+        return
+    console.print(f"Draining [bold]{queued}[/bold] document(s) with unmined relationships ...")
+    stats = ctx.pipeline.drain_pending_graph(
+        source_id=source_id, log=lambda line: console.print(f"[dim]{line}[/dim]")
+    )
+    console.print(f"[green]done:[/green] {stats.summary()}")
+    for err in stats.errors[:5]:
+        console.print(f"[yellow]warn:[/yellow] {err}")
+
+
 @app.command("test")
 def test_source(
     name: str = typer.Argument(..., help="Configured source name"),
@@ -1049,29 +1090,65 @@ def browser_login(
     url: str = typer.Argument(..., help="Login page to open (e.g. your SSO portal or the tool's URL)"),
     workspace: Optional[Path] = WORKSPACE_OPT,
 ):
-    """Open a real Chromium window; sign in, then close it. The session persists."""
-    from quickjoiner.connectors.browser.session import login
+    """Open a real Chromium window; sign in, then close it. The session persists.
+
+    Afterwards the URL is re-fetched headlessly through the saved session and the result
+    reported — a login that did not take is otherwise indistinguishable from one that did,
+    right up until a sync mysteriously ingests nothing."""
+    from quickjoiner.connectors.browser.session import login, verify_session
 
     ws = _workspace(workspace)
     console.print(f"Opening browser for [bold]{url}[/bold] — sign in, then close the window.")
     try:
-        login(ws, url)
+        report = login(ws, url, on_log=lambda m: console.print(f"[green]{m}[/green]"))
     except RuntimeError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1)
-    console.print("[green]Browser session saved.[/green] Scrape connectors with use_browser=true can now use it.")
+    if report["hosts"]:
+        console.print(f"[dim]captured {report['cookies']} cookie(s) "
+                      f"({report['real_cookies']} session/auth) for: {', '.join(report['hosts'])}[/dim]")
+    console.print("Verifying the saved session...")
+    ok, detail = verify_session(ws, url)
+    if ok:
+        console.print(f"[green]✓ Signed in.[/green] {detail}")
+        console.print("Scrape connectors with use_browser=true can now use it.")
+    else:
+        console.print(f"[yellow]✗ Not signed in — the session was not captured.[/yellow] {detail}")
+        console.print("[dim]Tip: complete the sign-in until the site's own page renders, then close "
+                      "the window. If your SSO offers a 'Use Domain Credentials' / Windows-integrated "
+                      "button, prefer the username+password form — Chromium here has no enterprise "
+                      "auth allowlist.[/dim]")
+        raise typer.Exit(1)
 
 
 @browser_app.command("status")
-def browser_status(workspace: Optional[Path] = WORKSPACE_OPT):
-    """Show whether a saved browser session exists for this workspace."""
-    from quickjoiner.connectors.browser.session import has_profile, profile_dir
+def browser_status(
+    url: Optional[str] = typer.Argument(None, help="Optionally verify the session against this URL"),
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """Show the saved browser session — and, with a URL, whether it actually still works."""
+    from quickjoiner.connectors.browser.session import (
+        has_profile,
+        profile_dir,
+        session_hosts,
+        verify_session,
+    )
 
     ws = _workspace(workspace)
-    if has_profile(ws):
-        console.print(f"[green]Browser profile exists:[/green] {profile_dir(ws)}")
-    else:
+    if not has_profile(ws):
         console.print("[yellow]No browser profile yet.[/yellow] Run: qj browser login <url>")
+        return
+    console.print(f"[green]Browser profile exists:[/green] {profile_dir(ws)}")
+    hosts = session_hosts(ws)
+    if hosts:
+        console.print(f"[dim]saved session cookies for: {', '.join(hosts)}[/dim]")
+    else:
+        console.print("[yellow]No saved session cookies[/yellow] — a profile alone does not mean "
+                      "you are signed in anywhere.")
+    if url:
+        ok, detail = verify_session(ws, url)
+        console.print(f"[green]✓ Signed in.[/green] {detail}" if ok
+                      else f"[yellow]✗ Not signed in.[/yellow] {detail}")
 
 
 @app.command()

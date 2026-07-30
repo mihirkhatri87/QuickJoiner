@@ -15,7 +15,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, token } from "../api";
-import type { AuthStatus, ConnectorRow, ConnectorType, OAuthStatus, SettingDefaults, Settings, SyncJob, UserRow } from "../types";
+import type { AuthStatus, BrowserSessionStatus, ConnectorRow, ConnectorType, OAuthStatus, SettingDefaults, Settings, SyncJob, UserRow } from "../types";
 import { EditConnectorModal } from "./EditConnectorModal";
 import { Button, cn, Field, IconButton, schedLabel, Select, SYNC_OPTIONS, TextInput } from "./ui";
 
@@ -114,7 +114,8 @@ export function SettingsDrawer({
           </Section>
 
           <Section title="Workspace">
-            <WorkspaceSettings locked={auth.enabled && !auth.user} onFlash={flash} onChanged={onChanged} />
+            <WorkspaceSettings locked={auth.enabled && !auth.user} onFlash={flash} onChanged={onChanged}
+                               onOpenSync={onOpenSync} />
           </Section>
 
           <Section title="Connectors">
@@ -309,6 +310,70 @@ function Group({
         <fieldset disabled={locked} className={cn("pb-3", locked && "opacity-60")}>
           {children}
         </fieldset>
+      )}
+    </div>
+  );
+}
+
+/** Documents that were ingested but never had their relationships mined — a connector that
+ * pulls a moving window (recent sprints) never re-provides them, so nothing retries the
+ * deferred extraction on its own. Shown here rather than left invisible, with the one
+ * action that finishes them. Silent when the queue is empty (the normal state). */
+function PendingRelationships({
+  locked,
+  onFlash,
+  onOpenSync,
+}: {
+  locked: boolean;
+  onFlash: (m: string, ok?: boolean) => void;
+  onOpenSync: (source: string, clean: boolean) => void;
+}) {
+  const [pending, setPending] = useState<{ total: number; extraction_enabled: boolean } | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = () => api.graphPending().then(setPending).catch(() => setPending(null));
+  useEffect(() => {
+    load();
+  }, []);
+
+  if (!pending || pending.total === 0) return null;
+
+  const drain = async () => {
+    setBusy(true);
+    try {
+      const { job } = await api.drainGraph();
+      onFlash("Mining relationships — watch its progress in the log.", true);
+      onOpenSync(job.source, false); // attach to the running job's live log
+    } catch (e) {
+      onFlash(String((e as Error).message), false);
+    } finally {
+      setBusy(false);
+      load();
+    }
+  };
+
+  return (
+    <div className="mt-2.5 rounded-sm border border-[var(--border)] bg-fill px-3 py-2.5">
+      <div className="text-[12px] text-ink">
+        <span className="font-mono tabular-nums text-gold">{pending.total}</span> ingested document
+        {pending.total === 1 ? " has" : "s have"} unmined relationships
+      </div>
+      <p className="mt-1 text-[11px] leading-relaxed text-muted">
+        Their extraction was deferred at ingest and never resolved — a connector that pulls a
+        moving window (recent sprints) never re-provides them, so no sync will retry it. Mining
+        re-reads the text already indexed for them; no connector round-trip, one LLM call each.
+      </p>
+      {pending.extraction_enabled ? (
+        <div className="mt-2">
+          <Button onClick={drain} disabled={busy || locked}>
+            {busy ? "starting…" : "Mine now"}
+          </Button>
+        </div>
+      ) : (
+        <p className="mt-2 text-[11px] text-gold">
+          Turn on relationship extraction above (and save) before mining — nothing could resolve
+          them otherwise.
+        </p>
       )}
     </div>
   );
@@ -546,10 +611,12 @@ function WorkspaceSettings({
   locked,
   onFlash,
   onChanged,
+  onOpenSync,
 }: {
   locked: boolean;
   onFlash: (m: string, ok?: boolean) => void;
   onChanged: () => void;
+  onOpenSync: (source: string, clean: boolean) => void;
 }) {
   const [s, setS] = useState<Settings | null>(null);
   const [defs, setDefs] = useState<SettingDefaults | null>(null);
@@ -759,6 +826,7 @@ function WorkspaceSettings({
           note={note("graph.entity_resolution")}
           hint="Before creating a new graph entity, check for a same-type near-duplicate (embedding candidates + LLM adjudication) and merge into it instead — e.g. a wiki's 'Webroot Connector' and a repo's 'AppRiver.Connector.Web' becoming one node. Ingest-time — re-sync to apply."
         />
+        <PendingRelationships locked={locked} onFlash={onFlash} onOpenSync={onOpenSync} />
       </Group>
 
       <Group title="Repositories" locked={locked} changed={changed("repos", REPOS_KEYS)}>
@@ -1281,6 +1349,119 @@ function OneDrivePanel({ c }: { c: ConnectorRow }) {
   );
 }
 
+/** Sign-in state for a credential-gated `web_scrape` connector (use_browser=true).
+ *
+ * A gated site does not fail — it answers 200 with a login page, which the crawler drops
+ * as too short, so an expired session looks exactly like an empty site. This plate makes
+ * that state visible and fixable in one click. The window opens on the QuickJoiner HOST,
+ * which is the same machine as the UI in a local-first setup and is stated plainly when
+ * it isn't. */
+function BrowserSignInPanel({ c }: { c: ConnectorRow }) {
+  const [s, setS] = useState<BrowserSessionStatus | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const pollRef = useRef<number | null>(null);
+
+  const refresh = useCallback(
+    async (verify = true) => {
+      try {
+        setS(await api.browserSession(c.name, verify));
+      } catch {
+        setS(null);
+      }
+    },
+    [c.name],
+  );
+
+  useEffect(() => {
+    refresh();
+    return () => {
+      if (pollRef.current) window.clearInterval(pollRef.current);
+    };
+  }, [refresh]);
+
+  const signIn = async () => {
+    setErr("");
+    setBusy(true);
+    try {
+      await api.browserLoginStart(c.name);
+      // Poll cheaply (verify=false) while the window is open; the job carries its own
+      // progress, and a full verify runs once it finishes. Bounded so an abandoned
+      // sign-in doesn't leave a timer running for the life of the page.
+      let ticks = 0;
+      if (pollRef.current) window.clearInterval(pollRef.current);
+      pollRef.current = window.setInterval(async () => {
+        ticks += 1;
+        const next = await api.browserSession(c.name, false).catch(() => null);
+        if (next) setS(next);
+        if (!next?.login?.active || ticks > 200) {
+          if (pollRef.current) window.clearInterval(pollRef.current);
+          pollRef.current = null;
+          setBusy(false);
+          refresh(true); // one real verification now that the window has closed
+        }
+      }, 3000);
+    } catch (e) {
+      setErr(String((e as Error).message));
+      setBusy(false);
+    }
+  };
+
+  if (!s) return null;
+  const login = s.login;
+  const running = Boolean(login?.active);
+  const signedIn = running ? null : s.signed_in;
+
+  return (
+    <div className="mt-3 rounded-md bg-fill2 p-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <span
+          className={cn(
+            "rounded-full px-2.5 py-1 font-mono text-[9px] uppercase tracking-[0.12em]",
+            running
+              ? "bg-gold-soft text-gold"
+              : signedIn
+                ? "bg-accent-soft text-accent"
+                : "bg-gold-soft text-gold",
+          )}
+        >
+          {running ? "signing in…" : signedIn ? "signed in" : "sign-in required"}
+        </span>
+        {s.hosts.length > 0 && (
+          <span className="font-mono text-[10px] text-faint">session for {s.hosts.join(", ")}</span>
+        )}
+        {c.can_manage && s.can_open_window && (
+          <button
+            onClick={signIn}
+            disabled={busy || running}
+            className="ml-auto rounded-full bg-fill px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.12em] text-ink hover:bg-raised2 disabled:opacity-40"
+          >
+            {running ? "Waiting…" : signedIn ? "Sign in again" : "Sign in to this site"}
+          </button>
+        )}
+      </div>
+      {/* The honest bit: say where the window opens, and where it can't. */}
+      {!s.can_open_window ? (
+        <div className="mt-2 text-[11.5px] text-gold">{s.display_hint}</div>
+      ) : running ? (
+        <div className="mt-2 text-[11.5px] text-muted">
+          {login?.message || "Opening a browser window on the QuickJoiner host…"}
+        </div>
+      ) : (
+        <div className="mt-2 text-[11.5px] text-muted">
+          {signedIn
+            ? s.detail
+            : (login?.state === "done" || login?.state === "error") && login?.message
+              ? login.message
+              : "This site needs a login. A browser window opens on the machine running " +
+                "QuickJoiner — sign in once and the session is reused for every sync."}
+        </div>
+      )}
+      {err && <div className="mt-2 text-[11.5px] text-danger">{err}</div>}
+    </div>
+  );
+}
+
 function ConnectorPlate({
   c,
   types,
@@ -1311,6 +1492,11 @@ function ConnectorPlate({
   const label = ctype?.label ?? c.type;
   const isRepo = c.type === "git" || c.type === "files";
   const isOneDrive = c.type === "onedrive";
+  // Only a scrape connector configured to use the signed-in browser can have a session
+  // to manage; a plain public crawl has nothing to sign in to.
+  const usesBrowser =
+    c.type === "web_scrape" &&
+    ["1", "true", "yes", "on"].includes(String(c.options?.use_browser ?? "").toLowerCase());
   const flash = (m: string, ok = true) => {
     setPmsg(m);
     setPok(ok);
@@ -1419,6 +1605,7 @@ function ConnectorPlate({
         ))}
       </div>
       {isOneDrive && <OneDrivePanel c={c} />}
+      {usesBrowser && <BrowserSignInPanel c={c} />}
       <div className="mt-3 flex flex-wrap items-center gap-1">
         <IconButton
           title="Test connection"

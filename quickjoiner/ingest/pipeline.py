@@ -11,7 +11,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
 
 from quickjoiner.config import GraphConfig, RetrievalConfig
 from quickjoiner.connectors.base import Document
@@ -66,6 +66,31 @@ def source_entity(source_id: str) -> tuple[str, str, str]:
         type_, name = "source", source_id
     kind = "repo" if type_ in _REPO_SOURCE_TYPES else "source"
     return (f"{kind}:{name.lower()}", name, kind)
+
+
+@dataclass
+class DrainStats:
+    """Outcome of a graph-pending drain (see `IngestPipeline.drain_pending_graph`)."""
+    documents: int = 0     # documents whose graph was rebuilt and pending cleared
+    faithful: int = 0      # ...of which carried their stored deterministic payload
+    text_only: int = 0     # ...of which predate it, so only stored text could be re-mined
+    missing_text: int = 0  # no chunks left to read: left pending rather than guessed at
+    orphans: int = 0       # pending rows for documents that no longer exist
+    errors: list[str] = field(default_factory=list)
+
+    def summary(self) -> str:
+        parts = [f"{self.documents} documents drained"]
+        if self.faithful:
+            parts.append(f"{self.faithful} rebuilt in full")
+        if self.text_only:
+            parts.append(f"{self.text_only} re-mined from stored text only")
+        if self.missing_text:
+            parts.append(f"{self.missing_text} skipped (no stored text)")
+        if self.orphans:
+            parts.append(f"{self.orphans} orphan rows swept")
+        if self.errors:
+            parts.append(f"{len(self.errors)} errors")
+        return ", ".join(parts)
 
 
 @dataclass
@@ -144,6 +169,13 @@ class IngestPipeline:
         # (fast, local) chunk/embed/catalog loop finishes, instead of serializing
         # network round-trips one document at a time. 1 = fully sequential (default).
         self._triple_workers = max(1, triple_workers)
+
+    @property
+    def extracts_triples(self) -> bool:
+        """Whether LLM relationship extraction is wired up (`graph.extract_triples` +
+        a reachable provider). Callers that only make sense with it — the pending drain —
+        check this rather than reaching for the private attribute."""
+        return self._triple_extractor is not None
 
     def ingest(self, documents: Iterable[Document], source_id: str,
                control: Any = None,
@@ -334,12 +366,102 @@ class IngestPipeline:
             # Written now (fast, synchronous) so it survives a crash/kill between
             # here and _resolve_pending_triples actually persisting this doc's
             # triples — see graph_pending's schema comment for why that matters.
-            self._catalog.mark_graph_pending(doc_id, source_id)
+            # The deterministic assertions ride along so a later drain can finish this
+            # document even if its connector never re-yields it (a moving-window
+            # connector's aged-out work item), rather than re-deriving only the part
+            # that is still visible in the stored text.
+            self._catalog.mark_graph_pending(
+                doc_id, source_id,
+                json.dumps({"entities": entities, "aliases": alias_rows, "edges": edges}),
+            )
             pending.append((doc_id, entities, alias_rows, edges, text, doc.title, doc.kind))
             return
 
         self._persist_graph(doc_id, entities, alias_rows, edges, source_id,
                             doc.title, doc.kind)
+
+    # ---------------------------------------------------------------- drain
+    def drain_pending_graph(self, source_id: str | None = None, control: Any = None,
+                            log: Callable[[str], None] | None = None) -> DrainStats:
+        """Finish the deferred graph work for documents whose connector will never
+        re-provide them (AI_ROADMAP #25).
+
+        `graph_pending` rows are normally retried by the next sync that re-yields the
+        document — which never comes for a connector that ingests a moving window (a TFS
+        work item that has aged out of every team's recent-sprint slice). Those documents
+        keep their chunks, their vectors and their citations, and have **no edges at all**,
+        because `_sync_graph` defers a qualifying document's whole graph — deterministic
+        assertions included — until its LLM triples resolve. This pass re-reads the text
+        that was actually indexed and finishes them in place, with no connector round-trip.
+
+        Faithfulness is explicit, not assumed: rows written since `graph_pending.graph_json`
+        exists carry the exact deterministic payload computed at ingest (a connector's own
+        dev-link/hierarchy edges included), so they rebuild completely. Rows that predate
+        it can only be rebuilt from stored text — ticket keys, code structure, pub/sub —
+        and are counted separately so the log can say which is which instead of implying a
+        full recovery. A document whose chunks are gone is left pending, never guessed at.
+        """
+        stats = DrainStats()
+        stats.orphans = self._catalog.sweep_orphan_graph_pending()
+        rows = self._catalog.list_graph_pending(source_id)
+        if not rows:
+            return stats
+        by_source: dict[str, list[dict]] = {}
+        for row in rows:
+            by_source.setdefault(row["source_id"], []).append(row)
+        for src, group in by_source.items():
+            if log:
+                log(f"{src}: {len(group)} documents with unmined relationships")
+            texts = self._stored_texts(group)
+            pending: list = []
+            for row in group:
+                if control is not None:
+                    control.check()  # this phase is fast+local, but a stop shouldn't wait for it
+                text = texts.get(row["doc_id"], "")
+                if not text.strip():
+                    stats.missing_text += 1
+                    continue
+                raw = row.get("graph_json") or ""
+                metadata: dict = {}
+                if raw:
+                    try:
+                        metadata["graph"] = json.loads(raw)
+                        stats.faithful += 1
+                    except ValueError:
+                        stats.text_only += 1
+                else:
+                    stats.text_only += 1
+                doc = Document(uri=row["uri"] or "", title=row["title"] or "",
+                               text=text, kind=row["kind"] or "doc", metadata=metadata)
+                try:
+                    self._sync_graph(doc, row["doc_id"], src, text, pending)
+                    stats.documents += 1
+                except Exception as exc:  # one bad document never stops the drain
+                    stats.errors.append(f"{row['uri']}: {exc}")
+            if pending:
+                self._resolve_pending_triples(pending, src, control)
+        return stats
+
+    def _stored_texts(self, rows: list[dict]) -> dict[str, str]:
+        """Reconstruct each document's text from the chunks that were indexed for it.
+
+        Contextual chunking prepends a `[source · title · path]` breadcrumb to every
+        chunk before embedding; it is stripped back off here so the rebuilt text is the
+        document, not the document with its provenance line repeated N times."""
+        doc_ids = [r["doc_id"] for r in rows]
+        batch = getattr(self._store, "get_documents_chunks", None)
+        chunks_by_doc = (
+            batch(doc_ids) if batch is not None
+            else {d: self._store.get_document_chunks(d) for d in doc_ids}
+        )
+        out: dict[str, str] = {}
+        for row in rows:
+            chunks = chunks_by_doc.get(row["doc_id"]) or []
+            crumb = f"[{breadcrumb(row['source_id'], row['title'] or '', row['uri'] or '')}]\n"
+            out[row["doc_id"]] = "\n\n".join(
+                c[len(crumb):] if c.startswith(crumb) else c for c in chunks
+            )
+        return out
 
     def _resolve_pending_triples(self, pending: list, source_id: str,
                                  control: Any = None) -> None:

@@ -250,6 +250,11 @@ FORM_SPECS: dict[str, dict] = {
         "blurb": "Crawl internal docs or portals. Polite by default; falls back to a "
                  "real browser when a page refuses a plain fetch. Last resort when there's no API.",
         "suggests": ["What do the internal docs cover?"],
+        # Only meaningful for a credential-gated site, but the form is field-driven and
+        # cannot know that yet — the plate's Sign in button is the real affordance.
+        "next_step": "If the site needs a login, press **Sign in to this site** on the "
+                     "connector plate after saving — a browser window opens on the "
+                     "QuickJoiner host for you to sign in once.",
         "fields": [
             _f("start_urls", "Start URLs", required=True, list_=True,
                placeholder="https://docs.acme.internal/"),
@@ -260,7 +265,9 @@ FORM_SPECS: dict[str, dict] = {
                help="How many link hops to follow from a start URL (start page = 0). "
                     "Empty = unlimited; the page limit still applies."),
             _f("use_browser", "Always use signed-in browser session", placeholder="true",
-               help="Needs qj browser login first; renders JS and reuses your SSO session."),
+               help="Required for sites behind a login: renders JS and reuses your signed-in "
+                    "session. Sign in from the connector plate after saving. Also the only "
+                    "path that works when the site uses an internal CA certificate."),
             _f("fallback_to_browser", "Fall back to a browser if blocked", placeholder="true",
                help="On by default: if a plain fetch is refused (e.g. a 444/403), retry the "
                     "crawl with a real headless browser."),

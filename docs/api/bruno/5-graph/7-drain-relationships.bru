@@ -1,0 +1,27 @@
+meta {
+  name: Mine unmined relationships
+  type: http
+  seq: 7
+}
+
+post {
+  url: {{baseUrl}}/api/graph/drain
+  body: none
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{token}}
+}
+
+docs {
+  Starts a background job (source `graph relationships`) that re-reads the text already
+  indexed for the queued documents and finishes their graph in place — no connector
+  round-trip, one LLM call per document. Watch it with
+  `GET /api/sync/graph relationships/logs`.
+
+  409 while another job is running (it writes edges across sources) or when
+  `graph.extract_triples` is off — nothing could resolve them.
+
+  Add `?source_id=files:handbook` to scope the drain to one source.
+}

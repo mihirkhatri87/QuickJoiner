@@ -293,16 +293,36 @@ class KnowledgeStore:
         the original text lives (the catalog only stores metadata + a hash), so
         anything needing a document's actual content (e.g. repo-doc generation
         reading an existing AGENTS.md back) reconstructs it from here."""
+        return self.get_documents_chunks([doc_id]).get(doc_id, [])
+
+    def get_documents_chunks(self, doc_ids: list[str]) -> dict[str, list[str]]:
+        """The same, for MANY documents in ONE filtered scan.
+
+        The per-document form used to materialize the entire table and filter in
+        Python, which is fine for the one-off it was written for and quadratic for a
+        caller with a work-list (the graph-pending drain reads thousands). A pushed-down
+        `doc_id IN (…)` predicate with only the three needed columns keeps that a single
+        bounded read. Ids are content hashes, so they carry no quoting hazard; they're
+        still stripped of quotes before interpolation rather than trusted.
+        """
         table = self._table()
-        if table is None:
-            return []
+        if table is None or not doc_ids:
+            return {}
+        wanted = ", ".join('"' + d.replace('"', "") + '"' for d in dict.fromkeys(doc_ids))
         try:
-            rows = table.to_arrow().select(["doc_id", "chunk_index", "text"]).to_pylist()
+            rows = (
+                table.search(None)
+                .where(f"doc_id IN ({wanted})")
+                .select(["doc_id", "chunk_index", "text"])
+                .limit(0)  # 0 = no limit for a plain (non-vector) query
+                .to_list()
+            )
         except Exception:
-            return []
-        matched = [r for r in rows if r["doc_id"] == doc_id]
-        matched.sort(key=lambda r: r["chunk_index"])
-        return [r["text"] for r in matched]
+            return {}
+        out: dict[str, list[tuple[int, str]]] = {}
+        for r in rows:
+            out.setdefault(r["doc_id"], []).append((r["chunk_index"], r["text"]))
+        return {k: [t for _, t in sorted(v)] for k, v in out.items()}
 
     def delete_source(self, source_id: str) -> None:
         table = self._table()
@@ -379,7 +399,11 @@ class KnowledgeStore:
     def ensure_ann_index(self) -> None:
         """Build the approximate (IVF) vector index once the corpus warrants it.
         Below the threshold LanceDB brute-forces — exact and fast at small scale.
-        Purely an optimization: any failure leaves search correct, just slower."""
+        An index build failure just leaves search slower (falls back to brute force
+        scan) — but a SUCCESSFUL build is not scorewise free: LanceDB's default index
+        is IVF_PQ (lossy product quantization), so `_dense`'s `refine_factor` (see
+        RetrievalConfig.ann_refine_factor) is load-bearing for correct scores, not an
+        optional tune — without it this index returns badly distorted cosines."""
         table = self._table()
         if table is None:
             return
@@ -397,7 +421,12 @@ class KnowledgeStore:
     # ----------------------------------------------------------------- search
     def _dense(self, table, vector, limit: int, id_filter: list[str] | None = None,
                scope: "SearchScope | None" = None) -> list[dict]:
-        q = table.search(vector, vector_column_name="vector").metric("cosine")
+        # refine_factor re-ranks ANN candidates against their un-quantized vectors —
+        # without it, LanceDB's default IVF_PQ index returns scores off by 0.25-0.45
+        # cosine (see RetrievalConfig.ann_refine_factor). A no-op below ann_min_rows,
+        # where search is already exact brute force.
+        q = (table.search(vector, vector_column_name="vector").metric("cosine")
+             .refine_factor(self._retrieval.ann_refine_factor))
         clauses = []
         if id_filter:
             clauses.append(f"id IN ({_sql_list(id_filter)})")

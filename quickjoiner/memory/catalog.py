@@ -78,8 +78,11 @@ _SCHEMA_STATEMENTS = [
     # edges land; without this table, a killed/crashed backfill would leave those docs
     # with a hash that already matches their content, so a later incremental sync would
     # see them as "unchanged" and skip them forever, never retrying the graph work.
+    # graph_json holds the deterministic assertions computed alongside the deferred LLM
+    # triples, so a drain (below) can finish an aged-out document's graph faithfully.
     """CREATE TABLE IF NOT EXISTS graph_pending (
-        doc_id TEXT PRIMARY KEY, source_id TEXT NOT NULL DEFAULT '')""",
+        doc_id TEXT PRIMARY KEY, source_id TEXT NOT NULL DEFAULT '',
+        graph_json TEXT NOT NULL DEFAULT '')""",
     # One row per sync run (written at start, updated when it ends) so "what has been
     # happening?" survives a page reload AND a server restart — SyncManager's job map is
     # in-memory and per-process, which is enough to *watch* a run but not to remember it.
@@ -143,6 +146,10 @@ _MIGRATION_STATEMENTS = [
     # entities/edges, not stored raw). Default '{}' so every pre-existing document and every
     # connector that never sets Document.metadata["display"] reads as an empty dict, not null.
     "ALTER TABLE documents ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'",
+    # The deterministic half of a document's deferred graph work (2026-07-30). Rows that
+    # predate this column drain with only what their stored text still yields — stated
+    # plainly in the drain's log rather than passed off as a complete rebuild.
+    "ALTER TABLE graph_pending ADD COLUMN graph_json TEXT NOT NULL DEFAULT ''",
 ]
 
 
@@ -548,12 +555,52 @@ class _SqlCatalog:
         return counts
 
     # -- deferred graph work (see graph_pending's comment in the schema) --------
-    def mark_graph_pending(self, doc_id: str, source_id: str) -> None:
+    def mark_graph_pending(self, doc_id: str, source_id: str, graph_json: str = "") -> None:
+        """`graph_json` carries the DETERMINISTIC assertions computed for this document
+        at ingest (the connector's own `metadata["graph"]` — ADO dev-links/hierarchy,
+        GitLab MR edges — plus ticket/code/pubsub edges). They are deferred alongside the
+        LLM triples rather than written first, so until the pending row resolves the
+        document has no edges at all; keeping the payload here means a later **drain**
+        can finish the job faithfully instead of re-deriving only what the stored text
+        still shows. Re-marking an already-pending document refreshes the payload — the
+        newer computation is by definition the better one."""
         self._write(
-            "INSERT INTO graph_pending (doc_id, source_id) VALUES (?, ?) "
-            "ON CONFLICT(doc_id) DO NOTHING",
-            (doc_id, source_id),
+            "INSERT INTO graph_pending (doc_id, source_id, graph_json) VALUES (?, ?, ?) "
+            "ON CONFLICT(doc_id) DO UPDATE SET source_id = excluded.source_id, "
+            "graph_json = excluded.graph_json",
+            (doc_id, source_id, graph_json),
         )
+
+    def list_graph_pending(self, source_id: str | None = None,
+                           limit: int | None = None) -> list[dict]:
+        """Documents whose deferred graph work never landed, joined to what the drain
+        needs to redo it without a connector round-trip (uri/title/kind + the stored
+        deterministic payload). The JOIN also means a pending row whose document has
+        since been deleted simply doesn't appear — `sweep_orphan_graph_pending` removes
+        those separately."""
+        sql = (
+            "SELECT p.doc_id AS doc_id, p.source_id AS source_id, p.graph_json AS graph_json, "
+            "d.uri AS uri, d.title AS title, d.kind AS kind "
+            "FROM graph_pending p JOIN documents d ON d.doc_id = p.doc_id"
+        )
+        params: tuple = ()
+        if source_id is not None:
+            sql += " WHERE p.source_id = ?"
+            params = (source_id,)
+        sql += " ORDER BY p.source_id, d.uri"
+        if limit is not None:
+            sql += f" LIMIT {int(limit)}"
+        return self._read_all(sql, params)
+
+    def sweep_orphan_graph_pending(self) -> int:
+        """Drop pending rows for documents that no longer exist (deleted source, purged
+        document). Returns how many were removed."""
+        stale = self._read_all(
+            "SELECT doc_id FROM graph_pending WHERE doc_id NOT IN (SELECT doc_id FROM documents)"
+        )
+        for row in stale:
+            self._write("DELETE FROM graph_pending WHERE doc_id = ?", (row["doc_id"],))
+        return len(stale)
 
     def clear_graph_pending(self, doc_id: str) -> None:
         self._write("DELETE FROM graph_pending WHERE doc_id = ?", (doc_id,))
@@ -567,6 +614,12 @@ class _SqlCatalog:
         else:
             row = self._read_one("SELECT COUNT(*) AS n FROM graph_pending WHERE source_id = ?", (source_id,))
         return int(row["n"]) if row else 0
+
+    def graph_pending_by_source(self) -> list[dict]:
+        return self._read_all(
+            "SELECT source_id, COUNT(*) AS n FROM graph_pending "
+            "GROUP BY source_id ORDER BY n DESC"
+        )
 
     def stats(self) -> dict:
         docs = self._read_one(
@@ -715,9 +768,36 @@ class _SqlCatalog:
 
     # -- knowledge graph --------------------------------------------------------
     def upsert_entity(self, entity_id: str, name: str, type_: str, source_id: str = "") -> None:
+        """Insert or update an entity, protecting a well-cased display name.
+
+        Deterministic extractors (deps.py, code_graph.py, connector metadata) name a
+        node once at creation; LLM triple extraction can later propose the SAME id with
+        a worse-cased guess ('nautical' for 'Nautical'), which a plain
+        `DO UPDATE SET name=excluded.name` silently accepts — degrading the graph view,
+        `resolve_entity` output and citations org-wide (found live, plan 05 C4 leg).
+
+        The preference is resolved **inside the statement**, not by reading first: a
+        read-then-write would add a round trip per entity per evidence document (the
+        hottest write path in a large sync) and would not be atomic — concurrent source
+        syncs share one catalog, so two threads could interleave and still clobber.
+        Rules, in order: a materially different name (case-insensitively) wins as a
+        genuine rename; otherwise a case-only variant loses to an incumbent that carries
+        any uppercase; an all-lowercase incumbent is upgraded by the candidate.
+
+        Known backend divergence: SQLite's `lower()` folds ASCII only, Postgres's is
+        locale-aware, so a name whose only difference is the case of a NON-ASCII letter
+        counts as a rename on SQLite and as a case variant on Postgres. Entity names here
+        are repo/package/service identifiers (effectively ASCII), so this is noted rather
+        than worked around — doing so would mean a custom collation on both engines."""
         self._write(
             """INSERT INTO entities (id, name, type, source_id) VALUES (?, ?, ?, ?)
-               ON CONFLICT(id) DO UPDATE SET name=excluded.name, type=excluded.type""",
+               ON CONFLICT(id) DO UPDATE SET
+                 name = CASE
+                          WHEN lower(entities.name) <> lower(excluded.name) THEN excluded.name
+                          WHEN entities.name <> lower(entities.name) THEN entities.name
+                          ELSE excluded.name
+                        END,
+                 type = excluded.type""",
             (entity_id, name, type_, source_id),
         )
 

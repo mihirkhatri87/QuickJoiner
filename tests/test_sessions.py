@@ -136,15 +136,106 @@ def test_parse_triples_pubsub_and_storage_vocab():
     ]
 
 
+def test_parse_triples_enforces_relation_signatures():
+    """AI #21: the type check and the relation check used to be independent, so a line
+    whose three words were each in-vocabulary passed even when the combination is a
+    category error. Signatures close that hole without narrowing the vocabulary."""
+    from quickjoiner.ingest.triples import Triple, parse_triples
+
+    triples = parse_triples([
+        # the motivating impossible line from the roadmap: every word legal, shape absurd
+        "environment: prod | owns | person: bob",
+        "person: bob | owns | service: checkout",      # same relation, right way round
+        # the single most common real error on the live corpus (548 edges): inverted
+        # `works_on` — a ticket is worked ON, it does not work on anything
+        "ticket: NAUT-1 | works_on | person: meena",
+        "person: meena | works_on | ticket: NAUT-1",
+        "ticket: NAUT-1 | deploys | environment: prod",  # a ticket doesn't deploy
+        "service: checkout | deploys | environment: prod",
+        "topic: order-events | publishes_to | service: billing",  # publisher/topic inverted
+        "service: billing | publishes_to | topic: order-events",
+        "service: checkout | publishes_to | service: payments",  # you publish to a topic
+    ])
+    assert triples == [
+        Triple("person", "bob", "owns", "service", "checkout"),
+        Triple("person", "meena", "works_on", "ticket", "NAUT-1"),
+        Triple("service", "checkout", "deploys", "environment", "prod"),
+        Triple("service", "billing", "publishes_to", "topic", "order-events"),
+    ]
+
+
+def test_signatures_admit_the_shapes_real_org_prose_actually_uses():
+    """Calibration guard (2026-07-30). The first cut of this table was drawn around an
+    idealised ontology and, measured against the live 109k-edge graph, threw away 1,809
+    perfectly sensible statements. These are the highest-volume ones it was wrong about —
+    they must keep validating, or the table has drifted back toward tidy-but-lossy."""
+    from quickjoiner.ingest.triples import signature_allows
+
+    for src, rel, dst in [
+        ("person", "owns", "ticket"),          # ×47 live — ticket ownership is standard
+        ("team", "owns", "ticket"),            # ×38
+        ("person", "works_on", "team"),        # ×246
+        ("service", "part_of", "environment"), # ×328 — "part of the LDAP-build environment"
+        ("environment", "provides", "service"),# ×74 — a host provides a service
+        ("team", "provides", "service"),       # ×49
+        ("repo", "provides", "project"),       # ×50
+        ("project", "deploys", "service"),     # ×45 — deployment-tooling language
+        ("service", "depends_on", "environment"),  # ×39
+    ]:
+        assert signature_allows(src, rel, dst), f"{src} | {rel} | {dst} should be admitted"
+
+
+def test_every_relation_is_signed_or_deliberately_unsigned():
+    """A new verb added to TRIPLE_RELS must declare its signature (or be listed as
+    deliberately unrestricted) — otherwise it would silently bypass the new gate."""
+    from quickjoiner.ingest.triples import (
+        RELATION_SIGNATURES,
+        TRIPLE_RELS,
+        TRIPLE_TYPES,
+        UNSIGNED_RELS,
+    )
+
+    assert set(RELATION_SIGNATURES) | UNSIGNED_RELS == TRIPLE_RELS
+    assert not (set(RELATION_SIGNATURES) & UNSIGNED_RELS)
+    for rel, (domain, range_) in RELATION_SIGNATURES.items():
+        assert domain <= TRIPLE_TYPES and range_ <= TRIPLE_TYPES, rel
+
+
+def test_deterministic_extractor_edges_satisfy_their_signatures():
+    """The connectors emit these same verbs without going through parse_triples, so the
+    table must not declare a shape the shipped extractors already contradict (Octopus
+    service->deploys->environment, the ADO/Jira ticket hierarchy, deps.py maps)."""
+    from quickjoiner.ingest.triples import signature_allows
+
+    for src, rel, dst in [
+        ("service", "deploys", "environment"),   # octopus dashboard
+        ("ticket", "part_of", "project"),        # jira issue -> project
+        ("ticket", "part_of", "ticket"),         # ADO/Jira Epic hierarchy
+        ("repo", "depends_on", "package"),       # deps.py dependency map
+        ("repo", "provides", "package"),
+        ("repo", "publishes_to", "topic"),       # ingest/pubsub.py
+        ("repo", "subscribes_to", "topic"),
+        ("repo", "stores_in", "datastore"),
+    ]:
+        assert signature_allows(src, rel, dst), f"{src} {rel} {dst}"
+
+
 def test_compress_prompt_vocab_in_lockstep_with_validator():
     """Both LLM prompts enumerate the vocabulary from the sets themselves — a new
     verb/type must appear in the prompts without any hand-edit."""
-    from quickjoiner.ingest.triples import DOC_TRIPLE_SYSTEM, TRIPLE_RELS, TRIPLE_TYPES
+    from quickjoiner.ingest.triples import (
+        DOC_TRIPLE_SYSTEM,
+        SIGNATURE_LINES,
+        TRIPLE_RELS,
+        TRIPLE_TYPES,
+    )
     from quickjoiner.sessions import COMPRESS_SYSTEM
 
     for vocab_word in TRIPLE_RELS | TRIPLE_TYPES:
         assert vocab_word in COMPRESS_SYSTEM
         assert vocab_word in DOC_TRIPLE_SYSTEM
+    # ...and so must the signatures, for the same reason.
+    assert SIGNATURE_LINES in COMPRESS_SYSTEM and SIGNATURE_LINES in DOC_TRIPLE_SYSTEM
 
 
 # -- projects & session lifecycle -------------------------------------------------

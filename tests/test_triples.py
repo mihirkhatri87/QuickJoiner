@@ -12,6 +12,7 @@ from quickjoiner.ingest.entity_resolution import EntityResolver
 from quickjoiner.ingest.pipeline import IngestPipeline, _doc_id
 from quickjoiner.ingest.triples import Triple, extract_doc_triples, triples_to_graph
 from quickjoiner.llm.base import ChatResult
+from quickjoiner.sync_control import SyncControl, SyncStopped
 
 from tests.conftest import FakeEmbedder
 
@@ -239,6 +240,134 @@ def test_interrupted_batch_is_retried_on_next_sync(store, catalog):
     rels = {(r["rel"], r["dst"]) for r in catalog.graph_neighbors(checkout["id"])}
     assert ("depends_on", catalog.resolve_entity("payments")["id"]) in rels
     assert not catalog.is_graph_pending(doc_id)
+
+
+# ------------------------------------------------- draining aged-out pending work
+
+def _stranded(store, catalog):
+    """Ingest one prose doc and stop the run before its deferred graph work resolves —
+    leaving it exactly as an aged-out work item is: indexed, hashed, chunked, citable,
+    still `graph_pending`, and with no edges at all."""
+    doc = Document(
+        uri="tfs://wi/4210", title="Work item 4210",
+        text="The billing service depends on payments to settle invoices.", kind="doc",
+        metadata={"graph": {
+            "entities": [["ticket:tfs-1", "TFS-1", "ticket"], ["repo:nautical", "Nautical", "repo"]],
+            "aliases": [],
+            "edges": [["ticket:tfs-1", "implemented_in", "repo:nautical", "dev link"]],
+        }},
+    )
+    cancelled = SyncControl(is_cancelled=lambda: True, wait_while_paused=lambda: None)
+    try:
+        IngestPipeline(
+            store, catalog, RetrievalConfig(),
+            GraphConfig(extract_triples=True, triple_min_chars=1),
+            triple_extractor=lambda text, title: [],
+        ).ingest([doc], "azure_devops:tfs", control=cancelled)
+    except SyncStopped:
+        pass
+    return doc, _doc_id("azure_devops:tfs", doc.uri)
+
+
+def test_drain_mines_relationships_for_documents_a_connector_never_re_yields(store, catalog):
+    """AI #25: a moving-window connector never re-provides an aged-out work item, so its
+    queued graph work is retried by nothing. The drain finishes it from the text that was
+    actually indexed — no connector round-trip — including the deterministic edges that
+    were deferred alongside the triples."""
+    _, doc_id = _stranded(store, catalog)
+    # The failed extraction left the document with no edges at all — not even the
+    # connector's own dev-link — which is exactly the state the roadmap describes.
+    assert catalog.is_graph_pending(doc_id)
+    assert catalog.resolve_entity("billing") is None
+    assert catalog.graph_neighbors("ticket:tfs-1") == []
+
+    calls: list[str] = []
+
+    def extractor(text, title):
+        calls.append(title)
+        assert "billing service depends on payments" in text  # rebuilt from stored chunks
+        return [Triple("service", "billing", "depends_on", "service", "payments")]
+
+    pipe = IngestPipeline(store, catalog, RetrievalConfig(),
+                          GraphConfig(extract_triples=True, triple_min_chars=1),
+                          triple_extractor=extractor)
+    stats = pipe.drain_pending_graph()
+
+    assert calls == ["Work item 4210"]
+    assert (stats.documents, stats.faithful, stats.text_only) == (1, 1, 0)
+    billing = catalog.resolve_entity("billing")
+    assert ("depends_on", catalog.resolve_entity("payments")["id"]) in {
+        (r["rel"], r["dst"]) for r in catalog.graph_neighbors(billing["id"])
+    }
+    # ...and the deterministic payload the connector supplied is restored too, which is
+    # the whole reason it is stored on the pending row rather than re-derived.
+    assert ("implemented_in", "repo:nautical") in {
+        (r["rel"], r["dst"]) for r in catalog.graph_neighbors("ticket:tfs-1")
+    }
+    assert not catalog.is_graph_pending(doc_id)
+    assert pipe.drain_pending_graph().documents == 0  # nothing left queued
+
+
+def test_drain_reports_documents_that_predate_the_stored_payload_separately(store, catalog):
+    """Rows written before graph_pending.graph_json existed can only be re-mined from
+    stored text. That is a partial recovery and the stats say so, rather than reporting a
+    number that reads like a full rebuild."""
+    _, doc_id = _stranded(store, catalog)
+    catalog._write("UPDATE graph_pending SET graph_json = '' WHERE doc_id = ?", (doc_id,))
+
+    pipe = IngestPipeline(store, catalog, RetrievalConfig(),
+                          GraphConfig(extract_triples=True, triple_min_chars=1),
+                          triple_extractor=lambda text, title: [])
+    stats = pipe.drain_pending_graph()
+    assert (stats.documents, stats.faithful, stats.text_only) == (1, 0, 1)
+    # The connector's dev-link edge is genuinely unrecoverable here — it was never in the
+    # document's text — and is NOT invented.
+    assert catalog.graph_neighbors("ticket:tfs-1") == []
+
+
+def test_drain_scopes_to_one_source_and_sweeps_orphans(store, catalog):
+    _, doc_id = _stranded(store, catalog)
+    catalog.mark_graph_pending("ghost-doc", "confluence:eng")  # document no longer exists
+
+    pipe = IngestPipeline(store, catalog, RetrievalConfig(),
+                          GraphConfig(extract_triples=True, triple_min_chars=1),
+                          triple_extractor=lambda text, title: [])
+    stats = pipe.drain_pending_graph(source_id="confluence:eng")
+    assert stats.orphans == 1 and stats.documents == 0  # nothing real under that source
+    assert catalog.is_graph_pending(doc_id)  # the other source was left alone
+
+
+def test_drain_leaves_a_document_with_no_stored_text_queued(store, catalog):
+    """A document whose chunks are gone cannot be rebuilt from anything — it stays queued
+    instead of being resolved with an empty graph and marked done."""
+    _, doc_id = _stranded(store, catalog)
+    store.delete_document(doc_id)
+
+    calls: list[str] = []
+    pipe = IngestPipeline(store, catalog, RetrievalConfig(),
+                          GraphConfig(extract_triples=True, triple_min_chars=1),
+                          triple_extractor=lambda text, title: calls.append(title) or [])
+    stats = pipe.drain_pending_graph()
+    assert (stats.documents, stats.missing_text) == (0, 1)
+    assert calls == [] and catalog.is_graph_pending(doc_id)
+
+
+def test_drain_strips_the_contextual_breadcrumb_it_added_at_ingest(store, catalog):
+    """Contextual chunking prepends `[source · title · path]` to every chunk before
+    embedding; the rebuilt text must be the document, not the document with its
+    provenance line repeated once per chunk."""
+    _, doc_id = _stranded(store, catalog)
+    crumb = "azure_devops:tfs · Work item 4210"
+    stored = store.get_document_chunks(doc_id)
+    assert stored and stored[0].startswith(f"[{crumb}"), "guard: the chunk really is prefixed"
+
+    seen: list[str] = []
+    IngestPipeline(store, catalog, RetrievalConfig(contextual_chunks=True),
+                   GraphConfig(extract_triples=True, triple_min_chars=1),
+                   triple_extractor=lambda text, title: seen.append(text) or []
+                   ).drain_pending_graph()
+    assert seen and crumb not in seen[0]
+    assert seen[0].startswith("The billing service")
 
 
 def test_unchanged_doc_without_pending_flag_is_still_skipped(store, catalog):

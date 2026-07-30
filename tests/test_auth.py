@@ -272,7 +272,7 @@ def test_settings_get_patch_and_persist(tmp_path, monkeypatch):
     client = TestClient(create_app(ws))
 
     s = client.get("/api/settings").json()
-    assert s["retrieval"]["min_score"] == 0.55 and s["llm"]["provider"] == "anthropic"
+    assert s["retrieval"]["min_score"] == 0.64 and s["llm"]["provider"] == "anthropic"
     assert s["embedding_reindex_required"] is True
 
     # Open mode: no sign-in required to tune.

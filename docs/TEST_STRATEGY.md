@@ -6,10 +6,18 @@ non-coverage dimensions that actually catch bugs (property, parity, mutation, E2
 
 ## 1. Current state (measured honestly)
 
-- **Backend**: ~399 tests green (local + a pg parity suite, env-gated, that runs against
-  Docker), but coverage is *unmeasured* — no `pytest-cov` gate. Strong areas: connectors' pure
-  converters, retrieval, graph, API contracts, sessions, evals (incl. threshold calibration +
+- **Backend**: **724 tests green** (2026-07-30; local + a pg parity suite, env-gated, that runs
+  against Docker), but coverage is *unmeasured* — no `pytest-cov` gate. Strong areas: connectors'
+  pure converters, retrieval, graph, API contracts, sessions, evals (incl. threshold calibration +
   report comparison), alias query expansion. Known thin areas listed in §3.
+- **Flake watch**: `test_sync_then_sources_and_search` was failing ~1 run in 4 (2026-07-30). Not a
+  product bug — contextual chunking puts the document's **uri** in the chunk breadcrumb, and under
+  `FakeEmbedder`'s 32-bucket hash the random pytest tmp path moves the cosine ±0.06, straddling the
+  new `min_score=0.64` gate (at the old 0.55 it never crossed). Fixed the same way two sibling tests
+  already were: bypass `min_score` when the assertion is about *memory being searchable*, not about
+  grounding behaviour. **Standing lesson: any test asserting a hit under the real threshold with
+  FakeEmbedder is a coin flip on the temp directory's name** — assert grounding behaviour only where
+  the score is genuinely the subject, with fixed text.
 - **Frontend**: **zero automated tests.** TypeScript + one live browser pass is the net.
 - **E2E**: manual browser verification only (it caught the pan crash — proof this layer pays).
 
@@ -56,6 +64,10 @@ non-coverage dimensions that actually catch bugs (property, parity, mutation, E2
 | `evals/harness.py` | ✅ agent-layer branches, calibration + comparison covered (`test_evals.py`): calibrate clean-separation, monotone curve, plateau-midpoint (not edge), floor-unreachable, thin-set flag, apply round-trip; `compare_reports` regression/tolerance/direction; remaining: report JSON schema snapshot |
 | `memory/expansion.py` | ✅ covered (`test_expansion.py`): window lookup incl. 4-token, longest-window-first, stopword-only skip, cap, no-double-append, end-to-end retrieval lift on FakeEmbedder store, `search_memory`/config wiring; remaining: `/api/search` wiring assertion |
 | `ingest/pipeline.py` | error accumulation | doc that raises mid-iteration → stats.errors, rest ingested; ensure_ann_index absent on store (PG) is a no-op |
+| `ingest/pipeline.py` graph-pending drain | ✅ covered (`test_triples.py`, 2026-07-30): a document stranded by a **stopped** run (the real shape of the bug, produced with a cancelling `SyncControl` rather than by mocking) is shown to have no edges at all, then rebuilt from its stored chunks — including the connector-supplied deterministic payload — with the extractor asserted to receive the *document's* text, not the breadcrumb-prefixed chunk. The three honesty properties each have their own test: a row predating `graph_pending.graph_json` counts as `text_only` and its unrecoverable connector edge is **not invented**; a document whose chunks are gone stays queued rather than being resolved empty; a scoped drain leaves other sources alone while still sweeping orphan rows. Plus job-level behaviour in `test_sync_manager.py` (refuses with no extractor, mutual exclusion with syncs both ways, stop leaves the rest queued) and the endpoints in `test_api.py`. **Remaining: no Postgres run** of `list_graph_pending`/`sweep_orphan_graph_pending` — portable `?`-SQL in the neutral base, SQLite-verified only |
+| `ingest/triples.py` relation signatures | ✅ covered (`test_sessions.py`, 2026-07-30): the motivating impossible line (`environment: prod \| owns \| person: bob`) is dropped while the same relation the right way round survives, across four shapes (inverted publisher/topic, place-vs-container `part_of`, non-software `deploys`). Two lockstep guards do the durable work: every relation in `TRIPLE_RELS` must declare a signature or be listed deliberately unsigned, and every shape the **deterministic** extractors already emit must satisfy the table — so a future signature can't silently start deleting real connector edges |
+| `memory/store.py` ANN scoring | ✅ covered (`test_retrieval.py`, 2026-07-29): the suite now **builds a real IVF_PQ index** (400 rows over `ann_min_rows=200` — LanceDB needs ≥256 to train PQ) and asserts the indexed score is within 0.03 of exact brute force, closing the hole that let the product-quantization defect ship: every prior test either stubbed `ensure_ann_index` to assert it was *called* or ran corpora far below the 4000-row default, so **no test had ever built an index**. Verified to genuinely fail (0.28 off) with `refine_factor` reverted. Plus `ann_refine_factor=0` — the obvious way to "turn it off" — is asserted to be **rejected at config validation**, because LanceDB raises on it and it would otherwise break every dense search on an indexed workspace |
+| `catalog.upsert_entity` name preference | ✅ covered (`test_graph.py` SQLite + `test_pg_backend.py` Postgres): an LLM-proposed lowercase name cannot clobber a well-cased incumbent, an all-lowercase incumbent *is* upgraded, and a genuinely different name still applies as a rename. Resolved inside the `ON CONFLICT` statement rather than read-then-write, so it costs no extra round trip on the hottest graph-write path and cannot lose a race between concurrent source syncs. **Remaining: the Postgres twin is env-gated and was not executed** (no Docker on this machine) — the shared statement is parsed by both engines on every insert, so a syntax error would surface, but the CASE *semantics* are SQLite-verified only |
 | `auth.py` | token lifecycle edges | logout unknown token; open-mode → first user flips enabled; PBKDF2 verify negative |
 
 ### 3.3 Property-based suites (hypothesis)

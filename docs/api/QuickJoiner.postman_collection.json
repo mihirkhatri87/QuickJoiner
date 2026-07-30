@@ -1,8 +1,8 @@
 {
   "info": {
-    "name": "QuickJoiner API — connected flow",
+    "name": "QuickJoiner API \u2014 connected flow",
     "_postman_id": "qj-connected-flow-0001",
-    "description": "An end-to-end runbook for driving QuickJoiner over its HTTP API: check health, (optionally) sign in, connect a source, sync it, watch progress, then query the learned memory and graph. Requests are chained — test scripts capture the bearer token, connector name, and a session id into collection variables, so you can run the whole folder top-to-bottom with the Collection Runner.\n\nSet the `baseUrl` variable (default http://localhost:8787). Auth is OPTIONAL: skip the Authentication folder to run in open mode; run it once to turn auth on and capture a token for the rest.\n\nStreaming note: /api/chat, /api/scrape and /api/sync/{name}/logs return Server-Sent Events (text/event-stream). Postman shows the raw stream; read `data:` lines until a `done` event.",
+    "description": "An end-to-end runbook for driving QuickJoiner over its HTTP API: check health, (optionally) sign in, connect a source, sync it, watch progress, then query the learned memory and graph. Requests are chained \u2014 test scripts capture the bearer token, connector name, and a session id into collection variables, so you can run the whole folder top-to-bottom with the Collection Runner.\n\nSet the `baseUrl` variable (default http://localhost:8787). Auth is OPTIONAL: skip the Authentication folder to run in open mode; run it once to turn auth on and capture a token for the rest.\n\nStreaming note: /api/chat, /api/scrape and /api/sync/{name}/logs return Server-Sent Events (text/event-stream). Postman shows the raw stream; read `data:` lines until a `done` event.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -117,6 +117,11 @@
     {
       "key": "progressToken",
       "value": "demo-progress-token"
+    },
+    {
+      "key": "scrapeConnector",
+      "value": "Plumber",
+      "description": "A web_scrape connector with use_browser=true (a site behind a login)"
     }
   ],
   "auth": {
@@ -131,7 +136,7 @@
   },
   "item": [
     {
-      "name": "0 · Status",
+      "name": "0 \u00b7 Status",
       "item": [
         {
           "name": "Health",
@@ -163,7 +168,7 @@
       ]
     },
     {
-      "name": "1 · Authentication (optional)",
+      "name": "1 \u00b7 Authentication (optional)",
       "description": "Run ONCE to turn auth on + capture a token. Skip entirely to stay in open mode.",
       "item": [
         {
@@ -191,7 +196,7 @@
           }
         },
         {
-          "name": "Login → capture token",
+          "name": "Login \u2192 capture token",
           "event": [
             {
               "listen": "test",
@@ -249,7 +254,7 @@
       ]
     },
     {
-      "name": "2 · Connect a source",
+      "name": "2 \u00b7 Connect a source",
       "item": [
         {
           "name": "List connector types",
@@ -257,11 +262,11 @@
             "method": "GET",
             "url": "{{baseUrl}}/api/connectors/types"
           },
-          "description": "The catalog of connector types and each type's configurable fields (required / secret flags) plus supported `modes`. Use it to fill `options` on the next request. A type may also carry `next_step` — what to do AFTER saving, for connectors that aren't usable the moment they're created (OneDrive needs an interactive Microsoft 365 sign-in, which can only happen once the connector exists)."
+          "description": "The catalog of connector types and each type's configurable fields (required / secret flags) plus supported `modes`. Use it to fill `options` on the next request. A type may also carry `next_step` \u2014 what to do AFTER saving, for connectors that aren't usable the moment they're created (OneDrive needs an interactive Microsoft 365 sign-in, which can only happen once the connector exists)."
         },
         {
           "name": "Create a 'files' connector",
-          "description": "Point `connectorPath` at a real folder first. Swap type/options for git/github/jira/etc. — see the connector types response for each type's fields.",
+          "description": "Point `connectorPath` at a real folder first. Swap type/options for git/github/jira/etc. \u2014 see the connector types response for each type's fields.",
           "event": [
             {
               "listen": "test",
@@ -299,7 +304,7 @@
         },
         {
           "name": "Rename connector (before first sync)",
-          "description": "Rename — allowed ONLY before the first sync (0 documents), since the name keys every document/vector/graph node/watermark it would ingest. 409 once it has learned anything (clean it up first) or if the new name is taken. Same endpoint patches options/sharing/schedule.",
+          "description": "Rename \u2014 allowed ONLY before the first sync (0 documents), since the name keys every document/vector/graph node/watermark it would ingest. 409 once it has learned anything (clean it up first) or if the new name is taken. Same endpoint patches options/sharing/schedule.",
           "request": {
             "method": "PATCH",
             "header": [
@@ -314,11 +319,53 @@
             },
             "url": "{{baseUrl}}/api/connectors/{{connectorName}}"
           }
+        },
+        {
+          "name": "Gated site: is the browser session working?",
+          "description": "Fetches the connector's start URL through the saved browser session and reports content vs a sign-in page. A saved profile alone proves nothing \u2014 this is what distinguishes 'signed in' from 'silently ingesting zero documents'.",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/connectors/{{scrapeConnector}}/browser/session",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "connectors",
+                "{{scrapeConnector}}",
+                "browser",
+                "session"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Gated site: open a sign-in window",
+          "description": "Opens a real Chromium window ON THE QUICKJOINER HOST for a web_scrape connector with use_browser=true. Background job \u2014 poll the session request above. 409 when one is already open or the host has no display (use `qj browser login <url>` there instead). The URL comes from the connector's own start_urls, never the request body.",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/connectors/{{scrapeConnector}}/browser/login",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "connectors",
+                "{{scrapeConnector}}",
+                "browser",
+                "login"
+              ]
+            }
+          }
         }
       ]
     },
     {
-      "name": "3 · Sync & watch",
+      "name": "3 \u00b7 Sync & watch",
       "item": [
         {
           "name": "Start sync",
@@ -372,7 +419,7 @@
         },
         {
           "name": "Stream live logs (SSE)",
-          "description": "Server-Sent Events. Postman renders the raw stream — read `data:` lines until `done`.",
+          "description": "Server-Sent Events. Postman renders the raw stream \u2014 read `data:` lines until `done`.",
           "request": {
             "method": "GET",
             "header": [
@@ -392,8 +439,8 @@
           }
         },
         {
-          "name": "Upload a document (Word/PPT/Excel/PDF/…)",
-          "description": "multipart/form-data — pick one or more files under the `files` key. Each is extracted and ingested into the rolling Uploads connector. Do not set Content-Type by hand; Postman adds the multipart boundary.",
+          "name": "Upload a document (Word/PPT/Excel/PDF/\u2026)",
+          "description": "multipart/form-data \u2014 pick one or more files under the `files` key. Each is extracted and ingested into the rolling Uploads connector. Do not set Content-Type by hand; Postman adds the multipart boundary.",
           "request": {
             "method": "POST",
             "body": {
@@ -430,7 +477,7 @@
       ]
     },
     {
-      "name": "4 · Query the memory",
+      "name": "4 \u00b7 Query the memory",
       "item": [
         {
           "name": "Search (keyword + semantic)",
@@ -480,7 +527,7 @@
         },
         {
           "name": "Attach a file to a question (context, not memory)",
-          "description": "multipart/form-data — pick file(s) under `files`. Returns attachment ids to pass as `attachment_ids` on the chat request. These are per-question context (extracted to text, injected into the turn), NOT ingested into memory, and auto-deleted after the retention window. Capture an id into `attachmentId` to try the download below.",
+          "description": "multipart/form-data \u2014 pick file(s) under `files`. Returns attachment ids to pass as `attachment_ids` on the chat request. These are per-question context (extracted to text, injected into the turn), NOT ingested into memory, and auto-deleted after the retention window. Capture an id into `attachmentId` to try the download below.",
           "event": [
             {
               "listen": "test",
@@ -524,7 +571,7 @@
         },
         {
           "name": "Learn an attachment into memory",
-          "description": "Promote a per-question chat attachment into PERMANENT memory: the already-uploaded file is ingested into the rolling Uploads connector (chunked, embedded, graphed, citable). Attaching is context for one question by design; this is the explicit opt-in that makes it memory — the \"Learning permanently\" toggle in the UI. 410 once the retention sweep has deleted the bytes, 404 for an unknown id. `progress_token` is optional (client-minted) — pass one to make this request's real chunk-embedding progress readable via the next request while it's still running; omit it for the plain behaviour the CLI/agent's qj_api tool use.",
+          "description": "Promote a per-question chat attachment into PERMANENT memory: the already-uploaded file is ingested into the rolling Uploads connector (chunked, embedded, graphed, citable). Attaching is context for one question by design; this is the explicit opt-in that makes it memory \u2014 the \"Learning permanently\" toggle in the UI. 410 once the retention sweep has deleted the bytes, 404 for an unknown id. `progress_token` is optional (client-minted) \u2014 pass one to make this request's real chunk-embedding progress readable via the next request while it's still running; omit it for the plain behaviour the CLI/agent's qj_api tool use.",
           "request": {
             "method": "POST",
             "header": [],
@@ -551,7 +598,7 @@
         },
         {
           "name": "Poll ingest progress",
-          "description": "Real chunk-embedding progress for an in-flight ad-hoc ingest — poll this in parallel with a \"Learn an attachment into memory\" request sent with the same progress_token. Embedding a large document (e.g. a whole zip's concatenated text) can take minutes on a CPU-only machine; this is what a UI polls instead of showing nothing. 204 (empty body) if the token is unknown: never started, already finished and aged out (5 minutes), or nobody will ever start it — not an error. 200 body: {\"done\": <chunks embedded>, \"total\": <chunks total>}; total of 0 means extraction/chunking hasn't finished yet.",
+          "description": "Real chunk-embedding progress for an in-flight ad-hoc ingest \u2014 poll this in parallel with a \"Learn an attachment into memory\" request sent with the same progress_token. Embedding a large document (e.g. a whole zip's concatenated text) can take minutes on a CPU-only machine; this is what a UI polls instead of showing nothing. 204 (empty body) if the token is unknown: never started, already finished and aged out (5 minutes), or nobody will ever start it \u2014 not an error. 200 body: {\"done\": <chunks embedded>, \"total\": <chunks total>}; total of 0 means extraction/chunking hasn't finished yet.",
           "request": {
             "method": "GET",
             "header": [],
@@ -571,7 +618,7 @@
       ]
     },
     {
-      "name": "5 · Explore the graph & gaps",
+      "name": "5 \u00b7 Explore the graph & gaps",
       "item": [
         {
           "name": "Graph snapshot",
@@ -607,16 +654,38 @@
             "method": "GET",
             "url": "{{baseUrl}}/api/gaps"
           }
+        },
+        {
+          "name": "Unmined relationships (queue)",
+          "description": "Documents that were ingested but whose relationship extraction never resolved. A connector that pulls a moving window (recent sprints) never re-provides them, so no sync retries it.",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/graph/pending"
+          }
+        },
+        {
+          "name": "Mine unmined relationships",
+          "description": "Starts a background job (source `graph relationships`) that re-reads the text already indexed for those documents and finishes their graph \u2014 no connector round-trip. Watch it via `GET /api/sync/graph relationships/logs`. 409 while another job runs or when graph.extract_triples is off. Add `?source_id=files:handbook` to scope it.",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/graph/drain"
+          }
         }
       ]
     },
     {
-      "name": "6 · OneDrive / SharePoint (per-user, on demand)",
-      "description": "This connector authenticates as a **person**, not with a static secret, and it never crawls: it ingests exactly the documents you point it at.\n\n1. Create it with your Azure app registration's Application (client) ID — it saves even though it is not signed in yet, because the token is keyed to the connector.\n2. Sign in: `Start sign-in` returns an `authorize_url`; open it in a browser and complete Microsoft sign-in (the redirect to `/api/oauth/callback` stores the token). In a terminal or container use `qj onedrive login <name>` (device code) instead — no redirect needed.\n3. Learn specific documents by link or drive path. A folder learns the readable files under it.\n\nSet `onedriveConnector`, `onedriveClientId` and `onedriveTarget` in the collection variables.",
+      "name": "6 \u00b7 OneDrive / SharePoint (per-user, on demand)",
+      "description": "This connector authenticates as a **person**, not with a static secret, and it never crawls: it ingests exactly the documents you point it at.\n\n1. Create it with your Azure app registration's Application (client) ID \u2014 it saves even though it is not signed in yet, because the token is keyed to the connector.\n2. Sign in: `Start sign-in` returns an `authorize_url`; open it in a browser and complete Microsoft sign-in (the redirect to `/api/oauth/callback` stores the token). In a terminal or container use `qj onedrive login <name>` (device code) instead \u2014 no redirect needed.\n3. Learn specific documents by link or drive path. A folder learns the readable files under it.\n\nSet `onedriveConnector`, `onedriveClientId` and `onedriveTarget` in the collection variables.",
       "item": [
         {
           "name": "Create OneDrive connector",
-          "description": "`access` requests only the delegated Graph scopes you need: my_drive → Files.Read, shared_with_me → Files.Read.All, sharepoint → Sites.Read.All (usually admin consent). The response's `test.message` says \"not signed in yet\" — expected.",
+          "description": "`access` requests only the delegated Graph scopes you need: my_drive \u2192 Files.Read, shared_with_me \u2192 Files.Read.All, sharepoint \u2192 Sites.Read.All (usually admin consent). The response's `test.message` says \"not signed in yet\" \u2014 expected.",
           "request": {
             "method": "POST",
             "header": [
@@ -685,7 +754,7 @@
         },
         {
           "name": "Learn documents on demand",
-          "description": "Resolves each target with the signed-in user's own access, extracts text and ingests it. `notes` lists everything NOT learned and why (unsupported type, too large, or an image — images need vision support, which is on the roadmap). `warning` restates that learned documents join the workspace's shared memory.",
+          "description": "Resolves each target with the signed-in user's own access, extracts text and ingests it. `notes` lists everything NOT learned and why (unsupported type, too large, or an image \u2014 images need vision support, which is on the roadmap). `warning` restates that learned documents join the workspace's shared memory.",
           "request": {
             "method": "POST",
             "header": [
@@ -715,7 +784,7 @@
         },
         {
           "name": "Sign out",
-          "description": "Deletes the stored Microsoft 365 refresh token. Deleting the connector does this automatically — a live refresh token must not outlive its connector.",
+          "description": "Deletes the stored Microsoft 365 refresh token. Deleting the connector does this automatically \u2014 a live refresh token must not outlive its connector.",
           "request": {
             "method": "DELETE",
             "header": [],
@@ -736,12 +805,12 @@
       ]
     },
     {
-      "name": "7 · Documents, labels & scoped questions",
+      "name": "7 \u00b7 Documents, labels & scoped questions",
       "description": "See what a connector ingested, label it, and ask a question limited to that slice.\n\n`uri_prefix` picks the label granularity: '' = whole connector, a folder path = that folder AND files ingested into it later, a full document uri = one document. A scope on `POST /api/chat` is resolved server-side into a real pre-filter on both retrieval legs, and live tools for connectors outside the scope are withheld for that turn.",
       "item": [
         {
           "name": "List a source's documents",
-          "description": "Each document with the labels that apply to it, including ones inherited from its folder or the connector — resolved at read time, so folder tags cover later files. Each document also carries `metadata` — a small connector-supplied JSON blob for UI display only, `{}` for every connector that doesn't set it. Azure DevOps stamps work_item_type/state/team/sprint/parent_id/changed_date/closed_date there, which is what the document browser uses to render TFS work items as an Epic/Feature/Story/Task tree.",
+          "description": "Each document with the labels that apply to it, including ones inherited from its folder or the connector \u2014 resolved at read time, so folder tags cover later files. Each document also carries `metadata` \u2014 a small connector-supplied JSON blob for UI display only, `{}` for every connector that doesn't set it. Azure DevOps stamps work_item_type/state/team/sprint/parent_id/changed_date/closed_date there, which is what the document browser uses to render TFS work items as an Epic/Feature/Story/Task tree.",
           "request": {
             "method": "GET",
             "header": [],
@@ -761,7 +830,7 @@
         },
         {
           "name": "List an archive's contents",
-          "description": "A .zip ingests as ONE document (its members' text concatenated — see ingest/extract._extract_zip), so the listing above shows it as one opaque row. This recovers the member list — and any files it skipped, and why — from the document's own extracted text (there's no separate column for it). `doc_id` is one of the doc_id values from the request above. Returns {\"members\": [...], \"notes\": [...]} — empty lists (not an error) for a document that isn't an archive.",
+          "description": "A .zip ingests as ONE document (its members' text concatenated \u2014 see ingest/extract._extract_zip), so the listing above shows it as one opaque row. This recovers the member list \u2014 and any files it skipped, and why \u2014 from the document's own extracted text (there's no separate column for it). `doc_id` is one of the doc_id values from the request above. Returns {\"members\": [...], \"notes\": [...]} \u2014 empty lists (not an error) for a document that isn't an archive.",
           "request": {
             "method": "GET",
             "header": [],
@@ -815,7 +884,7 @@
         },
         {
           "name": "List all labels",
-          "description": "Every tag/aka in the workspace — what the UI's question-scope picker offers.",
+          "description": "Every tag/aka in the workspace \u2014 what the UI's question-scope picker offers.",
           "request": {
             "method": "GET",
             "header": [],
@@ -833,7 +902,7 @@
         },
         {
           "name": "Ask a scoped question",
-          "description": "SSE, like the unscoped ask. Searches strictly less rather than filtering afterwards. A scoped 'no results' is reported as 'not in the sources you scoped to', never as 'never learned' — the model is told it only searched a slice.",
+          "description": "SSE, like the unscoped ask. Searches strictly less rather than filtering afterwards. A scoped 'no results' is reported as 'not in the sources you scoped to', never as 'never learned' \u2014 the model is told it only searched a slice.",
           "request": {
             "method": "POST",
             "header": [
@@ -888,7 +957,7 @@
       ]
     },
     {
-      "name": "8 · Lifecycle & cleanup",
+      "name": "8 \u00b7 Lifecycle & cleanup",
       "item": [
         {
           "name": "Clean up one connector (keep config)",
@@ -906,7 +975,7 @@
         },
         {
           "name": "Reset ALL memory (keep connectors)",
-          "description": "DANGER — wipes every ingested document, vector and graph edge across the whole workspace. Runs as a background job (returns {job}, source 'all memory') — watch it via the sync logs stream (source `all memory`) or the activity feed. Refuses (409) while any sync runs.",
+          "description": "DANGER \u2014 wipes every ingested document, vector and graph edge across the whole workspace. Runs as a background job (returns {job}, source 'all memory') \u2014 watch it via the sync logs stream (source `all memory`) or the activity feed. Refuses (409) while any sync runs.",
           "request": {
             "method": "POST",
             "url": "{{baseUrl}}/api/memory/reset"

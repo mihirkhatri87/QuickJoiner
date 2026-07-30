@@ -1,6 +1,8 @@
 import type {
   AuthStatus,
   BridgeEntity,
+  BrowserLoginJob,
+  BrowserSessionStatus,
   ChatEvent,
   ConnectorRow,
   ConnectorType,
@@ -292,6 +294,20 @@ export const api = {
       `/api/connectors/${encodeURIComponent(name)}/oauth/start`,
       { method: "POST" },
     ),
+  // Credential-gated web_scrape sign-in. Unlike the Microsoft flow there is no redirect:
+  // a real browser window opens ON THE QUICKJOINER HOST (same machine as the UI in a
+  // local-first setup), so this starts a background job the UI polls.
+  browserLoginStart: (name: string) =>
+    req<{ login: BrowserLoginJob }>(
+      `/api/connectors/${encodeURIComponent(name)}/browser/login`,
+      { method: "POST" },
+    ),
+  // `verify=false` answers from stored cookies alone — cheap enough to poll while a
+  // sign-in window is open; the default actually fetches the start URL.
+  browserSession: (name: string, verify = true) =>
+    req<BrowserSessionStatus>(
+      `/api/connectors/${encodeURIComponent(name)}/browser/session?verify=${verify}`,
+    ),
   oauthSignOut: (name: string) =>
     req<{ signed_out: boolean }>(`/api/connectors/${encodeURIComponent(name)}/oauth`, {
       method: "DELETE",
@@ -321,6 +337,19 @@ export const api = {
   // configured. Runs as a background job (streams logs, lands in the activity feed) — the
   // returned job's source is the sentinel "all memory". Refuses (409) while any sync runs.
   resetMemory: () => req<{ job: SyncJob }>("/api/memory/reset", { method: "POST" }),
+  // Documents that were ingested but whose relationship extraction never resolved — a
+  // connector that ingests a moving window never re-provides them, so nothing retries it.
+  graphPending: () =>
+    req<{ total: number; by_source: { source_id: string; count: number }[]; extraction_enabled: boolean }>(
+      "/api/graph/pending",
+    ),
+  // Mine those documents' relationships from the text already indexed for them. Background
+  // job (sentinel source "graph relationships"); 409 while another job runs or extraction is off.
+  drainGraph: (sourceId?: string) =>
+    req<{ job: SyncJob }>(
+      `/api/graph/drain${sourceId ? `?source_id=${encodeURIComponent(sourceId)}` : ""}`,
+      { method: "POST" },
+    ),
   // Sync activity over a rolling window (running + finished), newest first. Survives a
   // page reload and a server restart — the backend persists it. Backs the bell menu.
   notifications: (hours = 24) => req<NotificationsResponse>(`/api/notifications?hours=${hours}`),
@@ -337,9 +366,10 @@ export const api = {
       const job = syncs.find((s) => s.source === name);
       if (job && ["done", "error", "stopped"].includes(job.state)) {
         const s = job.stats;
-        const result = s
-          ? `${s.added} added, ${s.updated} updated, ${s.skipped} unchanged`
-          : job.error || job.state;
+        const result =
+          s && "added" in s
+            ? `${s.added} added, ${s.updated} updated, ${s.skipped} unchanged`
+            : job.error || job.state;
         return { result, job };
       }
     }

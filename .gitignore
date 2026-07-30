@@ -30,3 +30,9 @@ briefs/
 exports/
 repos/
 evals/
+# The unanchored `evals/` rule above (meant for a workspace's generated
+# <workspace>/evals/*.json reports) also matched docs/evals/ — the checked-in,
+# hand-authored eval sets (found 2026-07-29: docs/evals/multi-hop-crosssource.yaml
+# had silently never been committed since the initial commit). Un-ignore it explicitly.
+!docs/evals/
+!docs/evals/**

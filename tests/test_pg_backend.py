@@ -112,6 +112,24 @@ def test_pg_documents_and_stats(pg):
     assert stats["documents"] == 1 and stats["chunks"] == 5
 
 
+def test_pg_upsert_entity_name_preference_matches_sqlite(pg):
+    """The name-preference CASE in upsert_entity's ON CONFLICT is hand-written portable
+    SQL, so it needs Postgres parity coverage — the SQLite twin lives in test_graph.py
+    (`test_upsert_entity_keeps_incumbent_name_over_worse_cased_variant`)."""
+    catalog, _ = pg
+    catalog.upsert_entity("repo:nautical", "Nautical", "repo")
+    catalog.upsert_entity("repo:nautical", "nautical", "repo")  # LLM-proposed downgrade
+    assert catalog.resolve_entity("repo:nautical")["name"] == "Nautical"
+
+    catalog.upsert_entity("repo:stevedore", "stevedore", "repo")
+    catalog.upsert_entity("repo:stevedore", "Stevedore", "repo")  # upgrade wins
+    assert catalog.resolve_entity("repo:stevedore")["name"] == "Stevedore"
+
+    catalog.upsert_entity("repo:renamed", "Old Name", "repo")
+    catalog.upsert_entity("repo:renamed", "New Name", "repo")  # real rename still applies
+    assert catalog.resolve_entity("repo:renamed")["name"] == "New Name"
+
+
 def test_pg_knowledge_graph_roundtrip(pg):
     catalog, _ = pg
     catalog.upsert_document("d9", "git:a", "u9", "Dep map", "doc", "h", None, 1)

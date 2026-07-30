@@ -23,7 +23,10 @@ this was a rendering and interaction change, not a data one.
 **Phase C SHIPPED 2026-07-11**: the compression/distill prompt emits a
 RELATIONSHIPS section (`type: name | relation | type: name`); `parse_triples`
 validates strictly against type/relation vocabularies (off-vocabulary lines are
-dropped, never invented, capped at 20); accepted triples ride the
+dropped, never invented, capped at 20) **and, since 2026-07-30, against per-relation
+domain/range signatures** (`RELATION_SIGNATURES` — the three words each being legal
+is not enough, the combination must be a shape the relation can hold, so
+`environment: prod | owns | person: bob` no longer becomes an edge); accepted triples ride the
 `conversation://` document as graph metadata, so the pipeline persists them
 with the conversation as citable evidence. Keyless mode skips triples — the
 graph stays deterministic-only without an LLM. All three phases complete.

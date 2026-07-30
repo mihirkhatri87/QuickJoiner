@@ -108,6 +108,10 @@ _ROUTES: list[tuple[str, str, str, Optional[str]]] = [
     # token; it is guarded instead by the unguessable `state` this server minted and
     # holds in memory for one pending flow.
     ("POST", "/api/connectors/{name}/oauth/start", "connectors:write", "name"),
+    # Opening a sign-in window is a connector-configuration act (it changes what the
+    # connector can reach), so it sits at the same tier as editing one.
+    ("POST", "/api/connectors/{name}/browser/login", "connectors:write", "name"),
+    ("GET", "/api/connectors/{name}/browser/session", "connectors:read", "name"),
     ("GET", "/api/connectors/{name}/oauth/status", "connectors:read", "name"),
     ("DELETE", "/api/connectors/{name}/oauth", "connectors:write", "name"),
     ("GET", "/api/oauth/callback", PUBLIC, None),
@@ -145,6 +149,10 @@ _ROUTES: list[tuple[str, str, str, Optional[str]]] = [
     ("GET", "/api/graph/path", "graph:read", None),
     ("GET", "/api/graph/search", "graph:read", None),
     ("GET", "/api/graph/bridges", "graph:read", None),
+    ("GET", "/api/graph/pending", "graph:read", None),
+    # Draining spends LLM calls and rewrites edges across sources — the same tier as
+    # running a sync, not a read.
+    ("POST", "/api/graph/drain", "sync:run", None),
     # Knowledge gaps
     ("GET", "/api/gaps", "gaps:read", None),
     ("POST", "/api/gaps/resolve", "gaps:write", None),

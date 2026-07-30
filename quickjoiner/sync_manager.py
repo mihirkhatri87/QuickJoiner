@@ -37,6 +37,7 @@ _HEARTBEAT_SECONDS = 20  # "still syncing…" cadence while a connector is mid-p
 _DONE = object()  # sentinel pushed to subscribers when a job ends
 _HISTORY_RETENTION_DAYS = 7  # rolling window kept in sync_events (UI asks for 24h of it)
 RESET_SOURCE = "all memory"  # sentinel "source" name for the workspace-wide memory-reset job
+DRAIN_SOURCE = "graph relationships"  # ...and for the workspace-wide graph-pending drain
 
 # Self-healing auto-retry on a transient NETWORK failure mid-sync. A raised exception kills
 # the connector's generator (a Python generator can't resume past a raise), so "resume" means
@@ -65,7 +66,7 @@ class SyncJob:
     source_name: str
     source_id: str
     state: str = "running"  # running | paused | retrying | stopping | stopped | done | error
-    kind: str = "sync"  # sync | cleanup (a purge with no re-pull)
+    kind: str = "sync"  # sync | cleanup (purge, no re-pull) | reset | drain (graph-only)
     clean: bool = False
     cleanup_on_stop: bool = False
     # A paused sync reconstructed after a process restart (see revive_paused): no live worker
@@ -233,6 +234,8 @@ class SyncManager:
                 raise RuntimeError(f"A sync is already running for {source_name!r}")
             if self.is_running(RESET_SOURCE):
                 raise RuntimeError("A memory reset is running — wait for it to finish")
+            if self.is_running(DRAIN_SOURCE):
+                raise RuntimeError("A relationship drain is running — wait for it to finish")
             source = next((s for s in self.ctx.config.sources if s.name == source_name), None)
             if source is None:
                 raise KeyError(f"No configured source {source_name!r}")
@@ -261,6 +264,8 @@ class SyncManager:
                 raise RuntimeError(f"A job is already running for {source_name!r}")
             if self.is_running(RESET_SOURCE):
                 raise RuntimeError("A memory reset is running — wait for it to finish")
+            if self.is_running(DRAIN_SOURCE):
+                raise RuntimeError("A relationship drain is running — wait for it to finish")
             self._counter += 1
             job = SyncJob(id=f"cleanup-{self._counter}-{uuid.uuid4().hex[:8]}",
                           source_name=source_name, source_id=source_id, kind="cleanup")
@@ -319,6 +324,72 @@ class SyncManager:
             job.state = "error"
             job.error = str(exc)
             self._log(job, f"✗ reset failed: {exc}")
+        finally:
+            job.ended_at = _now()
+            self._record(job)
+            self._close(job)
+
+    def start_drain(self, source_id: str | None = None) -> SyncJob:
+        """Mine the relationships of documents whose connector will never re-provide them
+        (AI_ROADMAP #25) — see `IngestPipeline.drain_pending_graph` for what that means and
+        how faithfully it can be done. Runs as an ordinary job (live log, activity feed,
+        pause/stop) because on a real corpus it is thousands of LLM calls, not a click.
+
+        Refuses while any other job is in flight, and syncs refuse while it runs: a drain
+        rewrites edges for documents across every source, so overlapping with a sync of one
+        of those sources would have two writers replacing the same document's edges."""
+        if not getattr(self.ctx.pipeline, "extracts_triples", False):
+            raise RuntimeError(
+                "LLM relationship extraction is off — enable graph.extract_triples "
+                "(Settings → Knowledge graph) before draining"
+            )
+        with self._lock:
+            active = self.active_sources()
+            if active:
+                raise RuntimeError(
+                    f"A job is running ({', '.join(active)}) — wait before draining relationships"
+                )
+            self._counter += 1
+            job = SyncJob(id=f"drain-{self._counter}-{uuid.uuid4().hex[:8]}",
+                          source_name=DRAIN_SOURCE, source_id=source_id or "", kind="drain")
+            self._jobs[DRAIN_SOURCE] = job
+        self._record(job)
+        threading.Thread(target=self._run_drain, args=(job,), daemon=True).start()
+        return job
+
+    def _run_drain(self, job: SyncJob) -> None:
+        control = self._build_control(job)
+        try:
+            pending = self.ctx.catalog.count_graph_pending(job.source_id or None)
+            self._log(job, f"🔗 mining relationships for {pending} document(s) "
+                           "whose graph work never landed…")
+            stats = self.ctx.pipeline.drain_pending_graph(
+                source_id=job.source_id or None, control=control,
+                log=lambda line: self._log(job, line),
+            )
+            job.stats = {
+                "documents": stats.documents, "faithful": stats.faithful,
+                "text_only": stats.text_only, "missing_text": stats.missing_text,
+                "orphans": stats.orphans, "errors": stats.errors[:20],
+            }
+            job.ingested = stats.documents
+            if stats.text_only:
+                # Say which documents could only be partially rebuilt rather than
+                # reporting a number that reads like a full recovery.
+                self._log(job, f"ℹ {stats.text_only} document(s) predate the stored "
+                               "deterministic payload — re-mined from their indexed text only")
+            if stats.missing_text:
+                self._log(job, f"ℹ {stats.missing_text} document(s) have no stored text "
+                               "left to read — left queued, not guessed at")
+            self._log(job, f"✓ {stats.summary()}")
+            job.state = "done"
+        except SyncStopped:
+            job.state = "stopped"
+            self._log(job, "■ stopped — undrained documents stay queued for the next run")
+        except Exception as exc:  # noqa: BLE001
+            job.state = "error"
+            job.error = str(exc)
+            self._log(job, f"✗ drain failed: {exc}")
         finally:
             job.ended_at = _now()
             self._record(job)

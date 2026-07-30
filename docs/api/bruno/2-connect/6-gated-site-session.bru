@@ -1,0 +1,22 @@
+meta {
+  name: Gated site — is the browser session working?
+  type: http
+  seq: 6
+}
+
+get {
+  url: {{baseUrl}}/api/connectors/{{scrapeConnector}}/browser/session
+}
+
+docs {
+  For a `web_scrape` connector with `use_browser=true` (a site behind a login).
+
+  Fetches the connector's start URL **through the saved browser session** and reports
+  whether it got content or a sign-in page. A saved profile alone proves nothing — this
+  is what distinguishes "signed in" from "silently ingesting zero documents", because a
+  gated site answers an unauthenticated request with `200 OK` and a login form rather
+  than an error.
+
+  `?verify=false` skips the live fetch and answers from stored cookies alone — cheap
+  enough to poll while a sign-in window is open.
+}

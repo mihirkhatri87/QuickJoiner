@@ -58,6 +58,11 @@ function toneFor(n: SyncJob) {
     if (n.state === "done") return { ...base, label: "memory reset" };
     return base;
   }
+  if (n.kind === "drain") {
+    if (running) return { ...base, label: "mining relationships" };
+    if (n.state === "done") return { ...base, label: "relationships mined" };
+    return base;
+  }
   if (n.kind !== "cleanup") return base;
   if (running) return { ...base, label: "cleaning up" };
   if (n.state === "done") return { ...base, label: "cleaned up" };
@@ -67,6 +72,7 @@ function toneFor(n: SyncJob) {
 function detail(n: SyncJob): string {
   const cleanup = n.kind === "cleanup";
   const reset = n.kind === "reset";
+  const drain = n.kind === "drain";
   // A live run leads with its stage + %, so the menu answers "how far along?" at a glance.
   const stage = n.phase ? `${n.phase}${n.percent != null ? ` · ${n.percent}%` : ""}` : "";
   if (n.state === "retrying") return stage ? `network error · ${stage}` : "network error · retrying";
@@ -74,12 +80,19 @@ function detail(n: SyncJob): string {
   if (n.state === "running" || n.state === "stopping") {
     if (stage) return stage;
     if (reset) return `wiping all memory · started ${ago(n.started_at)}`;
+    if (drain) return `mining queued documents · started ${ago(n.started_at)}`;
     return `${cleanup ? "forgetting this source" : "started"} ${ago(n.started_at)}`;
   }
   if (n.state === "error") return n.error || "failed";
   if (n.state === "interrupted") return "server restarted before it finished";
   if (reset && n.state === "done") return "all documents, vectors and graph wiped · connectors kept";
   if (cleanup && n.state === "done") return "documents, vectors and graph edges removed";
+  if (n.stats && "documents" in n.stats) {
+    const s = n.stats;
+    return `${s.documents} document${s.documents === 1 ? "" : "s"} mined` +
+      (s.text_only ? ` · ${s.text_only} partial` : "") +
+      (s.missing_text ? ` · ${s.missing_text} still queued` : "");
+  }
   if (n.stats) {
     const s = n.stats;
     return `${s.added} added · ${s.updated} updated · ${s.skipped} unchanged` +

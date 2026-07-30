@@ -89,11 +89,19 @@ class EmbeddingConfig(BaseModel):
 class RetrievalConfig(BaseModel):
     top_k: int = 8
     # Below this cosine-similarity score hits are dropped; if nothing clears it the agent
-    # must say "not learned yet". Tuned for BAAI/bge-small-en-v1.5 (relevant ~0.64+,
-    # unrelated ~0.55 and below) — retune if you switch embedding models.
+    # must say "not learned yet". Retuned 2026-07-29 (plan 05, coupled with the
+    # ann_refine_factor fix above): the old 0.55 was calibrated against IVF_PQ's
+    # DISTORTED scores. True cosines shift the whole distribution up, and a 12-case
+    # refusal set found NO threshold cleanly separates refusal near-misses (0.62-0.78)
+    # from real answerable hits (0.66-0.87) — `qj eval --calibrate`'s own max-margin
+    # pick was 0.72, but that cost 3-4 of 20 answerable cases their grounding. 0.64 is
+    # a deliberately conservative middle ground: zero measured answerable-recall cost
+    # on that eval set, while still gating out some refusal near-misses (3 of 12 vs 0
+    # at the old 0.55) — see docs/plans/05-eval-on-connected-org.md for the full sweep.
+    # Retune again (via --calibrate) if you switch embedding models or the eval set grows.
     # NOTE: this gate stays cosine-based even in hybrid mode — hybrid changes which
     # candidates surface and their order, never the grounded-vs-refuse decision.
-    min_score: float = 0.55
+    min_score: float = 0.64
     # Hybrid retrieval: dense (vector) + sparse (BM25 full-text) legs fused with
     # reciprocal rank fusion. The sparse leg rescues exact-token matches (error
     # codes, ticket IDs, service names) that sit outside the dense top-k.
@@ -109,6 +117,30 @@ class RetrievalConfig(BaseModel):
     # LanceDB builds an approximate (IVF) vector index once the chunk count crosses
     # this threshold; below it brute-force search is exact and fast enough.
     ann_min_rows: int = 4000
+    # LanceDB's default IVF index is IVF_PQ (product-quantized) and is lossy enough to
+    # matter. `refine_factor` re-ranks the ANN candidates against their un-quantized
+    # vectors; without it the index silently degrades retrieval on any workspace past
+    # ann_min_rows.
+    # **Measured directly on the live 56,401-chunk corpus (real IvfPq index, 8-bit PQ /
+    # 24 sub-vectors, lancedb 0.34.0, 2026-07-30), 12 real queries:**
+    #   recall@5 vs exact brute force ... refine=1: 45%      refine=10: 100%
+    #   top-1 identical to exact ........ refine=1: 9/12     refine=10: 12/12
+    #   p50 latency ..................... refine=1: 16.4ms   refine=10: 17.6ms
+    #                                     (brute force 21.3ms — refined ANN is still faster)
+    # NB the failure mode is **missing documents, not distorted scores**: for any chunk
+    # the unrefined search did return, its reported cosine matched exact to 4 decimal
+    # places. It substitutes worse-but-plausible chunks and reports honest-looking scores
+    # for them, so nothing in the numbers reveals the loss — which is what let it ship.
+    # (Plan 05's 2026-07-28 note described it as a 0.25-0.45 score distortion on the same
+    # top chunk; that form did not reproduce on this version/corpus. Same root cause, same
+    # fix, and the fix is validated either way.)
+    # Harmless below ann_min_rows (no index yet) — LanceDB ignores it for brute force.
+    # `ge=1` is load-bearing, not decoration: LanceDB RAISES "Refine factor cannot be
+    # zero" on 0, so an unvalidated 0 (the obvious way someone would try to "turn this
+    # off") would break EVERY dense search on an indexed workspace. There is no reason
+    # to want it off — without it retrieval is simply worse — so 0 is rejected at
+    # config validation instead of silently degrading back to the defect.
+    ann_refine_factor: int = Field(default=10, ge=1)
     # Second-stage ranking with a cross-encoder over the fused candidates. A
     # cross-encoder reads query+candidate together, so it resolves nuance (code vs
     # prose, near-duplicates) that bi-encoder cosine misses. On by default; "none"
@@ -175,8 +207,11 @@ class GraphConfig(BaseModel):
     triple_min_chars: int = 400  # skip trivially short documents
     # Concurrent LLM calls for triple extraction during one ingest batch — the
     # extractor is the bottleneck on a large corpus (one blocking network call per
-    # qualifying doc); keep modest by default to avoid hammering a shared LLM proxy.
-    triple_workers: int = 4
+    # qualifying doc). Measured live against the real broker (plan 05, 2026-07-28):
+    # p50 ~18s/call, so the old default of 4 meant ~10h to drain 5.6k docs, where
+    # 16 keeps latency flat with zero errors and finishes in ~1-2h (32 tested clean
+    # too, but is more likely to be impolite to a shared broker).
+    triple_workers: int = 16
     # Entity-resolution dedup (ingest/entity_resolution.py): merge a newly-seen
     # entity into an existing one of the same type via embedding-candidate search +
     # LLM adjudication (Graphiti-style), instead of creating a duplicate node every

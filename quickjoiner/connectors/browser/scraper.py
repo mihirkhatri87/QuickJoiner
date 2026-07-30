@@ -204,13 +204,23 @@ class WebScrapeConnector(Connector):
         if not starts:
             return ConnectionStatus(False, "No 'start_urls' configured")
         if self._use_browser():
-            from quickjoiner.connectors.browser.session import has_profile
+            from quickjoiner.connectors.browser.session import has_profile, verify_session
 
             if not has_profile(self.workspace):
                 return ConnectionStatus(
                     False, "use_browser=true but no browser profile; run: qj browser login <url>"
                 )
-            return ConnectionStatus(True, f"Browser profile ready; {len(starts)} start URL(s)")
+            # A profile *directory* existing proves nothing — the session it holds may be
+            # absent or expired, and this used to report OK for a connector that could not
+            # fetch a single page (the sync then reported a bare "0 documents"). Actually
+            # fetch the start URL through the session and say what came back.
+            ok, detail = verify_session(self.workspace, starts[0])
+            if not ok:
+                return ConnectionStatus(
+                    False, f"Signed-in session not working: {detail} "
+                           f"Run: qj browser login {starts[0]}"
+                )
+            return ConnectionStatus(True, f"Signed in; {detail}")
         try:
             self._fetch_http(starts[0])
             return ConnectionStatus(True, f"GET {starts[0]} -> ok")
@@ -255,11 +265,44 @@ class WebScrapeConnector(Connector):
             return False
 
     def _crawl_via_browser(self, starts, prefixes, budget) -> Iterator[Document]:
-        from quickjoiner.connectors.browser.session import browser_session, fetch_html
+        from quickjoiner.connectors.browser.session import (
+            browser_session,
+            fetch_html,
+            looks_like_login,
+        )
 
         with browser_session(self.workspace) as context:
-            yield from self._crawl(list(starts), set(), prefixes, budget,
-                                   lambda url: fetch_html(context, url), self._max_depth())
+            auth_walls: list[str] = []
+
+            def fetch(url: str) -> str:
+                page = context.new_page()
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=5000)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    # An expired/absent session doesn't fail — it 200s with a login page,
+                    # which page_document then drops as too short. That produced a silent
+                    # "0 documents" indistinguishable from an empty site. Count them so the
+                    # sync can say WHY it found nothing.
+                    try:
+                        if looks_like_login(page.url, url, page.inner_text("body"), page.title() or ""):
+                            auth_walls.append(url)
+                            return ""
+                    except Exception:  # noqa: BLE001
+                        pass
+                    return page.content()
+                finally:
+                    page.close()
+
+            yield from self._crawl(list(starts), set(), prefixes, budget, fetch, self._max_depth())
+            if auth_walls:
+                self._stage(
+                    f"⚠ {len(auth_walls)} page(s) returned a sign-in page, not content — "
+                    f"the browser session has expired or was never captured. "
+                    f"Run: qj browser login {starts[0]}"
+                )
 
     def _fetch_http(self, url: str) -> str:
         """Fetch one page politely: rate-limited, retried on transient failures,

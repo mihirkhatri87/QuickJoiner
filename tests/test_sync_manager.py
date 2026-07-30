@@ -77,6 +77,9 @@ class FakeCatalog:
         self.calls.append("reset_knowledge")
         return {"documents": 12, "entities": 5, "edges": 9}
 
+    def count_graph_pending(self, source_id=None):
+        return 2
+
 
 class FakeStore:
     def __init__(self):
@@ -94,8 +97,17 @@ class FakePipeline:
     runs) and returns simple stats. Accepts the optional `control` the manager threads in
     for the deferred-graph phase; a test can drive it via `graph_batches`."""
 
+    extracts_triples = True  # the drain job's precondition
+
     def __init__(self, graph_batches=0):
         self.graph_batches = graph_batches  # simulate N pausable post-ingest graph waves
+
+    def drain_pending_graph(self, source_id=None, control=None, log=None):
+        from quickjoiner.ingest.pipeline import DrainStats
+
+        if log:
+            log("files:demo: 2 documents with unmined relationships")
+        return DrainStats(documents=2, faithful=1, text_only=1)
 
     def ingest(self, docs, source_id, control=None):
         stats = IngestStats()
@@ -452,6 +464,64 @@ def test_sync_refuses_while_a_reset_is_running(monkeypatch):
         mgr.start("demo")
     gate.set()
     _wait(mgr, "all memory", {"done"})
+
+
+# --------------------------------------------------------- graph-relationship drain
+
+def test_drain_runs_as_a_job_and_reports_what_it_recovered():
+    ctx = _ctx([])
+    ctx.pipeline = FakePipeline()
+    mgr = SyncManager(ctx)
+    job = mgr.start_drain()
+    assert job.kind == "drain" and job.source_name == "graph relationships"
+    done = _wait(mgr, "graph relationships", {"done", "error"})
+    assert done.state == "done"
+    assert done.stats["documents"] == 2 and done.stats["text_only"] == 1
+    # The partial-recovery case is stated in the log, not hidden behind a total that
+    # reads like a full rebuild.
+    assert any("re-mined from their indexed text only" in line for line in done.logs)
+    assert ctx.catalog.events[done.id]["kind"] == "drain"
+
+
+def test_drain_refuses_without_an_extractor_configured():
+    """Nothing could resolve, so it says so instead of quietly clearing the queue."""
+    ctx = _ctx([])
+    ctx.pipeline.extracts_triples = False
+    with pytest.raises(RuntimeError, match="extract_triples"):
+        SyncManager(ctx).start_drain()
+
+
+def test_drain_and_syncs_exclude_each_other(monkeypatch):
+    ctx = _ctx([_source()])
+    gate = threading.Event()
+    orig = sm.SyncManager._run_drain
+    monkeypatch.setattr(sm.SyncManager, "_run_drain",
+                        lambda self, job: (gate.wait(timeout=5), orig(self, job)))
+    mgr = SyncManager(ctx)
+    mgr.start_drain()
+    _wait(mgr, "graph relationships", {"running"})
+    with pytest.raises(RuntimeError, match="drain"):
+        mgr.start("demo")  # a drain rewrites edges across sources
+    gate.set()
+    _wait(mgr, "graph relationships", {"done"})
+
+
+def test_drain_stop_leaves_the_rest_queued():
+    ctx = _ctx([])
+
+    def blocking_drain(source_id=None, control=None, log=None):
+        for _ in range(300):  # the drain checkpoints per document; a stop lands on one
+            control.check()
+            time.sleep(0.01)
+        raise AssertionError("should have stopped")
+
+    ctx.pipeline.drain_pending_graph = blocking_drain
+    mgr = SyncManager(ctx)
+    job = mgr.start_drain()
+    job.cancel.set()
+    done = _wait(mgr, "graph relationships", {"stopped", "done", "error"})
+    assert done.state == "stopped"
+    assert any("stay queued" in line for line in done.logs)
 
 
 # --------------------------------------------------------------- 24h history feed

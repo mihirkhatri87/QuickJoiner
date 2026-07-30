@@ -650,6 +650,77 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
         job = syncs.start_cleanup(name, source_id)
         return {"removed": name, "job": job.summary()}
 
+    # ------------------------------------------------- credential-gated web scraping
+    # Sign-in for a `web_scrape` connector with use_browser=true. Unlike the Microsoft
+    # flow below there is no redirect: a real Chromium window opens ON THE SERVER HOST
+    # and the user signs in there, so this is a background job the UI polls. The URL is
+    # taken from the connector's own configuration, never from the request — this route
+    # must not become a way to make the server open an arbitrary page.
+    def _scrape_connector(name: str, user: str | None):
+        from quickjoiner.connectors.browser.scraper import WebScrapeConnector
+        from quickjoiner.connectors.registry import create_connector
+
+        source = _find_source(name, user)
+        connector = create_connector(source, ctx.workspace)
+        if not isinstance(connector, WebScrapeConnector):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{name!r} is a {source.type} connector, not a web_scrape one",
+            )
+        starts = connector._start_urls()
+        if not starts:
+            raise HTTPException(status_code=400, detail=f"{name!r} has no start_urls configured")
+        return source, connector, starts[0]
+
+    @api.post("/api/connectors/{name}/browser/login", tags=["Connectors"], summary="Open a sign-in window on the QuickJoiner host for a credential-gated web_scrape connector. Background job — poll GET .../browser/session. 409 if one is already open or the host has no display.")
+    def browser_login_start(name: str, authorization: str | None = Header(default=None)):
+        """Start an interactive sign-in for a `use_browser=true` scrape connector.
+
+        A real browser window opens **on the machine running QuickJoiner** (same machine as
+        the UI in a local-first setup; a headless host is refused with an explanation).
+        The window's URL comes from the connector's own `start_urls`."""
+        from quickjoiner.connectors.browser import login_jobs
+
+        user = _user(authorization)
+        _require_user(user)
+        source, _connector, url = _scrape_connector(name, user)
+        _require("connectors:write", user)
+        if not can_manage(source, user, auth.enabled):
+            raise HTTPException(status_code=403, detail="Only the owner can sign this connector in")
+        try:
+            job = login_jobs.start(ctx.workspace, name, url)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        return {"login": job.summary()}
+
+    @api.get("/api/connectors/{name}/browser/session", tags=["Connectors"], summary="Whether this web_scrape connector's saved browser session still works (fetches its start URL and reports content vs sign-in page), plus any in-flight sign-in.")
+    def browser_session_status(name: str, verify: bool = True,
+                               authorization: str | None = Header(default=None)):
+        """Report the saved session's real state. `verify=false` skips the live fetch and
+        answers from stored cookies alone — cheap, for polling while a window is open."""
+        from quickjoiner.connectors.browser import login_jobs
+        from quickjoiner.connectors.browser.session import (
+            has_profile,
+            session_hosts,
+            verify_session,
+        )
+
+        user = _user(authorization)
+        _source, _connector, url = _scrape_connector(name, user)
+        job = login_jobs.status(name)
+        out: dict = {
+            "url": url,
+            "has_profile": has_profile(ctx.workspace),
+            "hosts": session_hosts(ctx.workspace),
+            "can_open_window": login_jobs.display_hint() is None,
+            "display_hint": login_jobs.display_hint(),
+            "login": job.summary() if job else None,
+        }
+        if verify and not (job and job.summary()["active"]):
+            ok, detail = verify_session(ctx.workspace, url)
+            out["signed_in"], out["detail"] = ok, detail
+        return out
+
     # ---------------------------------------------------------------- Microsoft 365
     # Sign-in for the OneDrive/SharePoint connector. Two flows exist because
     # QuickJoiner runs in two places: this is the browser one (authorization code +
@@ -1482,6 +1553,38 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
             return {"entity": {"id": ent["id"], "name": ent["name"], "type": ent["type"]},
                     **ctx.catalog.graph_snapshot(ent["id"], limit)}
         return ctx.catalog.graph_snapshot(None, limit)
+
+    @api.get("/api/graph/pending", tags=["Knowledge graph"], summary="How many ingested documents still have unmined relationships (deferred LLM triple extraction that never resolved), broken down by source.")
+    def graph_pending(authorization: str | None = Header(default=None)):
+        """Documents whose deferred graph work never landed. A connector that ingests a
+        moving window (recent sprints) never re-yields them, so they stay queued forever
+        with chunks and citations but no edges — `POST /api/graph/drain` finishes them."""
+        _user(authorization)
+        return {
+            "total": ctx.catalog.count_graph_pending(),
+            "by_source": [
+                {"source_id": r["source_id"], "count": int(r["n"])}
+                for r in ctx.catalog.graph_pending_by_source()
+            ],
+            "extraction_enabled": bool(getattr(ctx.pipeline, "extracts_triples", False)),
+        }
+
+    @api.post("/api/graph/drain", tags=["Knowledge graph"], summary="Mine the relationships of documents whose deferred graph work never landed, without a connector round-trip. Runs as a background job (returns {job}, source \"graph relationships\"). 409 while any other job is running or when LLM triple extraction is off.")
+    def graph_drain(source_id: str | None = None,
+                    authorization: str | None = Header(default=None)):
+        """Re-read the text already indexed for each queued document and resolve its
+        relationships in place. Optionally scoped to one `source_id`. Runs as a background
+        job so it streams logs and lands in the activity feed — it is one LLM call per
+        document. Refuses (409) while another job is in flight (it writes edges across
+        sources) or when `graph.extract_triples` is off (nothing could resolve)."""
+        user = _user(authorization)
+        _require_user(user)
+        _require("sync:run", user)
+        try:
+            job = syncs.start_drain(source_id)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        return {"job": job.summary()}
 
     @api.get("/api/graph/search", tags=["Knowledge graph"], summary="Entity autocomplete over the graph (name/alias substring, ranked by connectivity).")
     def graph_search(q: str, limit: int = 10):

@@ -442,12 +442,21 @@ is a lookup rather than a bet on vector ranking:
   from dependency maps, ticket-key references, issue/deploy metadata, **code structure**
   (`repo --defines--> symbol`, `repo --imports--> module`, per code file), and — optionally —
   **LLM-extracted relationships** over prose docs (`graph.extract_triples`, off by default; every
-  edge validated against a fixed vocabulary and cited to its document).
+  edge validated against a fixed vocabulary **and against per-relation domain/range signatures** —
+  "prod owns bob" is dropped even though every word is legal — and cited to its document).
 - **Graph-expansion retrieval** (on by default): once an answer is grounded, QuickJoiner walks one
   hop out in the graph to surface linked evidence the vector search missed (a ticket → the repo that
   references it → the deploy that shipped it). It never changes the grounded-vs-refuse decision.
 - Surfaced as the **Waypoints** graph view, agent tools `graph_neighbors` / `graph_path`, and
   `GET /api/graph` / `GET /api/graph/path`.
+
+When relationship extraction is on, it runs *after* the fast ingest loop — so a run that is stopped
+(or a connector that pulls a **moving window**, like Azure DevOps' recent sprints) can leave
+documents indexed and citable but with no relationships mined, and nothing re-provides them for a
+later sync to retry. Settings → **Knowledge graph** shows that queue whenever it isn't empty, with
+one button to finish it; `qj drain-graph [source]` and `POST /api/graph/drain` do the same from the
+CLI/API. It re-reads the text already indexed for those documents — no connector round-trip — and
+tells you plainly which ones it could rebuild in full versus only re-mine from stored text.
 
 Retrieval quality is tuned for this too: **contextual chunking** prepends each chunk with its
 `source · title · path` breadcrumb (and markdown sub-chunks keep their section heading) so a
@@ -498,7 +507,44 @@ qj extract report.pptx                 # what can QuickJoiner actually read from
                                        #   per-slide character counts; --full for all text.
                                        #   Needs no workspace and ingests nothing.
 qj browser login https://sso.acme.com  # persistent Playwright profile (install: pip install -e ".[browser]")
+qj browser status https://sso.acme.com # is that saved sign-in still working?
 ```
+
+### Ingesting a site behind a login
+
+**From the web UI:** create the connector with **"Always use signed-in browser session"**
+ticked, then press **Sign in to this site** on its plate — a browser window opens on the
+machine running QuickJoiner, you sign in once, and the plate switches from `sign-in required`
+to `signed in`. If a later sync hits an expired session, the sync log says so and offers the
+same button. *(The window opens on the **server's** desktop; on a headless host the UI says so
+and points you at the CLI below.)*
+
+**From the CLI**, point a `web_scrape` connector at it with **`use_browser=true`** and sign in once:
+
+```powershell
+qj connect web_scrape --name Plumber -o start_urls=https://plumber.acme.corp/ `
+                                     -o use_browser=true -o max_pages=300
+qj browser login https://plumber.acme.corp/   # real window; sign in, then close it
+qj sync Plumber
+```
+
+`login` tells you *"✓ signed in — you can close the window now"* the moment the sign-in
+round-trip lands, and re-checks it after the window closes rather than assuming. Two things
+worth knowing, both learned the hard way:
+
+- **Session cookies.** Most SSO sign-ins (anything `IsPersistent=false`, including ASP.NET
+  Core's default) issue a cookie the browser keeps only in memory, so a browser profile alone
+  loses your login the instant the window closes. QuickJoiner captures those explicitly while
+  the window is open and replays them on each crawl — this is why signing in actually sticks.
+- **A login page is not an error.** A gated site answers an unauthenticated request with
+  `200 OK` and a sign-in form, so nothing "fails". If your session lapses, the sync says
+  *"⚠ N page(s) returned a sign-in page"* and `qj test <name>` refuses rather than reporting
+  a healthy connector that quietly ingests nothing.
+
+If your SSO offers a "Use Domain Credentials" / Windows-integrated button, prefer the
+username+password form — this Chromium has no enterprise auth allowlist, so the integrated
+path usually dead-ends. Internal CA certificates are fine: Chromium uses the OS trust store
+(the plain-HTTP path does not, which is another reason `use_browser=true` matters here).
 
 ## Cloud mode (Postgres + pgvector)
 

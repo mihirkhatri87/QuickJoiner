@@ -249,3 +249,76 @@ def test_browser_mode_requires_profile(tmp_path):
     )
     status = connector.test()
     assert not status.ok and "qj browser login" in status.message
+
+
+# ---------------------------------------------- auth-wall detection (2026-07-30)
+# A credential-gated site does not fail a fetch: it answers 200 with a sign-in page,
+# which page_document then drops as too short. That produced a silent "0 documents"
+# indistinguishable from an empty site — found live against an internal OIDC app.
+
+def test_looks_like_login_detects_the_sso_redirect_and_the_form():
+    from quickjoiner.connectors.browser.session import looks_like_login
+
+    # 1. redirected to the identity provider — a different host is sufficient on its own,
+    #    even though the login page's own text is short.
+    assert looks_like_login(
+        "https://staffaccount.apps.example.corp/SignIn?ReturnUrl=%2Fconnect",
+        "https://plumber.example.corp/",
+        "STAFF LOGIN\nUse Domain Credentials\nUsername\nPassword\nSign In",
+        "Identity Server",
+    )
+    # 2. same-host login page — caught on text instead
+    assert looks_like_login(
+        "https://plumber.example.corp/login", "https://plumber.example.corp/login",
+        "Please sign in\nUsername\nPassword", "Login",
+    )
+    # 3. real content on the right host is NOT flagged...
+    assert not looks_like_login(
+        "https://plumber.example.corp/repos", "https://plumber.example.corp/repos",
+        "Repository map\n" + "billing-api  team-payments  logs: kibana-prod\n" * 60,
+        "Repository map",
+    )
+    # 4. ...and neither is a long genuine page that merely talks *about* authentication
+    assert not looks_like_login(
+        "https://plumber.example.corp/docs/auth", "https://plumber.example.corp/docs/auth",
+        "How single sign-on works here. Users sign in with a username and password.\n" * 40,
+        "Authentication guide",
+    )
+
+
+def test_login_state_roundtrip_keeps_session_cookies(tmp_path):
+    """The whole point: a session cookie (expires -1) is what a persistent profile CANNOT
+    keep, so it must survive save/load — otherwise sign-in silently evaporates."""
+    from quickjoiner.connectors.browser.session import (
+        load_state,
+        save_state,
+        session_hosts,
+    )
+
+    state = {"cookies": [
+        {"name": ".AspNetCore.Cookies", "value": "x", "domain": "plumber.example.corp",
+         "path": "/", "expires": -1, "httpOnly": True, "secure": True, "sameSite": "Lax"},
+        {"name": ".AspNetCore.Correlation.abc", "value": "y", "domain": "plumber.example.corp",
+         "path": "/", "expires": 1.0, "httpOnly": True, "secure": True, "sameSite": "None"},
+    ], "origins": []}
+    save_state(tmp_path, state)
+    assert load_state(tmp_path) == state
+    assert session_hosts(tmp_path) == ["plumber.example.corp"]
+    assert load_state(tmp_path)["cookies"][0]["expires"] == -1  # session cookie preserved
+
+
+def test_handshake_cookies_are_not_mistaken_for_a_session():
+    """OIDC leaves Correlation/Nonce crumbs even when sign-in never completed — counting
+    those as 'signed in' is exactly what made the failure look like success."""
+    from quickjoiner.connectors.browser.session import _is_handshake
+
+    assert _is_handshake(".AspNetCore.Correlation.7JEHBXl9QMt4roq1")
+    assert _is_handshake(".AspNetCore.OpenIdConnect.Nonce.CfDJ8NGeFphj")
+    assert not _is_handshake(".AspNetCore.Cookies")
+    assert not _is_handshake("idsrv.session")
+
+
+def test_missing_state_file_is_not_an_error(tmp_path):
+    from quickjoiner.connectors.browser.session import load_state, session_hosts
+
+    assert load_state(tmp_path) is None and session_hosts(tmp_path) == []

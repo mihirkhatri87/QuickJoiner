@@ -11,10 +11,16 @@ export interface SyncJob {
   source: string;
   state: SyncState;
   /** "sync" pulls documents in; "cleanup" purges what a source taught us; "reset" wipes ALL
-   * ingested memory across the workspace (source is the sentinel "all memory"). */
-  kind: "sync" | "cleanup" | "reset";
+   * ingested memory across the workspace (source is the sentinel "all memory"); "drain"
+   * mines relationships for already-ingested documents whose connector never re-yields them
+   * (source is the sentinel "graph relationships"). */
+  kind: "sync" | "cleanup" | "reset" | "drain";
   clean: boolean;
-  stats: { added: number; updated: number; skipped: number; chunks: number; errors: number } | null;
+  /** Sync jobs report ingest counts; a drain reports what it recovered. */
+  stats:
+    | { added: number; updated: number; skipped: number; chunks: number; errors: number }
+    | { documents: number; faithful: number; text_only: number; missing_text: number; orphans: number }
+    | null;
   error: string | null;
   started_at: string;
   ended_at: string | null;
@@ -105,6 +111,33 @@ export interface ConnectorRow {
   sync_interval_minutes: number | null;
   options: Record<string, unknown>;
   modes: string[];
+}
+
+/** An in-flight interactive browser sign-in running on the QuickJoiner host. */
+export interface BrowserLoginJob {
+  source: string;
+  url: string;
+  state: "opening" | "waiting" | "verifying" | "done" | "error";
+  message: string;
+  signed_in: boolean | null;
+  hosts: string[];
+  started_at: string;
+  ended_at: string | null;
+  active: boolean;
+}
+
+/** Whether a credential-gated web_scrape connector's saved browser session still works.
+ * `signed_in` comes from actually fetching the start URL — a saved profile alone proves
+ * nothing, which is the trap this endpoint exists to close. Absent while a login runs. */
+export interface BrowserSessionStatus {
+  url: string;
+  has_profile: boolean;
+  hosts: string[];
+  can_open_window: boolean;
+  display_hint: string | null;
+  login: BrowserLoginJob | null;
+  signed_in?: boolean;
+  detail?: string;
 }
 
 /** OneDrive/SharePoint sign-in state. Never carries the tokens themselves — only who

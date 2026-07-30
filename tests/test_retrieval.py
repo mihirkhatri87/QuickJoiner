@@ -10,6 +10,9 @@ deterministic without depending on real embedding geometry.
 
 from __future__ import annotations
 
+import pytest
+from pydantic import ValidationError
+
 from quickjoiner.config import RetrievalConfig
 from quickjoiner.connectors.base import Document
 from quickjoiner.ingest.normalize import normalize_query, normalize_text
@@ -186,6 +189,73 @@ def test_create_store_wires_retrieval_config(tmp_path):
     store = create_store(tmp_path / "ws", FakeEmbedder(), retrieval)
     assert store._retrieval is retrieval
     assert store._reranker is None  # explicitly disabled -> no cross-encoder built
+
+
+# --------------------------------------------------------------- IVF_PQ scoring
+# Regression for the plan-05 finding (2026-07-28): LanceDB's default ANN index is
+# IVF_PQ (product-quantized), which distorts `_dense`'s cosine SCORE by 0.25-0.45 —
+# not just recall — because `min_score` gates on that same score. No prior test
+# ever crossed `ann_min_rows` with a real index, so nothing caught it. LanceDB
+# needs >=256 rows to train PQ at all, hence the bulk of rows below.
+
+_ANN_WORDS = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta",
+              "iota", "kappa", "lambda", "mu", "nu", "xi", "omicron", "pi", "rho",
+              "sigma", "tau", "upsilon", "phi", "chi", "psi", "omega", "zero",
+              "one", "two", "three", "four", "five"]
+
+
+def _bulk_chunks(n: int, seed: int = 0) -> list[str]:
+    import random
+    rng = random.Random(seed)
+    return [" ".join(rng.choices(_ANN_WORDS, k=6)) for _ in range(n)]
+
+
+def test_ann_refine_factor_restores_exact_scores_above_min_rows(workspace):
+    chunks = _bulk_chunks(400)
+    query = "alpha beta gamma delta epsilon zeta"
+
+    # Exact (brute-force, no index): the ground truth. ann_min_rows is set above
+    # the row count so no index gets built.
+    exact_store = KnowledgeStore(workspace / "exact", FakeEmbedder(),
+                                  retrieval=RetrievalConfig(ann_min_rows=10_000, hybrid=False, reranker="none"))
+    exact_store.upsert_document("bulk", "src", "u", "Bulk", "doc", chunks)
+    exact_hits = exact_store.search(query, top_k=5, min_score=0.0)
+    assert exact_hits
+    exact_top_score = exact_hits[0].score
+
+    # Same data, but small enough ann_min_rows that a real IVF_PQ index is built.
+    indexed_store = KnowledgeStore(workspace / "indexed", FakeEmbedder(),
+                                    retrieval=RetrievalConfig(ann_min_rows=200, hybrid=False, reranker="none"))
+    indexed_store.upsert_document("bulk", "src", "u", "Bulk", "doc", chunks)
+    indexed_store.ensure_ann_index()
+    assert indexed_store._table().list_indices()  # index actually built, not skipped
+
+    indexed_hits = indexed_store.search(query, top_k=5, min_score=0.0)
+    assert indexed_hits
+    # Same top hit, and its score restored to (near) the exact cosine — refine_factor
+    # re-ranks the ANN candidates against their un-quantized vectors.
+    assert indexed_hits[0].doc_id == exact_hits[0].doc_id
+    assert abs(indexed_hits[0].score - exact_top_score) < 0.03
+
+
+def test_ann_refine_factor_defaults_on_and_rejects_the_crashing_zero():
+    assert RetrievalConfig().ann_refine_factor == 10
+    assert RetrievalConfig(ann_refine_factor=1).ann_refine_factor == 1  # minimum-cost setting
+    # LanceDB raises "Refine factor cannot be zero", so 0 would break every dense
+    # search on an indexed workspace — it must be rejected at config validation, not
+    # accepted and left to explode at query time.
+    with pytest.raises(ValidationError):
+        RetrievalConfig(ann_refine_factor=0)
+
+
+def test_ann_refine_factor_one_still_searches_on_a_real_index(workspace):
+    """The `ge=1` floor must actually be usable, not just non-zero."""
+    store = KnowledgeStore(workspace, FakeEmbedder(),
+                           retrieval=RetrievalConfig(ann_min_rows=200, hybrid=False,
+                                                     reranker="none", ann_refine_factor=1))
+    store.upsert_document("bulk", "src", "u", "Bulk", "doc", _bulk_chunks(400))
+    store.ensure_ann_index()
+    assert store.search("alpha beta gamma delta epsilon zeta", top_k=3, min_score=0.0)
 
 
 # -------------------------------------------------------- contextual chunking

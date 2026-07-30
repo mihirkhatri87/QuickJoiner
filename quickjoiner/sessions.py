@@ -34,6 +34,7 @@ from quickjoiner.llm.base import Message, ToolCall
 from quickjoiner.ingest.triples import (
     ALLOWED_RELS_LINE,
     ALLOWED_TYPES_LINE,
+    SIGNATURE_LINES,
     TRIPLE_RELS,
     TRIPLE_TYPES,
     Triple,
@@ -59,6 +60,7 @@ RELATIONSHIPS lines record concrete links between two NAMED things that this
 conversation established (e.g. "team: payments guild | owns | repo: proj-a").
 {ALLOWED_TYPES_LINE}
 {ALLOWED_RELS_LINE}
+{SIGNATURE_LINES}
 Use names exactly as the conversation gave them. Never invent relationships.
 
 If a section has nothing, leave it empty. Output nothing else.\

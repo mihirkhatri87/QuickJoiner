@@ -14,7 +14,7 @@ import quickjoiner.app as app_module
 from quickjoiner.api.app import create_app
 from quickjoiner.api.hooks import verify_signature
 from quickjoiner.app import AppContext, build_context
-from quickjoiner.config import RetrievalConfig
+from quickjoiner.config import RetrievalConfig, SourceConfig
 from quickjoiner.llm.base import AgentTool, ChatResult, ToolCall, ToolSpec
 
 from tests.conftest import FakeEmbedder
@@ -101,6 +101,10 @@ def test_learn_endpoint_teaches_fact(client):
                                         "topic": "nautical ownership"})
     assert r.status_code == 200
     assert "Remembered" in r.json()["result"]
+    # This checks the note is live memory, not grounding-threshold behavior — bypass
+    # min_score so it stays robust to retuning (FakeEmbedder's breadcrumb dilution
+    # scores real content lower than bge-small would for the same text).
+    client.patch("/api/settings", json={"retrieval": {"min_score": 0.0}})
     hits = client.get("/api/search", params={"q": "payments guild owns nautical"}).json()
     assert any(h["uri"].startswith("note://") for h in hits)  # taught note is live memory
 
@@ -358,6 +362,13 @@ def test_sync_then_sources_and_search(client):
     handbook = next(r for r in rows if r["name"] == "handbook")
     assert handbook["documents"] == 1 and handbook["configured"] is True
 
+    # This checks the synced doc is searchable memory, not grounding-threshold behavior —
+    # bypass min_score so it stays robust to retuning (see test_learn_endpoint_teaches_fact).
+    # It matters more here than it looks: contextual chunking puts the document's **uri** in
+    # the chunk's breadcrumb, and under FakeEmbedder's 32-bucket hash that random pytest
+    # tmp path shifts the cosine by ±0.06 run to run — straddling the 0.64 gate, so the
+    # assertion was a coin flip on the temp directory's name.
+    client.patch("/api/settings", json={"retrieval": {"min_score": 0.0}})
     hits = client.get("/api/search", params={"q": "We deploy with Octopus on Fridays."}).json()
     assert hits and hits[0]["uri"].startswith("file://")
     assert "Octopus" in hits[0]["text"]
@@ -536,6 +547,49 @@ def test_reset_memory_wipes_knowledge_keeps_connectors(client):
     # Re-sync repopulates from scratch (watermark was cleared).
     client.post("/api/sync/handbook")
     assert _wait_sync(client, "handbook")["stats"]["added"] == 1
+
+
+def test_graph_pending_and_drain_endpoints(api_workspace):
+    """AI #25: the queue is visible, and draining it runs as a real background job."""
+    ctx = build_context(api_workspace)  # explicit ctx so the test can wire its extractor
+    client = TestClient(create_app(api_workspace, ctx=ctx))
+    client.post("/api/sync/handbook")
+    _wait_sync(client, "handbook")
+    doc_id = ctx.catalog.documents_for_source("files:handbook")[0]["doc_id"]
+
+    empty = client.get("/api/graph/pending").json()
+    assert empty["total"] == 0 and empty["extraction_enabled"] is False
+    # With extraction off there is nothing a drain could resolve, so it refuses outright
+    # instead of quietly clearing the queue.
+    assert client.post("/api/graph/drain").status_code == 409
+
+    ctx.catalog.mark_graph_pending(doc_id, "files:handbook")
+    listed = client.get("/api/graph/pending").json()
+    assert listed["total"] == 1
+    assert listed["by_source"] == [{"source_id": "files:handbook", "count": 1}]
+
+    calls: list[str] = []
+    ctx.config.graph.triple_min_chars = 1  # the fixture's doc is a couple of lines long
+    ctx.pipeline._triple_extractor = lambda text, title: calls.append(title) or []
+    r = client.post("/api/graph/drain")
+    assert r.status_code == 200
+    job = r.json()["job"]
+    assert job["kind"] == "drain" and job["source"] == "graph relationships"
+    done = _wait_job(client, "graph relationships")
+    assert done["state"] == "done" and done["stats"]["documents"] == 1
+    assert calls == ["deploys.md"]  # the queued document's text was re-read and mined
+    assert client.get("/api/graph/pending").json()["total"] == 0
+
+
+def test_drain_refuses_while_a_job_runs(api_workspace, monkeypatch):
+    """It rewrites edges across sources, so it must not race a sync of one of them."""
+    import quickjoiner.sync_manager as sm
+
+    ctx = build_context(api_workspace)
+    ctx.pipeline._triple_extractor = lambda text, title: []
+    client = TestClient(create_app(api_workspace, ctx=ctx))
+    monkeypatch.setattr(sm.SyncManager, "active_sources", lambda self: ["handbook"])
+    assert client.post("/api/graph/drain").status_code == 409
 
 
 def test_reset_memory_refuses_while_a_job_runs(client, monkeypatch):
@@ -807,6 +861,9 @@ def test_hook_github_scheme_ingests_and_registers_source(client):
     ghrepo = next(r for r in rows if r["name"] == "ghrepo")
     assert ghrepo["documents"] == 1
 
+    # This checks the pushed doc is live memory, not grounding-threshold behavior —
+    # bypass min_score so it stays robust to retuning (see test_learn_endpoint_teaches_fact).
+    client.patch("/api/settings", json={"retrieval": {"min_score": 0.0}})
     hits = client.get(
         "/api/search", params={"q": "The Friday deploy fails intermittently on the smoke stage."}
     ).json()
@@ -1038,3 +1095,57 @@ def test_deleting_a_onedrive_connector_removes_its_stored_refresh_token(client, 
     assert client.delete("/api/connectors/gone").status_code == 200
     # A refresh token is redeemable on its own — it must not outlive its connector.
     assert not token_path(api_workspace, "onedrive:gone").exists()
+
+
+# ------------------------------------------------- browser sign-in for gated scraping
+
+def test_browser_session_endpoints_report_and_guard(api_workspace, monkeypatch):
+    """A credential-gated scrape connector's session is inspectable and re-signinable from
+    the UI. The session check must FETCH, not just look for a profile directory — that is
+    the trap that made a broken connector report healthy."""
+    from quickjoiner.connectors.browser import login_jobs
+
+    ctx = build_context(api_workspace)
+    ctx.catalog.write_source(SourceConfig(
+        name="gated", type="web_scrape",
+        options={"start_urls": "https://gated.test/", "use_browser": "true"}))
+    ctx.config = ctx.catalog.load_config()
+    client = TestClient(create_app(api_workspace, ctx=ctx))
+
+    monkeypatch.setattr("quickjoiner.connectors.browser.session.verify_session",
+                        lambda ws, url: (False, "landed on https://sso.test/SignIn — that is a sign-in page."))
+    body = client.get("/api/connectors/gated/browser/session").json()
+    assert body["url"] == "https://gated.test/"
+    assert body["signed_in"] is False and "sign-in page" in body["detail"]
+
+    monkeypatch.setattr("quickjoiner.connectors.browser.session.verify_session",
+                        lambda ws, url: (True, "https://gated.test/ returned 4210 characters"))
+    assert client.get("/api/connectors/gated/browser/session").json()["signed_in"] is True
+
+    # Starting a sign-in is a background job; the URL comes from the connector's own
+    # config, never the request (this route must not open arbitrary pages on the server).
+    started = {}
+
+    def fake_start(ws, name, url):
+        started["url"] = url
+        return login_jobs.LoginJob(source=name, url=url)
+
+    monkeypatch.setattr(login_jobs, "start", fake_start)
+    r = client.post("/api/connectors/gated/browser/login")
+    assert r.status_code == 200
+    assert started["url"] == "https://gated.test/"
+    assert r.json()["login"]["source"] == "gated"
+
+    # A host with no display refuses with an explanation rather than hanging.
+    def boom(ws, name, url):
+        raise RuntimeError("This server has no display")
+
+    monkeypatch.setattr(login_jobs, "start", boom)
+    r = client.post("/api/connectors/gated/browser/login")
+    assert r.status_code == 409 and "no display" in r.json()["detail"]
+
+
+def test_browser_session_rejects_a_non_scrape_connector(api_workspace):
+    client = TestClient(create_app(api_workspace))
+    r = client.get("/api/connectors/handbook/browser/session")
+    assert r.status_code == 400 and "not a web_scrape" in r.json()["detail"]

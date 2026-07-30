@@ -64,7 +64,7 @@ ACs are Given/When/Then; tests name real files for shipped stories.
 - **E2.5 [S]** Secrets only via env indirection (`token=env:VAR`). Tests: `test_connectors.py::test_resolve_secret_precedence`.
 
 ### E3 — Grounded Q&A (the contract)
-- **E3.1 [S]** Agent must search before answering org questions; cites `[title|uri]`; refuses below `retrieval.min_score` (cosine 0.55, bge-small-tuned). Tests: `test_agent_loop.py`, `test_evals.py`.
+- **E3.1 [S]** Agent must search before answering org questions; cites `[title|uri]`; refuses below `retrieval.min_score` (cosine 0.64, bge-small-tuned; retuned 2026-07-29 together with the `ann_refine_factor` fix that stopped LanceDB's product-quantized index distorting the score this gate reads). Tests: `test_agent_loop.py`, `test_evals.py`, `test_retrieval.py`.
 - **E3.2 [S]** Hybrid retrieval: dense + BM25 (FTS5 / Postgres tsvector) fused by RRF; optional cross-encoder reranker; **the refusal gate stays dense** so hybrid never converts a refusal into an invention. Tests: `test_retrieval.py`, `test_pg_backend.py`.
 - **E3.3 [S]** Multi-hop chaining guidance (ticket → code → deploy) in the system prompt.
 - **E3.4 [S]** Streaming + extended thinking on both providers (Anthropic, Ollama); SSE events `thinking|delta|tool_call|answer|error|done`. Tests: `test_streaming.py`, `test_api.py`.

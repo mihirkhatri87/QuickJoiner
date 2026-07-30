@@ -117,6 +117,22 @@ class PgVectorStore:
             ).fetchall()
         return [row["text"] for row in rows]
 
+    def get_documents_chunks(self, doc_ids: list[str]) -> dict[str, list[str]]:
+        """Ordered chunk texts for many documents in one round trip (see the LanceDB
+        store's note — the graph-pending drain reads thousands)."""
+        if not doc_ids:
+            return {}
+        with self._pool.connection() as conn:
+            rows = conn.execute(
+                "SELECT doc_id, text FROM chunks WHERE doc_id = ANY(%s) "
+                "ORDER BY doc_id, chunk_index",
+                (list(dict.fromkeys(doc_ids)),),
+            ).fetchall()
+        out: dict[str, list[str]] = {}
+        for row in rows:
+            out.setdefault(row["doc_id"], []).append(row["text"])
+        return out
+
     def delete_source(self, source_id: str) -> None:
         with self._pool.connection() as conn:
             conn.execute("DELETE FROM chunks WHERE source_id = %s", (source_id,))

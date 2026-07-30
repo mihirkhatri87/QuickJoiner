@@ -50,10 +50,16 @@ qj onedrive login|status|logout <name>        # Microsoft 365 device-code sign-i
 qj onedrive learn <name> <url-or-path>...     #   connector; `learn` ingests ONLY what you point
                                               #   at (nothing is crawled). Web UI: Sign in with
                                               #   Microsoft on the connector plate.
-qj browser login <url> / qj browser status    # Playwright profile for user-credential fallback
+qj browser login <url> / qj browser status [url]  # Playwright profile for credential-gated
+                                              #   sites; `login` captures session cookies and
+                                              #   VERIFIES the sign-in took (exit 1 if not),
+                                              #   `status [url]` re-checks it later
 qj eval <set.yaml> [--init] [--agent]         # grounding evals: retrieval metrics always
                                               #   (recall@k, MRR, threshold, refusal accuracy);
                                               #   --agent adds end-to-end behavior checks (needs LLM)
+qj drain-graph [name]                         # mine relationships for already-ingested docs whose
+                                              #   deferred extraction never resolved (a moving-window
+                                              #   connector never re-yields them, so no sync retries it)
 ```
 
 Workspace layout: `catalog.db` (SQLite — **config settings + connector sources now live here**,
@@ -366,6 +372,32 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   when the API implies it (legacy `QueueClient` deliberately ignored). Same pure contract as
   code_graph (`extract_pubsub_graph(text, uri, src_id)`), wired beside it in `_sync_graph`; always on;
   tests `tests/test_pubsub_graph.py` incl. the cross-repo publisher↔subscriber bridge deps.py can't make.
+  **Draining deferred graph work a connector will never re-provide (`drain_pending_graph`,
+  2026-07-30, AI_ROADMAP #25):** a `graph_pending` row is normally retried by the next sync that
+  re-yields the document — which never comes for a connector ingesting a moving window (a TFS
+  work item aged out of every team's recent-sprint slice; the live workspace had **1,331** such
+  documents). Those documents keep their chunks, vectors and citations and have **no edges at
+  all**, because `_sync_graph` defers a qualifying document's ENTIRE graph — connector-supplied
+  `metadata["graph"]` included — until its LLM triples resolve. `drain_pending_graph(source_id=,
+  control=, log=)` re-reads the text that was actually indexed (`store.get_documents_chunks`,
+  one filtered scan for the whole work-list; the contextual-chunking breadcrumb is stripped back
+  off so the rebuilt text is the document, not its provenance line repeated per chunk), rebuilds
+  a synthetic `Document`, and runs it through the SAME `_sync_graph` → `_resolve_pending_triples`
+  path — no connector round-trip, and pause/stop/staging work exactly as in a sync. **Faithfulness
+  is explicit, not assumed:** `mark_graph_pending` now stores the deterministic payload
+  (`graph_pending.graph_json`) so a drained document is rebuilt *completely* (dev-links,
+  hierarchy, deps edges), while rows predating that column can only be re-mined from stored text
+  and are counted+logged separately (`DrainStats.faithful` vs `text_only`) rather than folded into
+  a total that would read as full recovery. A document whose chunks are gone stays queued
+  (`missing_text`), never resolved with an invented empty graph; `sweep_orphan_graph_pending`
+  drops rows whose document was deleted. Surfaces: `SyncManager.start_drain` (`kind="drain"`,
+  sentinel source `"graph relationships"` — refuses while any other job runs, and syncs refuse
+  while it runs, since it writes edges across sources; refuses outright when
+  `graph.extract_triples` is off rather than silently clearing the queue),
+  `GET /api/graph/pending` + `POST /api/graph/drain[?source_id=]`, `qj drain-graph [name]`, and a
+  Settings → Knowledge graph panel that appears only when the queue is non-empty. Tests:
+  `tests/test_triples.py` (faithful vs text-only rebuild, scoping, orphan sweep, missing-text
+  left queued, breadcrumb strip), `tests/test_sync_manager.py`, `tests/test_api.py`.
   `triples.py` holds the shared triple vocab + `parse_triples` + `triples_to_graph`
   (**re-exported from `sessions.py`** for back-compat) and `extract_doc_triples(provider,…)` — optional
   LLM relationship extraction over prose docs, config-gated by `graph.extract_triples` (OFF by default:
@@ -379,6 +411,40 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   (lockstep-guarded by `test_compress_prompt_vocab_in_lockstep_with_validator`). Ingest-time: new
   verbs mine prose only when `graph.extract_triples` is on + re-sync; distillation picks them up on
   every compression regardless.
+  **Relation signatures (ontology-lite domain/range validation, 2026-07-30, AI_ROADMAP #21):**
+  the type check and the relation check were independent, so a line whose three words were each
+  in-vocabulary became a real edge even when the combination is a category error —
+  `environment: prod | owns | person: bob` validated. `RELATION_SIGNATURES` declares, per relation,
+  which entity types may stand on its LEFT (domain) and RIGHT (range); `signature_allows` (pure) is
+  a second gate inside `parse_triples`, dropping an off-signature line exactly like an
+  off-vocabulary one — never coercing it. Deliberately **permissive**: it rejects impossible
+  shapes, not arguable ones, because a tight signature silently deletes true relationships (the
+  failure that actually matters for a system whose claim is that it only says what it learned).
+  `references` is explicitly `UNSIGNED_RELS` — it asserts co-occurrence ("mentioned alongside"),
+  not a typed link, so constraining it would only invent violations.
+  **Calibrated against the real 109k-edge graph, not taste (same day, during live testing):**
+  the first cut was drawn around an idealised ontology and rejected **4,201 of 29,461**
+  in-vocabulary edges (13.6%) — of which **43% were perfectly sensible statements** real org
+  prose makes constantly (`person owns ticket`, `person works_on team` ×246,
+  `team provides service`, `service part_of environment` ×328). The data taught the actual
+  rule: **almost every genuine error is a *domain* error** — the subject cannot perform the
+  relation (inverted `ticket works_on person` ×548 dominates, then software "working on"
+  things, then places/channels acting as agents). **Ranges** only earn their keep where the
+  object type is definitional (publish→topic, store→datastore, deploy→software|place).
+  So subjects are constrained tightly, objects loosely, and `person` is excluded as an object
+  generally (people own and work on things, not the reverse). Re-measured: **2,441 rejections
+  (8.3%), effectively all real category errors** (107 residual, itself dominated by the
+  genuine `service publishes_to service`). Live-verified end to end against gemma4: 13 triples
+  extracted from realistic prose, **all signature-valid**, including the two shapes the first
+  table would have wrongly dropped — regression-guarded by
+  `test_signatures_admit_the_shapes_real_org_prose_actually_uses`. `SIGNATURE_LINES` renders the
+  table into **both** extraction prompts from that same dict (same lockstep discipline as the
+  ALLOWED_* lines), so a model is told the shape up front instead of having lines silently
+  discarded. The deterministic extractors don't route through `parse_triples` and build their
+  edges from structure, so every shape they emit conforms **by construction** — pinned by
+  `test_deterministic_extractor_edges_satisfy_their_signatures` rather than given the
+  lower-confidence scoring penalty the roadmap item speculated about (it could never fire).
+  A new verb in `TRIPLE_RELS` must declare a signature or be listed unsigned — lockstep-tested.
   **Entity-resolution adjudicator gets evidence context (plan 06 §1.D, 2026-07-17):** the
   `Adjudicator` seam in `entity_resolution.py` is 5-arg — `(type, name, candidates,
   new_entity_context, candidate_contexts)`. `pipeline._persist_graph` threads the evidence doc's
@@ -770,6 +836,51 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   respected. Injectable seams for offline tests: `_fetch_http` and `_transport` (httpx MockTransport).
   Browser hardening lives in `browser/session.py` (`DESKTOP_UA`, `_CONTEXT_OPTS`, `_STEALTH_JS`
   masking `navigator.webdriver`) — applied to both `qj browser login` and headless fetch.
+  **Credentialed sites: session-cookie capture + auth-wall detection (2026-07-30, found live
+  against an internal OIDC app).** A persistent profile only retains cookies Chromium writes to
+  **disk** — i.e. those carrying an explicit `Expires`. The cookie that actually authenticates
+  you usually has none: ASP.NET Core's `.AspNetCore.Cookies`, and any `IsPersistent=false`
+  sign-in, are **session cookies** held in memory and discarded when the window closes. So a
+  user could sign in perfectly and end up with a profile containing only OIDC
+  `Correlation`/`Nonce` handshake crumbs (those *do* carry Expires) — and every later fetch
+  landed back on the login page, was dropped by `page_document`'s 80-char floor, and the sync
+  reported a bare **"0 documents"**, indistinguishable from an empty site. Three fixes, all in
+  `session.py`: (1) `login()` snapshots `context.storage_state()` **while the window is still
+  open** (that export includes session cookies as `expires: -1`) to `<workspace>/browser_state.json`
+  every `_SNAPSHOT_SECONDS`, and `browser_session()` re-injects them via `add_cookies`
+  (per-cookie salvage on failure; the profile still does the heavy lifting). (2)
+  `looks_like_login(final_url, requested_url, text, title)` (**pure, tested**) — two independent
+  signals, either sufficient: the browser ended on a **different host** than requested (the SSO
+  redirect), or the page reads like a sign-in form (≥2 markers AND < 2000 chars, so a genuine
+  page *about* auth isn't flagged). (3) `verify_session(workspace, url)` fetches through the
+  saved session and reports content-vs-auth-wall. Wired in: `qj browser login` prints
+  "✓ signed in — you can close the window now" the moment the round-trip lands and **verifies
+  after the window closes** (exit 1 if not, with the Windows-integrated-auth tip);
+  `qj browser status [url]` lists the hosts with saved session cookies and optionally verifies;
+  `WebScrapeConnector.test()` with `use_browser=true` now **actually fetches the start URL**
+  instead of merely checking a profile directory exists (it used to green-light a connector that
+  could not fetch a single page); and `_crawl_via_browser` counts auth-wall pages and reports
+  `⚠ N page(s) returned a sign-in page…` via `_stage`, so a zero-document sync says *why*.
+  `_is_handshake` keeps OIDC crumbs from being mistaken for a real session. Tests:
+  `tests/test_scraper.py` (login detection incl. both false-positive guards, state round-trip
+  preserving `expires: -1`, handshake-cookie discrimination).
+  **Sign-in from the web UI (`login_jobs.py`, same day):** `qj browser login` is a blocking CLI
+  flow, so the UI drives the same thing as a background job — `POST /api/connectors/{name}/
+  browser/login` starts it, `GET …/browser/session` reports state. Two deliberate constraints:
+  the window's URL comes from the **connector's own `start_urls`**, never the request body (this
+  route must not become "make the server open an arbitrary page"), and `display_hint()` refuses
+  up front on a headless host (Linux with no `DISPLAY`/`WAYLAND_DISPLAY`) with instructions
+  rather than hanging until a launch timeout. **The window opens on the machine running the
+  server** — the same machine as the UI in a local-first workspace, and stated plainly in the UI
+  when it isn't. One login at a time per connector. Frontend: `BrowserSignInPanel` on the
+  connector plate (rendered only for `web_scrape` + a truthy `use_browser`, so a public crawl
+  shows nothing), polling `verify=false` while a window is open and running one real
+  verification when it closes; plus a **Sign in to this site** affordance in `SyncLogModal`
+  when a finished run's log carries the auth-wall line, since that is where the user is looking
+  when a sync mysteriously finds nothing. `web_scrape` gained a `next_step` in FORM_SPECS.
+  Tests: `tests/test_api.py` (session reports fetch-derived signed-in state, login start uses
+  the connector's configured URL, headless host → 409, non-scrape connector → 400).
+  Browser-verified against the real gated site.
 - `quickjoiner/connectors/specs.py` — `FORM_SPECS` per-type field catalog (label/required/secret/
   env/list) + `connector_catalog()` (adds supported `modes`) driving the web-UI connector forms
   and capability stamps. **Keep field keys in sync with what each connector reads from `options`.**
@@ -952,8 +1063,12 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   **runs as a background job** (`SyncManager.start_reset`, `kind="reset"`, source sentinel
   `"all memory"`) so it streams logs + lands in the activity feed/history like a cleanup; returns
   `{job}`; refuses 409 while any sync is active (and syncs refuse while a reset runs). The logs SSE
-  endpoint was relaxed to serve manager-only jobs (reset, or a just-deleted connector's cleanup) —
-  auth-gated, not requiring a configured source;
+  endpoint was relaxed to serve manager-only jobs (reset, drain, or a just-deleted connector's
+  cleanup) — auth-gated, not requiring a configured source;
+  **`GET /api/graph/pending`** (`graph:read`) — how many ingested documents still have unmined
+  relationships, by source, plus whether extraction is even enabled; **`POST /api/graph/drain
+  [?source_id=]`** (`sync:run`) starts the drain job described in the sync-manager bullet, 409
+  while another job runs or when `graph.extract_triples` is off;
   **`POST /api/uploads`** (multipart, `memory:write`) — off-hand document uploads (chat drag-drop /
   attach button / API): each file is `save_upload`-ed into `<workspace>/uploads/` and ingested into
   the rolling uploads source via `ingest.extract`, so it's cited memory immediately; returns a
@@ -1277,6 +1392,15 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   Resume/Stop with no UI change. Tests: `tests/test_sync_manager.py` (revive-as-cold, cold-resume
   re-pulls + completes, cold-stop finalizes, dead-running→interrupted, config-gone→interrupted) +
   `tests/test_catalog.py` (prune keeps unfinished, `list_unfinished_syncs`).
+  **Drain jobs** (`start_drain(source_id=None)`, `SyncJob.kind` = `drain`, sentinel source
+  `"graph relationships"`): mine relationships for documents whose deferred graph work never
+  landed — see the `ingest/pipeline.py` `drain_pending_graph` note above for what it does and how
+  faithfully. It is a job rather than a click because on a real corpus it is thousands of LLM
+  calls; it therefore streams logs, reports `graph relationships (done/total)`, and pauses/stops
+  like a sync (a stop leaves the rest queued, so the UI offers a plain Stop with no
+  "clean up partial data?" prompt — there is no partial data, only unfinished queue).
+  Mutually exclusive with every other job in both directions, since it writes edges across
+  sources.
   **Cleanup jobs** (`start_cleanup(name, source_id)`, `SyncJob.kind` = `sync|cleanup`): the same
   `_purge` as a clean sync, without the re-pull — documents (cascading graph edges), vectors, FTS,
   orphan graph nodes and the watermark. It takes `source_id` as an argument rather than looking the
@@ -1325,13 +1449,43 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
 
 ## Conventions & gotchas
 
-- **Grounding threshold**: `retrieval.min_score = 0.55`, empirically tuned for bge-small
-  (relevant ≥ 0.64, unrelated ≤ 0.55). Retune if the embedding model changes **or if
-  `embedding.instruct` is toggled** (asymmetric query instructions shift the cosine distribution).
-  Borderline hits are passed to the LLM with scores; the prompt makes the final relevance judgment.
-  Don't guess the retune by hand — `qj eval SET --calibrate` recommends the value from a real eval
-  set (and `--apply` writes it). It picks the **midpoint of the optimal band**, so it won't jump to
-  a false-refusal-heavy threshold, and it warns when the eval set is too thin to trust.
+- **Grounding threshold**: `retrieval.min_score = 0.64`. **FIXED 2026-07-29 (Plan 05 /
+  PRIORITIES #0, was a known defect):** above `retrieval.ann_min_rows` (4000),
+  `ensure_ann_index()` builds LanceDB's default **IVF_PQ** index, which is product-quantized and
+  lossy enough to matter. It has **two observed faces**, both fixed by the same change: scores
+  wrong by 0.25–0.45 cosine on the *same* top chunk (measured 2026-07-28 on `eval-c3`;
+  `nprobes` doesn't help), and — re-measured 2026-07-30 on the live 56,401-chunk `default`
+  workspace — the right chunks **missing from the results entirely**, with accurate-looking
+  scores on the worse chunks it substitutes (**recall@5 vs exact: 45% → 100%**, top-1 9/12 →
+  12/12). The second face is the more dangerous one: nothing in the numbers reveals it.
+  `_dense()` now sets `refine_factor` (`RetrievalConfig.ann_refine_factor`,
+  default 10) to re-rank ANN candidates against their un-quantized vectors — restores exact
+  results for +1.2ms/query measured (still *faster* than brute force: 17.6ms vs 21.3ms p50),
+  regression-tested in `tests/test_retrieval.py`
+  (`test_ann_refine_factor_restores_exact_scores_above_min_rows`, crosses `ann_min_rows` for real,
+  which no prior test did). Small workspaces (< 4000 chunks) search exactly and were never
+  affected. **The coupled retune**: with true cosines the whole score distribution shifts up, and
+  an expanded 12-case refusal set (was 4, now cleared `CALIBRATION_MIN_CASES`) found refusal
+  near-misses (0.62–0.78) and real answerable hits (0.66–0.87) overlap enough that **no threshold
+  cleanly separates them** — `qj eval --calibrate`'s own max-margin pick was 0.72 (refusal_accuracy
+  0.917, but costs 3–4 of 20 answerable cases their grounding). Shipped **0.64** instead, a
+  deliberately conservative choice (user call, not the calibrator's own recommendation): zero
+  measured answerable-recall cost on the expanded eval set, while still gating 3 of 12 refusal
+  near-misses that leaked at the old 0.55 (up from 0). ⚠ **This retune reaches NEW workspaces
+  only** (found in live testing 2026-07-30): `catalog.save_config` does a full `model_dump`, so
+  every field is materialized into the `settings.config` blob at first save and pins that value
+  forever — the live `default` workspace still runs `min_score=0.55` and `qj eval` there still
+  reports refusal_accuracy 0.0. Changing a default in `config.py` is therefore NOT a way to
+  change behavior for anyone who already has a workspace; it must be set in Settings, or the
+  persistence made default-aware (PRIORITIES #3). Retune again if the embedding model changes,
+  `embedding.instruct` is toggled, or the eval set grows enough to change the overlap picture — see
+  `docs/plans/05-eval-on-connected-org.md` for the full sweep across candidate thresholds.
+  Borderline hits are still passed to the LLM with scores; the prompt makes the final relevance
+  judgment, which is why agent-layer refusal_accuracy has historically stayed at 1.0 even when the
+  retrieval-layer proxy leaks — the retrieval threshold is a coarse pre-filter, not the only line of
+  defense. **Standing gap** (PRIORITIES #34, unresolved by this fix): the overlap itself means
+  threshold tuning alone has a ceiling — the embedding fine-tune question is now framed as a
+  refusal-discrimination problem, not a recall problem.
 - Secrets in connector options support env indirection: `token=env:GITHUB_TOKEN`
   (resolved by `connectors/util.resolve_secret`). Never write literal secrets into config.yaml.
 - All tool results for one assistant turn must land in a single Anthropic user message
@@ -2143,6 +2297,36 @@ Post-phase additions (2026-07-07, all tested — suite: **89 passed**):
   job instead of always assuming a direct handle_event→ingest. Suite: **705 passed** (+4), 12
   skipped. A step-by-step setup guide for TFS/GitLab/Octopus was published as a Claude Artifact
   rather than embedded here (living reference material, not architecture).
+- Plan-05 close-out: IVF_PQ grounding fix + coupled retune + two graph defects (2026-07-29,
+  working the top of `docs/PRIORITIES.md`). **(1) `retrieval.ann_refine_factor`** (new, default
+  10, `ge=1`) — `KnowledgeStore._dense` now re-ranks ANN candidates against un-quantized vectors,
+  fixing scores that LanceDB's default IVF_PQ index was distorting by 0.25–0.45 cosine on any
+  workspace past `ann_min_rows`. The suite now builds a **real index** for the first time (no
+  prior test ever did, which is why this shipped at all), and the guard is verified to fail
+  without the fix. `ge=1` is deliberate: LanceDB *raises* on 0, so the obvious "turn it off"
+  value would have broken every dense search — it's rejected at config validation (clean 400
+  through `PATCH /api/settings`) rather than left to explode at query time. Postgres is
+  unaffected (pgvector HNSW returns true distances; no product quantization).
+  **(2) `retrieval.min_score` 0.55 → 0.64**, coupled to (1) since the old value was calibrated
+  against the distorted distribution. Chosen conservatively **against** `--calibrate`'s own
+  max-margin pick of 0.72: 0.64 costs no answerable case its grounding on the eval set while
+  gating 3 of 12 refusal near-misses (up from 0); 0.72 would gate 6 but cost 3–4 answerable
+  cases. **(3) Eval set 21 → 32 cases** (`docs/evals/multi-hop-crosssource.yaml`, 4 → 12 refusal
+  cases, clearing `CALIBRATION_MIN_CASES`; +3 relation-shaped person/team cases so a future C4
+  re-test can actually detect the org-chart layer). Candidates that turned out to have genuine
+  adjacent content in the corpus were rejected rather than shipped as fake refusals.
+  **(4) `catalog.upsert_entity` no longer lets an LLM-proposed name clobber a well-cased
+  deterministic one** — resolved inside the `ON CONFLICT` CASE, not read-then-write, so the
+  hottest graph-write path gains no round trip and no race between concurrent source syncs.
+  **(5) `graph.triple_workers` 4 → 16** (measured p50 ~18 s/call: 4 meant ~10 h to drain a real
+  corpus). Also fixed: `.gitignore`'s unanchored `evals/` rule had been silently swallowing
+  `docs/evals/` since the initial commit, so **the eval set this plan is built around had never
+  actually been committed**. Suite: **710 passed**, 13 skipped (the new Postgres parity test is
+  env-gated). **Not verified: the Postgres path** — Docker was unavailable, so the shared
+  `ON CONFLICT` statement is SQLite-verified and only statically reviewed for pg (a syntax error
+  would surface on any insert, but the CASE semantics are untested there). Also unverified: any
+  agent-layer effect of the new threshold — that needs ≥3 replicates per the plan's own
+  methodology note and real LLM spend.
 
 ## Next steps (agreed with user)
 

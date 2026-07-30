@@ -58,7 +58,8 @@ login request stores the bearer token so every later request sends `Authorizatio
    file to a question (per-question context — extracted to text, injected into the turn, NOT memory;
    auto-deleted after the retention window) + download it. **Learn an attachment** promotes one of
    those files into permanent memory when you actually want it kept.
-6. **5 · Graph** — snapshot, entity search, path between two entities, bridges, gaps.
+6. **5 · Graph** — snapshot, entity search, path between two entities, bridges, gaps, and the
+   unmined-relationship queue + the drain that finishes it.
 7. **6 · OneDrive / SharePoint** — create the connector, sign in to Microsoft 365
    (authorization code + PKCE; `qj onedrive login <name>` is the no-browser alternative),
    check who it acts as, learn specific documents **on demand**, and sign out. This connector
