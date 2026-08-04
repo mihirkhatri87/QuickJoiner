@@ -13,7 +13,9 @@ from typing import Any
 import httpx
 
 from quickjoiner.config import LLMConfig
-from quickjoiner.llm.base import ChatResult, LLMProvider, Message, StreamCallback, ToolCall, ToolSpec
+from quickjoiner.llm.base import (
+    ChatResult, LLMProvider, Message, StreamCallback, TokenUsage, ToolCall, ToolSpec,
+)
 
 
 def accumulate_chunk(message: dict[str, Any], acc: dict[str, Any], on_stream: StreamCallback | None) -> None:
@@ -67,6 +69,7 @@ class OllamaProvider(LLMProvider):
                 for t in tools
             ]
 
+        final: dict[str, Any] = {}  # the done chunk / response carries the token counts
         if on_stream is not None:
             acc: dict[str, Any] = {"text": "", "thinking": "", "tool_calls": []}
             with httpx.stream(
@@ -79,13 +82,15 @@ class OllamaProvider(LLMProvider):
                     chunk = json.loads(line)
                     accumulate_chunk(chunk.get("message", {}), acc, on_stream)
                     if chunk.get("done"):
+                        final = chunk
                         break
             raw_calls = acc["tool_calls"]
             text, thinking = acc["text"], acc["thinking"]
         else:
             resp = httpx.post(f"{self._base_url}/api/chat", json=payload, timeout=300.0)
             resp.raise_for_status()
-            message = resp.json().get("message", {})
+            final = resp.json()
+            message = final.get("message", {})
             raw_calls = message.get("tool_calls") or []
             text, thinking = message.get("content", ""), message.get("thinking", "") or ""
 
@@ -97,7 +102,15 @@ class OllamaProvider(LLMProvider):
             )
             for i, tc in enumerate(raw_calls)
         ]
-        return ChatResult(text=text, tool_calls=tool_calls, thinking=thinking)
+        return ChatResult(
+            text=text, tool_calls=tool_calls, thinking=thinking,
+            # Ollama names these prompt_eval_count/eval_count; it reports no cache
+            # counters, so `cached` stays 0 (KV-prefix reuse is invisible over /api/chat).
+            usage=TokenUsage(
+                prompt=int(final.get("prompt_eval_count") or 0),
+                completion=int(final.get("eval_count") or 0),
+            ),
+        )
 
     @staticmethod
     def _to_wire(messages: list[Message], system: str | None) -> list[dict[str, Any]]:

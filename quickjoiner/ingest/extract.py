@@ -645,6 +645,82 @@ def _extract_xlsx(data: bytes, image_handler: ImageHandler | None = None) -> str
         wb.close()
 
 
+# ── HTML tables ───────────────────────────────────────────────────────────────────────────
+# `soup.get_text()` puts every cell on its own line, which destroys a table outright: the
+# column each value belonged to is gone, and — worse — a BLANK cell simply vanishes, so every
+# later value in that row shifts left into the wrong column. Measured on a real internal
+# service catalogue: a member row missing only its email rendered its Location where Phone
+# belonged, and nothing in the stored text said so. Rows are therefore rendered as markdown
+# pipe rows instead, which keeps the header, keeps the alignment, keeps empty cells as empty,
+# and makes each row a self-contained line that chunks and embeds far better than a vertical
+# stream of orphaned cells. `ingest/tables.py` then mines these rows for graph edges.
+_MAX_TABLE_ROWS = 500        # a rendered table past this is truncated, and says so
+_MAX_CELL_CHARS = 300        # one runaway cell can't dominate the document
+
+
+def _cell_text(cell) -> str:
+    """One cell's text, whitespace-collapsed, `|` escaped so it can't break the row."""
+    text = " ".join((cell.get_text(" ", strip=True) or "").split())
+    if len(text) > _MAX_CELL_CHARS:
+        text = text[:_MAX_CELL_CHARS] + "…"
+    return text.replace("|", "\\|")
+
+
+def _table_rows(table) -> list[list[str]]:
+    """Cells per row, with colspan expanded to empty padding so columns stay aligned."""
+    rows: list[list[str]] = []
+    for tr in table.find_all("tr", recursive=True):
+        # Only cells belonging to THIS table — a nested table has already been rendered
+        # into a string by the caller (innermost-first), so nothing is double-counted.
+        cells = [c for c in tr.find_all(["th", "td"], recursive=False)]
+        if not cells:
+            continue
+        row: list[str] = []
+        for c in cells:
+            row.append(_cell_text(c))
+            try:
+                span = int(c.get("colspan") or 1)
+            except (TypeError, ValueError):
+                span = 1
+            row.extend([""] * max(0, min(span, 20) - 1))
+        rows.append(row)
+    return rows
+
+
+def render_html_table(table) -> str:
+    """One `<table>` element as a markdown pipe table (header + rows), or plain lines
+    when it is a layout table rather than a data table.
+
+    Single-column tables are old-fashioned page layout, not data; rendering those as
+    pipe rows would wrap ordinary prose in table syntax for no gain, so they degrade to
+    their text. Everything else keeps its shape.
+    """
+    rows = _table_rows(table)
+    if not rows:
+        return ""
+    width = max(len(r) for r in rows)
+    if width < 2:
+        return "\n".join(c for r in rows for c in r if c)
+
+    truncated = len(rows) > _MAX_TABLE_ROWS
+    if truncated:
+        rows = rows[:_MAX_TABLE_ROWS]
+    rows = [r + [""] * (width - len(r)) for r in rows]
+
+    # A header row is one made of <th>, else the first row when it is fully populated
+    # (a data-first table with no <th> still reads correctly with its first row as header).
+    first_tr = table.find("tr")
+    has_th = bool(first_tr and first_tr.find("th"))
+    header, body = (rows[0], rows[1:]) if (has_th or all(rows[0])) else ([""] * width, rows)
+
+    out = ["| " + " | ".join(header) + " |",
+           "| " + " | ".join(["---"] * width) + " |"]
+    out.extend("| " + " | ".join(r) + " |" for r in body)
+    if truncated:
+        out.append(f"… (table truncated at {_MAX_TABLE_ROWS} rows)")
+    return "\n".join(out)
+
+
 def _extract_html(data: bytes, image_handler: ImageHandler | None = None) -> str:
     import base64
 
@@ -654,7 +730,9 @@ def _extract_html(data: bytes, image_handler: ImageHandler | None = None) -> str
     for tag in soup(["script", "style", "nav", "footer", "header"]):
         tag.decompose()
     # Keep image alt/title captions as text — a free, dependency-less win now (many diagrams
-    # ship a meaningful alt); replace the <img> with its caption so it lands inline.
+    # ship a meaningful alt); replace the <img> with its caption so it lands inline. Runs
+    # BEFORE table rendering so an image inside a cell still contributes its caption (and
+    # still reaches the vision seam) instead of being destroyed with the table element.
     derived: list[str] = []
     for img in soup.find_all("img"):
         caption = (img.get("alt") or img.get("title") or "").strip()
@@ -668,6 +746,14 @@ def _extract_html(data: bytes, image_handler: ImageHandler | None = None) -> str
             except Exception:  # noqa: BLE001
                 pass
         img.replace_with(f"[image: {caption}]" if caption else "")
+    # Only tables that contain no other table are rendered. A table nested inside another
+    # is almost always the meaningful one — old intranet apps wrap real data tables in
+    # layout tables — so rendering the outer one would bury the data in a single cell.
+    # The skipped wrapper still contributes its text normally.
+    for table in soup.find_all("table"):
+        if table.find("table") is not None:
+            continue
+        table.replace_with("\n" + render_html_table(table) + "\n")
     text = "\n".join(line.strip() for line in soup.get_text("\n").splitlines() if line.strip())
     return "\n".join([text, *derived]).strip()
 

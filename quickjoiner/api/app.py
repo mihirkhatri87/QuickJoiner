@@ -165,6 +165,21 @@ class UploadLocalRequest(BaseModel):
     path: str  # a file path on the server, ingested into the rolling uploads connector
 
 
+class BrowserInputEvent(BaseModel):
+    """One input event for a remote (headless, polled-screenshot) sign-in session. A fixed
+    shape, not an arbitrary passthrough — `connectors/browser/session._apply_input` further
+    whitelists `type` and ignores anything it doesn't recognize."""
+
+    type: str  # mousemove | mousedown | mouseup | wheel | keydown | keyup | press | type
+    x: float | None = None
+    y: float | None = None
+    button: str | None = None
+    deltaX: float | None = None
+    deltaY: float | None = None
+    key: str | None = None
+    text: str | None = None
+
+
 def _oauth_page(heading: str, detail: str) -> str:
     """The tiny page Microsoft's redirect lands on. Self-contained (no assets, no JS)
     because it renders in whatever browser did the sign-in, which may not be the one
@@ -683,12 +698,13 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
 
         user = _user(authorization)
         _require_user(user)
-        source, _connector, url = _scrape_connector(name, user)
+        source, connector, url = _scrape_connector(name, user)
         _require("connectors:write", user)
         if not can_manage(source, user, auth.enabled):
             raise HTTPException(status_code=403, detail="Only the owner can sign this connector in")
         try:
-            job = login_jobs.start(ctx.workspace, name, url)
+            job = login_jobs.start(ctx.workspace, name, url,
+                                   ignore_https_errors=connector._ignore_https_errors())
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
         return {"login": job.summary()}
@@ -706,7 +722,7 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
         )
 
         user = _user(authorization)
-        _source, _connector, url = _scrape_connector(name, user)
+        _source, connector, url = _scrape_connector(name, user)
         job = login_jobs.status(name)
         out: dict = {
             "url": url,
@@ -714,12 +730,83 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
             "hosts": session_hosts(ctx.workspace),
             "can_open_window": login_jobs.display_hint() is None,
             "display_hint": login_jobs.display_hint(),
+            "remote_capable": login_jobs.login_mode() == "remote",
             "login": job.summary() if job else None,
         }
         if verify and not (job and job.summary()["active"]):
-            ok, detail = verify_session(ctx.workspace, url)
+            ok, detail = verify_session(ctx.workspace, url,
+                                        ignore_https_errors=connector._ignore_https_errors())
             out["signed_in"], out["detail"] = ok, detail
         return out
+
+    def _require_scrape_manage(name: str, user: str | None):
+        """Shared gate for the remote sign-in stream/input/done routes below: same level as
+        starting the login itself (not mere read access), since the stream can show — and the
+        input channel can type — credentials for whatever site the connector points at."""
+        source, _connector, url = _scrape_connector(name, user)
+        _require("connectors:write", user)
+        if not can_manage(source, user, auth.enabled):
+            raise HTTPException(status_code=403, detail="Only the owner can control this sign-in")
+        return source, _connector, url
+
+    @api.get("/api/connectors/{name}/browser/session/frames", tags=["Connectors"], summary="Server-Sent Events stream of a running remote sign-in's live screencast frames (jpeg, base64), ending with a `done` event. 404 if no remote sign-in is running.")
+    def browser_session_frames(name: str, authorization: str | None = Header(default=None)):
+        """Live view for a `mode: "remote"` sign-in (headless host, no local display) — the
+        counterpart to the real window that opens locally. One `meta` event announces the
+        actual frame size first, so the frontend never hardcodes a viewport."""
+        from quickjoiner.connectors.browser import login_jobs
+        from quickjoiner.connectors.browser.session import _CONTEXT_OPTS
+
+        user = _user(authorization)
+        _require_scrape_manage(name, user)
+        q = login_jobs.subscribe_frames(name)
+        if q is None:
+            raise HTTPException(status_code=404, detail=f"No remote sign-in running for {name!r}")
+        viewport = _CONTEXT_OPTS["viewport"]
+
+        def stream():
+            yield f"data: {json.dumps({'type': 'meta', **viewport})}\n\n"
+            while True:
+                item = q.get()
+                if item is login_jobs.FRAME_DONE:
+                    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                    return
+                yield f"data: {json.dumps({'type': 'frame', 'data': item})}\n\n"
+
+        return StreamingResponse(stream(), media_type="text/event-stream")
+
+    @api.post("/api/connectors/{name}/browser/session/input", tags=["Connectors"], summary="Send one input event (click/scroll/keystroke) to a running remote sign-in. 404 if none is running, 409 if this sign-in is a local window instead.")
+    def browser_session_input(name: str, event: BrowserInputEvent,
+                              authorization: str | None = Header(default=None)):
+        from quickjoiner.connectors.browser import login_jobs
+
+        user = _user(authorization)
+        _require_scrape_manage(name, user)
+        job = login_jobs.status(name)
+        if job and job.summary()["active"] and job.mode != "remote":
+            raise HTTPException(
+                status_code=409,
+                detail="This sign-in is a window on the QuickJoiner host — interact with that instead.",
+            )
+        if not login_jobs.push_input(name, event.model_dump(exclude_none=True)):
+            raise HTTPException(status_code=404, detail=f"No remote sign-in running for {name!r}")
+        return {"ok": True}
+
+    @api.post("/api/connectors/{name}/browser/session/done", tags=["Connectors"], summary="Finish a running remote sign-in: capture the session and close it. 404 if none is running, 409 if this sign-in is a local window instead.")
+    def browser_session_done(name: str, authorization: str | None = Header(default=None)):
+        from quickjoiner.connectors.browser import login_jobs
+
+        user = _user(authorization)
+        _require_scrape_manage(name, user)
+        job = login_jobs.status(name)
+        if job and job.summary()["active"] and job.mode != "remote":
+            raise HTTPException(
+                status_code=409,
+                detail="This sign-in is a window on the QuickJoiner host — close that window instead.",
+            )
+        if not login_jobs.signal_done(name):
+            raise HTTPException(status_code=404, detail=f"No remote sign-in running for {name!r}")
+        return {"ok": True}
 
     # ---------------------------------------------------------------- Microsoft 365
     # Sign-in for the OneDrive/SharePoint connector. Two flows exist because
@@ -957,6 +1044,10 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
         except Exception as exc:  # pydantic validation error -> bad input
             raise HTTPException(status_code=400, detail=str(exc))
         ctx.catalog.save_config(c)  # persist; live agents read ctx.config on next build
+        # Re-derive the store + ingest pipeline, which are BUILT from config rather than
+        # reading it per call — without this a graph/retrieval toggle only took effect
+        # after a server restart, and a re-sync in between silently used the old settings.
+        ctx.apply_config()
         return _settings_view()
 
     @api.post("/api/llm/test", tags=["Settings"], summary="Probe the configured LLM provider with a one-token round-trip. Accepts UNSAVED llm overrides so a client can verify a proxy/model before saving.")

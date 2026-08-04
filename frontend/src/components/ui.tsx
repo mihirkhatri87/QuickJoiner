@@ -1,4 +1,10 @@
-import type { ButtonHTMLAttributes, InputHTMLAttributes, ReactNode, SelectHTMLAttributes } from "react";
+import type {
+  ButtonHTMLAttributes,
+  InputHTMLAttributes,
+  ReactNode,
+  SelectHTMLAttributes,
+  TextareaHTMLAttributes,
+} from "react";
 
 export function cn(...parts: (string | false | null | undefined)[]): string {
   return parts.filter(Boolean).join(" ");
@@ -85,6 +91,19 @@ export function TextInput({ className, ...rest }: InputHTMLAttributes<HTMLInputE
     <input
       className={cn(
         "w-full rounded-sm border border-transparent bg-fill px-3 py-2.5 text-[13.5px] text-ink outline-none transition placeholder:text-faint focus:border-[color-mix(in_srgb,var(--accent)_55%,transparent)] focus:bg-raised",
+        className,
+      )}
+      {...rest}
+    />
+  );
+}
+
+export function TextArea({ className, ...rest }: TextareaHTMLAttributes<HTMLTextAreaElement>) {
+  return (
+    <textarea
+      rows={3}
+      className={cn(
+        "w-full resize-y rounded-sm border border-transparent bg-fill px-3 py-2.5 text-[13.5px] leading-relaxed text-ink outline-none transition placeholder:text-faint focus:border-[color-mix(in_srgb,var(--accent)_55%,transparent)] focus:bg-raised",
         className,
       )}
       {...rest}

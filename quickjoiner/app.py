@@ -14,6 +14,7 @@ from quickjoiner.llm import create_provider
 from quickjoiner.memory.base import CatalogBackend, StoreBackend
 from quickjoiner.memory.embedder import create_embedder
 from quickjoiner.memory.factory import create_catalog, create_store
+from quickjoiner.memory.reranker import create_reranker
 
 
 @dataclass
@@ -28,6 +29,34 @@ class AppContext:
     # an app is built (the CLI builds one lazily around this same ctx on first control call).
     app: object | None = None
     internal_secret: str = ""
+    # The embedding settings `store.embedder` was built from. Rebuilding a fastembed
+    # embedder reloads the ONNX model eagerly, so `apply_config()` only does it when
+    # these actually changed.
+    embedding_signature: dict | None = None
+
+    def apply_config(self) -> None:
+        """Re-derive everything that was BUILT FROM config, after `self.config` changed.
+
+        `build_context` constructs the pipeline and store once at process start, so a
+        settings save used to reach the persisted config and nothing else: turning on
+        `graph.extract_triples` left the already-built pipeline holding no triple
+        extractor, and a clean re-sync then ingested with the old behaviour — silently,
+        since nothing reports which config a running pipeline was born with. Retrieval
+        knobs the store itself holds (hybrid, rrf_k, ANN, reranker) had the same trap.
+        Called after every settings write, so a toggle applies to the next sync/query
+        without restarting the server.
+        """
+        signature = self.config.embedding.model_dump()
+        embedder = self.store.embedder
+        if signature != self.embedding_signature:
+            embedder = create_embedder(self.config.embedding)
+            self.embedding_signature = signature
+            self.store = create_store(self.workspace, embedder, self.config.retrieval)
+        else:
+            # Same vectors, only the query-side knobs moved — mutate in place rather than
+            # reopening LanceDB + the FTS sidecar under a possibly-running sync.
+            self.store.set_retrieval(self.config.retrieval, create_reranker(self.config.retrieval))
+        self.pipeline = _build_pipeline(self.config, self.catalog, self.store, embedder)
 
     def build_provider(self, provider_override: str | None = None, model_override: str | None = None):
         llm = self.config.llm.model_copy()
@@ -158,7 +187,7 @@ def _make_triple_extractor(config: Config):
     state: dict = {}
     lock = threading.Lock()
 
-    def extractor(text: str, title: str) -> list:
+    def extractor(text: str, title: str, guidance: str = "") -> list:
         if "provider" not in state:
             with lock:
                 if "provider" not in state:
@@ -166,7 +195,7 @@ def _make_triple_extractor(config: Config):
                         state["provider"] = create_provider(config.llm)
                     except Exception:
                         state["provider"] = None
-        return extract_doc_triples(state["provider"], text, title)
+        return extract_doc_triples(state["provider"], text, title, guidance=guidance)
 
     return extractor
 
@@ -197,18 +226,28 @@ def _make_entity_resolver(config: Config, catalog, embedder):
     return EntityResolver(catalog=catalog, embedder=embedder, adjudicate=adjudicate)
 
 
+def _build_pipeline(config: Config, catalog, store, embedder) -> IngestPipeline:
+    """The one place an IngestPipeline is wired from config — shared by first-time
+    construction (`build_context`) and by `AppContext.apply_config()`, so a rebuilt
+    pipeline can't drift from the one the process started with."""
+    triple_extractor = _make_triple_extractor(config) if config.graph.extract_triples else None
+    entity_resolver = (
+        _make_entity_resolver(config, catalog, embedder) if config.graph.entity_resolution else None
+    )
+    return IngestPipeline(
+        store, catalog, config.retrieval, config.graph, triple_extractor,
+        entity_resolver, triple_workers=config.graph.triple_workers,
+    )
+
+
 def build_context(workspace: Path) -> AppContext:
     load_env(workspace)
     catalog = create_catalog(workspace)
     config = catalog.load_config()
     embedder = create_embedder(config.embedding)
     store = create_store(workspace, embedder, config.retrieval)
-    triple_extractor = _make_triple_extractor(config) if config.graph.extract_triples else None
-    entity_resolver = _make_entity_resolver(config, catalog, embedder) if config.graph.entity_resolution else None
-    pipeline = IngestPipeline(
-        store, catalog, config.retrieval, config.graph, triple_extractor,
-        entity_resolver, triple_workers=config.graph.triple_workers,
-    )
     return AppContext(
-        workspace=workspace, config=config, catalog=catalog, store=store, pipeline=pipeline
+        workspace=workspace, config=config, catalog=catalog, store=store,
+        pipeline=_build_pipeline(config, catalog, store, embedder),
+        embedding_signature=config.embedding.model_dump(),
     )

@@ -14,6 +14,9 @@ terms of service.
 Options:
     start_urls:          one URL or a list — crawl roots (required)
     allow_prefixes:      URL prefixes the crawler may follow (default: each start URL's folder)
+    same_host_only:      true (default) -> never follow a link off the start URLs' hosts,
+                         whatever allow_prefixes says (an internal app links out to the
+                         trackers/repos it references; those are other systems)
     max_pages:           crawl budget (default 30)
     max_depth:           link-hop limit from a start URL (start page = depth 0; links on it
                          = depth 1, ...). Unset = unlimited (budget still applies).
@@ -28,11 +31,21 @@ Options:
 
 from __future__ import annotations
 
+import hashlib
 import random
+import re
 import time
 from typing import Any, Callable, Iterator
 from urllib import robotparser
-from urllib.parse import urldefrag, urljoin, urlparse
+from urllib.parse import (
+    parse_qsl,
+    quote,
+    urldefrag,
+    urlencode,
+    urljoin,
+    urlparse,
+    urlunparse,
+)
 
 import httpx
 from bs4 import BeautifulSoup
@@ -43,6 +56,15 @@ from quickjoiner.connectors.registry import register
 
 DROP_TAGS = ["script", "style", "nav", "footer", "header", "aside", "form"]
 DEFAULT_MAX_PAGES = 30
+
+# Query parameters that identify a referral, not a page. They never change what is
+# rendered, so leaving them in crawls the same page once per campaign link. Deliberately
+# short and unambiguous — a plausible-but-real parameter (`ref`, `id`, `source`) is left
+# alone, because dropping one silently merges two genuinely different pages.
+TRACKING_PARAMS = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "utm_id",
+    "gclid", "dclid", "fbclid", "msclkid", "mc_cid", "mc_eid", "igshid", "_ga", "_gl",
+}
 
 # Statuses that mean "come back later" — worth a backoff+retry.
 RETRY_STATUSES = {429, 500, 502, 503, 504}
@@ -84,27 +106,87 @@ class Blocked(Exception):
         super().__init__(f"{url} -> {status if status is not None else 'connection refused'}")
 
 
+def canonical_url(url: str) -> str:
+    """One canonical spelling per page, so `visited` actually dedupes.
+
+    Two URLs differing only in case, a default port, duplicate slashes, parameter ORDER
+    or a tracking parameter address the same page — but comparing raw strings crawls each
+    spelling separately, and each becomes its own document (a doc_id is
+    sha256(source_id|uri)). Query VALUES are preserved exactly and no parameter is dropped
+    for being "probably a filter": `?team=30` and `?team=41` are genuinely different pages,
+    and merging them would lose real content — the far worse error of the two.
+    """
+    parsed = urlparse(urldefrag(url).url)
+    scheme, host = parsed.scheme.lower(), parsed.netloc.lower()
+    for default in (("http", ":80"), ("https", ":443")):
+        if scheme == default[0] and host.endswith(default[1]):
+            host = host.rsplit(":", 1)[0]
+    pairs = [
+        (k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+        if k.lower() not in TRACKING_PARAMS
+    ]
+    # quote_via=quote keeps %20 as %20 rather than rewriting it to '+', so the stored uri
+    # stays the URL the user would actually paste into a browser.
+    query = urlencode(sorted(pairs), quote_via=quote)
+    return urlunparse((scheme, host, re.sub(r"/{2,}", "/", parsed.path) or "/",
+                       parsed.params, query, ""))
+
+
+def page_title(url: str, region, site_title: str) -> str:
+    """The page's own heading, preferring an <h1> inside the content over <title>.
+
+    Plenty of apps set ONE static <title> for the whole site — observed live: 200 crawled
+    pages all titled "Home page - AppRiver.ContinuousDelivery", which makes every ingested
+    document look identical in the document browser and contributes nothing to the
+    retrieval breadcrumb. `region` is the post-DROP_TAGS content, so a brand <h1> sitting
+    in a <header>/<nav> is already gone; where a site really does repeat its name in the
+    body <h1>, this is no worse than the <title> it replaces.
+    """
+    h1 = region.find("h1") if region is not None else None
+    heading = h1.get_text(" ", strip=True) if h1 else ""
+    return heading or site_title or url
+
+
 def page_document(url: str, html: str) -> Document | None:
     """Extract readable text from a page; None if there is nothing worth keeping."""
     soup = BeautifulSoup(html, "html.parser")
+    # Read <title> before DROP_TAGS runs — it lives in <head>, but keeping the two reads
+    # together makes the ordering requirement for page_title's <h1> obvious.
+    site_title = soup.title.string.strip() if soup.title and soup.title.string else ""
     for tag in soup(DROP_TAGS):
         tag.decompose()
     main = soup.find("main") or soup.find("article") or soup
-    title = soup.title.string.strip() if soup.title and soup.title.string else url
     text = "\n".join(line.strip() for line in main.get_text("\n").splitlines() if line.strip())
     if len(text) < 80:  # navigation shells, login redirects, empty pages
         return None
-    return Document(uri=url, title=title, text=text, kind="doc")
+    return Document(uri=url, title=page_title(url, main, site_title), text=text, kind="doc")
 
 
-def extract_links(base_url: str, html: str, allow_prefixes: list[str]) -> list[str]:
-    """Same-crawl links: absolute, deduped, fragment-stripped, within the allowlist."""
+def allowed_hosts(start_urls: list[str]) -> set[str]:
+    """The hosts a crawl may touch: exactly those its start URLs name."""
+    return {h for h in (urlparse(u).netloc.lower() for u in start_urls) if h}
+
+
+def extract_links(base_url: str, html: str, allow_prefixes: list[str],
+                  hosts: set[str] | None = None) -> list[str]:
+    """Same-crawl links: absolute, canonicalized, deduped, within the allowlist.
+
+    `hosts` is a hard floor independent of `allow_prefixes`: a page on an internal app
+    routinely links out to the trackers and repos it references (the live case: a build
+    dashboard whose pages link into TFS), and following those would ingest a different
+    system entirely under this connector's name. A prefix list already scopes the crawl,
+    but it is user-editable and a single over-broad entry would let the crawl wander —
+    so the host check is applied as well, not instead.
+    """
     soup = BeautifulSoup(html, "html.parser")
     seen: list[str] = []
     for a in soup.find_all("a", href=True):
-        url = urldefrag(urljoin(base_url, a["href"])).url
-        if not url.startswith(("http://", "https://")):
+        raw = urljoin(base_url, a["href"])
+        if not raw.startswith(("http://", "https://")):
             continue
+        if hosts is not None and urlparse(raw).netloc.lower() not in hosts:
+            continue
+        url = canonical_url(raw)
         if not any(url.startswith(prefix) for prefix in allow_prefixes):
             continue
         if url not in seen:
@@ -155,6 +237,15 @@ class WebScrapeConnector(Connector):
     def _respect_robots(self) -> bool:
         return _truthy(self.options.get("respect_robots", True), True)
 
+    def _same_host_only(self) -> bool:
+        return _truthy(self.options.get("same_host_only", True), True)
+
+    def _ignore_https_errors(self) -> bool:
+        """`verify_tls=false` — accept a certificate this host can't chain to a trusted root.
+        Needed for an internal site issued by a private/corporate CA, which otherwise fails
+        every navigation with ERR_CERT_AUTHORITY_INVALID (including the sign-in view)."""
+        return not _truthy(self.options.get("verify_tls", True), True)
+
     def _rate_limit(self) -> float:
         try:
             return max(0.0, float(self.options.get("rate_limit_seconds", 1.0)))
@@ -179,6 +270,10 @@ class WebScrapeConnector(Connector):
                 follow_redirects=True,
                 timeout=30.0,
                 transport=getattr(self, "_transport", None),
+                # Same `verify_tls` the browser paths honour. Without it an internal-CA host
+                # fails TLS here too — and since robots.txt is fetched through this client,
+                # every host burned the full retry/backoff budget before the crawl could start.
+                verify=not self._ignore_https_errors(),
             )
             try:
                 client = httpx.Client(http2=True, **kwargs)  # match a browser's h2
@@ -214,7 +309,8 @@ class WebScrapeConnector(Connector):
             # absent or expired, and this used to report OK for a connector that could not
             # fetch a single page (the sync then reported a bare "0 documents"). Actually
             # fetch the start URL through the session and say what came back.
-            ok, detail = verify_session(self.workspace, starts[0])
+            ok, detail = verify_session(self.workspace, starts[0],
+                                        ignore_https_errors=self._ignore_https_errors())
             if not ok:
                 return ConnectionStatus(
                     False, f"Signed-in session not working: {detail} "
@@ -271,32 +367,43 @@ class WebScrapeConnector(Connector):
             looks_like_login,
         )
 
-        with browser_session(self.workspace) as context:
+        with browser_session(self.workspace,
+                             ignore_https_errors=self._ignore_https_errors()) as context:
             auth_walls: list[str] = []
+            # ONE page reused for the whole crawl, not a new tab per URL. Each tab is a
+            # separate Chromium renderer process, and creating/destroying one per page kept a
+            # pool of them alive — real memory churn in a container that has very little
+            # headroom (measured: 13 processes and ~1.2GB during a crawl). Navigating a single
+            # page is equivalent for our purposes: cookies live on the context, and a
+            # navigation resets page-level JS state anyway.
+            page = context.new_page()
 
             def fetch(url: str) -> str:
-                page = context.new_page()
+                page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 try:
-                    page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                    try:
-                        page.wait_for_load_state("networkidle", timeout=5000)
-                    except Exception:  # noqa: BLE001
-                        pass
-                    # An expired/absent session doesn't fail — it 200s with a login page,
-                    # which page_document then drops as too short. That produced a silent
-                    # "0 documents" indistinguishable from an empty site. Count them so the
-                    # sync can say WHY it found nothing.
-                    try:
-                        if looks_like_login(page.url, url, page.inner_text("body"), page.title() or ""):
-                            auth_walls.append(url)
-                            return ""
-                    except Exception:  # noqa: BLE001
-                        pass
-                    return page.content()
-                finally:
-                    page.close()
+                    page.wait_for_load_state("networkidle", timeout=5000)
+                except Exception:  # noqa: BLE001
+                    pass
+                # An expired/absent session doesn't fail — it 200s with a login page,
+                # which page_document then drops as too short. That produced a silent
+                # "0 documents" indistinguishable from an empty site. Count them so the
+                # sync can say WHY it found nothing.
+                try:
+                    if looks_like_login(page.url, url, page.inner_text("body"), page.title() or ""):
+                        auth_walls.append(url)
+                        return ""
+                except Exception:  # noqa: BLE001
+                    pass
+                return page.content()
 
-            yield from self._crawl(list(starts), set(), prefixes, budget, fetch, self._max_depth())
+            try:
+                yield from self._crawl(list(starts), set(), prefixes, budget, fetch,
+                                       self._max_depth())
+            finally:
+                try:
+                    page.close()
+                except Exception:  # noqa: BLE001
+                    pass  # context teardown closes it anyway
             if auth_walls:
                 self._stage(
                     f"⚠ {len(auth_walls)} page(s) returned a sign-in page, not content — "
@@ -364,13 +471,32 @@ class WebScrapeConnector(Connector):
 
     def _crawl(self, starts, visited, prefixes, budget,
                fetch: Callable[[str], str], max_depth: int | None = None) -> Iterator[Document]:
-        queue: list[tuple[str, int]] = [(url, 0) for url in starts]
-        enqueued = set(url for url in starts)
+        hosts = allowed_hosts(starts) if self._same_host_only() else None
+        queue: list[tuple[str, int]] = [(canonical_url(url), 0) for url in starts]
+        enqueued = {url for url, _ in queue}
+        # Canonical URLs stop the SAME page being fetched twice; this stops two genuinely
+        # different URLs that render byte-identical content becoming two documents. Live
+        # case: a dashboard's tag/team filter facets (`/?tag=CP`, `/?team=20`, …) that all
+        # render the same empty result list — 23 of one crawl's 200-page budget.
+        seen_text: set[str] = set()
+        duplicates = 0
         while queue and len(visited) < budget:
             url, depth = queue.pop(0)
             if url in visited:
                 continue
             visited.add(url)
+            # A browser-rendered page can take tens of seconds, so without a checkpoint here a
+            # Stop waits for the whole page; and without a stage the UI has nothing to show but
+            # "syncing…" for the entire crawl. The total is the KNOWN frontier (pages seen so
+            # far plus those still queued), capped at the budget — it grows as links are
+            # discovered rather than pretending the page limit is a real total, and it
+            # converges on the true count as the queue drains.
+            self._checkpoint()
+            self._stage(
+                f"crawling {urlparse(url).netloc}",
+                len(visited),
+                min(budget, len(visited) + len(queue)),
+            )
             if not self._robots_allow(url):
                 continue  # disallowed by robots.txt
             try:
@@ -381,10 +507,25 @@ class WebScrapeConnector(Connector):
                 continue
             doc = page_document(url, html)
             if doc:
-                yield doc
+                digest = hashlib.sha256(doc.text.encode("utf-8", errors="replace")).hexdigest()
+                if digest in seen_text:
+                    duplicates += 1
+                else:
+                    seen_text.add(digest)
+                    yield doc
             if max_depth is not None and depth >= max_depth:
                 continue  # deep enough — don't follow this page's links
-            for link in extract_links(url, html, prefixes):
+            for link in extract_links(url, html, prefixes, hosts):
                 if link not in enqueued:
                     enqueued.add(link)
                     queue.append((link, depth + 1))
+        # Say what the crawl left out. Both of these were silent before, and both change how
+        # you'd read the result: a truncated crawl looks like a complete one, and a pile of
+        # identical-looking pages looks like a broken crawler rather than a filtered site.
+        if duplicates:
+            self._stage(f"skipped {duplicates} page(s) whose content duplicated another URL")
+        if queue and len(visited) >= budget:
+            self._stage(
+                f"⚠ stopped at the {budget}-page limit with {len(queue)} link(s) still queued — "
+                f"raise max_pages to crawl further"
+            )

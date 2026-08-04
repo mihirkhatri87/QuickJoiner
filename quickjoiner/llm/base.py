@@ -57,6 +57,29 @@ class ToolCall:
 
 
 @dataclass
+class TokenUsage:
+    """Neutral token counts for one model turn — what a request actually cost.
+
+    Each provider maps its own wire shape onto these (Anthropic
+    input/output/cache_read/cache_creation; OpenAI-compatible prompt/completion +
+    prompt_tokens_details.cached; Ollama prompt_eval_count/eval_count). Zeros mean
+    "the provider didn't report it", not "it was free" — a non-streaming Ollama call
+    reports usage, a streamed one may not. `qj bench` aggregates these; the prompt-cache
+    work (llm.prompt_cache, S5) is verified through `cached`, which is the only
+    observable proof a cache prefix was actually read.
+    """
+
+    prompt: int = 0
+    completion: int = 0
+    cached: int = 0  # prompt tokens served from cache (read hits) — subset of `prompt`
+    cache_write: int = 0  # tokens written INTO the cache (Anthropic bills these at 1.25x)
+
+    @property
+    def total(self) -> int:
+        return self.prompt + self.completion
+
+
+@dataclass
 class ChatResult:
     text: str
     tool_calls: list[ToolCall] = field(default_factory=list)
@@ -66,6 +89,8 @@ class ChatResult:
     # blocks) that must be echoed back on the next turn; carried on the assistant
     # history message as "thinking_blocks".
     thinking_blocks: list[Any] = field(default_factory=list)
+    # What this turn cost. Empty (all zeros) when the provider reported nothing.
+    usage: TokenUsage = field(default_factory=TokenUsage)
 
 
 @dataclass

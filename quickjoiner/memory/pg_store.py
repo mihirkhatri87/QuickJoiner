@@ -19,7 +19,7 @@ from quickjoiner.config import RetrievalConfig
 from quickjoiner.ingest.normalize import normalize_query
 from quickjoiner.memory.embedder import Embedder
 from quickjoiner.memory.hybrid import rrf_fuse
-from quickjoiner.memory.store import SearchHit
+from quickjoiner.memory.store import NULL_TRACE, NullTrace, SearchHit
 
 _TOKEN = re.compile(r"[A-Za-z0-9_]+")
 
@@ -77,6 +77,12 @@ class PgVectorStore:
     @property
     def embedder(self):
         return self._embedder
+
+    def set_retrieval(self, retrieval, reranker=None) -> None:
+        """Adopt changed query-side settings without reopening the connection pool —
+        mirrors KnowledgeStore.set_retrieval (see AppContext.apply_config)."""
+        self._retrieval = retrieval or RetrievalConfig()
+        self._reranker = reranker
 
     @staticmethod
     def _vec(values) -> str:
@@ -159,25 +165,29 @@ class PgVectorStore:
         return "(" + " OR ".join(parts) + ")", params
 
     def search(self, query: str, top_k: int = 8, min_score: float = 0.0,
-               scope=None) -> list[SearchHit]:
+               scope=None, trace: "NullTrace | None" = None) -> list[SearchHit]:
+        trace = trace or NULL_TRACE
         query = normalize_query(query)
         r = self._retrieval
-        vector = self._vec(self._embedder.embed_query(query))
+        with trace.stage("embed_query"):
+            vector = self._vec(self._embedder.embed_query(query))
         hybrid = r.hybrid
         fetch = max(top_k * r.candidate_multiplier, top_k) if hybrid else top_k
         scope_sql, scope_params = self._scope_sql(scope)
 
         with self._pool.connection() as conn:
             # dense leg — rows keyed by chunk id, score = cosine similarity
-            rows = conn.execute(
-                "SELECT id, text, doc_id, source_id, uri, title, kind, "
-                "1 - (vector <=> %s::vector) AS score FROM chunks "
-                + (f"WHERE {scope_sql} " if scope_sql else "")
-                + "ORDER BY vector <=> %s::vector LIMIT %s",
-                (vector, *scope_params, vector, fetch),
-            ).fetchall()
+            with trace.stage("dense"):
+                rows = conn.execute(
+                    "SELECT id, text, doc_id, source_id, uri, title, kind, "
+                    "1 - (vector <=> %s::vector) AS score FROM chunks "
+                    + (f"WHERE {scope_sql} " if scope_sql else "")
+                    + "ORDER BY vector <=> %s::vector LIMIT %s",
+                    (vector, *scope_params, vector, fetch),
+                ).fetchall()
             by_id = {row["id"]: dict(row) for row in rows}
             dense_ids = [row["id"] for row in rows]
+            trace.count("dense_candidates", len(dense_ids))
 
             if not hybrid:
                 ordered = dense_ids
@@ -186,51 +196,62 @@ class PgVectorStore:
                 sparse_ids: list[str] = []
                 tsq = self._tsquery(query)
                 if tsq:
-                    sparse_rows = conn.execute(
-                        "SELECT id, text, doc_id, source_id, uri, title, kind, "
-                        "ts_rank(tsv, to_tsquery('english', %s)) AS rank "
-                        "FROM chunks WHERE tsv @@ to_tsquery('english', %s) "
-                        + (f"AND {scope_sql} " if scope_sql else "")
-                        + "ORDER BY rank DESC LIMIT %s",
-                        (tsq, tsq, *scope_params, fetch),
-                    ).fetchall()
-                    for row in sparse_rows:
-                        sparse_ids.append(row["id"])
-                        by_id.setdefault(row["id"], dict(row))
-                ordered = rrf_fuse([dense_ids, sparse_ids], r.rrf_k)
+                    with trace.stage("sparse"):
+                        sparse_rows = conn.execute(
+                            "SELECT id, text, doc_id, source_id, uri, title, kind, "
+                            "ts_rank(tsv, to_tsquery('english', %s)) AS rank "
+                            "FROM chunks WHERE tsv @@ to_tsquery('english', %s) "
+                            + (f"AND {scope_sql} " if scope_sql else "")
+                            + "ORDER BY rank DESC LIMIT %s",
+                            (tsq, tsq, *scope_params, fetch),
+                        ).fetchall()
+                        for row in sparse_rows:
+                            sparse_ids.append(row["id"])
+                            by_id.setdefault(row["id"], dict(row))
+                trace.count("sparse_candidates", len(sparse_ids))
+                with trace.stage("fuse"):
+                    ordered = rrf_fuse([dense_ids, sparse_ids], r.rrf_k)
 
                 # sparse-only candidates still need their cosine score (the
                 # grounding gate is always dense) — one targeted lookup
                 missing = [i for i in ordered if "score" not in by_id[i]]
+                trace.count("sparse_only", len(missing))
                 if missing:
-                    for row in conn.execute(
-                        "SELECT id, 1 - (vector <=> %s::vector) AS score "
-                        "FROM chunks WHERE id = ANY(%s)",
-                        (vector, missing),
-                    ).fetchall():
-                        by_id[row["id"]]["score"] = row["score"]
+                    with trace.stage("sparse_rescore"):
+                        for row in conn.execute(
+                            "SELECT id, 1 - (vector <=> %s::vector) AS score "
+                            "FROM chunks WHERE id = ANY(%s)",
+                            (vector, missing),
+                        ).fetchall():
+                            by_id[row["id"]]["score"] = row["score"]
 
         # optional second-stage ranking over the fused head
+        trace.count("fused", len(ordered))
         if self._reranker is not None and len(ordered) > 1:
             head = ordered[: r.rerank_candidates]
+            trace.count("reranked", len(head))
             try:
-                reordered = self._reranker.rank(query, [by_id[i]["text"] for i in head])
+                with trace.stage("rerank"):
+                    reordered = self._reranker.rank(query, [by_id[i]["text"] for i in head])
                 ordered = [head[j] for j in reordered] + ordered[len(head):]
             except Exception:
                 pass  # reranking is best-effort; RRF order stands
 
         hits = []
-        for id_ in ordered:
-            row = by_id[id_]
-            score = float(row.get("score", 0.0))
-            if score < min_score:
-                continue
-            hits.append(SearchHit(
-                text=row["text"], score=score, doc_id=row["doc_id"], source_id=row["source_id"],
-                uri=row["uri"], title=row["title"] or "", kind=row["kind"] or "doc",
-            ))
-            if len(hits) >= top_k:
-                break
+        with trace.stage("gate"):
+            for id_ in ordered:
+                row = by_id[id_]
+                score = float(row.get("score", 0.0))
+                if score < min_score:
+                    continue
+                hits.append(SearchHit(
+                    text=row["text"], score=score, doc_id=row["doc_id"],
+                    source_id=row["source_id"], uri=row["uri"],
+                    title=row["title"] or "", kind=row["kind"] or "doc",
+                ))
+                if len(hits) >= top_k:
+                    break
+        trace.count("hits", len(hits))
         return hits
 
     def close(self) -> None:

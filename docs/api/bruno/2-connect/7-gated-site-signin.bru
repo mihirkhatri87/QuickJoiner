@@ -15,18 +15,20 @@ headers {
 }
 
 docs {
-  Opens a real Chromium window **on the machine running QuickJoiner** so you can sign in
-  once; the session is then reused for every sync. Returns immediately (it is a background
-  job) — poll `GET .../browser/session` to see when it lands.
+  Starts a sign-in — the response's `login.mode` says which kind: a real Chromium window
+  **on the machine running QuickJoiner** (`"local"`, when it has a display), or a headless
+  session streamed back via requests 8–10 (`"remote"`, e.g. Docker/cloud with no display at
+  all). Either way the session is then reused for every sync. Returns immediately (it is a
+  background job) — poll `GET .../browser/session` to see when it lands.
 
-  409 when a sign-in window is already open for this connector, or when the host has no
-  display (Docker / a remote server) — in that case run `qj browser login <url>` on a
-  machine with a desktop that shares the workspace.
+  409 when a sign-in is already running for this connector. 409 with "Playwright is not
+  installed" only when the `browser` extra genuinely isn't there — a headless host on its
+  own no longer refuses (that's what request 8's screencast is for).
 
   The URL comes from the connector's own `start_urls`, never from the request body: this
   route must not become a way to make the server open an arbitrary page.
 
   Most SSO sign-ins issue a **session cookie**, which a browser profile cannot retain on
-  its own — QuickJoiner captures those explicitly while the window is open, which is what
-  makes the sign-in stick.
+  its own — QuickJoiner captures those explicitly (from the open window, or from the
+  headless page for a remote session), which is what makes the sign-in stick.
 }

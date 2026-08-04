@@ -159,6 +159,30 @@ To use Anthropic instead, edit `docker-compose.yml` (set `QJ_PROVIDER: anthropic
 All state (config, vectors, repo clones, model cache) persists in the `qj-data` volume. The image
 is lean by default; add the browser used by the `web_scrape` fallback with
 `docker build --build-arg WITH_BROWSER=1 .` (or uncomment the build args in the compose file).
+This same flag also covers credential-gated sites: a container has no display, so signing in
+opens a **live remote browser view in the UI** instead of a local window — see "Ingesting a
+site behind a login" below. No extra packages or ports needed for that; it rides the same
+headless Chromium.
+
+⚠️ **Give Docker enough memory if you crawl with the browser.** Chromium is the single
+hungriest thing QuickJoiner runs — a real crawl was measured at **~1.2 GB across 13 Chromium
+processes**. If Docker's VM is small (~2 GB is a common effective allocation, regardless of how
+much RAM the machine has), a crawl exhausts it and the container is killed mid-sync: every run
+then shows up as *"interrupted — server restarted before it finished"*, and the log panel
+reports a "network error" that is really just its stream being cut. Under real starvation the
+Docker *daemon* can fall over too, failing builds with an `EOF`/500. **Check what you have —
+`docker info --format "{{.MemTotal}}"` — and give it 4–8 GB** (Docker Desktop → Settings →
+Resources → Memory, or a `[wsl2]` / `memory=8GB` block in `%USERPROFILE%\.wslconfig` followed by
+`wsl --shutdown`). The compose file already sets `shm_size: 1gb`, because Docker's default 64 MB
+`/dev/shm` also crashes Chromium tabs.
+
+**Rebuilds are incremental.** The Dockerfile installs dependencies (and the ~250MB Chromium)
+from `pyproject.toml` alone, *before* copying any application code, so editing Python or
+frontend source doesn't re-resolve dependencies or re-download the browser. In practice a
+one-line Python change rebuilds in **~10s**, a frontend change in ~30s (dominated by the Vite
+build), and a no-op build in ~3s — versus ~5 minutes when a source edit invalidated the
+dependency layers. If you ever *do* need a genuinely clean build, use
+`docker compose build --no-cache`.
 
 ### Option B — Local install (the `qj` CLI)
 
@@ -379,11 +403,19 @@ A React app (Vite + TypeScript + Tailwind) with:
   provider before you save), retrieval knobs (**hybrid** dense+sparse, **cross-encoder reranker**,
   **graph-expansion**, **contextual chunking**), **knowledge-graph** LLM triple extraction, chat
   compression, and embeddings. Toggles are labelled query-time (take effect immediately) vs
-  ingest-time (need a re-sync to re-embed). Settings are grouped into **collapsible sections**
+  ingest-time (need a re-sync to re-embed) — either way they apply to the running server the
+  moment you save, no restart. Settings are grouped into **collapsible sections**
   that start closed, and each field tells you whether it still holds the **shipped default** —
   changed fields show what the default was, and a section header counts how many you've changed,
   so "what have I actually tuned here?" is answerable at a glance. Everything — config and
-  connectors — lives in the workspace's SQLite `catalog.db`, not a YAML file.
+  connectors — lives in the workspace's SQLite `catalog.db`, not a YAML file. Only the fields
+  you actually changed are stored, so a field left at its default keeps following QuickJoiner's
+  shipped default and **picks up an improved one when you upgrade** (a retuned grounding
+  threshold, say) instead of being frozen at whatever it was when the workspace was created. The
+  flip side: a value you deliberately set to exactly today's default is indistinguishable from
+  an untouched one, so it will move with a future retune — set it to something else, or re-set
+  it after upgrading, if you want it pinned. When an upgrade does adopt a new default for you,
+  the server logs the field and both values at startup, so nothing changes silently.
 - Composer commands: **`/qj <plain language>`** — control QuickJoiner through its own API in
   words (connect a source, sync, teach a fact, tune settings, manage access); and `/scrape <url>`
   (crawl → a cited report with mermaid diagrams you can then choose to learn). `/qj` replaces the
@@ -444,11 +476,27 @@ is a lookup rather than a bet on vector ranking:
   **LLM-extracted relationships** over prose docs (`graph.extract_triples`, off by default; every
   edge validated against a fixed vocabulary **and against per-relation domain/range signatures** —
   "prod owns bob" is dropped even though every word is legal — and cited to its document).
+- **Tables**, deterministically. A table is the most structured thing on a page and the hardest
+  for an LLM to read: flattened to text, a member roster is a wall of unlabelled values with no
+  sentence linking anyone to anything. Tables are now preserved as markdown rows at extraction —
+  keeping the header, the column alignment and **empty cells** (a blank cell used to vanish and
+  shift every later value in that row into the wrong column) — and mined structurally: a typed
+  column (`Team`, `Repository`, `Environment`, …) plus the entity a catalogue URL names itself by
+  (`/TeamDetails?team=Payments`) become edges, and a person row's **email becomes an alias**, so
+  the same human known as `a.lee@corp.com` in one system and "Ann Lee" in another is one node.
+  Works on any source whose text carries a table — scraped pages, Confluence, markdown, Office.
 - **Graph-expansion retrieval** (on by default): once an answer is grounded, QuickJoiner walks one
   hop out in the graph to surface linked evidence the vector search missed (a ticket → the repo that
   references it → the deploy that shipped it). It never changes the grounded-vs-refuse decision.
-- Surfaced as the **Waypoints** graph view, agent tools `graph_neighbors` / `graph_path`, and
-  `GET /api/graph` / `GET /api/graph/path`.
+- Surfaced as the **Waypoints** graph view, agent tools `graph_neighbors` / `graph_relations` /
+  `graph_path`, and `GET /api/graph` / `GET /api/graph/path`.
+
+**"List all X with their Y" is a graph question, not a search one.** Ask for every team with its
+members, or which team owns which repo, and vector search cannot answer it — it returns the top-k
+most *similar* chunks, so one overview page listing team names and head-counts fills the window
+while the pages holding the actual detail never surface. The `graph_relations` tool reads one
+relation across the whole graph instead, complete within its limit and citable per group, and says
+so plainly when the list is truncated rather than presenting a sample as the whole answer.
 
 When relationship extraction is on, it runs *after* the fast ingest loop — so a run that is stopped
 (or a connector that pulls a **moving window**, like Azure DevOps' recent sprints) can leave
@@ -468,6 +516,15 @@ for any org spoken-form in your question — so "how is connector monitor built"
 indexed only under `AppRiver.Connector.Monitor`, with no need to know the exact package name. And
 `qj eval --calibrate` recommends the grounding threshold for *your* corpus from a real eval set,
 so `retrieval.min_score` can be measured rather than guessed.
+
+Speed is measured the same way, by **`qj bench`**: it breaks a query's latency down by stage —
+embed, dense leg, sparse leg, fusion, reranking, the grounding gate, plus alias and graph
+expansion — so you can see *where* the time goes rather than only how long it took, and
+`--compare` fails a run that got more than 20% slower. Quality knobs cost real time, and this is
+how you decide whether they're worth it on your corpus: on a 56k-chunk workspace the cross-encoder
+reranker alone is ~77ms per candidate, which at the default depth of 24 is most of a query.
+`--agent` adds end-to-end answer latency and tokens per answer, including how much of the prompt
+your provider served from cache.
 
 Embeddings run locally via fastembed (`BAAI/bge-small-en-v1.5` by default; switch
 `embedding.provider` to `ollama` to use `nomic-embed-text`). These models are trained for
@@ -503,21 +560,41 @@ qj eval my-evals.yaml --calibrate      # recommend the best retrieval.min_score 
 qj eval my-evals.yaml --compare old.json  # delta table vs a past report; non-zero exit on a
                                           #   >2-point regression (use it as a CI merge gate)
 qj eval docs/evals/multi-hop-crosssource.yaml   # shipped multi-hop / cross-source eval set
+qj bench my-bench.yaml --init          # write a starter bench pack (an eval set works too)
+qj bench my-bench.yaml [--agent]       # SPEED + COST: where each query's milliseconds go
+                                       #   (embed / dense / sparse / fuse / rerank / gate,
+                                       #   p50+p95) and embedder chunks/sec; --agent adds
+                                       #   time-to-first-token, answer time and tokens per
+                                       #   answer (incl. how much the prompt cache saved)
+qj bench my-bench.yaml --compare old.json  # before/after table; non-zero exit if anything got
+                                           #   >20% slower or more expensive (CI merge gate)
 qj extract report.pptx                 # what can QuickJoiner actually read from this file?
                                        #   per-slide character counts; --full for all text.
                                        #   Needs no workspace and ingests nothing.
 qj browser login https://sso.acme.com  # persistent Playwright profile (install: pip install -e ".[browser]")
+                                       #   --insecure for an internal/private-CA certificate
 qj browser status https://sso.acme.com # is that saved sign-in still working?
 ```
 
 ### Ingesting a site behind a login
 
 **From the web UI:** create the connector with **"Always use signed-in browser session"**
-ticked, then press **Sign in to this site** on its plate — a browser window opens on the
-machine running QuickJoiner, you sign in once, and the plate switches from `sign-in required`
-to `signed in`. If a later sync hits an expired session, the sync log says so and offers the
-same button. *(The window opens on the **server's** desktop; on a headless host the UI says so
-and points you at the CLI below.)*
+ticked, then press **Sign in to this site** on its plate. What happens next depends on where
+QuickJoiner is running:
+
+- **A machine with a display** (your desktop): a real browser window opens on it, you sign in
+  once, and the plate switches from `sign-in required` to `signed in`.
+- **A headless host — Docker/cloud** (no display at all): instead of a window, a **live remote
+  browser view** opens right in the UI tab — QuickJoiner runs Chromium headless and streams it
+  to you, so you click/type on the streamed page exactly as if it were local. Typing, paste
+  (Ctrl/Cmd+V pastes *your* clipboard, not the server's), Enter/Tab/Backspace/Delete and
+  select-all all work; click the view first so it has keyboard focus. Press **"Done — capture
+  session"** when you're signed in (there's no window to close, so this is the explicit signal),
+  or **"Run in background"** to detach — the button on the connector plate turns into **"Open
+  sign-in view"** so you can come back to it. No extra setup needed — this works out of the box
+  with the same `WITH_BROWSER=1` image described above, no Xvfb/VNC required.
+
+If a later sync hits an expired session, the sync log says so and offers the same button.
 
 **From the CLI**, point a `web_scrape` connector at it with **`use_browser=true`** and sign in once:
 
@@ -543,8 +620,51 @@ worth knowing, both learned the hard way:
 
 If your SSO offers a "Use Domain Credentials" / Windows-integrated button, prefer the
 username+password form — this Chromium has no enterprise auth allowlist, so the integrated
-path usually dead-ends. Internal CA certificates are fine: Chromium uses the OS trust store
-(the plain-HTTP path does not, which is another reason `use_browser=true` matters here).
+path usually dead-ends.
+
+- **Internal/corporate CA certificates.** On your own desktop these usually just work, because
+  Chromium reads the OS trust store — which your machine has already been set up with. **A
+  container has not**, so an internal site signed by a private CA fails every navigation there
+  with `ERR_CERT_AUTHORITY_INVALID`; the remote sign-in view then shows Chrome's certificate
+  warning page instead of your login page. Turn **"Verify TLS certificate"** off on the connector
+  (`-o verify_tls=false` from the CLI, `--insecure` on `qj browser login`) for internal hosts you
+  trust. It's per-connector and off-by-default on purpose — QuickJoiner won't silently stop
+  verifying certificates for every site it touches.
+
+### What the crawler will and won't do
+
+- **It stays on the site.** Links to other hosts are never followed, whatever the prefix list
+  allows — an internal app links out to the trackers and repos it references, and those are
+  other systems. Turn off with `-o same_host_only=false` if a site genuinely spans two hosts.
+- **It visits each page once.** URLs are canonicalized first (host case, default port, duplicate
+  slashes, parameter order, `utm_*` tracking parameters), so the same page under several
+  spellings isn't ingested several times. Query *values* are kept exactly — `?team=30` and
+  `?team=41` are different pages, and full URLs including the query string are what the
+  document browser shows you.
+- **It drops byte-identical repeats.** A dashboard's filter facets often render the same empty
+  list under a dozen URLs; only the first is kept. The test is exact equality — pages that
+  merely resemble each other are all kept.
+- **It tells you what it left out.** The sync log reports duplicates skipped, and warns when it
+  stopped at the page limit with links still queued (rather than looking like a complete crawl).
+
+### Teaching it what a page means
+
+Sites like an internal service catalogue are a goldmine — which team owns which repository, who
+is on which team — but a page states that in a table whose meaning only your organization knows.
+Every connector has an optional **"What these documents contain"** box:
+
+> Each page describes one repository. The Team field is the team that owns it; Dependencies
+> lists the services it calls.
+
+That guides knowledge-graph extraction for this source: the extractor is told what a typical page
+*is*, so it recognizes the relationships being stated instead of mining generic prose. It can't
+loosen anything — every extracted relationship is still validated, and one the document doesn't
+state is still not recorded. Needs **Extract relationships from prose** on in ⚙ Settings, and
+applies to the next sync or `qj drain-graph <name>`.
+
+The joining across pages is the knowledge graph's job, not the prompt's: "team Acadia owns
+repo X" from one page and "repo X depends on Y" from another meet at the same entity, so a
+question about the services behind Z is answered from pages nothing ever read together.
 
 ## Cloud mode (Postgres + pgvector)
 

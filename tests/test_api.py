@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import queue
 
 import pytest
 import yaml
@@ -163,6 +164,31 @@ def test_settings_graph_and_retrieval_roundtrip(client):
     got = client.get("/api/settings").json()
     assert got["graph"]["extract_triples"] is True
     assert got["retrieval"]["reranker"] == "none"
+
+
+def test_settings_change_reaches_the_live_pipeline_not_just_the_saved_config(api_workspace):
+    """Reported live: `graph.extract_triples` was toggled on in Settings, a clean re-sync run,
+    and the graph still came back with only the deterministic edges. The setting HAD saved —
+    but `build_context` wires the triple extractor into the pipeline once at process start,
+    so the running pipeline kept the extractor it was born with (None) until a restart. A
+    settings write must re-derive the objects built from config, not just persist them."""
+    ctx = build_context(api_workspace)
+    client = TestClient(create_app(api_workspace, ctx=ctx))
+    assert ctx.pipeline.extracts_triples is False
+    assert client.get("/api/graph/pending").json()["extraction_enabled"] is False
+
+    assert client.patch("/api/settings", json={"graph": {"extract_triples": True}}).status_code == 200
+    assert ctx.pipeline.extracts_triples is True  # same process, no restart
+    assert client.get("/api/graph/pending").json()["extraction_enabled"] is True
+
+    # Query-side retrieval knobs live on the store object and must move too.
+    client.patch("/api/settings", json={"retrieval": {"hybrid": False, "reranker": "none"}})
+    assert ctx.store._retrieval.hybrid is False
+    assert ctx.store._reranker is None
+
+    # Turning it back off must also take effect immediately, not strand the extractor on.
+    client.patch("/api/settings", json={"graph": {"extract_triples": False}})
+    assert ctx.pipeline.extracts_triples is False
 
 
 def test_settings_defaults_are_shipped_values_not_current_ones(client):
@@ -570,7 +596,7 @@ def test_graph_pending_and_drain_endpoints(api_workspace):
 
     calls: list[str] = []
     ctx.config.graph.triple_min_chars = 1  # the fixture's doc is a couple of lines long
-    ctx.pipeline._triple_extractor = lambda text, title: calls.append(title) or []
+    ctx.pipeline._triple_extractor = lambda text, title, guidance="": calls.append(title) or []
     r = client.post("/api/graph/drain")
     assert r.status_code == 200
     job = r.json()["job"]
@@ -1113,20 +1139,22 @@ def test_browser_session_endpoints_report_and_guard(api_workspace, monkeypatch):
     client = TestClient(create_app(api_workspace, ctx=ctx))
 
     monkeypatch.setattr("quickjoiner.connectors.browser.session.verify_session",
-                        lambda ws, url: (False, "landed on https://sso.test/SignIn — that is a sign-in page."))
+                        lambda ws, url, ignore_https_errors=False: (
+                            False, "landed on https://sso.test/SignIn — that is a sign-in page."))
     body = client.get("/api/connectors/gated/browser/session").json()
     assert body["url"] == "https://gated.test/"
     assert body["signed_in"] is False and "sign-in page" in body["detail"]
 
     monkeypatch.setattr("quickjoiner.connectors.browser.session.verify_session",
-                        lambda ws, url: (True, "https://gated.test/ returned 4210 characters"))
+                        lambda ws, url, ignore_https_errors=False: (
+                            True, "https://gated.test/ returned 4210 characters"))
     assert client.get("/api/connectors/gated/browser/session").json()["signed_in"] is True
 
     # Starting a sign-in is a background job; the URL comes from the connector's own
     # config, never the request (this route must not open arbitrary pages on the server).
     started = {}
 
-    def fake_start(ws, name, url):
+    def fake_start(ws, name, url, ignore_https_errors=False):
         started["url"] = url
         return login_jobs.LoginJob(source=name, url=url)
 
@@ -1137,7 +1165,7 @@ def test_browser_session_endpoints_report_and_guard(api_workspace, monkeypatch):
     assert r.json()["login"]["source"] == "gated"
 
     # A host with no display refuses with an explanation rather than hanging.
-    def boom(ws, name, url):
+    def boom(ws, name, url, ignore_https_errors=False):
         raise RuntimeError("This server has no display")
 
     monkeypatch.setattr(login_jobs, "start", boom)
@@ -1149,3 +1177,96 @@ def test_browser_session_rejects_a_non_scrape_connector(api_workspace):
     client = TestClient(create_app(api_workspace))
     r = client.get("/api/connectors/handbook/browser/session")
     assert r.status_code == 400 and "not a web_scrape" in r.json()["detail"]
+
+
+def _gated_scrape_client(api_workspace):
+    ctx = build_context(api_workspace)
+    ctx.catalog.write_source(SourceConfig(
+        name="gated", type="web_scrape",
+        options={"start_urls": "https://gated.test/", "use_browser": "true"}))
+    ctx.config = ctx.catalog.load_config()
+    return TestClient(create_app(api_workspace, ctx=ctx))
+
+
+def test_browser_session_reports_remote_capable_on_a_headless_host(api_workspace, monkeypatch):
+    """`remote_capable` reflects `login_mode()` independent of any running job, so the
+    frontend can decide up front whether "Sign in" opens a local window or the remote modal."""
+    from quickjoiner.connectors.browser import login_jobs
+
+    client = _gated_scrape_client(api_workspace)
+    monkeypatch.setattr(login_jobs, "login_mode", lambda: "remote")
+    monkeypatch.setattr("quickjoiner.connectors.browser.session.verify_session",
+                        lambda ws, url, ignore_https_errors=False: (True, "ok"))
+    body = client.get("/api/connectors/gated/browser/session").json()
+    assert body["remote_capable"] is True
+    # display_hint()/can_open_window call login_mode() themselves, so they see the same patch.
+    assert body["can_open_window"] is True and body["display_hint"] is None
+
+
+def test_browser_session_frames_streams_meta_frames_then_done(api_workspace, monkeypatch):
+    from quickjoiner.connectors.browser import login_jobs
+
+    client = _gated_scrape_client(api_workspace)
+    q = queue.Queue()
+    q.put("frame-one")
+    q.put("frame-two")
+    q.put(login_jobs.FRAME_DONE)
+    monkeypatch.setattr(login_jobs, "subscribe_frames", lambda name: q)
+
+    r = client.get("/api/connectors/gated/browser/session/frames")
+    assert r.status_code == 200
+    events = [json.loads(line[len("data: "):]) for line in r.text.splitlines() if line.startswith("data: ")]
+    assert events[0] == {"type": "meta", "width": 1280, "height": 800}
+    assert [e["data"] for e in events if e["type"] == "frame"] == ["frame-one", "frame-two"]
+    assert events[-1] == {"type": "done"}
+
+
+def test_browser_session_frames_404s_when_no_remote_session_is_running(api_workspace, monkeypatch):
+    from quickjoiner.connectors.browser import login_jobs
+
+    client = _gated_scrape_client(api_workspace)
+    monkeypatch.setattr(login_jobs, "subscribe_frames", lambda name: None)
+    r = client.get("/api/connectors/gated/browser/session/frames")
+    assert r.status_code == 404
+
+
+def test_browser_session_input_routes_through_and_guards_a_local_job(api_workspace, monkeypatch):
+    from quickjoiner.connectors.browser import login_jobs
+
+    client = _gated_scrape_client(api_workspace)
+
+    monkeypatch.setattr(login_jobs, "push_input", lambda name, event: False)
+    r = client.post("/api/connectors/gated/browser/session/input", json={"type": "mousemove", "x": 1, "y": 2})
+    assert r.status_code == 404
+
+    captured = {}
+    monkeypatch.setattr(login_jobs, "push_input",
+                        lambda name, event: captured.setdefault("event", event) or True)
+    r = client.post("/api/connectors/gated/browser/session/input", json={"type": "keydown", "key": "Enter"})
+    assert r.status_code == 200 and r.json() == {"ok": True}
+    assert captured["event"] == {"type": "keydown", "key": "Enter"}
+
+    # A local-mode job in flight has no remote session to interact with — 409, not a no-op.
+    monkeypatch.setattr(login_jobs, "status", lambda name: login_jobs.LoginJob(
+        source=name, url="https://gated.test/", state="waiting", mode="local"))
+    r = client.post("/api/connectors/gated/browser/session/input", json={"type": "mousemove", "x": 1, "y": 2})
+    assert r.status_code == 409
+
+
+def test_browser_session_done_routes_through_and_guards_a_local_job(api_workspace, monkeypatch):
+    from quickjoiner.connectors.browser import login_jobs
+
+    client = _gated_scrape_client(api_workspace)
+
+    monkeypatch.setattr(login_jobs, "signal_done", lambda name: False)
+    r = client.post("/api/connectors/gated/browser/session/done")
+    assert r.status_code == 404
+
+    monkeypatch.setattr(login_jobs, "signal_done", lambda name: True)
+    r = client.post("/api/connectors/gated/browser/session/done")
+    assert r.status_code == 200 and r.json() == {"ok": True}
+
+    monkeypatch.setattr(login_jobs, "status", lambda name: login_jobs.LoginJob(
+        source=name, url="https://gated.test/", state="waiting", mode="local"))
+    r = client.post("/api/connectors/gated/browser/session/done")
+    assert r.status_code == 409

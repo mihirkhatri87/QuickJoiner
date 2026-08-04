@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import os
 from pathlib import Path
 
@@ -250,6 +251,73 @@ class Config(BaseModel):
     graph: GraphConfig = Field(default_factory=GraphConfig)
     repos: ReposConfig = Field(default_factory=ReposConfig)
     sources: list[SourceConfig] = Field(default_factory=list)
+
+
+# --- shipped defaults reaching workspaces that already exist -------------------------
+#
+# The settings blob is persisted SPARSELY (Catalog.save_config dumps with
+# exclude_defaults=True), so a field the user never set is simply absent and picks up
+# whatever default this file currently ships. That is what makes a retune here reach
+# everyone. It did NOT used to be: save_config dumped every field, so the value in force
+# the first time a workspace saved was materialised into the blob and pinned there
+# forever — measured 2026-07-31 on the live corpus, still running min_score 0.55 two
+# days after 0.64 shipped, which is why plan 05's retune had no effect on the only real
+# corpus it was calibrated against.
+#
+# A blob written by that older code has every field materialised, so "never set" and
+# "deliberately set" are indistinguishable in it — EXCEPT for a value that exactly equals
+# a default this file has since superseded. Those are listed below and dropped once (see
+# Catalog.load_config), letting the current default apply. Anything else is treated as a
+# real customisation and kept: the live workspace's deliberate `triple_workers: 8`
+# survives untouched, and so would a 0.55 someone chose on purpose *after* 0.64 shipped
+# (it would have been re-saved sparsely by then, so it isn't in the blob to prune).
+#
+# WHEN YOU CHANGE A DEFAULT ABOVE: add the old value here and bump DEFAULTS_EPOCH — that
+# is the step that makes the change reach anyone who already has a workspace.
+SUPERSEDED_DEFAULTS: dict[str, tuple] = {
+    "retrieval.min_score": (0.55,),      # -> 0.64 (plan 05 retune, 2026-07-29)
+    "retrieval.reranker": ("none",),     # -> "fastembed" (cross-encoder on by default)
+    "graph.triple_workers": (4,),        # -> 16 (measured p50 ~18s/call)
+}
+
+# Bumped whenever SUPERSEDED_DEFAULTS gains an entry, so the reconciliation runs again
+# for a workspace that has not re-saved (and thus not sparsified) since the last one.
+DEFAULTS_EPOCH = 1
+
+
+def _is_same_value(value: object, candidate: object) -> bool:
+    """Equality that won't confuse a bool with 0/1 (JSON round-trips both as scalars)."""
+    if isinstance(value, bool) != isinstance(candidate, bool):
+        return False
+    return value == candidate
+
+
+def reconcile_superseded_defaults(blob: dict) -> tuple[dict, list[tuple[str, object, object]]]:
+    """Drop stored values that are only a superseded shipped default (pure).
+
+    Returns `(pruned_blob, adopted)`, where `adopted` holds one `(path, was, now)` per
+    field the current default now governs — so the caller can SAY what moved instead of
+    changing a workspace's retrieval behaviour silently. The input blob is not mutated.
+    """
+    fresh = Config()
+    pruned = copy.deepcopy(blob)
+    adopted: list[tuple[str, object, object]] = []
+    for path, superseded in SUPERSEDED_DEFAULTS.items():
+        group, _, field = path.partition(".")
+        section = pruned.get(group)
+        if not isinstance(section, dict) or field not in section:
+            continue
+        was = section[field]
+        if not any(_is_same_value(was, old) for old in superseded):
+            continue  # a real customisation (or already the current value) — keep it
+        now = getattr(getattr(fresh, group), field)
+        if _is_same_value(was, now):
+            continue  # nothing would change; leave the blob alone
+        del section[field]
+        adopted.append((path, was, now))
+        if not section:
+            pruned.pop(group, None)
+    return pruned, adopted
 
 
 def workspace_dir(name: str | None = None) -> Path:

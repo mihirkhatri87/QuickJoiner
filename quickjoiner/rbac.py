@@ -112,6 +112,12 @@ _ROUTES: list[tuple[str, str, str, Optional[str]]] = [
     # connector can reach), so it sits at the same tier as editing one.
     ("POST", "/api/connectors/{name}/browser/login", "connectors:write", "name"),
     ("GET", "/api/connectors/{name}/browser/session", "connectors:read", "name"),
+    # Remote (headless-host) sign-in: the screencast can show, and the input channel can
+    # type, credentials for whatever site the connector points at, so all three sit at the
+    # same "connectors:write" tier as starting the login itself — not mere read access.
+    ("GET", "/api/connectors/{name}/browser/session/frames", "connectors:write", "name"),
+    ("POST", "/api/connectors/{name}/browser/session/input", "connectors:write", "name"),
+    ("POST", "/api/connectors/{name}/browser/session/done", "connectors:write", "name"),
     ("GET", "/api/connectors/{name}/oauth/status", "connectors:read", "name"),
     ("DELETE", "/api/connectors/{name}/oauth", "connectors:write", "name"),
     ("GET", "/api/oauth/callback", PUBLIC, None),

@@ -28,6 +28,14 @@ teach you with the remember tool.
 to explain and interpret retrieved facts, but never to invent org-specific facts such as \
 names, URLs, processes, owners, or dates.
 
+For "list all X with their Y" over the ORGANIZATION's own structure — every team with its \
+members, which team owns which repo, what is deployed where — call graph_relations(rel, \
+src_type, dst_type). That is one relation across the whole graph and it is complete within \
+its limit; search_memory cannot answer it, because it returns the top-k most similar chunks \
+and a single overview page will fill that window with names and counts while the pages \
+holding the detail never surface. Do NOT ask the same question once per entity, and do not \
+present a top-k sample as if it were the full list.
+
 For "how are X and Y related?" — two NAMED things — call graph_path(a, b) first: it returns \
 just the connecting chain (bounded hops), with evidence per hop. For "what does X connect to?" \
 — one thing, exploring broadly — call graph_neighbors instead. Don't call graph_neighbors on a \

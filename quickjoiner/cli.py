@@ -898,6 +898,161 @@ def eval_cmd(
         console.print("[green]No watched metric regressed beyond tolerance.[/green]")
 
 
+@app.command("bench")
+def bench_cmd(
+    pack: Path = typer.Argument(..., help="Path to a YAML bench pack (create one with --init). An eval set works too."),
+    init: bool = typer.Option(False, "--init", help="Write a starter bench pack to the given path and exit"),
+    agent: bool = typer.Option(False, "--agent", help="Also measure end-to-end answer latency + tokens (needs an LLM)"),
+    repeats: int = typer.Option(3, "--repeats", help="Timed runs per query (after warm-up)"),
+    warmup: int = typer.Option(1, "--warmup", help="Discarded warm-up runs — the first search loads the reranker model"),
+    no_embed: bool = typer.Option(False, "--no-embed", help="Skip the embedder throughput leg"),
+    compare: Optional[Path] = typer.Option(
+        None, "--compare",
+        help="Diff this run against a previous bench report JSON; exits non-zero if a "
+             "watched metric got >20% slower or more expensive",
+    ),
+    provider: Optional[str] = PROVIDER_OPT,
+    model: Optional[str] = MODEL_OPT,
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """Measure speed and cost: per-stage retrieval latency, embedder throughput, and
+    (with --agent) answer latency + tokens per answer.
+
+    The speed twin of `qj eval`. Run it before and after any performance change and
+    compare the two reports — a claim of "faster" without a bench table is a guess.
+    """
+    import json as _json
+
+    from quickjoiner.bench.harness import TEMPLATE, compare_reports, run_bench
+
+    if init:
+        if pack.exists():
+            console.print(f"[red]{pack} already exists; not overwriting.[/red]")
+            raise typer.Exit(1)
+        pack.parent.mkdir(parents=True, exist_ok=True)
+        pack.write_text(TEMPLATE, encoding="utf-8")
+        console.print(f"[green]Starter bench pack written:[/green] {pack} — edit it, then run: qj bench {pack}")
+        return
+
+    ctx = _context(workspace)
+    try:
+        with console.status("Benchmarking..."):
+            report = run_bench(
+                ctx, pack, agent_layer=agent, repeats=repeats, warmup=warmup,
+                embed=not no_embed, provider_override=provider, model_override=model,
+            )
+    except (ValueError, FileNotFoundError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    except Exception as exc:  # provider/setup failures on the agent layer
+        console.print(f"[red]Bench failed: {exc}[/red]")
+        raise typer.Exit(1)
+
+    summary = report["retrieval"]["summary"]
+    cfg = report["config"]
+    console.print(
+        f"[dim]{cfg['documents']} documents / {cfg['chunks']} chunks · {cfg['embedding']} · "
+        f"hybrid={cfg['hybrid']} reranker={cfg['reranker']}[/dim]"
+    )
+    stable = Table(title=f"Retrieval latency — {report['name']} "
+                         f"({summary['queries']} queries x {repeats} runs)")
+    stable.add_column("stage")
+    stable.add_column("p50 ms", justify="right")
+    stable.add_column("p95 ms", justify="right")
+    stable.add_column("share of p50", justify="right")
+    shares = summary.get("stage_share_of_p50", {})
+    for name, stats in sorted(summary["stages_ms"].items(),
+                              key=lambda kv: -kv[1].get("p50", 0)):
+        stable.add_row(name, f"{stats['p50']:.2f}", f"{stats['p95']:.2f}",
+                       f"{shares.get(name, 0) * 100:.0f}%")
+    total = summary["search_total_ms"]
+    stable.add_row("[bold]total[/bold]", f"[bold]{total['p50']:.2f}[/bold]",
+                   f"[bold]{total['p95']:.2f}[/bold]", "")
+    console.print(stable)
+    if summary.get("counts"):
+        console.print(f"[dim]Mean candidates: {summary['counts']}[/dim]")
+
+    if "embed" in report:
+        e = report["embed"]["summary"]
+        console.print(
+            f"Embedder [bold]{e['model']}[/bold] (device={e['device']}): "
+            f"{e['chunks_per_sec']} chunks/sec — {e['ms_per_chunk']:.3f} ms/chunk "
+            f"at batch {e['batch']}"
+        )
+
+    if agent and "agent" in report:
+        a = report["agent"]["summary"]
+        atable = Table(title="Agent layer")
+        atable.add_column("metric")
+        atable.add_column("p50", justify="right")
+        atable.add_column("p95", justify="right")
+        ft = a["first_token_ms"]
+        if ft.get("samples"):
+            atable.add_row("first token (ms)", f"{ft['p50']:.0f}", f"{ft['p95']:.0f}")
+        else:
+            atable.add_row("first token (ms)", f"[yellow]{ft.get('note', '-')}[/yellow]", "")
+        atable.add_row("full answer (ms)", f"{a['answer_ms']['p50']:.0f}", f"{a['answer_ms']['p95']:.0f}")
+        atable.add_row("tokens / answer", f"{a['tokens_per_answer']['p50']:.0f}",
+                       f"{a['tokens_per_answer']['p95']:.0f}")
+        console.print(atable)
+        console.print(
+            f"{a['rounds_per_answer']} model rounds and {a['tool_calls_per_answer']} tool "
+            f"calls per answer; {a['prompt_tokens_total']} prompt + "
+            f"{a['completion_tokens_total']} completion tokens over {a['answers']} answers."
+        )
+        if "cache_hit_rate" in a:
+            rate = a["cache_hit_rate"]
+            if rate > 0:
+                console.print(f"[green]Prompt cache: {rate:.1%} of prompt tokens were cache reads.[/green]")
+            else:
+                # Deliberately provider-neutral: Anthropic caches explicitly (llm.prompt_cache
+                # breakpoints), OpenAI-compatible backends do it automatically off a stable
+                # prefix, and Ollama reports no cache counter at all — so 0 means different
+                # things, and naming one config field would misdiagnose the other two.
+                console.print(
+                    "[yellow]Prompt cache: 0 of the prompt was served from cache. Either the "
+                    "backend doesn't cache (Ollama reports no counter at all), the prompt is "
+                    "under its minimum cacheable length, or the prefix isn't byte-stable.[/yellow]"
+                )
+    console.print(f"[green]Report saved:[/green] {report['report_path']}")
+
+    if compare is not None:
+        try:
+            old_report = _json.loads(Path(compare).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            console.print(f"[red]Could not read --compare report {compare}: {exc}[/red]")
+            raise typer.Exit(1)
+        diff = compare_reports(old_report, report)
+        dtable = Table(title=f"Compare vs {Path(compare).name}")
+        dtable.add_column("layer")
+        dtable.add_column("metric")
+        dtable.add_column("old", justify="right")
+        dtable.add_column("new", justify="right")
+        dtable.add_column("change", justify="right")
+        for row in diff["rows"]:
+            old_s = f"{row['old']:.2f}" if isinstance(row["old"], (int, float)) else "-"
+            new_s = f"{row['new']:.2f}" if isinstance(row["new"], (int, float)) else "-"
+            if row["change"] is None:
+                change_s = "-"
+            elif row["regressed"]:
+                change_s = f"[red]{row['change']:+.1%} slower[/red]"
+            elif not row["gated"]:
+                change_s = f"[dim]{row['change']:+.1%} (not gated)[/dim]"
+            elif row["change"] < 0:
+                change_s = f"[green]{row['change']:+.1%}[/green]"
+            else:
+                change_s = f"{row['change']:+.1%}"
+            dtable.add_row(row["layer"], row["metric"], old_s, new_s, change_s)
+        console.print(dtable)
+        if diff["regressed"]:
+            console.print(
+                f"[red]Regression: a watched metric got more than "
+                f"{diff['tolerance']:.0%} worse.[/red]"
+            )
+            raise typer.Exit(1)
+        console.print("[green]No watched metric regressed beyond tolerance.[/green]")
+
+
 @app.command()
 def extract(
     path: Path = typer.Argument(..., help="A document to run the text extractor over"),
@@ -1089,6 +1244,11 @@ app.add_typer(browser_app, name="browser")
 def browser_login(
     url: str = typer.Argument(..., help="Login page to open (e.g. your SSO portal or the tool's URL)"),
     workspace: Optional[Path] = WORKSPACE_OPT,
+    insecure: bool = typer.Option(
+        False, "--insecure",
+        help="Accept a certificate signed by a private/corporate CA (mirrors the connector's "
+             "verify_tls=false). Only for internal hosts you trust.",
+    ),
 ):
     """Open a real Chromium window; sign in, then close it. The session persists.
 
@@ -1100,7 +1260,8 @@ def browser_login(
     ws = _workspace(workspace)
     console.print(f"Opening browser for [bold]{url}[/bold] — sign in, then close the window.")
     try:
-        report = login(ws, url, on_log=lambda m: console.print(f"[green]{m}[/green]"))
+        report = login(ws, url, on_log=lambda m: console.print(f"[green]{m}[/green]"),
+                       ignore_https_errors=insecure)
     except RuntimeError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1)
@@ -1108,7 +1269,7 @@ def browser_login(
         console.print(f"[dim]captured {report['cookies']} cookie(s) "
                       f"({report['real_cookies']} session/auth) for: {', '.join(report['hosts'])}[/dim]")
     console.print("Verifying the saved session...")
-    ok, detail = verify_session(ws, url)
+    ok, detail = verify_session(ws, url, ignore_https_errors=insecure)
     if ok:
         console.print(f"[green]✓ Signed in.[/green] {detail}")
         console.print("Scrape connectors with use_browser=true can now use it.")
@@ -1125,6 +1286,10 @@ def browser_login(
 def browser_status(
     url: Optional[str] = typer.Argument(None, help="Optionally verify the session against this URL"),
     workspace: Optional[Path] = WORKSPACE_OPT,
+    insecure: bool = typer.Option(
+        False, "--insecure",
+        help="Accept a certificate signed by a private/corporate CA when verifying.",
+    ),
 ):
     """Show the saved browser session — and, with a URL, whether it actually still works."""
     from quickjoiner.connectors.browser.session import (
@@ -1146,7 +1311,7 @@ def browser_status(
         console.print("[yellow]No saved session cookies[/yellow] — a profile alone does not mean "
                       "you are signed in anywhere.")
     if url:
-        ok, detail = verify_session(ws, url)
+        ok, detail = verify_session(ws, url, ignore_https_errors=insecure)
         console.print(f"[green]✓ Signed in.[/green] {detail}" if ok
                       else f"[yellow]✗ Not signed in.[/yellow] {detail}")
 

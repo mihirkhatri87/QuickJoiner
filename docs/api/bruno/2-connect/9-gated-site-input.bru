@@ -1,0 +1,35 @@
+meta {
+  name: Gated site — send input to the remote sign-in
+  type: http
+  seq: 9
+}
+
+post {
+  url: {{baseUrl}}/api/connectors/{{scrapeConnector}}/browser/session/input
+  body: json
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{token}}
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "type": "keydown",
+    "key": "Tab"
+  }
+}
+
+docs {
+  One input event applied to the running remote (headless, streamed) sign-in — see
+  request 8. `type` is one of `mousemove|mousedown|mouseup|wheel|keydown|keyup|type`, each
+  taking the matching fields (`x`/`y`, `button`, `deltaX`/`deltaY`, `key`, or `text`). This
+  is the same fixed whitelist the backend enforces — anything else is silently ignored, not
+  an arbitrary passthrough to the browser.
+
+  404 when no remote sign-in is running for this connector; 409 when this connector's
+  sign-in is a **local** window on the QuickJoiner host instead (interact with that window
+  directly — there's nothing remote to send input to).
+}

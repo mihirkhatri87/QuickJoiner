@@ -16,6 +16,13 @@ import { Button, cn } from "./ui";
  * `autoStart` distinguishes the two ways in: true = the user pressed Sync (start the job,
  * then watch it), false = the user clicked an existing job to watch it.
  */
+/** How many times to re-attach the log stream before giving up. The stream dies whenever the
+ * server does (container restart / redeploy), and the browser surfaces that as a bare
+ * "network error" — which reads as though the SYNC failed rather than the viewer's connection.
+ * Reconnecting distinguishes the two honestly. */
+const RECONNECT_ATTEMPTS = 6;
+const RECONNECTING = "⚠ lost the connection to QuickJoiner — reconnecting…";
+
 export function SyncLogModal({
   name,
   clean,
@@ -64,14 +71,50 @@ export function SyncLogModal({
             /* non-fatal — the log stream still attaches below */
           }
         }
-        await api.streamSyncLogs(name, (e) => {
-          if (cancelled) return;
-          if (e.type === "log" && e.line) setLines((l) => [...l, e.line as string]);
-          else if (e.type === "done" && e.job) {
-            setJob(e.job);
-            changed.current?.();
+        // The log stream is a long-lived SSE connection, so it dies whenever the server does
+        // (a container restart, a redeploy). Reporting that raw — the browser calls it
+        // "network error" — reads as if the SYNC failed, which is a different and much more
+        // alarming claim than "the viewer lost its connection". Reconnect instead, and only
+        // after asking the server what actually happened to the run.
+        for (let attempt = 0; !cancelled; attempt++) {
+          try {
+            await api.streamSyncLogs(name, (e) => {
+              if (cancelled) return;
+              if (e.type === "log" && e.line) setLines((l) => [...l, e.line as string]);
+              else if (e.type === "done" && e.job) {
+                setJob(e.job);
+                changed.current?.();
+              }
+            });
+            return; // the stream ended normally (terminal `done`)
+          } catch (err) {
+            if (cancelled) return;
+            if (attempt >= RECONNECT_ATTEMPTS) {
+              setLines((l) => [...l, `✗ lost the connection to QuickJoiner: ${String((err as Error).message)}`]);
+              return;
+            }
+            setLines((l) =>
+              l[l.length - 1] === RECONNECTING ? l : [...l, RECONNECTING],
+            );
+            await new Promise((r) => setTimeout(r, Math.min(1000 * 2 ** attempt, 5000)));
+            if (cancelled) return;
+            // Is the server back, and did this run survive it? A job lives in the server's
+            // memory, so a restart ends it — retrying the stream forever would just spin.
+            try {
+              const { syncs } = await api.listSyncs();
+              const current = syncs.find((s) => s.source === name);
+              if (!current) {
+                setLines((l) => [...l, "✗ the server restarted — this run was interrupted."]);
+                changed.current?.();
+                return;
+              }
+              setJob(current);
+              setLines((l) => [...l, "▸ reconnected."]);
+            } catch {
+              /* server still down — keep retrying until the attempt budget runs out */
+            }
           }
-        });
+        }
       } catch (err) {
         if (!cancelled) setLines((l) => [...l, "✗ " + String((err as Error).message)]);
       }

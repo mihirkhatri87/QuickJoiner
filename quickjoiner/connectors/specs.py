@@ -24,14 +24,16 @@ from quickjoiner.connectors.registry import CONNECTOR_TYPES, _load_builtin_conne
 
 def _f(key: str, label: str, *, required: bool = False, secret: bool = False,
        env: str | None = None, placeholder: str = "", help: str = "",
-       list_: bool = False, lock_after_sync: bool = False) -> dict:
+       list_: bool = False, lock_after_sync: bool = False,
+       multiline: bool = False) -> dict:
     # lock_after_sync: editable only while the connector has 0 learned documents (same
     # rule as the connector name) — for identity-shaping fields whose edits could not be
     # applied consistently to already-ingested data. Enforced server-side in the PATCH
     # endpoint and rendered disabled (with the reason) in the edit form.
+    # multiline: render as a textarea — for prose fields, not one-line values.
     return {"key": key, "label": label, "required": required, "secret": secret,
             "env": env, "placeholder": placeholder, "help": help, "list": list_,
-            "lock_after_sync": lock_after_sync}
+            "lock_after_sync": lock_after_sync, "multiline": multiline}
 
 
 FORM_SPECS: dict[str, dict] = {
@@ -260,6 +262,10 @@ FORM_SPECS: dict[str, dict] = {
                placeholder="https://docs.acme.internal/"),
             _f("allow_prefixes", "Only follow links under", list_=True,
                placeholder="https://docs.acme.internal/"),
+            _f("same_host_only", "Stay on the start URLs' hosts", placeholder="true",
+               help="On by default: never follow a link to another host, whatever the prefix "
+                    "list allows. An internal app links out to the trackers and repos it "
+                    "references — those are other systems, not this one."),
             _f("max_pages", "Page limit", placeholder="50"),
             _f("max_depth", "Link depth limit", placeholder="4",
                help="How many link hops to follow from a start URL (start page = 0). "
@@ -273,6 +279,11 @@ FORM_SPECS: dict[str, dict] = {
                     "crawl with a real headless browser."),
             _f("respect_robots", "Respect robots.txt", placeholder="true",
                help="On by default. Turn off only for sites you own."),
+            _f("verify_tls", "Verify TLS certificate", placeholder="true",
+               help="Set to false for an internal site whose certificate is issued by a "
+                    "private/corporate CA the server doesn't trust (the sign-in view and every "
+                    "fetch otherwise fail with ERR_CERT_AUTHORITY_INVALID). Only do this for "
+                    "hosts you trust on your own network."),
             _f("rate_limit_seconds", "Delay between requests (s)", placeholder="1.0"),
             _f("user_agent", "Custom User-Agent", help="Overrides the default desktop-Chrome UA."),
         ],
@@ -294,6 +305,24 @@ for _spec in FORM_SPECS.values():
             help="Other names this system goes by (comma-separated) — powers alias search "
                  "and links it to same-named entities in the knowledge graph. Editable only "
                  "until the first sync."))
+
+# What this source's documents ARE, in its owner's words. A page carries its facts but not
+# its shape: a service-catalogue entry reads as a bare table of names unless you already
+# know the "Team" column means that team OWNS the repository, so a general extractor pulls
+# a fraction of what the page actually asserts. Universal (every connector has documents
+# whose shape only its owner knows) and, unlike `aka`, NOT locked after the first sync —
+# it changes nothing already stored, only what the next extraction pass looks for, so it is
+# meant to be refined once you see what came out.
+for _spec in FORM_SPECS.values():
+    _spec["fields"].append(_f(
+        "extraction_prompt", "What these documents contain", multiline=True,
+        placeholder="Each page describes one repository. The Team field is the team that "
+                    "owns it; Dependencies lists the services it calls.",
+        help="Optional. Guides knowledge-graph extraction for this source — say what a "
+             "typical page is and which relationships it states. It cannot loosen the "
+             "rules: every extracted relationship is still validated, and one the document "
+             "doesn't state is still not recorded. Needs 'Extract relationships from prose' "
+             "on in Settings; applies to the next sync or graph drain."))
 
 _MODE_LETTERS = [
     (Mode.PULL, "pull"), (Mode.PUSH, "hooks"), (Mode.LIVE, "live"),

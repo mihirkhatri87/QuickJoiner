@@ -113,7 +113,9 @@ export interface ConnectorRow {
   modes: string[];
 }
 
-/** An in-flight interactive browser sign-in running on the QuickJoiner host. */
+/** An in-flight interactive browser sign-in. `mode` picks the UI: "local" opened a real
+ * window on the QuickJoiner host; "remote" (headless host, e.g. Docker) streams the browser
+ * back as streamed frames instead — see RemoteBrowserModal. */
 export interface BrowserLoginJob {
   source: string;
   url: string;
@@ -121,6 +123,7 @@ export interface BrowserLoginJob {
   message: string;
   signed_in: boolean | null;
   hosts: string[];
+  mode: "local" | "remote";
   started_at: string;
   ended_at: string | null;
   active: boolean;
@@ -135,10 +138,26 @@ export interface BrowserSessionStatus {
   hosts: string[];
   can_open_window: boolean;
   display_hint: string | null;
+  /** True when this host would run a NEW sign-in as a remote (streamed) session —
+   * independent of whether one is currently running, so the UI can decide up front. */
+  remote_capable: boolean;
   login: BrowserLoginJob | null;
   signed_in?: boolean;
   detail?: string;
 }
+
+/** One input event for a running remote sign-in — mirrors the fixed whitelist
+ * `connectors/browser/session._apply_input` accepts on the backend. */
+export type RemoteBrowserInputEvent =
+  | { type: "mousemove"; x: number; y: number }
+  | { type: "mousedown"; x: number; y: number; button: "left" | "right" | "middle" }
+  | { type: "mouseup"; button: "left" | "right" | "middle" }
+  | { type: "wheel"; deltaX: number; deltaY: number }
+  | { type: "keydown"; key: string }
+  | { type: "keyup"; key: string }
+  /** A chord such as "Control+a", sent as one press so no modifier is left stuck down. */
+  | { type: "press"; key: string }
+  | { type: "type"; text: string };
 
 /** OneDrive/SharePoint sign-in state. Never carries the tokens themselves — only who
  * the connector acts as and how many documents it has been taught on demand. */
@@ -171,6 +190,9 @@ export interface ConnectorField {
   /** Editable only before the connector's first sync (0 documents) — same rule as the
    * connector name. Enforced server-side; the edit form renders it disabled after. */
   lock_after_sync?: boolean;
+  /** Render as a textarea — a prose field (e.g. "what these documents contain"), not a
+   * one-line value. */
+  multiline?: boolean;
 }
 export interface ConnectorType {
   type: string;

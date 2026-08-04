@@ -561,11 +561,15 @@ def test_graph_neighbors_tool_caps_hub_entities(catalog, store):
     assert "75 relationships" in out
     assert "too many to list in full" in out
     assert "graph_path" in out  # steers toward the bounded two-entity tool
-    assert "defines (70 total)" in out
+    # Groups are labelled by relation AND direction (`--rel-->` outgoing, `<--rel--`
+    # incoming), so a hub's incoming edges get their own sample budget instead of being
+    # sorted out of a shared one — see test_tables.py for the regression that forced it.
+    assert "--defines--> (70 total)" in out
     assert "…and 62 more not shown" in out  # 70 - 8 sampled
-    assert "depends_on (5 total)" in out
-    assert out.count("--defines-->") == 8  # sampled, not all 70
-    assert out.count("--depends_on-->") == 5  # under the per-relation sample cap, shown in full
+    assert "--depends_on--> (5 total)" in out
+    # 8 sampled rows + the group header line; 70 are never all listed.
+    assert out.count("--defines-->") == 9
+    assert out.count("--depends_on-->") == 6  # 5 rows + header: under the cap, shown in full
 
 
 def test_graph_neighbors_tool_lists_in_full_under_threshold(catalog, store):

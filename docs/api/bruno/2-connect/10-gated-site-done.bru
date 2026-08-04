@@ -1,0 +1,25 @@
+meta {
+  name: Gated site — finish the remote sign-in
+  type: http
+  seq: 10
+}
+
+post {
+  url: {{baseUrl}}/api/connectors/{{scrapeConnector}}/browser/session/done
+  body: none
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{token}}
+}
+
+docs {
+  "Done — capture session": tells a running remote (headless/screencast) sign-in to snapshot
+  its cookies and close, the same way closing the window does for a local sign-in — see
+  request 8. There's no window to close for a remote session, so this is the explicit
+  equivalent signal.
+
+  404 when no remote sign-in is running for this connector; 409 when this connector's
+  sign-in is a **local** window on the QuickJoiner host instead (close that window instead).
+}

@@ -19,6 +19,7 @@ from quickjoiner.connectors.deps import is_manifest_path
 from quickjoiner.ingest.chunkers import chunk_document
 from quickjoiner.ingest.code_graph import extract_code_graph, looks_like_code
 from quickjoiner.ingest.pubsub import extract_pubsub_graph
+from quickjoiner.ingest.tables import extract_table_graph
 from quickjoiner.ingest.entity_resolution import EntityResolver
 from quickjoiner.ingest.normalize import normalize_text
 from quickjoiner.ingest.triples import triples_to_graph
@@ -119,7 +120,12 @@ class IngestStats:
 # re-sync. History: v2 (2026-07-23) = ADO Development-link edges + GitLab MR/branch graph.
 # v3 (2026-07-26) = ADO Hierarchy (part_of)/Related (related_to) edges + per-doc display
 # metadata (work item type/state/team/sprint/parent id) for the document browser's tree view.
-GRAPH_EXTRACTOR_VERSION = 3
+# v4 (2026-07-31) = deterministic table extraction (ingest/tables.py): typed columns and the
+# URL's own subject parameter become edges, and a person row's email becomes an alias. NOTE
+# this one only self-heals for documents whose stored TEXT already carries markdown tables —
+# HTML ingested before extract.py started preserving them has a different hash and re-embeds
+# on its next sync anyway, which is when its tables first exist to be mined.
+GRAPH_EXTRACTOR_VERSION = 4
 
 
 def _doc_id(source_id: str, uri: str) -> str:
@@ -147,7 +153,7 @@ class IngestPipeline:
         catalog: Catalog,
         retrieval: RetrievalConfig | None = None,
         graph: GraphConfig | None = None,
-        triple_extractor: Callable[[str, str], list] | None = None,
+        triple_extractor: Callable[..., list] | None = None,
         entity_resolver: EntityResolver | None = None,
         triple_workers: int = 1,
     ):
@@ -157,8 +163,9 @@ class IngestPipeline:
         # is supplied (direct construction in tests) it stays off so chunk text is raw.
         self._contextual = bool(retrieval and retrieval.contextual_chunks)
         self._graph_cfg = graph or GraphConfig()
-        # (text, title) -> list[Triple]; supplied by the app when graph.extract_triples
-        # is on and an LLM is available. None => LLM triple extraction is skipped.
+        # (text, title, guidance) -> list[Triple]; supplied by the app when
+        # graph.extract_triples is on and an LLM is available. None => LLM triple
+        # extraction is skipped.
         self._triple_extractor = triple_extractor
         # Entity-resolution dedup (ingest/entity_resolution.py); None => every entity
         # id is created as-is (prior behavior, exact-match only).
@@ -361,6 +368,19 @@ class IngestPipeline:
             entities.extend(ps_ents)
             edges.extend(ps_edges)
 
+        # Tables (ingest/tables.py): typed columns and the URL's own subject parameter.
+        # Deterministic, so it lands whether or not LLM extraction is enabled — and it is
+        # what the LLM reads worst, since a table states its relationships structurally
+        # rather than in sentences.
+        tbl_ents, tbl_aliases, tbl_edges = extract_table_graph(
+            text, doc.uri, src_id, doc.title or ""
+        )
+        if tbl_edges:
+            _add_source_entity()
+            entities.extend(tbl_ents)
+            alias_rows.extend(tbl_aliases)
+            edges.extend(tbl_edges)
+
         if self._triple_extractor is not None and not is_code and self._triples_apply(doc, text):
             _add_source_entity()
             # Written now (fast, synchronous) so it survives a crash/kill between
@@ -486,11 +506,25 @@ class IngestPipeline:
         if control is not None:
             control.stage("graph relationships", done, total)
 
+    def _extraction_guidance(self, source_id: str) -> str:
+        """The source connector's `extraction_prompt` option — what its documents ARE,
+        in its owner's words (see triples.guided_system_prompt). Read per drain wave, not
+        per document, and best-effort: a catalog that can't answer just extracts without
+        the hint rather than failing a sync over an optional enrichment."""
+        try:
+            for cfg in self._catalog.list_source_configs():
+                if f"{cfg.type}:{cfg.name}" == source_id:
+                    return str(cfg.options.get("extraction_prompt") or "")
+        except Exception:  # noqa: BLE001
+            pass
+        return ""
+
     def _drain_pending(self, pending: list, source_id: str) -> None:
+        guidance = self._extraction_guidance(source_id)
         if self._triple_workers > 1 and len(pending) > 1:
             with concurrent.futures.ThreadPoolExecutor(max_workers=self._triple_workers) as pool:
                 futures = {
-                    pool.submit(self._triple_extractor, text, title): (doc_id, entities, alias_rows, edges, title, kind)
+                    pool.submit(self._triple_extractor, text, title, guidance): (doc_id, entities, alias_rows, edges, title, kind)
                     for doc_id, entities, alias_rows, edges, text, title, kind in pending
                 }
                 for fut in concurrent.futures.as_completed(futures):
@@ -503,7 +537,7 @@ class IngestPipeline:
         else:
             for doc_id, entities, alias_rows, edges, text, title, kind in pending:
                 try:
-                    triples = self._triple_extractor(text, title)
+                    triples = self._triple_extractor(text, title, guidance)
                 except Exception:
                     triples = []
                 self._apply_triples(triples, doc_id, entities, alias_rows, edges, title, source_id, kind)

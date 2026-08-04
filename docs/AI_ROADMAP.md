@@ -29,18 +29,39 @@ An item listed under a tier below is genuinely unbuilt.
   (we believe no product in this category does it). Original claims get re-checked at each
   frontier scan — the market moves.
 
-## 1. The three axes and where we stand (2026-07-17)
+## 1. The three axes and where we stand (2026-07-31)
 
 | Axis | Measured today? | Instruments | Biggest known gap |
 |---|---|---|---|
 | **Quality** (grounded, cited, multi-hop, honest refusal) | ✅ | `qj eval [--agent]`, `--calibrate`, `--compare`, hop_coverage | No per-claim verification at answer time (#13); no temporal model (#11) |
-| **Speed** (latency to first token / full answer / sync) | ❌ **not at all** | none — no timing anywhere in the repo | Can't optimize what we can't see → S1 |
-| **Cost** (tokens per answer, LLM calls per sync, index size) | ❌ | none | Same → S1 measures tokens/calls too |
+| **Speed** (latency to first token / full answer / sync) | ✅ **queries**, ❌ sync | `qj bench [--agent] --compare` — per-stage p50/p95, embedder chunks/sec | Rerank is 83% of a query (S4); a real sync's docs/min still isn't benched (S1 remainder) |
+| **Cost** (tokens per answer, LLM calls per sync, index size) | ✅ **per answer** | `qj bench --agent` — tokens/answer + cache-hit rate via `ChatResult.usage` | 22.4k tokens/answer with 0 cache reads on the live backend (S5); index size still unmeasured (S2) |
+
+The first bench run replaced two years of guessing with numbers, and immediately found a
+defect no correctness test could see (a 36k-row table scan inside alias expansion, 27% of
+query latency). That is the argument for the measurement-gate rule above, in one data point.
 
 ## 2. Quality roadmap (absorbed from AI_ARCHITECTURE §4; numbering preserved)
 
 ### Shipped (graduated)
 How each works is documented in `CLAUDE.md` — the source of truth for current behavior.
+- **Structured table extraction + the graph enumeration read** — `ingest/tables.py`,
+  `extract.render_html_table`, `catalog.graph_relations` + the `graph_relations` agent tool
+  (2026-07-31). Tables are preserved as markdown rows rather than flattened (a blank cell
+  used to vanish and shift the row's remaining values into the wrong column) and mined
+  deterministically: typed columns plus the entity a catalogue URL names itself by become
+  edges, and a person row's email becomes an alias — the fix for a measured identity split
+  where only 1 of 875 person entities was shared across sources. `graph_relations` answers
+  "list all X with their Y", which neither existing graph tool nor top-k search could.
+  Measured trigger: 0 of 17 team pages produced an edge, while the same pages' key-value
+  blocks extracted fine.
+- **S1 `qj bench` — the latency/cost harness** — `quickjoiner/bench/harness.py` (2026-07-31).
+  Per-stage retrieval latency, embedder throughput, and (with `--agent`) answer latency +
+  tokens per answer; `--compare` is the >20% relative regression gate. Seams added for it:
+  `store.search(trace=)` on both backends and `ChatResult.usage`/`TokenUsage` on all three
+  providers. Paid for itself on its first run — see the S-track baseline above and the
+  36k-row entity table scan it exposed. Sync throughput is NOT covered; that remainder is
+  listed in the S-track as live work.
 - **#1 Contextual chunk enrichment** — deterministic breadcrumb form (2026-07-13).
   Remaining upgrade folded into #10.
 - **#3 Threshold calibration per workspace** — `qj eval --calibrate/--apply/--compare` (2026-07-17).
@@ -93,6 +114,16 @@ How each works is documented in `CLAUDE.md` — the source of truth for current 
   mechanism — no new signature concept was needed.)
 
 ### Tier 1 — highest leverage, low risk
+31. **Skip server error pages during a crawl** — *adopt, small.* Found 2026-07-31 while
+   diagnosing the table work: **363 of 728** documents in the live `web_scrape` corpus are
+   the identical ASP.NET *"Error. An error occurred while processing your request"* page,
+   ingested as real, answerable, citable content. The shipped content-dedupe collapses them
+   to one on the next clean re-sync, but one junk document in memory is still one too many,
+   and a crawl that silently indexes its own failures overstates coverage. Detect from
+   content markers and skip — deliberately the same shape as `looks_like_login`
+   (`browser/session.py`), which already solved the sibling problem of a page that returns
+   200 while containing nothing the crawl wanted. Must report the count it skipped, per the
+   no-silent-caps rule, so a broken crawl looks broken rather than thin.
 2. **AST-aware code chunking** (tree-sitter) — *adopt*. Functions/classes as chunk units
    with imports+signature context; symbol manifest feeds the graph. Target: large uplift on
    code questions. Externally validated by **Understand-Anything** (2026-07-23 scan), which
@@ -249,16 +280,21 @@ How each works is documented in `CLAUDE.md` — the source of truth for current 
 
 ## 3. Speed & cost roadmap (new axis — S-track)
 
-S1 is the prerequisite for everything else in this section: no speed work merges without a
-before/after bench table, exactly as no quality work merges without `--compare`.
+**S1 shipped 2026-07-31** (`qj bench` — see the Shipped ledger and CLAUDE.md's
+`bench/harness.py` bullet). Its rule now applies to everything below: no speed work merges
+without a before/after `qj bench --compare` table, exactly as no quality work merges without
+`qj eval --compare`. **Baseline on the live 56,519-chunk workspace** (32 queries × 3, after
+the alias-expansion index fix S1 itself surfaced): retrieval **p50 2186ms / p95 2834ms**, of
+which rerank 83%, sparse 4%, graph expansion 4%, dense 2%; embedder 112 chunks/sec;
+agent layer (gpt-oss-120b via litellm) first token 22.3s, full answer 32.7s, 22.4k
+tokens/answer over 3 rounds, **0 cache reads**. Beat those numbers or explain why not.
 
-- **S1 — `qj bench`: the latency/cost harness** — *adopt; build first*. Times every stage
-  per query over a query pack: embed-query, dense leg, sparse leg, RRF fuse, rerank, graph
-  expansion, gate decision; plus agent-layer first-token latency, full-answer latency, tool
-  rounds, and token counts (prompt/completion per answer). p50/p95, JSON reports beside the
-  eval reports, `--compare` with regression exit codes. Also benches sync throughput
-  (docs/min, embed batch rate). Cheap to build: the stages already have clean seams
-  (`store.search` legs in `hybrid.py`, reranker `rank()`, `graph_expand`, the agent loop).
+- **S1 remainder — sync throughput** — *not built*. `qj bench` measures query latency and
+  embedder throughput, not a real sync's docs/min. Deliberately deferred rather than faked:
+  a synthetic sync benchmarks a connector's fixture, not the network-bound reality, and the
+  honest number for a real pull is already recorded per run in `sync_events`. Wire that
+  history into the report (documents ÷ elapsed, per connector) rather than inventing a
+  synthetic sync. Small, and gates S6's before/after claim.
 - **S2 — ANN & vector economy at scale** — *adopt*. IVF tuning past `ann_min_rows`,
   scalar/binary quantization for large corpora, measured on S1 **and** the eval pack
   (gate: zero grounded-recall loss — a faster index that changes the gate's inputs is a
@@ -267,18 +303,29 @@ before/after bench table, exactly as no quality work merges without `--compare`.
   independent tool calls within one agent round concurrently; embed batches during sync
   pipelined with upserts. The agent loop is round-sequential today; multi-tool rounds are
   the cheap win.
-- **S4 — Reranker right-sizing** — *adopt*. Auto-tune `rerank_candidates` depth from
-  measured marginal gain (S1 × eval); evaluate smaller/quantized CE models; consider
-  early-exit when fused-head order is already stable.
+- **S4 — Reranker right-sizing** — *adopt; now the single biggest speed lever, with numbers*.
+  S1 measured the cross-encoder at **~77ms per candidate** on the live corpus (~420-token
+  chunks), scaling linearly — 4→293ms, 12→879ms, 24→1843ms — so the shipped
+  `rerank_candidates=24` is **83% of a 2.2s query**. The open question is what that depth
+  buys: auto-tune it from measured marginal gain (S1 × eval, so a depth cut must show zero
+  recall loss on the eval set before it ships), evaluate smaller/quantized CE models, and
+  consider early-exit when the fused head order is already stable. Deliberately NOT changed
+  blind — the reranker is a *quality* knob, and trading recall for latency without the eval
+  half of the measurement is exactly the mistake this track exists to prevent.
 - **S5 — Prompt-cache-aware context assembly** — *adapt; partially shipped 2026-07-18*.
   SHIPPED (documented in CLAUDE.md `llm/` bullet): explicit Anthropic `cache_control`
   breakpoints (system block caches tools+system; moving message breakpoint + intermediate
   markers inside the 20-block lookback; `llm.prompt_cache` ON by default) and deterministic
   name-sorted tool specs in the agent — the byte-stable prefix that also feeds automatic
   prefix caching on OpenAI-compatible backends and Ollama/llama.cpp KV reuse. REMAINING:
-  (a) measure the actual cost delta via S1 token counts once `qj bench` exists (incl. live
-  `cache_read_input_tokens` verification — needs an Anthropic key); (b) a stable corpus
-  digest / stable `extra_system` framing so caching survives session-summary refreshes;
+  (a) ~~measure the cost delta via S1 token counts~~ **measurable as of 2026-07-31** and
+  measured on the live litellm/gpt-oss workspace: **22.4k tokens per answer over 3 rounds
+  with ZERO cache reads**, i.e. the whole prompt is re-paid every round on that backend.
+  Whether that is the broker not caching or a prefix that isn't byte-stable is the next
+  question, and `qj bench --agent`'s `cache_hit_rate` is how it gets answered. Anthropic
+  `cache_read_input_tokens` verification still needs an API key (none on this machine).
+  (b) a stable corpus digest / stable `extra_system` framing so caching survives
+  session-summary refreshes;
   (c) keep volatile content (per-request scores, timestamps) after the last breakpoint as
   new prompt sections are added. (The narrow, cheap precursor to #16.)
 - **S6 — GPU-accelerated, resource-aware parallel ingestion** — *adopt*. **Partially shipped

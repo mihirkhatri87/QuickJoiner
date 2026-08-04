@@ -33,6 +33,12 @@ enhancement:
   whose combination is a category error (`environment: prod | owns | person: bob`) is dropped
   like any other invalid line. The deterministic extractors satisfy those signatures by
   construction — validators constrain what the LLM may add, never what structure already proves.
+  The clearest demonstration of this invariant paying out arrived 2026-07-31: on a real
+  service catalogue the LLM extracted **0 edges from 17 team pages**, because a table
+  flattened to text carries no sentence relating anyone to anything, while the *same* pages'
+  key-value prose extracted normally. Preserving the table's structure at extraction and
+  reading it deterministically (`ingest/tables.py`) recovered all 17. Structure the model
+  cannot read is not a prompting problem.
 
 ## 2. The stack as built (and why)
 
@@ -53,7 +59,8 @@ enhancement:
                            → dense-gated refusal (I1) → scored, cited chunks
                         ▼
                 AGENT  tool loop (≤10 rounds): search_memory · graph_neighbors ·
-                       graph_path · remember · live connector tools · ops tools
+                       graph_relations · graph_path · remember · live connector tools ·
+                       ops tools
                         ▼
                 SURFACES  SSE chat/UI · CLI · briefs · evals · exports
 ```
@@ -63,8 +70,13 @@ Key defended choices:
 - **Hybrid with RRF, not score mixing.** Ranks, not scores, fuse (k=60): immune to scale
   mismatch between cosine and BM25, deterministic, tunable with two knobs. Sparse-only
   candidates get their cosine computed *afterwards* purely to face the gate (I1).
-- **Reranker off by default.** A cross-encoder is a quality lever with a latency/model-
-  download cost; it reorders the fused head only. Local-first means opt-in heavyweight.
+- **Reranker on by default, and it is the dominant query cost.** A cross-encoder reorders
+  the fused head only, but reads query+candidate together, so it costs a forward pass per
+  candidate — measured at **~77ms/candidate**, i.e. 83% of a 2.2s query at the shipped
+  depth of 24 (`qj bench`, 2026-07-31). Kept on because retrieval quality is the product;
+  right-sizing the depth against measured marginal gain is S4. `QJ_DISABLE_RERANKER=1` or
+  `retrieval.reranker="none"` turns it off, and the ~80MB model loads lazily on first use,
+  so nothing is paid by a workspace that never searches.
 - **The graph is relational, not a graph DB.** At org scale (10³–10⁵ entities) SQL with
   three indexed tables beats operating Neptune/Neo4j; BFS in Python over ≤10⁴ edges is
   microseconds. Revisit only past ~10⁷ edges (see CLOUD_ROADMAP Y3).
@@ -79,7 +91,10 @@ Key defended choices:
   prefix caching on OpenAI-compatible backends and local KV-cache reuse. `llm.prompt_cache`
   gates the explicit markers (ON). Both sides are observable at DEBUG: Anthropic
   `cache_read_input_tokens`, OpenAI-compatible `prompt_tokens_details.cached_tokens`.
-  Cost-delta measurement is pending S1 (`qj bench`).
+  Measured as of 2026-07-31 via `qj bench --agent`, which reports a `cache_hit_rate` from
+  `ChatResult.usage` — and the first live reading was **0%** on the litellm/gpt-oss backend
+  (22.4k prompt tokens re-paid every round), so on that path this is currently a designed
+  capability rather than a realised saving. Anthropic's side still needs an API key to verify.
 - **Evals in the repo.** Retrieval metrics (recall@k, MRR, grounded-recall, refusal
   accuracy) are deterministic and LLM-free, so quality is CI-checkable — the control
   system for every enhancement below (nothing merges without an eval gate).
@@ -102,9 +117,10 @@ Each maps to a pending item in `docs/AI_ROADMAP.md` (noted in parentheses).
    2026-07-30, that defect has two faces — distorted scores on the right chunk (observed
    2026-07-28) and, on another index instance, the right chunks missing entirely
    (recall@5 45% → 100% with the fix). Both are fixed; the overlap is real and is what
-   remains. **Caveat on this whole line of work:** a changed default in `config.py` does not
-   reach an existing workspace (`save_config` materializes every field), so the retuned
-   threshold applies only to workspaces created after it — see PRIORITIES #3.
+   remains. (A retuned default used to reach only *new* workspaces — `save_config`
+   materialized every field, pinning it — so this threshold sat unapplied on the live corpus
+   for two days. Fixed 2026-07-31: the settings blob is now stored sparsely, with a logged
+   one-time adoption of superseded defaults. See CLAUDE.md's `memory/` bullet.)
 2. Chunking is format-aware but not *meaning*-aware; no doc-level context in chunks; code
    chunking is line-based, not AST-based (#2, #10).
 3. No temporal model: stale evidence ranks equal to fresh; no as-of queries (#11, #5).
@@ -115,8 +131,13 @@ Each maps to a pending item in `docs/AI_ROADMAP.md` (noted in parentheses).
    are unexploited (#15, #16, S5).
 7. Graph is entity-level; no community/global summaries for "what is this org about?"
    corpus-level questions (#12).
-8. **Nothing measures latency or cost** — no timing instrumentation anywhere in the answer
-   or sync path; speed work is blind until the bench harness exists (S1).
+8. **Query latency and per-answer cost are measured; a real sync's throughput is not.**
+   `qj bench` (2026-07-31) times every retrieval stage and, with `--agent`, answer latency
+   and tokens per answer. What it revealed on the live corpus is itself a limitation worth
+   stating: a query costs **~2.2s p50, 83% of it in the cross-encoder** (~77ms per
+   candidate at the default depth of 24), and an answer costs **22.4k tokens over 3 model
+   rounds with zero prompt-cache reads** on the current backend. Sync throughput
+   (docs/min) still has no harness (S1 remainder).
 9. Document ingestion is **text-first**: Word/PPT/Excel/PDF/HTML extract their text layer, but
    **images inside documents and scanned/image-only PDFs are not read** — the `ingest/extract.py`
    `ImageHandler` seam is wired for it, awaiting the vision layer (#23, plan 07).

@@ -208,23 +208,73 @@ def build_builtin_tools(
             # corroboration queries there either — the flag is classification-only).
             lines.extend(_format_edge(r, flag_weak=True) for r in rows)
         else:
-            by_rel: dict[str, list] = {}
+            # Grouped by relation AND DIRECTION. Grouping by relation alone silently hid
+            # whole categories: a team with 39 outgoing `works_on` (its projects) and 15
+            # incoming `works_on` (its people) put all 54 in one bucket ordered by dst, so
+            # the 8 sampled rows were all projects and not one member appeared — the
+            # question that motivated this. Incoming and outgoing are different facts and
+            # each gets its own budget.
+            by_rel: dict[tuple[str, bool], list] = {}
             for r in rows:
-                by_rel.setdefault(r["rel"], []).append(r)
+                by_rel.setdefault((r["rel"], r["src"] == ent["id"]), []).append(r)
             lines = [
                 f"{ent['name']} ({ent['type']}) has {len(rows)} relationships — a hub, too "
                 f"many to list in full. Showing up to {_NEIGHBORS_SAMPLE_PER_REL} examples per "
-                "relation type below; if you're checking a specific other entity, use "
-                "graph_path(a, b) instead — it returns just the connecting chain, not everything."
+                "relation type below; for the COMPLETE list of one relation use "
+                "graph_relations, and if you're checking a specific other entity use "
+                "graph_path(a, b) — it returns just the connecting chain, not everything."
             ]
-            for rel, group in sorted(by_rel.items(), key=lambda kv: -len(kv[1])):
-                lines.append(f"\n{rel} ({len(group)} total):")
+            for (rel, outgoing), group in sorted(by_rel.items(), key=lambda kv: -len(kv[1])):
+                arrow = f"--{rel}-->" if outgoing else f"<--{rel}--"
+                lines.append(f"\n{arrow} ({len(group)} total):")
                 lines.extend(_format_edge(r) for r in group[:_NEIGHBORS_SAMPLE_PER_REL])
                 if len(group) > _NEIGHBORS_SAMPLE_PER_REL:
-                    lines.append(f"  …and {len(group) - _NEIGHBORS_SAMPLE_PER_REL} more not shown.")
+                    lines.append(f"  …and {len(group) - _NEIGHBORS_SAMPLE_PER_REL} more not shown "
+                                 f"— graph_relations('{rel}') lists them all.")
         lines.append(
             "Cite the evidence documents; call search_memory on them for the underlying text."
         )
+        return "\n".join(lines)
+
+    # One relation across the whole graph, grouped by its right-hand entity — the shape
+    # "list every team with its members" needs. Bounded, and truncation is stated.
+    _RELATIONS_LIMIT = 400
+
+    def graph_relations(rel: str, src_type: str | None = None,
+                        dst_type: str | None = None) -> str:
+        rows = catalog.graph_relations(rel, src_type, dst_type, limit=_RELATIONS_LIMIT + 1)
+        if not rows:
+            filters = ", ".join(
+                f"{k}={v}" for k, v in (("src_type", src_type), ("dst_type", dst_type)) if v
+            )
+            return (f"NO_RESULTS: no {rel!r} relationships recorded"
+                    + (f" for {filters}" if filters else "")
+                    + ". Check the relation name, or use search_memory — the graph only "
+                      "holds relationships an ingested document actually asserted.")
+        truncated = len(rows) > _RELATIONS_LIMIT
+        rows = rows[:_RELATIONS_LIMIT]
+
+        grouped: dict[str, list] = {}
+        for r in rows:
+            grouped.setdefault(r["dst_name"] or r["dst"], []).append(r)
+        head = f"{len(rows)} {rel!r} relationship(s)"
+        if src_type or dst_type:
+            head += f" ({src_type or 'any'} -> {dst_type or 'any'})"
+        lines = [f"{head}, grouped by the thing on the right:"]
+        for dst, group in grouped.items():
+            names = sorted({(r["src_name"] or r["src"]) for r in group})
+            evidence = sorted({(r["evidence_title"] or r["evidence_uri"] or "")
+                               for r in group if r["evidence_title"] or r["evidence_uri"]})
+            cite = f" [evidence: {'; '.join(evidence[:2])}]" if evidence else ""
+            lines.append(f"\n{dst} ({len(names)}):{cite}")
+            lines.append("  " + ", ".join(names))
+        if truncated:
+            lines.append(
+                f"\n⚠ truncated at {_RELATIONS_LIMIT} relationships — there are more. Narrow "
+                "with src_type/dst_type, or ask about specific entities, and TELL THE USER "
+                "the list is partial."
+            )
+        lines.append("Cite the evidence documents for the groups you report.")
         return "\n".join(lines)
 
     # 5, not 3: matches the web UI's Path Finder default. A repo's own
@@ -390,6 +440,39 @@ def build_builtin_tools(
                 },
             ),
             fn=graph_neighbors,
+        ),
+        AgentTool(
+            spec=ToolSpec(
+                name="graph_relations",
+                description=(
+                    "List EVERY recorded relationship of one kind across the whole "
+                    "organization, grouped by the entity on the right — the tool for "
+                    "'list all X with their Y' questions. Use this instead of repeating "
+                    "search_memory per entity: 'all teams with their members' is "
+                    "graph_relations('works_on', src_type='person', dst_type='team'); "
+                    "'which team owns which repo' is graph_relations('owns', "
+                    "src_type='team', dst_type='repo'); 'what is deployed where' is "
+                    "graph_relations('deploys'). Relations: works_on, owns, part_of, "
+                    "depends_on, provides, deploys, references, publishes_to, "
+                    "subscribes_to, stores_in, implemented_in, builds, related_to. "
+                    "Types: person, team, repo, service, project, package, environment, "
+                    "ticket, pipeline, topic, datastore, branch, merge_request, symbol, "
+                    "module. Says so explicitly if the list is truncated."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "rel": {"type": "string",
+                                "description": "Relation name, e.g. works_on"},
+                        "src_type": {"type": "string",
+                                     "description": "Optional entity type on the left"},
+                        "dst_type": {"type": "string",
+                                     "description": "Optional entity type on the right"},
+                    },
+                    "required": ["rel"],
+                },
+            ),
+            fn=graph_relations,
         ),
         AgentTool(
             spec=ToolSpec(

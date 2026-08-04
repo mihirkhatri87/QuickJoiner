@@ -19,4 +19,10 @@ docs {
 
   `?verify=false` skips the live fetch and answers from stored cookies alone — cheap
   enough to poll while a sign-in window is open.
+
+  `remote_capable` says whether this host would run a NEW sign-in as a remote
+  (screencast) session rather than a local window — independent of whether one is
+  currently running, so a UI can decide up front which flow "Sign in" opens. The
+  in-flight `login` object (when present) carries `mode: "local" | "remote"` for the
+  same reason once a sign-in is actually running.
 }

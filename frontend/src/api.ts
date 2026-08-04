@@ -3,6 +3,7 @@ import type {
   BridgeEntity,
   BrowserLoginJob,
   BrowserSessionStatus,
+  RemoteBrowserInputEvent,
   ChatEvent,
   ConnectorRow,
   ConnectorType,
@@ -308,6 +309,23 @@ export const api = {
     req<BrowserSessionStatus>(
       `/api/connectors/${encodeURIComponent(name)}/browser/session?verify=${verify}`,
     ),
+  // Remote (headless-host) sign-in: same job as browserLoginStart, but when the QuickJoiner
+  // host has no display it streams the browser back via CDP screencast instead of opening a
+  // window — watch it with streamBrowserFrames, drive it with these two.
+  streamBrowserFrames: (
+    name: string,
+    onEvent: (e: { type: "meta"; width: number; height: number } | { type: "frame"; data: string } | { type: "done" }) => void,
+  ) => streamGetSSE(`/api/connectors/${encodeURIComponent(name)}/browser/session/frames`, onEvent),
+  browserSessionInput: (name: string, event: RemoteBrowserInputEvent) =>
+    req<{ ok: boolean }>(`/api/connectors/${encodeURIComponent(name)}/browser/session/input`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(event),
+    }),
+  browserSessionDone: (name: string) =>
+    req<{ ok: boolean }>(`/api/connectors/${encodeURIComponent(name)}/browser/session/done`, {
+      method: "POST",
+    }),
   oauthSignOut: (name: string) =>
     req<{ signed_out: boolean }>(`/api/connectors/${encodeURIComponent(name)}/oauth`, {
       method: "DELETE",

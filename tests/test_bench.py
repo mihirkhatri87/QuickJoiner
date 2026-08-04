@@ -1,0 +1,236 @@
+"""The `qj bench` speed/cost harness (AI_ROADMAP S1).
+
+The pure layers (percentiles, pack loading, report comparison) are tested directly; the
+measurement seam is tested by running a REAL search through a real store and asserting the
+stages it reports, since the whole value of the harness is that its numbers correspond to
+work that actually happened. Wall-clock durations themselves are never asserted — a test
+that fails when the machine is busy teaches everyone to ignore it.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from quickjoiner.agent.agent import OnboardingAgent
+from quickjoiner.bench.harness import (
+    MIN_SAMPLES_FOR_GATE,
+    TEMPLATE,
+    compare_reports,
+    load_querypack,
+    percentiles,
+    summarize_agent,
+    summarize_retrieval,
+    QueryTiming,
+)
+from quickjoiner.bench.harness import AgentTiming
+from quickjoiner.llm.base import ChatResult, LLMProvider, TokenUsage, ToolCall
+from quickjoiner.memory.store import NULL_TRACE, SearchTrace
+
+from tests.test_agent_loop import ScriptedProvider, _echo_tool
+
+
+# -- pure helpers ------------------------------------------------------------------
+
+def test_percentiles_report_their_own_sample_count():
+    stats = percentiles([10.0, 20.0, 30.0, 40.0])
+    assert stats["samples"] == 4 and stats["p50"] == 25.0
+    assert stats["min"] == 10.0 and stats["max"] == 40.0
+    # An empty series reports nothing rather than a misleading zero.
+    assert percentiles([]) == {"samples": 0}
+
+
+def test_querypack_accepts_a_bench_pack_or_an_eval_set(tmp_path):
+    pack = tmp_path / "pack.yaml"
+    pack.write_text(TEMPLATE, encoding="utf-8")
+    name, queries = load_querypack(pack)
+    assert name == "my-org-bench" and len(queries) == 4
+
+    # An eval set's questions ARE a query pack — benching needs no second file.
+    evalset = tmp_path / "evals.yaml"
+    evalset.write_text(
+        "name: my-evals\ncases:\n  - id: a\n    question: How do we deploy?\n"
+        "    expect:\n      refusal: true\n",
+        encoding="utf-8",
+    )
+    assert load_querypack(evalset) == ("my-evals", ["How do we deploy?"])
+
+    empty = tmp_path / "empty.yaml"
+    empty.write_text("name: nothing\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_querypack(empty)
+
+
+def _report(p50: float, p95: float = 100.0, samples: int = 12) -> dict:
+    return {"retrieval": {"summary": {
+        "search_total_ms": {"p50": p50, "p95": p95, "samples": samples},
+    }}}
+
+
+def test_compare_flags_a_relative_slowdown_not_an_absolute_one():
+    """20% is the gate — so the same +5ms passes at 100ms and fails at 8ms."""
+    assert not compare_reports(_report(100.0), _report(105.0))["regressed"]
+    assert compare_reports(_report(8.0), _report(10.0))["regressed"]
+
+    faster = compare_reports(_report(100.0), _report(50.0))
+    assert not faster["regressed"]
+    row = next(r for r in faster["rows"] if r["metric"] == "search_total_ms.p50")
+    assert row["change"] == -0.5  # reported as a proportion, negative = faster
+
+
+def test_compare_reports_thin_samples_but_never_gates_on_them():
+    """A p95 over 3 runs is noise; a gate that fires on noise gets switched off."""
+    thin = compare_reports(_report(10.0, samples=2), _report(100.0, samples=2))
+    row = next(r for r in thin["rows"] if r["metric"] == "search_total_ms.p50")
+    assert row["change"] == 9.0 and row["gated"] is False and row["regressed"] is False
+    assert not thin["regressed"]
+    assert f"2 samples" in row["note"]
+
+    ok = compare_reports(_report(10.0, samples=MIN_SAMPLES_FOR_GATE),
+                         _report(100.0, samples=MIN_SAMPLES_FOR_GATE))
+    assert ok["regressed"] is True
+
+
+def test_summarize_retrieval_reports_where_the_time_went():
+    timings = [
+        QueryTiming("q1", {"dense": 10.0, "rerank": 90.0}, {"hits": 5}, 100.0),
+        QueryTiming("q2", {"dense": 10.0, "rerank": 90.0}, {"hits": 3}, 100.0),
+    ]
+    summary = summarize_retrieval(timings)
+    assert summary["queries"] == 2 and summary["runs"] == 2
+    assert summary["search_total_ms"]["p50"] == 100.0
+    # The share is the number that actually directs optimisation work.
+    assert summary["stage_share_of_p50"] == {"dense": 0.1, "rerank": 0.9}
+    assert summary["counts"]["hits"] == 4.0
+
+
+# -- the measurement seam ----------------------------------------------------------
+
+def test_search_trace_records_the_stages_of_a_real_search(store):
+    store.upsert_document("d1", "files:notes", "notes/deploy.md", "Deploy", "doc",
+                          ["we deploy to production every friday"])
+    trace = SearchTrace()
+    hits = store.search("how do we deploy to production", top_k=3, min_score=0.0, trace=trace)
+
+    assert hits, "the fixture document should be retrievable"
+    # Every stage a query actually ran is timed and named.
+    assert {"embed_query", "dense", "gate"} <= set(trace.stages)
+    assert all(v >= 0.0 for v in trace.stages.values())
+    assert trace.total_ms == pytest.approx(sum(trace.stages.values()), abs=1e-3)
+    # Counts explain the timings (why rerank cost what it did).
+    assert trace.counts["hits"] == len(hits)
+    assert trace.counts["dense_candidates"] >= len(hits)
+
+
+def test_tracing_is_opt_in_and_changes_nothing(store):
+    """Production passes no trace; results must be identical either way."""
+    store.upsert_document("d1", "files:notes", "notes/deploy.md", "Deploy", "doc",
+                          ["we deploy to production every friday"])
+    untraced = store.search("deploy production", top_k=3, min_score=0.0)
+    traced = store.search("deploy production", top_k=3, min_score=0.0, trace=SearchTrace())
+    assert [h.doc_id for h in untraced] == [h.doc_id for h in traced]
+    assert [h.score for h in untraced] == [h.score for h in traced]
+
+    # The null trace measures nothing and swallows every call, so the hot path is free.
+    with NULL_TRACE.stage("anything"):
+        pass
+    NULL_TRACE.count("anything", 1)
+
+
+def test_stage_entered_twice_accumulates_rather_than_overwriting():
+    """`_dense` runs twice on a hybrid query (dense leg + sparse rescore); attributing
+    only the last call would under-report the leg that was measured."""
+    trace = SearchTrace()
+    for _ in range(2):
+        with trace.stage("dense"):
+            pass
+    assert len(trace.stages) == 1 and trace.stages["dense"] >= 0.0
+
+
+# -- agent-layer token accounting --------------------------------------------------
+
+def test_agent_sums_token_usage_and_rounds_across_a_tool_loop():
+    """The S5 cost measurement: tokens are per-ROUND on the wire but per-ANSWER to a
+    user, and a tool loop can be many rounds."""
+    provider = ScriptedProvider([
+        ChatResult(text="", tool_calls=[ToolCall(id="c1", name="echo", input={})],
+                   usage=TokenUsage(prompt=100, completion=10, cached=80)),
+        ChatResult(text="the answer", usage=TokenUsage(prompt=250, completion=40, cached=200)),
+    ])
+    agent = OnboardingAgent(provider, [_echo_tool()], system="sys")
+    answer, _ = agent.ask("q")
+
+    assert answer == "the answer"
+    assert agent.last_rounds == 2
+    assert agent.last_usage.prompt == 350 and agent.last_usage.completion == 50
+    assert agent.last_usage.cached == 280  # what prompt caching actually saved
+    assert agent.last_usage.total == 400
+
+
+def test_agent_usage_resets_per_turn_so_answers_are_not_cumulative():
+    provider = ScriptedProvider([
+        ChatResult(text="one", usage=TokenUsage(prompt=100, completion=10)),
+        ChatResult(text="two", usage=TokenUsage(prompt=200, completion=20)),
+    ])
+    agent = OnboardingAgent(provider, [_echo_tool()], system="sys")
+    agent.ask("first")
+    agent.ask("second")
+    assert agent.last_usage.prompt == 200 and agent.last_rounds == 1
+
+
+def test_a_provider_that_reports_no_usage_leaves_zeros_not_errors():
+    """Ollama over a stream may report nothing; the bench must degrade, never fail."""
+    provider = ScriptedProvider([ChatResult(text="answer")])
+    agent = OnboardingAgent(provider, [_echo_tool()], system="sys")
+    agent.ask("q")
+    assert agent.last_usage.total == 0 and agent.last_rounds == 1
+
+
+def test_summarize_agent_surfaces_the_cache_hit_rate():
+    timings = [
+        AgentTiming("q1", 120.0, 900.0, 2, 1, 1000, 100, 800, 400),
+        AgentTiming("q2", 80.0, 700.0, 1, 0, 500, 50, 0, 200),
+    ]
+    summary = summarize_agent(timings)
+    assert summary["answers"] == 2
+    assert summary["rounds_per_answer"] == 1.5
+    assert summary["tokens_per_answer"]["p50"] == pytest.approx(825.0)
+    assert summary["cache_hit_rate"] == round(800 / 1500, 3)
+
+
+def test_summarize_agent_says_why_first_token_is_missing():
+    """A non-streaming provider and a provider that streamed nothing are different
+    problems — dropping the row would hide both."""
+    summary = summarize_agent([AgentTiming("q", None, 500.0, 1, 0, 10, 5, 0, 20)])
+    assert summary["first_token_ms"]["samples"] == 0
+    assert "no streamed text deltas" in summary["first_token_ms"]["note"]
+
+
+# -- what the harness found the first time it ran -----------------------------------
+
+def test_resolve_entity_name_lookup_is_indexed_not_a_table_scan(catalog):
+    """Regression guard for the defect `qj bench` found on its first real run.
+
+    `resolve_entity`'s `WHERE id = ? OR LOWER(name) = ?` could not use an index for the
+    LOWER(name) branch, so every call scanned the whole entities table — 36,203 rows on
+    the live workspace, ~30 calls per query via alias expansion, measuring as 27% of
+    total retrieval latency (841ms p50). The expression index makes both branches
+    indexed; this asserts the PLANNER agrees, because the correctness tests passed
+    perfectly throughout and would never have caught it.
+    """
+    catalog.upsert_entity("repo:appriver.nautical.models", "AppRiver.Nautical.Models", "repo")
+    catalog.add_entity_alias("nautical models", "repo:appriver.nautical.models")
+
+    plan = " ".join(
+        str(tuple(row)) for row in catalog._conn.execute(
+            "EXPLAIN QUERY PLAN SELECT * FROM entities WHERE id = ? OR LOWER(name) = ?",
+            ("x", "x"),
+        )
+    )
+    assert "idx_entities_lower_name" in plan, plan
+    assert "SCAN entities" not in plan, plan
+
+    # …and the lookup still resolves by id, by name (any case) and by alias.
+    assert catalog.resolve_entity("repo:appriver.nautical.models")["name"] == "AppRiver.Nautical.Models"
+    assert catalog.resolve_entity("appriver.NAUTICAL.models")["id"] == "repo:appriver.nautical.models"
+    assert catalog.resolve_entity("nautical models")["id"] == "repo:appriver.nautical.models"
+    assert catalog.resolve_entity("no such thing") is None

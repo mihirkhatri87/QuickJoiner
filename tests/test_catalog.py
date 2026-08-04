@@ -8,7 +8,16 @@ from __future__ import annotations
 
 import json
 
-from quickjoiner.config import SourceConfig
+from pydantic import Field
+
+from quickjoiner.config import (
+    SUPERSEDED_DEFAULTS,
+    Config,
+    GraphConfig,
+    RetrievalConfig,
+    SourceConfig,
+    reconcile_superseded_defaults,
+)
 
 
 def test_reset_knowledge_wipes_ingested_but_keeps_connectors(catalog):
@@ -119,3 +128,94 @@ def test_update_document_metadata_is_a_standalone_backfill(catalog):
     row = catalog.documents_for_source("azure_devops:tfs")[0]
     assert json.loads(row["metadata_json"]) == {"state": "Closed", "team": "Payments"}
     assert row["content_hash"] == "h1"  # untouched — this is a metadata-only update
+
+
+# --- shipped config defaults reaching an existing workspace ---------------------------
+# Regression cover for the defect found in live testing (2026-07-31): save_config dumped
+# EVERY field, so the first save pinned every value forever and plan 05's min_score
+# retune never reached the only real corpus it was calibrated against.
+
+
+def test_config_is_persisted_sparsely_so_shipped_defaults_stay_live(catalog):
+    """Only real customisations are stored; untouched fields follow config.py."""
+    config = catalog.load_config()
+    config.retrieval.top_k = 11  # a genuine customisation
+    catalog.save_config(config)
+
+    blob = json.loads(catalog.get_setting("config"))
+    assert blob["retrieval"] == {"top_k": 11}  # min_score & co. are NOT materialised
+    assert "chat" not in blob and "llm" not in blob
+
+    # An untouched field reads back as whatever the code currently ships...
+    assert catalog.load_config().retrieval.min_score == RetrievalConfig().min_score
+    assert catalog.load_config().retrieval.top_k == 11  # ...and the customisation survives
+
+    # ...so a retune shipped in config.py DOES reach this already-saved workspace, which
+    # is the whole point. Modelled as a subclass because pydantic bakes field defaults
+    # into the compiled schema, so monkeypatching one has no effect on validation.
+    class _Retuned(RetrievalConfig):
+        min_score: float = 0.9
+
+    class _RetunedConfig(Config):
+        retrieval: _Retuned = Field(default_factory=_Retuned)
+
+    retuned = _RetunedConfig.model_validate(blob)
+    assert retuned.retrieval.min_score == 0.9  # untouched field follows the new default
+    assert retuned.retrieval.top_k == 11  # customisation still wins over it
+
+
+def test_a_pinned_superseded_default_is_adopted_once_and_customisations_are_kept(catalog):
+    """The migration for blobs written before sparse persistence.
+
+    Mirrors the live workspace exactly: min_score pinned at the superseded 0.55, and a
+    deliberate triple_workers=8 that matches no shipped default.
+    """
+    catalog.load_config()  # create the workspace's settings row
+    dense = {
+        "org": "appriver",
+        "retrieval": {"top_k": 8, "min_score": 0.55, "reranker": "fastembed"},
+        "graph": {"extract_triples": True, "triple_workers": 8},
+    }
+    catalog.set_setting("config", json.dumps(dense))
+    catalog.set_setting("config_defaults_epoch", "0")  # as if written by the old code
+
+    config = catalog.load_config()
+    assert config.retrieval.min_score == RetrievalConfig().min_score  # 0.55 -> shipped
+    assert config.graph.triple_workers == 8  # deliberate value, not a superseded default
+    assert config.retrieval.top_k == 8 and config.graph.extract_triples is True
+
+    stored = json.loads(catalog.get_setting("config"))
+    assert "min_score" not in stored["retrieval"]  # pruned, so it tracks the code now
+    assert stored["graph"]["triple_workers"] == 8
+
+    # Runs once: a later deliberate 0.55 is a real choice and must NOT be re-adopted.
+    config.retrieval.min_score = 0.55
+    catalog.save_config(config)
+    assert catalog.load_config().retrieval.min_score == 0.55
+
+
+def test_reconcile_superseded_defaults_is_pure_and_reports_what_moved():
+    blob = {"retrieval": {"min_score": 0.55}, "graph": {"triple_workers": 4}}
+    pruned, adopted = reconcile_superseded_defaults(blob)
+
+    assert blob == {"retrieval": {"min_score": 0.55}, "graph": {"triple_workers": 4}}  # unmutated
+    assert pruned == {}  # both sections emptied and dropped
+    assert sorted(adopted) == [
+        ("graph.triple_workers", 4, GraphConfig().triple_workers),
+        ("retrieval.min_score", 0.55, RetrievalConfig().min_score),
+    ]
+    # A value matching no superseded default is untouched, whatever it is.
+    assert reconcile_superseded_defaults({"retrieval": {"min_score": 0.71}}) == (
+        {"retrieval": {"min_score": 0.71}}, [],
+    )
+
+
+def test_every_superseded_default_names_a_real_config_field():
+    """Lockstep: a renamed/removed field must not leave a dead migration entry behind."""
+    fresh = Config()
+    for path, superseded in SUPERSEDED_DEFAULTS.items():
+        group, _, field = path.partition(".")
+        section = getattr(fresh, group)
+        assert field in type(section).model_fields, f"{path} names no live config field"
+        current = getattr(section, field)
+        assert current not in superseded, f"{path}: current default is listed as superseded"

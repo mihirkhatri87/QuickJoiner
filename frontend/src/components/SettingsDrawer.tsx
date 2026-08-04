@@ -17,7 +17,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, token } from "../api";
 import type { AuthStatus, BrowserSessionStatus, ConnectorRow, ConnectorType, OAuthStatus, SettingDefaults, Settings, SyncJob, UserRow } from "../types";
 import { EditConnectorModal } from "./EditConnectorModal";
-import { Button, cn, Field, IconButton, schedLabel, Select, SYNC_OPTIONS, TextInput } from "./ui";
+import { RemoteBrowserModal } from "./RemoteBrowserModal";
+import { Button, cn, Field, IconButton, schedLabel, Select, SYNC_OPTIONS, TextArea, TextInput } from "./ui";
 
 const ALL_MODES = ["pull", "hooks", "live", "browser", "scrape"];
 
@@ -1360,6 +1361,7 @@ function BrowserSignInPanel({ c }: { c: ConnectorRow }) {
   const [s, setS] = useState<BrowserSessionStatus | null>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
+  const [showRemote, setShowRemote] = useState(false);
   const pollRef = useRef<number | null>(null);
 
   const refresh = useCallback(
@@ -1380,11 +1382,27 @@ function BrowserSignInPanel({ c }: { c: ConnectorRow }) {
     };
   }, [refresh]);
 
+  // Keep the plate live while a sign-in runs even if this component didn't start it — a
+  // page reload, or detaching the remote viewer, otherwise leaves a job in flight with
+  // nothing here polling it, so the plate would sit on a stale "signing in…" forever.
+  const active = Boolean(s?.login?.active);
+  useEffect(() => {
+    if (!active) return;
+    const id = window.setInterval(() => refresh(false), 3000);
+    return () => window.clearInterval(id);
+  }, [active, refresh]);
+
   const signIn = async () => {
     setErr("");
     setBusy(true);
     try {
-      await api.browserLoginStart(c.name);
+      const res = await api.browserLoginStart(c.name);
+      if (res.login.mode === "remote") {
+        // Headless host — there's no window to poll for, just the live view.
+        setBusy(false);
+        setShowRemote(true);
+        return;
+      }
       // Poll cheaply (verify=false) while the window is open; the job carries its own
       // progress, and a full verify runs once it finishes. Bounded so an abandoned
       // sign-in doesn't leave a timer running for the life of the page.
@@ -1410,55 +1428,82 @@ function BrowserSignInPanel({ c }: { c: ConnectorRow }) {
   if (!s) return null;
   const login = s.login;
   const running = Boolean(login?.active);
+  const remoteRunning = running && login?.mode === "remote";
   const signedIn = running ? null : s.signed_in;
 
   return (
-    <div className="mt-3 rounded-md bg-fill2 p-3">
-      <div className="flex flex-wrap items-center gap-2">
-        <span
-          className={cn(
-            "rounded-full px-2.5 py-1 font-mono text-[9px] uppercase tracking-[0.12em]",
-            running
-              ? "bg-gold-soft text-gold"
-              : signedIn
-                ? "bg-accent-soft text-accent"
-                : "bg-gold-soft text-gold",
-          )}
-        >
-          {running ? "signing in…" : signedIn ? "signed in" : "sign-in required"}
-        </span>
-        {s.hosts.length > 0 && (
-          <span className="font-mono text-[10px] text-faint">session for {s.hosts.join(", ")}</span>
-        )}
-        {c.can_manage && s.can_open_window && (
-          <button
-            onClick={signIn}
-            disabled={busy || running}
-            className="ml-auto rounded-full bg-fill px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.12em] text-ink hover:bg-raised2 disabled:opacity-40"
+    <>
+      <div className="mt-3 rounded-md bg-fill2 p-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <span
+            className={cn(
+              "rounded-full px-2.5 py-1 font-mono text-[9px] uppercase tracking-[0.12em]",
+              running
+                ? "bg-gold-soft text-gold"
+                : signedIn
+                  ? "bg-accent-soft text-accent"
+                  : "bg-gold-soft text-gold",
+            )}
           >
-            {running ? "Waiting…" : signedIn ? "Sign in again" : "Sign in to this site"}
-          </button>
+            {running ? "signing in…" : signedIn ? "signed in" : "sign-in required"}
+          </span>
+          {s.hosts.length > 0 && (
+            <span className="font-mono text-[10px] text-faint">session for {s.hosts.join(", ")}</span>
+          )}
+          {c.can_manage && s.can_open_window && (
+            <button
+              // A running REMOTE sign-in is re-openable: the viewer is a viewer, not a leash
+              // (closing it only detaches), so this is how you get back to it — otherwise a
+              // detached sign-in is stranded with no way to finish it.
+              onClick={remoteRunning ? () => setShowRemote(true) : signIn}
+              disabled={busy || (running && !remoteRunning)}
+              className="ml-auto rounded-full bg-fill px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.12em] text-ink hover:bg-raised2 disabled:opacity-40"
+            >
+              {remoteRunning
+                ? "Open sign-in view"
+                : running
+                  ? "Waiting…"
+                  : signedIn
+                    ? "Sign in again"
+                    : "Sign in to this site"}
+            </button>
+          )}
+        </div>
+        {/* The honest bit: say where the window opens, and where it can't. */}
+        {!s.can_open_window ? (
+          <div className="mt-2 text-[11.5px] text-gold">{s.display_hint}</div>
+        ) : running ? (
+          <div className="mt-2 text-[11.5px] text-muted">
+            {login?.message ||
+              (s.remote_capable
+                ? "Opening a remote browser view…"
+                : "Opening a browser window on the QuickJoiner host…")}
+          </div>
+        ) : (
+          <div className="mt-2 text-[11.5px] text-muted">
+            {signedIn
+              ? s.detail
+              : (login?.state === "done" || login?.state === "error") && login?.message
+                ? login.message
+                : s.remote_capable
+                  ? "This site needs a login. QuickJoiner has no display of its own here, so " +
+                    "signing in opens a live remote view you interact with right in this tab."
+                  : "This site needs a login. A browser window opens on the machine running " +
+                    "QuickJoiner — sign in once and the session is reused for every sync."}
+          </div>
         )}
+        {err && <div className="mt-2 text-[11.5px] text-danger">{err}</div>}
       </div>
-      {/* The honest bit: say where the window opens, and where it can't. */}
-      {!s.can_open_window ? (
-        <div className="mt-2 text-[11.5px] text-gold">{s.display_hint}</div>
-      ) : running ? (
-        <div className="mt-2 text-[11.5px] text-muted">
-          {login?.message || "Opening a browser window on the QuickJoiner host…"}
-        </div>
-      ) : (
-        <div className="mt-2 text-[11.5px] text-muted">
-          {signedIn
-            ? s.detail
-            : (login?.state === "done" || login?.state === "error") && login?.message
-              ? login.message
-              : "This site needs a login. A browser window opens on the machine running " +
-                "QuickJoiner — sign in once and the session is reused for every sync."}
-        </div>
+      {showRemote && (
+        <RemoteBrowserModal
+          name={c.name}
+          onClose={() => {
+            setShowRemote(false);
+            refresh(true);
+          }}
+        />
       )}
-      {err && <div className="mt-2 text-[11.5px] text-danger">{err}</div>}
-    </div>
+    </>
   );
 }
 
@@ -1815,12 +1860,20 @@ function ConnectorForm({
         ].filter(Boolean);
         return (
           <Field key={f.key} label={`${f.label}${f.required ? " *" : ""}`} hint={hints.join(" — ")}>
-            <TextInput
-              type={f.secret ? "password" : "text"}
-              placeholder={f.placeholder}
-              value={vals[f.key] ?? ""}
-              onChange={(e) => setVals((p) => ({ ...p, [f.key]: e.target.value }))}
-            />
+            {f.multiline ? (
+              <TextArea
+                placeholder={f.placeholder}
+                value={vals[f.key] ?? ""}
+                onChange={(e) => setVals((p) => ({ ...p, [f.key]: e.target.value }))}
+              />
+            ) : (
+              <TextInput
+                type={f.secret ? "password" : "text"}
+                placeholder={f.placeholder}
+                value={vals[f.key] ?? ""}
+                onChange={(e) => setVals((p) => ({ ...p, [f.key]: e.target.value }))}
+              />
+            )}
           </Field>
         );
       })}

@@ -438,8 +438,14 @@ at the cost of 3-4 answerable cases (`ticket-hpul-domain-filter` 0.655, `ticket-
 win, and the calibrator cannot see that recall loss is disproportionate to the audience (a new hire
 asking who's on their team is a far more common question than someone probing for a fabricated
 CVE's bug bounty payout). This is deliberately a conservative interim value, not a claim that the
-overlap problem is solved — see PRIORITIES #36 for the standing embedding-fine-tune gap this
-doesn't close. `RetrievalConfig.ann_refine_factor` (new field, default 10) and the retuned
+overlap problem is solved — see PRIORITIES #33 for the standing embedding-fine-tune gap this
+doesn't close. **Postscript (2026-07-31): this retune reached nothing for its first two days.**
+`save_config` materialized every field, so the live workspace stayed pinned at 0.55 and the
+zero-cost improvement measured above was purely theoretical there. Fixed by storing the settings
+blob sparsely plus a logged one-time adoption of superseded defaults (CLAUDE.md `memory/`
+bullet); verified against a copy of the real workspace — 0.55→0.64 adopted, the deliberate
+`triple_workers: 8` untouched. A future retune must add its old value to
+`config.SUPERSEDED_DEFAULTS` and bump `DEFAULTS_EPOCH` to reach workspaces that predate it. `RetrievalConfig.ann_refine_factor` (new field, default 10) and the retuned
 `min_score` default landed together in `quickjoiner/config.py`; `KnowledgeStore._dense` now applies
 it. Regression test: `tests/test_retrieval.py::test_ann_refine_factor_restores_exact_scores_above_min_rows`
 builds a real 400-row IVF_PQ index (LanceDB's PQ trainer needs ≥256 rows) and asserts the indexed

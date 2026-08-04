@@ -16,4 +16,9 @@ docs {
   A type may also carry `next_step` — what you must do AFTER saving, for connectors that
   aren't usable the moment they're created (OneDrive needs an interactive Microsoft 365
   sign-in, which can only happen once the connector exists).
+
+  Each field carries `multiline` — true for prose fields a UI should render as a textarea
+  rather than a single-line input. Every type has one: `extraction_prompt`, an optional
+  description of what this source's documents contain, which guides knowledge-graph
+  extraction for it (needs `graph.extract_triples` on in /api/settings).
 }

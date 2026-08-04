@@ -2,7 +2,7 @@ import { X } from "lucide-react";
 import { useState } from "react";
 import { api } from "../api";
 import type { ConnectorRow, ConnectorType } from "../types";
-import { Button, Field, Select, SYNC_OPTIONS, TextInput } from "./ui";
+import { Button, Field, Select, SYNC_OPTIONS, TextArea, TextInput } from "./ui";
 
 /** Full edit of a configured connector: every option field (secrets kept unless
  * retyped), sharing, and the sync schedule. Name and type are the connector's
@@ -114,15 +114,26 @@ export function EditConnectorModal({
             ].filter(Boolean);
             return (
               <Field key={f.key} label={`${f.label}${f.required ? " *" : ""}`} hint={hints.join(" — ")}>
-                <TextInput
-                  type={f.secret ? "password" : "text"}
-                  placeholder={f.placeholder}
-                  value={vals[f.key] ?? ""}
-                  disabled={locked}
-                  readOnly={locked}
-                  className={locked ? "cursor-not-allowed opacity-60" : undefined}
-                  onChange={(e) => setVals((p) => ({ ...p, [f.key]: e.target.value }))}
-                />
+                {f.multiline ? (
+                  <TextArea
+                    placeholder={f.placeholder}
+                    value={vals[f.key] ?? ""}
+                    disabled={locked}
+                    readOnly={locked}
+                    className={locked ? "cursor-not-allowed opacity-60" : undefined}
+                    onChange={(e) => setVals((p) => ({ ...p, [f.key]: e.target.value }))}
+                  />
+                ) : (
+                  <TextInput
+                    type={f.secret ? "password" : "text"}
+                    placeholder={f.placeholder}
+                    value={vals[f.key] ?? ""}
+                    disabled={locked}
+                    readOnly={locked}
+                    className={locked ? "cursor-not-allowed opacity-60" : undefined}
+                    onChange={(e) => setVals((p) => ({ ...p, [f.key]: e.target.value }))}
+                  />
+                )}
               </Field>
             );
           })}

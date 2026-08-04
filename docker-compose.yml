@@ -3,10 +3,15 @@ services:
     build:
       context: .
       # Uncomment to bundle the Playwright browser (web_scrape fallback):
-      # args:
-      #   WITH_BROWSER: "1"
+      args:
+        WITH_BROWSER: "1"
     image: quickjoiner:latest
     container_name: quickjoiner
+    # Docker gives a container 64MB of /dev/shm, and Chromium keeps renderer shared memory
+    # there — a real crawl exhausts it and tabs start crashing. The code also passes
+    # --disable-dev-shm-usage, so this is belt-and-braces (and helps anything else that
+    # expects a normal-sized /dev/shm).
+    shm_size: "1gb"
     ports:
       - "8787:8787"
     volumes:
@@ -15,7 +20,12 @@ services:
       - qj-data:/data
     environment:
       # First-boot defaults only — after that, tune everything from the UI ⚙ Settings.
-      QJ_PROVIDER: ollama
+      QJ_PROVIDER: litellm
+      LITELLM_API_KEY: "${LITELLM_API_KEY:-}"
+      OCTOPUS_API_KEY: "${OCTOPUS_API_KEY:-}"
+      AZURE_DEVOPS_PAT: "${AZURE_DEVOPS_PAT:-}"
+      GITLAB_TOKEN: "${GITLAB_TOKEN:-}"
+      CONFLUENCE_API_TOKEN: "${CONFLUENCE_API_TOKEN:-}"
       # For the Anthropic provider, supply a key (uncomment and set in your shell/.env):
       # ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
     extra_hosts:

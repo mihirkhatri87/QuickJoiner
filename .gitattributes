@@ -1,0 +1,4 @@
+# Shell scripts run inside Linux containers — a Windows checkout with core.autocrlf=true
+# otherwise rewrites their shebang line to "#!/bin/sh\r", which fails inside the container
+# with a confusing "no such file or directory" pointing at a file that clearly exists.
+*.sh text eol=lf

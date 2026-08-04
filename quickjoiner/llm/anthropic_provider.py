@@ -25,7 +25,9 @@ import logging
 from typing import Any
 
 from quickjoiner.config import LLMConfig
-from quickjoiner.llm.base import ChatResult, LLMProvider, Message, StreamCallback, ToolCall, ToolSpec
+from quickjoiner.llm.base import (
+    ChatResult, LLMProvider, Message, StreamCallback, TokenUsage, ToolCall, ToolSpec,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -115,19 +117,28 @@ class AnthropicProvider(LLMProvider):
 
     @staticmethod
     def _to_result(response: Any) -> ChatResult:
-        usage = getattr(response, "usage", None)
-        if usage is not None:
+        raw = getattr(response, "usage", None)
+        tokens = TokenUsage()
+        if raw is not None:
+            # input_tokens EXCLUDES cached reads on this API, so add them back — `prompt`
+            # is defined as the whole prompt, with `cached` the part that was free.
+            cache_read = int(getattr(raw, "cache_read_input_tokens", 0) or 0)
+            tokens = TokenUsage(
+                prompt=int(getattr(raw, "input_tokens", 0) or 0) + cache_read,
+                completion=int(getattr(raw, "output_tokens", 0) or 0),
+                cached=cache_read,
+                cache_write=int(getattr(raw, "cache_creation_input_tokens", 0) or 0),
+            )
             logger.debug(
                 "anthropic usage: input=%s cache_read=%s cache_write=%s output=%s",
-                getattr(usage, "input_tokens", None),
-                getattr(usage, "cache_read_input_tokens", None),
-                getattr(usage, "cache_creation_input_tokens", None),
-                getattr(usage, "output_tokens", None),
+                getattr(raw, "input_tokens", None), cache_read,
+                tokens.cache_write, tokens.completion,
             )
         if response.stop_reason == "refusal":
             return ChatResult(
                 text="The model declined to answer this request.",
                 stop_reason="refusal",
+                usage=tokens,
             )
         text = "".join(b.text for b in response.content if b.type == "text")
         thinking = "".join(b.thinking for b in response.content if b.type == "thinking")
@@ -146,6 +157,7 @@ class AnthropicProvider(LLMProvider):
             stop_reason=response.stop_reason,
             thinking=thinking,
             thinking_blocks=thinking_blocks,
+            usage=tokens,
         )
 
     @staticmethod

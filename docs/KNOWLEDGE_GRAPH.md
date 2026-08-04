@@ -113,6 +113,16 @@ Notes:
 2. **Ticket references** (Phase A): commit-history documents and PR/issue
    documents already contain ticket keys (`NAUT-123`); a regex extractor emits
    `repo --references--> ticket` and `ticket --references--> repo`.
+2b. **Tables** (`ingest/tables.py`, shipped 2026-07-31): the most structured content on a
+   page, and previously the least mined — measured on a real service catalogue, **0 of 17**
+   team pages produced an edge because a flattened table carries no sentence linking a
+   person to a team. Extraction now preserves tables as markdown rows, and this extractor
+   reads typed columns plus the entity a catalogue URL names itself by
+   (`?team=Payments`), emitting the relation an ordered pair of typed cells asserts. A
+   person row's email is registered as an **alias**, which is what merges the same human
+   across sources that name people by email, display name and full name respectively.
+   Deterministic (no LLM), so it lands regardless of `graph.extract_triples`, and its
+   emitted shapes are lockstep-tested against `RELATION_SIGNATURES`.
 3. **Connector metadata** (Phase B): Jira projects, ADO repos/pipelines,
    Octopus projects each register themselves as entities on sync
    (`service --deploys--> repo` where derivable).
@@ -195,6 +205,13 @@ Notes:
   relation with `detail` and evidence doc titles/uris. The system prompt gains
   one line: *"For questions about how projects/packages/services relate, call
   graph_neighbors first, then search_memory on the evidence."*
+- `graph_relations(rel, src_type?, dst_type?)` — **shipped 2026-07-31.** Every edge of one
+  relation across the whole graph, grouped by the entity on the right. This is the
+  ENUMERATION read: `graph_neighbors` answers "what is attached to this one thing" and
+  `graph_path` "how do these two connect", but "list every team with its members" is
+  neither, and vector search cannot serve it either (top-k *similar* chunks, never
+  all-matching-a-filter). Bounded, with truncation stated rather than a sample presented
+  as the whole answer.
 - `graph_path(a: str, b: str, max_hops: int = 3)` — BFS over `edges`,
   returns the chain with evidence per hop, or "no known path" (which the
   agent reports as not-learned, keeping refusal honest).

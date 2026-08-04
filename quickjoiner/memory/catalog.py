@@ -12,11 +12,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+
+log = logging.getLogger(__name__)
+
+_CONFIG_KEY = "config"  # settings row holding the (sparse) workspace config blob
+_DEFAULTS_EPOCH_KEY = "config_defaults_epoch"  # config.DEFAULTS_EPOCH last reconciled
 
 # Portable across SQLite and Postgres: TEXT/INTEGER, DEFAULT, PRIMARY KEY, UNIQUE,
 # CREATE INDEX IF NOT EXISTS, and integer flags for shared/configured.
@@ -150,6 +156,14 @@ _MIGRATION_STATEMENTS = [
     # predate this column drain with only what their stored text still yields — stated
     # plainly in the drain's log rather than passed off as a complete rebuild.
     "ALTER TABLE graph_pending ADD COLUMN graph_json TEXT NOT NULL DEFAULT ''",
+    # Expression index for resolve_entity's case-insensitive name lookup (2026-07-31,
+    # found by `qj bench`). Without it `WHERE id = ? OR LOWER(name) = ?` cannot use an
+    # index for the second branch, so every call SCANNED the whole entities table —
+    # 36,203 rows on the live workspace, ~30 times per query (alias expansion slides
+    # 1-4-token windows), which measured as 27% of total retrieval latency. Portable:
+    # both SQLite and Postgres support indexes on an expression, and it must spell
+    # LOWER(name) exactly as the query does for the planner to match it.
+    "CREATE INDEX IF NOT EXISTS idx_entities_lower_name ON entities(LOWER(name))",
 ]
 
 
@@ -209,7 +223,7 @@ class _SqlCatalog:
         """Load the workspace Config, migrating a legacy config.yaml once (SQLite only)."""
         from quickjoiner.config import Config
 
-        raw = self.get_setting("config")
+        raw = self.get_setting(_CONFIG_KEY)
         if raw is None:
             legacy = self.workspace / "config.yaml" if self.workspace else None
             if legacy and legacy.exists():
@@ -223,14 +237,55 @@ class _SqlCatalog:
                 config = Config()
                 self.save_config(config)
             return config
-        config = Config.model_validate(json.loads(raw))  # blob excludes sources
+        # Blob excludes sources, and (since it is stored sparsely) any field the user
+        # never set — those pick up whatever default config.py currently ships.
+        config = Config.model_validate(self._adopt_shipped_defaults(json.loads(raw)))
         config.sources = self.list_source_configs()
         return config
 
+    def _adopt_shipped_defaults(self, blob: dict) -> dict:
+        """Once per workspace: drop values that are only a superseded shipped default.
+
+        A blob written before sparse persistence has every field materialised, pinning
+        whatever default was in force when the workspace first saved (see
+        config.SUPERSEDED_DEFAULTS for the full reasoning). This prunes exactly those
+        values so the current default applies, leaves real customisations alone, and
+        LOGS every field it moves — a workspace's retrieval behaviour should never
+        change silently. Runs again if DEFAULTS_EPOCH is bumped for a new entry.
+        """
+        from quickjoiner.config import DEFAULTS_EPOCH, reconcile_superseded_defaults
+
+        try:
+            done = int(self.get_setting(_DEFAULTS_EPOCH_KEY) or 0)
+        except ValueError:
+            done = 0
+        if done >= DEFAULTS_EPOCH:
+            return blob
+        pruned, adopted = reconcile_superseded_defaults(blob)
+        for path, was, now in adopted:
+            log.info(
+                "config: %s was pinned to the superseded default %r; adopting the "
+                "shipped default %r (change it in Settings to keep %r)", path, was, now, was
+            )
+        if adopted:
+            self.set_setting(_CONFIG_KEY, json.dumps(pruned))
+        self.set_setting(_DEFAULTS_EPOCH_KEY, str(DEFAULTS_EPOCH))
+        return pruned
+
     def save_config(self, config) -> None:
-        """Persist Config: settings blob + reconciled connector sources."""
-        blob = config.model_dump(mode="json", exclude={"sources"})
-        self.set_setting("config", json.dumps(blob))
+        """Persist Config: settings blob + reconciled connector sources.
+
+        `exclude_defaults` is what lets a retuned default in config.py reach an existing
+        workspace: only fields that actually differ from the shipped default are stored,
+        so an untouched field stays governed by the code rather than being frozen at
+        whatever it happened to be the first time this workspace saved. The trade-off is
+        deliberate — a value explicitly set to today's default is indistinguishable from
+        an untouched one and will follow a future retune. That matches what the Settings
+        drawer already tells the user ("default"), and the alternative is the bug this
+        replaces: a shipped retune that silently never applies anywhere.
+        """
+        blob = config.model_dump(mode="json", exclude={"sources"}, exclude_defaults=True)
+        self.set_setting(_CONFIG_KEY, json.dumps(blob))
         keep = set()
         for source in config.sources:
             self.write_source(source)
@@ -901,6 +956,32 @@ class _SqlCatalog:
             self._EDGE_SELECT + " WHERE g.src = ? OR g.dst = ? ORDER BY g.rel, g.dst",
             (entity_id, entity_id),
         )
+
+    def graph_relations(self, rel: str, src_type: str | None = None,
+                        dst_type: str | None = None, limit: int = 400) -> list[dict]:
+        """Every edge of one relation shape, optionally constrained by the entity type on
+        each end — the ENUMERATION read the graph could not previously serve.
+
+        `graph_neighbors` answers "what is attached to this one thing" and `graph_path`
+        "how do these two connect", but "list every team with its members" is neither: it
+        is one relation across the whole graph. Vector search cannot answer it either
+        (it returns the top-k most similar chunks, never all-matching-a-filter), so
+        without this it took one question per entity.
+
+        Deterministic and complete within `limit`; the caller reports truncation rather
+        than presenting a partial list as the whole answer.
+        """
+        sql = self._EDGE_SELECT + " WHERE g.rel = ?"
+        params: list = [rel]
+        if src_type:
+            sql += " AND s.type = ?"
+            params.append(src_type)
+        if dst_type:
+            sql += " AND t.type = ?"
+            params.append(dst_type)
+        sql += " ORDER BY t.name, s.name LIMIT ?"
+        params.append(max(1, limit))
+        return self._read_all(sql, tuple(params))
 
     def edge_corroboration(self, src: str, rel: str, dst: str) -> dict:
         """How many distinct evidence docs, and distinct sources, assert one exact

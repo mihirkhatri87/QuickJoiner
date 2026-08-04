@@ -6,7 +6,7 @@ non-coverage dimensions that actually catch bugs (property, parity, mutation, E2
 
 ## 1. Current state (measured honestly)
 
-- **Backend**: **724 tests green** (2026-07-30; local + a pg parity suite, env-gated, that runs
+- **Backend**: **801 tests green** (2026-07-31; local + a pg parity suite, env-gated, that runs
   against Docker), but coverage is *unmeasured* — no `pytest-cov` gate. Strong areas: connectors'
   pure converters, retrieval, graph, API contracts, sessions, evals (incl. threshold calibration +
   report comparison), alias query expansion. Known thin areas listed in §3.
@@ -94,6 +94,12 @@ non-coverage dimensions that actually catch bugs (property, parity, mutation, E2
   planted facts, refusal on 10 planted absences, with FakeEmbedder; runs in <5 s.
 - Real-embedding nightly job (bge-small cached): thresholds from `qj eval` must not regress
   >2 pts vs the committed baseline JSON.
+- **Speed/cost regressions have the same shape of gate** (2026-07-31): `qj bench --compare`
+  exits non-zero when a watched metric gets >20% slower or more expensive. Relative, not
+  absolute — +5ms means nothing at 500ms and everything at 8ms — and a metric with fewer
+  than 5 samples is reported but never gated, so the gate cannot fire on noise. The harness
+  itself is unit-tested (`tests/test_bench.py`) with no wall-clock assertions anywhere: a
+  test that fails when the machine is busy teaches everyone to ignore it.
 
 ## 4. Frontend plan (0 → 90)
 

@@ -57,6 +57,11 @@ qj browser login <url> / qj browser status [url]  # Playwright profile for crede
 qj eval <set.yaml> [--init] [--agent]         # grounding evals: retrieval metrics always
                                               #   (recall@k, MRR, threshold, refusal accuracy);
                                               #   --agent adds end-to-end behavior checks (needs LLM)
+qj bench <pack.yaml> [--init] [--agent]       # speed/cost: per-stage retrieval latency (p50/p95)
+    [--compare old.json] [--repeats N]        #   + embedder chunks/sec always; --agent adds answer
+                                              #   latency + tokens/answer (needs LLM). An eval set
+                                              #   works as a pack. --compare exits 1 on a >20%
+                                              #   regression — the speed twin of `qj eval --compare`
 qj drain-graph [name]                         # mine relationships for already-ingested docs whose
                                               #   deferred extraction never resolved (a moving-window
                                               #   connector never re-yields them, so no sync retries it)
@@ -71,6 +76,37 @@ Docker: `docker compose up` (or `docker build` + `docker run -p 8787:8787 -v qj-
 All state persists in the `/data` volume; first-boot provider defaults via `QJ_PROVIDER`, then
 tune everything from the UI. Lean image by default; `--build-arg WITH_BROWSER=1` bundles Playwright
 for the web_scrape browser fallback. Host Ollama reachable at `host.docker.internal:11434`.
+**`.gitattributes` pins `*.sh` to LF** — a Windows checkout with `core.autocrlf=true` otherwise
+rewrites `docker-entrypoint.sh`'s shebang to `#!/bin/sh\r`, and the container dies in a restart
+loop on `exec … no such file or directory`, naming a file that plainly exists (hit live).
+**Chromium needs memory + `/dev/shm` headroom (diagnosed live, 2026-07-30).** A browser crawl in
+the container repeatedly killed the whole server mid-sync; every orphaned run then surfaced as
+"interrupted — server restarted before it finished", and the UI's log stream died with it and
+reported the browser's bare "network error" as though the *sync* had failed. Measured rather
+than guessed: `docker inspect` showed `ExitCode=0`/`OOMKilled=false` (a clean SIGTERM, NOT a
+cgroup OOM), while sampling `docker stats` through a crawl showed memory climbing to
+**1.195 GiB of a 1.916 GiB VM** across 13 Chromium processes, then the container vanishing at
+exactly that peak. Root cause is host-side: Docker's VM was running with only ~2 GB **on a 64 GB
+machine** (no `.wslconfig`); the Docker *daemon itself* then died mid-build with an
+`EOF`/500 — the same starvation one level up — and came back allocated 16.7 GB, after which the
+kills stopped. So the operational rule is simply **give Docker real memory before crawling with
+a browser** (4–8 GB+); a ~2 GB VM cannot host Chromium plus the embedder. Two code-side reductions ship regardless: `_CHROMIUM_ARGS = ["--disable-dev-shm-usage"]`
+applied at the single `_context_opts` choke point (Docker gives a container **64 MB** of
+`/dev/shm` and Chromium keeps renderer shared memory there — exhausting it crashes tabs with
+nothing in the error naming shared memory; the flag backs it with /tmp instead), plus
+`shm_size: "1gb"` in `docker-compose.yml` as belt-and-braces; and `_crawl_via_browser` now
+**reuses ONE page** for the whole crawl instead of opening a tab per URL — each tab is its own
+renderer process, so per-URL create/destroy kept a pool of them alive. Cookies live on the
+context and a navigation resets page-level JS state, so reuse is equivalent here.
+**Dockerfile layer order is dictated by rebuild cost** (restructured 2026-07-30, measured):
+dependencies + the ~250MB Chromium install from `pyproject.toml` alone come FIRST, and
+`COPY quickjoiner` / `COPY --from=ui` come after, so a source edit can't invalidate them. A
+stub `quickjoiner/__init__.py` satisfies hatchling during the dependency install, then the real
+package lands via `pip install --no-deps .` — so the dependency list is still declared exactly
+once, in `pyproject.toml`, with nothing duplicated into the Dockerfile. BuildKit cache mounts
+back pip and npm. Measured on this machine: one-line Python change **311s → 10.9s**, no-op
+build 3.2s, frontend-only ~33s (Vite build dominates); image export alone fell 67s → 1s.
+Previously BOTH source copies preceded the install layer, so every edit re-downloaded Chromium.
 
 ## Architecture
 
@@ -183,7 +219,35 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   ingestion-bucket source rows (`configured=0`) + gaps, keeping configured connectors, users,
   sessions and settings (neutral `?`-SQL ⇒ both backends; caller wipes vectors via `store.reset()`);
   `load_config`/`save_config`/`list_source_configs`/`write_source` are the config API, with
-  one-time YAML migration), `embedder.py` (fastembed `BAAI/bge-small-en-v1.5` default;
+  one-time YAML migration.
+  **The settings blob is SPARSE — this is what lets a retuned default reach a workspace that
+  already exists (2026-07-31, user-reported):** `save_config` dumps with
+  `exclude_defaults=True`, so only fields that genuinely differ from the shipped default are
+  stored and an untouched field stays governed by `config.py`. It used to dump every field,
+  which materialized whatever value was in force the first time a workspace saved and **pinned
+  it forever** — so plan 05's `min_score` 0.55→0.64 retune, and every default change before it,
+  reached new workspaces only. Measured on the live corpus two days after that retune shipped:
+  still running 0.55, so its whole measured benefit (3 of 12 refusal near-misses gated at zero
+  recall cost) was unrealised. The trade-off is deliberate and one-directional: a value
+  explicitly set to *today's* default is indistinguishable from an untouched one and will follow
+  a future retune — which is exactly what the Settings drawer already tells the user ("default"),
+  and strictly better than a shipped retune that silently applies nowhere.
+  A blob written by the old code has everything materialized, so "never set" and "deliberately
+  set" cannot be told apart in it — **except** for a value that equals a default this repo has
+  since superseded. `config.SUPERSEDED_DEFAULTS` (pure `reconcile_superseded_defaults`) lists
+  those three (`retrieval.min_score` 0.55, `retrieval.reranker` "none", `graph.triple_workers` 4
+  — the only defaults ever changed, confirmed against git history, not memory) and
+  `_adopt_shipped_defaults` prunes them ONCE per workspace, guarded by a `config_defaults_epoch`
+  settings row against `config.DEFAULTS_EPOCH`. It **logs every field it moves** at INFO —
+  retrieval behaviour must never change silently — and keeps anything else, so the live
+  workspace's deliberate `graph.triple_workers: 8` survives untouched. Verified against a copy
+  of the real 11-connector workspace: min_score 0.55→0.64 announced, triple_workers 8 and the
+  already-current reranker untouched, all connectors intact, idempotent on the second load.
+  ⚠ **When you change a default in `config.py`, add the old value to `SUPERSEDED_DEFAULTS` and
+  bump `DEFAULTS_EPOCH`** — that is the step that carries the change to anyone who has not
+  re-saved since (after any settings write the blob is sparse and needs no entry).
+  `GET /api/settings` is unaffected: it dumps the in-memory `Config`, which is always
+  complete), `embedder.py` (fastembed `BAAI/bge-small-en-v1.5` default;
   `FASTEMBED_CACHE_PATH` pins the model cache; ollama provider defaults to `nomic-embed-text`.
   **Asymmetric retrieval** (`embedding.instruct`, OFF by default): prepend the model's task
   instruction to queries vs passages — `_INSTRUCTIONS` table maps a model-name substring to
@@ -260,11 +324,35 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   rel, dst)` — distinct evidence docs + distinct sources per exact edge (the
   `(src,rel,dst,evidence_doc_id)` PK already stores one row per corroborating doc);
   `entity_evidence(entity_id, limit)` — evidence titles/kinds for adjudication context.
+  **`graph_relations(rel, src_type, dst_type, limit)` (2026-07-31, same neutral `?`-SQL, no
+  schema change)** — every edge of ONE relation shape, optionally constrained by the entity
+  type on each end, ordered by destination then source. The enumeration read the graph could
+  not previously serve: `graph_neighbors` answers "what is attached to this one thing" and
+  `graph_path` "how do these two connect", but "every team with its members" is neither —
+  it is one relation across the whole graph. Backs the `graph_relations` agent tool.
 - `quickjoiner/ingest/` — `extract.py` (**the single text-extraction choke point**, 2026-07-22):
   `extract_text(bytes, filename) -> str` turns any supported file into plain text — Word (`.docx`),
   PowerPoint (`.pptx`), Excel (`.xlsx`) and PDF (`.pdf`) via lazy office/PDF parsers
   (python-docx/python-pptx/openpyxl/pypdf), plus Markdown/text/JSON/CSV/code decoded directly and
-  HTML stripped to text (keeping `<img alt>` captions). **Office shape-tree recursion
+  HTML stripped to text (keeping `<img alt>` captions).
+  **HTML tables are rendered as markdown pipe rows, not flattened (2026-07-31,
+  user-reported via "list all teams with their members").** `soup.get_text()` puts every
+  cell on its own line, which destroys the table: the column each value belonged to is
+  gone and — worse — a **blank cell simply vanishes**, so every later value in that row
+  shifts left into the wrong column. Measured on the live corpus: a member row missing
+  only its email rendered its Location where Phone belonged, and nothing in the stored
+  text revealed it (you could only recover the truth by diffing against a row that
+  happened to be complete). `render_html_table` keeps the header, the alignment and empty
+  cells, escapes `|`, expands `colspan` to padding, and caps rows/cell length
+  (`_MAX_TABLE_ROWS` 500 / `_MAX_CELL_CHARS` 300, truncation stated). Two deliberate
+  shape rules: a **single-column** table is page layout, not data, so it degrades to its
+  text rather than wrapping prose in table syntax; and only **leaf** tables render (one
+  containing another is skipped) because old intranet apps wrap real data tables in
+  layout tables, and rendering the outer one would bury the data in a single cell. Runs
+  AFTER the `<img>` pass so an image inside a cell still contributes its caption and
+  still reaches the vision seam. Each row is also a self-contained line, which chunks and
+  embeds far better than a vertical stream of orphaned cells. Consumed by
+  `ingest/tables.py`. **Office shape-tree recursion
   (2026-07-24, user-reported):** `slide.shapes` yields only TOP-LEVEL shapes, so every label
   inside a **grouped** diagram was dropped — silently, with the extraction still reporting
   success. A PowerPoint architecture diagram is precisely a group of labelled boxes, so an
@@ -332,6 +420,47 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   into text with **no extractor changes**. `TEXT_EXTENSIONS`/`DOC_EXTENSIONS`/`CODE_EXTENSIONS`/
   `NAMED_TEXT_FILES` live here now (`files.py` re-exports them). Tests: `tests/test_extract.py`
   (per-format, HTML alt-text, corrupt→error, inert-vs-invoked vision seam).
+  **`tables.py` — deterministic graph extraction from tabular content (2026-07-31,
+  AI_ROADMAP-adjacent, user-reported).** A table is the most structured thing on a page and
+  was the least mined: measured on the live 728-page internal service catalogue, **0 of 17**
+  team pages produced a single edge, while the SAME pages' key-value blocks
+  ("Teams: Caffeine") extracted fine. The LLM wasn't at fault — a flattened table is a wall
+  of unlabelled values with no sentence linking a person to a team, so emitting nothing was
+  the honest outcome. Structure was the whole difference, so this reads it directly, the way
+  `code_graph.py`/`pubsub.py` read code and config. It runs on the **markdown pipe rows**
+  `extract.py` now preserves, NOT on HTML, so it serves every source whose text carries a
+  table (scraped pages, Confluence `body.view`, markdown, Office). Two things are read, and
+  only two, because both are *stated* rather than inferred: **(1) typed columns** — a header
+  names its column's type via `_HEADER_TYPES` (`Team`, `Repository`, `Environment`, … incl.
+  a multi-word tail match so "Octopus Project" types but "Projected Cost" doesn't); a
+  generic `Name` column is typed ONLY when an email column proves the rows are people, or
+  when the table's own caption announces what it lists (`_CAPTION_TYPES`: "Teams" → team) —
+  "Name" heads lists of services as often as lists of people, so anything less is a guess.
+  **(2) The subject in the URL** — catalogue web apps carry the entity in the query string
+  (`/TeamDetails?id=45&team=Autobots`), which is the page stating its own subject in
+  machine-readable form; `subject_entities` reads only `_URL_SUBJECT_PARAMS` and only values
+  that look like names (an opaque `?id=45` names nothing). That subject pairs with each row,
+  which is what turns a members table with **no team column** into `person --works_on-->
+  team`. `_PAIR_RELATIONS` maps an ordered pair of typed cells to its relation
+  (person+team → works_on, team+repo → owns, service+environment → deploys, …) — a
+  deliberate subset of `triples.RELATION_SIGNATURES`, **lockstep-tested** against it so this
+  extractor can never emit a shape the vocabulary's own domain/range validation would reject
+  (`builds` is exempt via `_DETERMINISTIC_ONLY_RELS`: connector-vocabulary, same footing as
+  ADO's, no signature to check). **A person row's email becomes an ALIAS of that person** —
+  the fix for a measured identity split on the live graph: only **1 of 875** person entities
+  was shared across sources, because Plumber names people by email (`lthillet@opentext.com`),
+  Confluence by display name (`Chris S`), TFS by full name (`Greyden Hochstetler`) — three
+  disjoint node sets for the same humans. The table carries name AND email in one row, so
+  aliasing them is definitional, not inferred. Honesty guards: booleans/numbers/`N/A`
+  placeholders are never entities (`_NON_ENTITY_VALUES`), names are length-bounded, an
+  untyped column contributes nothing rather than a guess, and an entity that took part in no
+  edge is dropped (it is exactly what `gc_orphan_entities` sweeps). Bounded per doc
+  (20 tables / 400 rows / 600 edges). Pure, same contract as its siblings:
+  `(text, uri, src_id, title) -> (entities, aliases, edges)`; wired into `_sync_graph`
+  beside `extract_pubsub_graph`, so it lands whether or not LLM extraction is enabled.
+  Tests: `tests/test_tables.py` (19, incl. the blank-cell regression, layout-vs-data table
+  shapes, caption typing vs guessing, the signature lockstep, and an end-to-end
+  HTML → rows → edges → `graph_relations` pass).
   `pipeline.py` (**normalize → sha256 dedupe → chunk → embed → upsert;
   idempotent**; optionally injected a `triple_extractor`).
   **Graph-extractor version — refresh the graph on a plain sync, no re-embed (2026-07-23):**
@@ -834,6 +963,37 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   nginx 444 / WAF 403; realistic headers alone clear most (verified live vs opentext.com). No
   CAPTCHA-solving, IP rotation, or TLS-forgery — a site that still refuses a real browser is
   respected. Injectable seams for offline tests: `_fetch_http` and `_transport` (httpx MockTransport).
+  **Crawl identity: canonical URLs, a same-host floor, content dedupe, honest titles
+  (2026-07-30, user-reported "numerous homepage entries").** Measured against the live
+  `plumber.appriver.corp` crawl before changing anything, which separated the real defects from
+  the imagined ones. **Already correct, confirmed not assumed:** every one of the 200 ingested
+  documents was on the start host (zero TFS links followed — `extract_links`' prefix filter plus
+  `default_prefixes` scoping to the start URL's folder), and no URL was fetched twice in a pass
+  (`visited`/`enqueued`). **Actually wrong:** (1) dedupe compared *raw URL strings*, so spellings
+  of one page (host case, default port, `//`, parameter ORDER, a `utm_*` tracking param) each
+  became their own document — a doc_id is `sha256(source_id|uri)`. `canonical_url` (pure) fixes
+  that, and deliberately does **not** drop parameters for looking like filters: `?team=30` and
+  `?team=41` are different pages and merging them loses real content, the worse of the two errors.
+  Escaping is preserved as `%20`, not rewritten to `+`, so the stored uri is the one a user could
+  paste. (2) Two genuinely different URLs rendering byte-identical content still became two
+  documents — 23 of that crawl's 200-page budget went on the dashboard's own `?tag=`/`?team=`
+  filter facets. The crawl now hashes each page's extracted text and yields a repeat once;
+  **exact equality only**, since anything looser starts discarding pages that merely resemble
+  each other. (3) **Titles are not identifiers**: the app served ONE static `<title>`
+  ("Home page - AppRiver.ContinuousDelivery") for all 200 pages, so the document browser showed
+  200 identical rows and the contextual-chunking breadcrumb learned nothing from any of them.
+  `page_title` prefers an `<h1>` **from the post-`DROP_TAGS` content region** (so a brand `<h1>`
+  in a `<header>` is already gone) and falls back to `<title>` then the URL — weakly dominant: a
+  site that repeats its name in the body `<h1>` is no worse off than the `<title>` it replaces.
+  (4) The crawl was **silent about what it left out** — it hit `max_pages` exactly and looked
+  complete; `_crawl` now reports both the duplicate count and a truncation warning naming how many
+  links were still queued. Also added: `same_host_only` (option, default true, in `FORM_SPECS`) as
+  a hard floor **independent of** `allow_prefixes` — the prefix list is user-editable and one
+  over-broad entry would let the crawl wander into a system it isn't the connector for. NB titles
+  change only on **re-ingest**: the doc hash is over text alone, so already-ingested pages keep
+  their old titles until a clean re-sync. Tests: `tests/test_scraper.py` (canonicalization
+  collapse/preserve, host floor vs an over-broad prefix list, content dedupe, `<h1>` preference +
+  the brand-heading false positive).
   Browser hardening lives in `browser/session.py` (`DESKTOP_UA`, `_CONTEXT_OPTS`, `_STEALTH_JS`
   masking `navigator.webdriver`) — applied to both `qj browser login` and headless fetch.
   **Credentialed sites: session-cookie capture + auth-wall detection (2026-07-30, found live
@@ -868,19 +1028,153 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   flow, so the UI drives the same thing as a background job — `POST /api/connectors/{name}/
   browser/login` starts it, `GET …/browser/session` reports state. Two deliberate constraints:
   the window's URL comes from the **connector's own `start_urls`**, never the request body (this
-  route must not become "make the server open an arbitrary page"), and `display_hint()` refuses
-  up front on a headless host (Linux with no `DISPLAY`/`WAYLAND_DISPLAY`) with instructions
-  rather than hanging until a launch timeout. **The window opens on the machine running the
-  server** — the same machine as the UI in a local-first workspace, and stated plainly in the UI
-  when it isn't. One login at a time per connector. Frontend: `BrowserSignInPanel` on the
-  connector plate (rendered only for `web_scrape` + a truthy `use_browser`, so a public crawl
-  shows nothing), polling `verify=false` while a window is open and running one real
-  verification when it closes; plus a **Sign in to this site** affordance in `SyncLogModal`
-  when a finished run's log carries the auth-wall line, since that is where the user is looking
-  when a sync mysteriously finds nothing. `web_scrape` gained a `next_step` in FORM_SPECS.
-  Tests: `tests/test_api.py` (session reports fetch-derived signed-in state, login start uses
-  the connector's configured URL, headless host → 409, non-scrape connector → 400).
+  route must not become "make the server open an arbitrary page"), and (superseded 2026-07-30,
+  see below) `display_hint()` used to refuse up front on a headless host. One login at a time per
+  connector. Frontend: `BrowserSignInPanel` on the connector plate (rendered only for
+  `web_scrape` + a truthy `use_browser`, so a public crawl shows nothing), polling `verify=false`
+  while a login runs and running one real verification when it ends; plus a **Sign in to this
+  site** affordance in `SyncLogModal` when a finished run's log carries the auth-wall line, since
+  that is where the user is looking when a sync mysteriously finds nothing. `web_scrape` gained a
+  `next_step` in FORM_SPECS. Tests: `tests/test_api.py` (session reports fetch-derived signed-in
+  state, login start uses the connector's configured URL, non-scrape connector → 400).
   Browser-verified against the real gated site.
+  **Remote sign-in for headless hosts — Docker/cloud (2026-07-30):** the constraint above — "the
+  window opens on the machine running the server" — makes the whole feature useless the moment
+  QuickJoiner runs somewhere with no display at all, which is exactly the Docker/cloud case (the
+  user's own question: "this works locally — what happens when I deploy this on cloud?").
+  `login_jobs.login_mode() -> "local"|"remote"|"unavailable"` replaces the old binary
+  `display_hint()` check: a real display → `"local"` (the flow above, byte-for-byte unchanged);
+  no display but Playwright importable → `"remote"`, the new case — `display_hint()` now returns
+  `None` here too, so a headless host is no longer a dead end; no display AND the `browser` extra
+  not installed → `"unavailable"` (still refuses). **`session.login_remote()`** is the remote
+  counterpart to `login()`: launches Chromium in ordinary `headless=True` mode (no X server
+  needed at all — this is what made Xvfb+VNC unnecessary, see below) and streams the login page
+  as **polled JPEG frames** (`page.screenshot(type="jpeg")` every `_FRAME_INTERVAL_SECONDS`=0.2)
+  instead of putting a window on screen, so a person finishes the SSO/MFA flow from a browser tab
+  that isn't this process's own display.
+  **Polling, not CDP screencast (corrected 2026-07-30 after live testing):**
+  the first cut used CDP's event-driven `Page.startScreencast` — efficient
+  in principle since it only pushes on a compositor repaint — and produced **zero frames** against
+  a real page. `startScreencast` only fires on a *subsequent* repaint, and the sequence here is
+  `goto()` completes → stream attaches → the page is idle and never repaints again, so nothing
+  was ever going to arrive. `page.screenshot()` always returns the current frame on demand at
+  ~75ms for a full 1280×800 capture, cheap enough to poll and simpler than a CDP session (no
+  session/ack handshake, no stop/restart across navigations). Runs
+  entirely on the thread that owns the Playwright sync objects (not thread-safe across threads),
+  draining a caller-supplied `input_queue` each tick through a **fixed-whitelist**
+  `_apply_input(page, event)` (mousemove/down/up, wheel, keydown/up, insert-text — unknown/
+  malformed events are swallowed, never raised, since a bad event must not kill a sign-in the
+  caller can't retry) and re-targeting capture+input to the newest page on `context.on("page",
+  …)` (best-effort popup handling — a separate "Sign in with Google"-style popup window is only
+  partially covered by tracking the newest page, not a guarantee). Ends when a `capture_event` is
+  set (the UI's **"Done — capture session"**) or after `idle_timeout_s` (900s default) with no
+  input — unlike a local window there is no OS-level "closed" signal for an abandoned remote tab.
+  Shares the exact same session-cookie snapshot loop as `login()` via a factored-out `_finish()`
+  tail, so a remote sign-in is captured exactly as faithfully as a local one — this was a hard
+  requirement, since the whole point of the snapshot loop (see the module docstring above) is not
+  losing session cookies, and the remote path must not regress that. `login_jobs.py` gained a
+  `RemoteSession` registry (`frame_subscribers`, `input_queue`, `capture_event`) parallel to
+  `_jobs`, one per connector, alive only while its job runs; `subscribe_frames`/`push_input`/
+  `signal_done` are its API. New routes: `GET .../browser/session/frames` (SSE — a `meta` event
+  announcing the actual frame size first so the frontend never hardcodes a viewport, then `frame`
+  events, then `done`), `POST .../browser/session/input` (one whitelisted event), `POST
+  .../browser/session/done`. All three gated at the same `connectors:write` + `can_manage` tier
+  as starting the login itself, not mere read access — the stream can show, and the input channel
+  can type, credentials for whatever site the connector points at. `browser_session_status` gained
+  an additive `remote_capable` field (`login_mode() == "remote"`, independent of any running job)
+  so the frontend knows up front which UI a "Sign in" click will open. **Chosen over Xvfb +
+  x11vnc + noVNC/websockify** (the literal ask) after presenting both trade-offs to the user: CDP
+  screencast needs zero new Docker packages (headless Chromium already covers it — the existing
+  `WITH_BROWSER=1` build arg is untouched, no Docker/compose change at all) and zero new Python
+  deps, and reuses the SSE pattern already proven for live sync logs (`streamGetSSE`) plus the
+  existing bearer-token auth with no second port to secure; Xvfb+noVNC would have needed several
+  new apt packages, a second in-container process to supervise alongside `qj serve`, and a
+  VNC-over-websocket bridge to protect. Frontend: `RemoteBrowserModal.tsx` — a `<canvas>` painted
+  from decoded JPEG frames (`createImageBitmap`), pointer/wheel/keyboard handlers mapped through
+  the canvas's native-vs-displayed size ratio and coalesced (~30ms) into the same input events the
+  backend whitelists, footer **"Done — capture session"** / "Run in background" (same
+  viewer-not-a-leash semantics as `SyncLogModal` — closing only detaches, the sign-in keeps
+  running server-side); `BrowserSignInPanel` branches on the started job's `mode` to open it
+  instead of the local polling flow, unchanged for `mode: "local"`.
+  **Two UI defects found in live browser testing (2026-07-30, both fixed):** (1) the modal
+  rendered *confined to the settings drawer* instead of covering the screen — `SettingsDrawer`'s
+  panel carries `transition-transform` for its slide animation, and **any** CSS transform on an
+  ancestor (even `translate-x-0`) creates a new containing block for position-fixed
+  descendants, so the overlay was positioned against the drawer rather than the viewport. Fixed
+  with `createPortal` to `document.body` — the same escape `SyncLogModal` gets for free by being
+  mounted at the top level in `App.tsx`; the panel is 80vw × 80vh with the canvas
+  flex-filling it. (2) A detached sign-in was **stranded**: "Run in background" closes the viewer
+  (deliberately — it's a viewer, not a leash), but nothing re-opened it, so a running remote job
+  showed a disabled "Waiting…" button forever. The button now reads **"Open sign-in view"** and
+  re-attaches whenever `login.mode === "remote"` and the job is active, and the plate polls while
+  any job is active (not only one it started itself, so a page reload doesn't strand it either).
+  **Live-verified end to end against a real public site (x.com/login) in the headless container**,
+  which isolates the streaming path from any single site's quirks: 43 frames captured over 12s
+  (8KB → 44KB as the JS-driven login modal rendered), and a synthesized click + `insert-text`
+  landed in the real "Email or username" field — proven by x.com's *own* JavaScript then enabling
+  its "Continue" button, i.e. the page genuinely processed the events rather than merely having
+  pixels drawn. Tests:
+  `tests/test_browser_login.py` (pure — `login_mode()`'s three outcomes, `_apply_input`'s
+  whitelist + swallow-don't-raise behavior, the `RemoteSession` registry round trip, `start()`
+  wiring the right queue/event into `login_remote` and tearing the session down on completion) +
+  route-level guards in `tests/test_api.py` (`remote_capable`, frames SSE body via a pre-filled
+  fake queue, input/done 404-no-session and 409-if-local-mode branches). RBAC: the 3 new routes
+  added to `rbac.py`'s route-capability map at `connectors:write` (the coverage lockstep test
+  catches an unmapped route). **Still unverified: a real credential-gated SSO/MFA sign-in
+  end-to-end** — the streaming and input paths are proven against x.com above, but no real
+  protected corpus has been signed into and synced through this path yet.
+  **Internal-CA sites need `verify_tls=false` (2026-07-30, found live).** The first real target
+  was an internal site whose certificate chains to a private corporate CA, and every navigation
+  died with `ERR_CERT_AUTHORITY_INVALID` — including the sign-in view, which then streamed
+  Chrome's own certificate interstitial and read as "the remote view is blank/broken". The
+  `web_scrape` connector gained a **`verify_tls`** option (mirroring the ADO connector's existing
+  one), surfaced in `FORM_SPECS`; `scraper._ignore_https_errors()` is its inverse and threads
+  through `session._context_opts(ignore_https_errors)` into `login()`, `login_remote()`,
+  `browser_session()` and `verify_session()`, plus `login_jobs.start()` and both API routes, and
+  a `--insecure` flag on `qj browser login` / `qj browser status`. Opt-in per connector, never a
+  default — silently trusting any certificate would defeat TLS for every site QuickJoiner
+  touches. `verify_session` also now **names a certificate failure specifically** instead of
+  reporting it as a failed sign-in: the old message told the user to sign in again, which sends
+  them round a loop that cannot possibly succeed. `verify_tls` reaches the **plain-HTTP client
+  too** (`_get_client(verify=…)`), not just the browser paths — robots.txt is fetched through
+  that client, so an internal-CA host otherwise burned the full retry/backoff budget on every
+  host before the crawl could start.
+  **Input pipeline rebuilt (2026-07-30, third live round — reported as "can type the username
+  but not the password; paste, Enter, Delete, Backspace and Sign In all do nothing").** The
+  backend was never at fault (verified by driving `_apply_input` against the real gated page:
+  click, type, Backspace and Enter all landed, and Enter submitted the form). Three frontend
+  defects, each independently sufficient to scramble real typing:
+  (1) **Unordered delivery** — `sendInput` fired a fire-and-forget POST per event, and
+  concurrent `fetch`es have no ordering guarantee, so a `keyup` could overtake its `keydown`
+  and characters could transpose or vanish. Now a strict FIFO with one request in flight;
+  `mousemove` is *coalesced in place* rather than queued (it's the only high-frequency event
+  and a stale cursor position is worthless — queuing them starved the keystrokes behind them).
+  (2) **Every key sent as `keydown`/`keyup`** — modifier presses were replayed separately (risking
+  a stuck modifier), and a ctrl/cmd chord arrived as two unrelated key events. Keys now split
+  three ways: modifier-only presses are dropped (`e.key` already carries the shifted character),
+  a chord goes as one **`press`**, a printable character as **text insertion** (exact for
+  symbols/unicode, no keymap guesswork), and only named keys (Enter/Backspace/Delete/Tab/arrows)
+  as `keydown`+`keyup`.
+  (3) **Paste had no handler at all** — replaying Ctrl+V remotely would paste the *server's*
+  clipboard, which is never what's wanted. An `onPaste` handler reads the **local** clipboard and
+  ships it as one text insertion.
+  **Ctrl+V then still did nothing (fourth live report) — `preventDefault()` ordering.** The
+  keydown handler called `e.preventDefault()` *before* its Ctrl+V early-return, and preventing
+  the default on that keydown **cancels the browser's paste action outright**, so the `paste`
+  event never fired and the handler above could never run. Measured both ways in a browser
+  (`preventDefault=False → paste fires`, `True → nothing`). The Ctrl/Cmd+V bail now happens
+  **before the event is touched at all**, in both keydown and keyup. Verified end-to-end that
+  paste, plain typing, named keys and chords all coexist: one Ctrl+V delivered the full
+  clipboard string (spaces and symbols intact) as a single insertion, with `a`/`b`, `Enter` and
+  `Control+a` still dispatching correctly. Worth remembering generally: a blanket
+  `preventDefault()` on keydown silently disables the whole clipboard path, and the failure is
+  invisible — no error, the event simply never arrives.
+  Backend gained the matching `press` type, with one measured special case: **headless Chromium
+  does not apply the select-all editing command from a synthesized `Control+A`** (the selection
+  stays collapsed, so Ctrl+A silently did nothing and a retype appended instead of replacing) —
+  so select-all goes through the DOM (`activeElement.select()`) instead. Verified end-to-end
+  against the real gated login page: per-character typing, Ctrl+A-then-retype replacing, bulk
+  (paste-style) insertion into the password field, Backspace and Tab all correct.
 - `quickjoiner/connectors/specs.py` — `FORM_SPECS` per-type field catalog (label/required/secret/
   env/list) + `connector_catalog()` (adds supported `modes`) driving the web-UI connector forms
   and capability stamps. **Keep field keys in sync with what each connector reads from `options`.**
@@ -895,8 +1189,48 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   not how documents get in).
   Each type also carries `suggests` (seed questions the type contributes to autocomplete —
   `suggest.py` reads them for configured source types); add them when you add a connector.
+  **`extraction_prompt` — what these documents ARE, in the connector owner's words**
+  (2026-07-30, user request; generic across all 13 types via the same guarded append as
+  `aka`, `multiline=True` so the form renders a textarea — new `_f(multiline=)` flag +
+  `TextArea` primitive + `ConnectorField.multiline`). A page carries its facts but not its
+  *shape*: an internal service catalogue's entry reads as a bare table of names unless you
+  already know the "Team" column means that team **owns** this repository, so the general
+  extractor mines a fraction of what the page actually asserts. The person who connected the
+  source knows the shape; this is where they say it. Threaded
+  `options["extraction_prompt"]` → `pipeline._extraction_guidance(source_id)` (resolved once
+  per drain wave from `list_source_configs`, best-effort — a catalog that can't answer just
+  extracts unguided) → `triple_extractor(text, title, guidance)` →
+  `triples.guided_system_prompt`, which appends it to `DOC_TRIPLE_SYSTEM` **fenced, capped at
+  `_GUIDANCE_MAX_CHARS` (2000), and explicitly subordinated** to the rules above it: it is
+  untrusted config text, so it may shape what the extractor *recognises* but cannot authorise
+  a relationship the document doesn't state, and everything it yields still passes the same
+  vocabulary + `RELATION_SIGNATURES` validation — a mistaken hint costs dropped lines, never
+  an unvalidated edge. Unset ⇒ the prompt is byte-identical to before. Deliberately **not**
+  `lock_after_sync` (unlike `aka`): it changes nothing already stored, only what the next
+  pass looks for, so it is meant to be refined once you see what came out — re-run via a
+  clean re-sync or `qj drain-graph <name>`. Needs `graph.extract_triples` on. The existing
+  vocabulary already covers the catalogue case (`team | owns | repo`,
+  `person | works_on | team`, `repo | part_of | project`), so this needed no vocab change.
+  Tests: `tests/test_triples.py` (empty ⇒ identical prompt, hint present + subordinating
+  sentence, length cap, off-signature/off-vocab lines still dropped under a "ignore the
+  rules" hint, pipeline resolves it from the source config, missing source ⇒ "").
 - `quickjoiner/agent/` — grounded system prompt (`prompts.py`), built-in tools
-  (search_memory/remember/list_sources + graph_neighbors/graph_path in `tools.py`),
+  (search_memory/remember/list_sources + graph_neighbors/**graph_relations**/graph_path in
+  `tools.py`; **`graph_relations(rel, src_type, dst_type)` is the ENUMERATION read** —
+  every edge of one relation across the whole graph, grouped by its right-hand entity, for
+  "list all teams with their members" / "which team owns which repo". Neither existing graph
+  tool served it (`graph_neighbors` is one entity, `graph_path` is two) and neither does
+  memory: search returns the top-k most *similar* chunks, so on the live corpus a single
+  `/Teams` overview page took slot 1 and **seven chunks of one 323-person roster** took the
+  rest, leaving zero of the 17 per-team detail pages in an 8-chunk window — names and counts
+  came back, members never did, and asking per-team worked only because the team name pulled
+  its own page to top-2. Bounded at 400 with truncation **stated**, not silently sampled.
+  Same pass fixed a real `graph_neighbors` defect: the hub branch grouped by relation
+  ALONE, so a team with 39 outgoing `works_on` (its projects) and 15 incoming (its people)
+  shared one bucket ordered by `dst` — every one of the 8 sampled rows was a project and
+  not one member appeared. Groups are now keyed by **(relation, direction)**, rendered
+  `--rel-->` / `<--rel--`, each with its own budget, and point at `graph_relations` for the
+  complete list),
   **multi-angle + confidence layer (plan 06, 2026-07-17)**: `confidence.py` (pure —
   `classify_evidence(title, uri, kind)` → dependency-map|meeting-notes|authored-doc|generic;
   `score_edge(class, doc_corr, source_corr)` → [0.05, 0.95], weights in one `_BASE` table;
@@ -1079,7 +1413,29 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   `GET/PATCH /api/settings` — the whole `Config` (llm/embedding/retrieval/chat/**graph**) as a
   tunable dict; `GET /api/settings/defaults` — the same groups built from **freshly-constructed
   config models** (never the saved config, or every field would read as default forever), so the
-  Settings drawer can mark which fields are still stock without hardcoding the values; `POST /api/llm/test` probes the provider with a one-token round-trip, accepting
+  Settings drawer can mark which fields are still stock without hardcoding the values.
+  **A settings write re-derives what was built FROM config** (`AppContext.apply_config()`,
+  2026-07-30, user-reported): `build_context` wires the store and the ingest pipeline once at
+  process start, so persisting alone left the *running* pipeline holding the extractors it was
+  born with — turning on `graph.extract_triples` saved fine, `GET /api/settings` read back
+  `true`, and a clean re-sync then ingested with no triple extractor, producing only
+  deterministic edges (observed live: saved config `extract_triples: true` while
+  `/api/graph/pending` reported `extraction_enabled: false`). Query-side retrieval knobs the
+  **store object** holds (`hybrid`, `rrf_k`, `candidate_multiplier`, `ann_*`, the reranker) had
+  the identical trap, while everything read per-call from `ctx.config` (`min_score`, `top_k`,
+  `graph_expansion`, `alias_expansion` — `build_agent` passes `config.retrieval` fresh each
+  turn) was always live, which is exactly what made the bug hard to see. `apply_config` rebuilds
+  the pipeline via the shared `_build_pipeline` helper and pushes retrieval into the existing
+  store through `set_retrieval(retrieval, reranker)` (both backends + the `StoreBackend`
+  Protocol) rather than reopening LanceDB + the FTS sidecar under a possibly-running sync; the
+  embedder — the one expensive object, `FastEmbedEmbedder.__init__` loads the ONNX model
+  eagerly — is only rebuilt when `config.embedding` actually changed, tracked by
+  `AppContext.embedding_signature`, and that case does build a fresh store since the vectors
+  themselves change. Note this fixes *future* ingests only: documents already ingested while the
+  extractor was absent were never queued in `graph_pending` (nothing deferred them), so they need
+  a clean re-sync — `drain-graph` has nothing to drain for them. Regression-tested in
+  `tests/test_api.py::test_settings_change_reaches_the_live_pipeline_not_just_the_saved_config`
+  (verified to fail without the call). `POST /api/llm/test` probes the provider with a one-token round-trip, accepting
   optional unsaved `llm` overrides so the Settings drawer can verify a proxy/model before saving,
   never persisting) + `hooks.py` (verified `POST /hooks/{source}` push ingestion — 2026-07-26:
   gained a `?token=<webhook_secret>` query-param scheme alongside the header-based ones, for a
@@ -1257,6 +1613,55 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   `qj eval SET --compare old.json`): per-metric delta table over `COMPARE_METRICS`
   (`false_refusal_rate` is lower-is-better), **exits non-zero** if any watched metric regressed by
   more than `COMPARE_TOLERANCE` (0.02) — the CI merge gate for any retrieval change.
+- `quickjoiner/bench/harness.py` — **`qj bench`: the latency/cost harness (2026-07-31,
+  AI_ROADMAP S1).** The speed/cost twin of the eval harness and deliberately its mirror
+  image — a YAML pack of queries (an **eval set works too**: its `cases[].question` list
+  IS a query pack), a JSON report under `<workspace>/bench/`, and a `--compare` that exits
+  non-zero on regression. The house rule it serves: no speed work merges without a
+  before/after bench table, exactly as no quality work merges without `qj eval --compare`.
+  Three layers: **retrieval** (no LLM, always) — per-stage p50/p95 for embed-query, dense,
+  sparse, fuse, sparse-rescore, rerank, gate, plus alias expansion and graph expansion,
+  which sit *around* `store.search` on the real `search_memory` path; **embed** (no LLM) —
+  embedder chunks/sec at a realistic batch, the ingest bottleneck S6 must beat; **agent**
+  (`--agent`, needs an LLM) — time to first token, full-answer time, model rounds, tool
+  calls, and tokens per answer incl. cache reads.
+  **Measurement seam:** `store.search(trace=SearchTrace())` (both backends + the
+  `StoreBackend` Protocol). Opt-in and caller-supplied — nothing in the product passes
+  one, so benchmarking cannot change what production does; `trace=None` gets a `NullTrace`
+  whose stages are an empty `with` block (~1µs total against a multi-ms search), which
+  keeps ONE search implementation rather than a traced fork of it. A stage entered twice
+  accumulates (`_dense` runs again for the sparse rescore).
+  **Token seam:** `ChatResult.usage` (`llm.base.TokenUsage`: prompt/completion/cached/
+  cache_write) — each provider maps its own wire shape onto it (Anthropic
+  input+cache_read/output/cache_creation, OpenAI-compatible prompt/completion +
+  `prompt_tokens_details.cached_tokens`, Ollama `prompt_eval_count`/`eval_count`), and
+  `OnboardingAgent.last_usage`/`last_rounds` sum it over a turn's rounds. Zeros mean "not
+  reported", never "free". This is what S5's cost-delta measurement needed and never had.
+  **Honesty built in:** warm-up runs are discarded (the ~80MB cross-encoder loads lazily on
+  first `rank()`; folding that into a p50 would make any change that moved it look like a
+  win), `samples` is reported beside every percentile, regressions are judged **relatively**
+  (`COMPARE_TOLERANCE` 0.20 — +5ms means nothing at 500ms and everything at 8ms, unlike the
+  eval harness's absolute 0.02 on rates), and a metric with fewer than
+  `MIN_SAMPLES_FOR_GATE` (5) samples is reported with its delta but **never fails the gate**
+  (a gate that fires on noise gets switched off, which costs more than it saves).
+  **What it found on its first real run** (live 21,607-doc / 56,519-chunk workspace, 32
+  queries × 3): total retrieval **3.08s p50** — nobody had ever measured the user-facing
+  number — of which **rerank 61%** (1.89s) and **alias expansion 27%** (841ms). The second
+  was a genuine defect, not a cost: `catalog.resolve_entity`'s `WHERE id = ? OR
+  LOWER(name) = ?` had no index for the LOWER(name) branch, so every call **scanned all
+  36,203 entities**, ~30 times per query (alias expansion slides 1–4-token windows) —
+  while the code comment asserted "every lookup is an exact indexed hit so the extra pass
+  is cheap". Fixed with an expression index (`idx_entities_lower_name`, in the shared
+  `_MIGRATION_STATEMENTS` ⇒ both backends; the planner now reports MULTI-INDEX OR):
+  `expand_query` **382ms → 1.88ms**, total **p50 3084→2186ms (−29%), p95 5862→2834ms
+  (−52%)**, measured with `--compare`. Guarded by an EXPLAIN-based test, because every
+  correctness test passed throughout and none of them could ever have caught it. The
+  remaining 83% is the cross-encoder at **~77ms/candidate** on ~420-token chunks, scaling
+  linearly (4→293ms, 12→879ms, 24→1843ms) — that is a `rerank_candidates` depth decision,
+  i.e. **S4**, now with data instead of speculation. Agent layer live (gpt-oss-120b via the
+  litellm broker): first token 22.3s, full answer 32.7s, **22.4k tokens/answer** over 3
+  rounds — and **zero cache reads**, the S5 verification that had been pending.
+  Tests: `tests/test_bench.py`.
 - `quickjoiner/scheduler.py` — APScheduler periodic syncs for sources with `sync_interval_minutes`,
   PLUS a standing `context-attachment-cleanup` sweep (every 6h + once at startup) that expires
   per-question chat attachments past `chat.context_retention_days`. Now **always** returns a running
@@ -1343,9 +1748,17 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   batches. Tests: the existing confluence paging/percent tests in `tests/test_connectors.py` cover it.
   **Phase label only** (UI shows a live shimmer, no fake denominator) where the API gives no cheap
   count: `github`/`gitlab` list APIs. All of these also `_checkpoint()` between page/section fetches so a stop lands
-  within a page. The remaining connectors (logsearch inventory, web_scrape) rely on the universal
-  between-document check — they finish in seconds / yield per page, so no long non-yielding stretch
-  to instrument. `SyncJob` gains `phase`/`phase_done`/`phase_total` + `percent()` (surfaced in every
+  within a page. The logsearch-inventory connector relies on the universal between-document
+  check — it finishes in seconds, so there is no long non-yielding stretch to instrument.
+  **`web_scrape` IS instrumented (2026-07-30)** — the earlier "it yields per page, so nothing to
+  do" reasoning was wrong for the browser path: one `page.goto` + networkidle can take tens of
+  seconds, so a Stop waited for the whole page and the UI showed a frozen "syncing…" for the
+  entire crawl. `_crawl` now `_checkpoint()`s and `_stage()`s per URL; the denominator is the
+  **known frontier** (`visited + queued`, capped at `max_pages`) rather than the raw page budget
+  — it grows as links are discovered and converges on the true count as the queue drains, which
+  is honest about a crawl whose size genuinely isn't known up front (a fixed `max_pages`
+  denominator would sit at 4% and then jump to done on a 12-page site).
+  `SyncJob` gains `phase`/`phase_done`/`phase_total` + `percent()` (surfaced in every
   `summary()`, so `/api/syncs` + `/api/notifications` carry them).
   **Self-healing network auto-retry (`_pull_with_auto_retry`/`_enter_network_hold`, state
   `retrying`, 2026-07-21):** a sync that dies mid-pull on a **transient network** failure no
@@ -1471,19 +1884,16 @@ for the web_scrape browser fallback. Host Ollama reachable at `host.docker.inter
   0.917, but costs 3–4 of 20 answerable cases their grounding). Shipped **0.64** instead, a
   deliberately conservative choice (user call, not the calibrator's own recommendation): zero
   measured answerable-recall cost on the expanded eval set, while still gating 3 of 12 refusal
-  near-misses that leaked at the old 0.55 (up from 0). ⚠ **This retune reaches NEW workspaces
-  only** (found in live testing 2026-07-30): `catalog.save_config` does a full `model_dump`, so
-  every field is materialized into the `settings.config` blob at first save and pins that value
-  forever — the live `default` workspace still runs `min_score=0.55` and `qj eval` there still
-  reports refusal_accuracy 0.0. Changing a default in `config.py` is therefore NOT a way to
-  change behavior for anyone who already has a workspace; it must be set in Settings, or the
-  persistence made default-aware (PRIORITIES #3). Retune again if the embedding model changes,
+  near-misses that leaked at the old 0.55 (up from 0). **This retune reaches EXISTING workspaces
+  too as of 2026-07-31** — it did not when it shipped, and the live corpus ran 0.55 for two days
+  afterwards; see the sparse-config-persistence bullet under `memory/` for the fix and the one
+  step (`SUPERSEDED_DEFAULTS` + `DEFAULTS_EPOCH`) a future retune must take. Retune again if the embedding model changes,
   `embedding.instruct` is toggled, or the eval set grows enough to change the overlap picture — see
   `docs/plans/05-eval-on-connected-org.md` for the full sweep across candidate thresholds.
   Borderline hits are still passed to the LLM with scores; the prompt makes the final relevance
   judgment, which is why agent-layer refusal_accuracy has historically stayed at 1.0 even when the
   retrieval-layer proxy leaks — the retrieval threshold is a coarse pre-filter, not the only line of
-  defense. **Standing gap** (PRIORITIES #34, unresolved by this fix): the overlap itself means
+  defense. **Standing gap** (PRIORITIES #33, unresolved by this fix): the overlap itself means
   threshold tuning alone has a ceiling — the embedding fine-tune question is now framed as a
   refusal-discrimination problem, not a recall problem.
 - Secrets in connector options support env indirection: `token=env:GITHUB_TOKEN`
@@ -2327,6 +2737,117 @@ Post-phase additions (2026-07-07, all tested — suite: **89 passed**):
   would surface on any insert, but the CASE semantics are untested there). Also unverified: any
   agent-layer effect of the new threshold — that needs ≥3 replicates per the plan's own
   methodology note and real LLM spend.
+- Settings changes now reach the running process (2026-07-30, user-reported: "I've these 2 on
+  but it seems the graph didn't get extracted when I did clean resync", with both **Extract
+  relationships from prose (LLM)** and **Entity resolution** shown enabled). Not a usage mistake
+  and not a graph bug — confirmed against their live container, which reported saved config
+  `graph.extract_triples: true` alongside `/api/graph/pending` → `extraction_enabled: false`.
+  `PATCH /api/settings` persisted the value and mutated `ctx.config`, but the pipeline holding
+  the triple extractor / entity resolver is built once in `build_context` at process start, so
+  the re-sync ran with the extractors the process was born with. Fixed with
+  `AppContext.apply_config()` called after every settings write — full design in the
+  `quickjoiner/api/` bullet above, including why query-side knobs read from `ctx.config` were
+  already live (which is what disguised it) and why the store is mutated rather than reopened.
+  Suite: **755 passed** (+1, verified to fail without the fix), 13 skipped. No API surface
+  change, so Swagger/Postman/Bruno are untouched; no frontend change — the drawer's own
+  "ingest-time — re-sync to apply" hint was already correct and only now actually true.
+  **Honest limitation, stated rather than papered over:** documents ingested while the extractor
+  was absent were never marked `graph_pending` (nothing deferred them), so `drain-graph` cannot
+  recover them — only a clean re-sync will. Turning extraction on could reasonably enqueue
+  already-ingested qualifying documents for the drain; that's a genuine follow-up, not built.
+- Crawl identity + connector-guided knowledge extraction (2026-07-30, same session, two user
+  reports on the same corpus). **(1)** "Is the scraper preventing duplicate pages, does it stay
+  inside the site's boundary, and why are there numerous homepage entries?" — measured against the
+  live crawl first, which split the question cleanly: the boundary and per-pass URL dedupe were
+  **already correct** (200/200 documents on the start host, zero TFS links followed, no URL fetched
+  twice), while raw-string URL comparison, byte-identical pages at different URLs, a static
+  site-wide `<title>`, and silence about a truncated crawl were **real defects**. Fixed with
+  `canonical_url`, a `same_host_only` hard floor, exact-content dedupe, `page_title`'s `<h1>`
+  preference, and truncation/duplicate reporting — full design in the `browser/` bullet — plus the
+  document browser now showing each document's **real URL with its query string** beside the title
+  (`relativeUri`), which is what made 171 distinct `/Details?id=…&project=…` pages visible as
+  distinct instead of 171 rows reading "Home page". **(2)** "I want it to capture as much important
+  information as possible… maybe we need a prompt that can guide knowledge extraction as part of
+  connector configuration" — shipped as the generic **`extraction_prompt`** connector option (see
+  the `specs.py` bullet). Worth stating plainly: the *cross-page* understanding the user asked
+  about is the knowledge graph itself, not a bigger context window — "team Acadia owns repo X" from
+  one page and "repo X depends on Y" from another join because both resolve to the same entity, so
+  the answer to "which team owns the services behind Z" is assembled from pages no single prompt
+  ever saw together. The guidance improves what each page *contributes*; the graph does the
+  joining. Suite: **765 passed** (+10), 13 skipped; frontend typecheck + build green. Not yet
+  verified live: no re-sync has been run with a guided prompt against the real corpus, so the
+  quality of what a hint actually buys is untested on real pages.
+- Shipped config defaults now reach workspaces that already exist (2026-07-31 — the top of the
+  PRIORITIES backlog, and the open question the previous session ended on). The settings
+  blob is persisted sparsely (`exclude_defaults=True`) so an untouched field follows `config.py`
+  instead of being frozen at whatever it was the first time that workspace saved, plus a
+  logged, once-per-workspace reconciliation of the three defaults this repo has ever changed
+  (`config.SUPERSEDED_DEFAULTS`, guarded by `DEFAULTS_EPOCH`). Full design in the `memory/`
+  bullet above, including why a deliberately-set value equal to today's default now follows a
+  future retune and why that trade is the right way round. Grounded in measurement at both
+  ends: git history says exactly three defaults ever moved (so the migration map is complete,
+  not guessed), and a copy of the real 11-connector workspace confirms the outcome —
+  `min_score` 0.55→0.64 adopted and announced, the deliberate `triple_workers: 8` and the
+  already-current reranker untouched, connectors intact, idempotent on re-load. The practical
+  payoff: plan 05's retune finally applies to the only real corpus, so its measured benefit
+  (3 of 12 refusal near-misses gated at zero answerable-recall cost) is realised rather than
+  theoretical. Suite: **769 passed** (+4, both behavioural tests verified to fail with the fix
+  reverted), 13 skipped. No API or frontend change — `/api/settings` dumps the in-memory
+  `Config`, which is complete either way.
+- `qj bench` — the latency/cost harness (2026-07-31, AI_ROADMAP **S1**, PRIORITIES top of
+  backlog after the config fix above). Design in the `bench/harness.py` bullet. The point of
+  the item was that speed and cost were **not measured anywhere in the repo**, so every
+  speed decision was taste; it now has the same shape of gate quality has had for months.
+  It earned its keep immediately, which is the part worth remembering: the first run on the
+  real corpus showed a **3.08s p50 query** — a number nobody had ever seen — and attributed
+  27% of it to alias expansion, whose own code comment asserted the opposite ("every lookup
+  is an exact indexed hit so the extra pass is cheap"). `EXPLAIN QUERY PLAN` confirmed a
+  full scan of 36,203 entities per window, ~30 windows per query, because
+  `WHERE id = ? OR LOWER(name) = ?` cannot index the second branch without an expression
+  index. One line in `_MIGRATION_STATEMENTS` later: `expand_query` **382ms → 1.88ms**, whole
+  query **p50 −29%, p95 −52%**, verified with the harness's own `--compare`. **The lesson to
+  carry:** every correctness test passed before and after — a performance defect of that size
+  was invisible to the entire suite, and a confident comment stood in for a measurement for
+  months. The remaining 83% is the cross-encoder (~77ms/candidate, linear in depth), which is
+  a *quality* trade and therefore S4's decision to make with eval data, not a bug to fix here.
+  Live agent numbers (gpt-oss-120b via the litellm broker): first token 22.3s, full answer
+  32.7s, 22.4k tokens/answer over 3 rounds, **0 cache reads** — closing S5's pending
+  cost-delta question with an uncomfortable answer rather than leaving it open. Suite:
+  **783 passed** (+14), 13 skipped. Not verified: the Postgres path (no Docker on this
+  machine) — the expression index and the pg `search(trace=)` instrumentation are
+  statically-reviewed only; and sync-throughput benching, which is deliberately left as a
+  named S1 remainder rather than faked with a synthetic sync.
+- Tables become structure, and the graph gets an enumeration read (2026-07-31, user-reported:
+  "it can pull team names with count but not the member names — asking per team works").
+  Diagnosed by measurement against the live container and the local 8-source workspace, which
+  split the question cleanly and produced a better design than the first two proposals (both
+  offered, both rejected in favour of what the data showed). **The user's own question — could
+  something like Firecrawl help? — was answered honestly as no:** it solves acquisition, which
+  this repo already solved for an internal, corporate-CA, session-authenticated host that
+  Firecrawl's cloud cannot reach, and does NOT solve querying (it returns JSON, not a queryable
+  store). The *pattern* behind the question was right, so it was built in-repo where the crawl,
+  the documents and the catalog already are. What the measurements found, in order of severity:
+  (1) HTML tables were flattened, and a **blank cell vanished** so later values shifted column —
+  a silent fidelity bug on every scraped table, unfixable by any amount of retrieval tuning
+  since the information was already gone at ingest; (2) **0 of 17** team pages produced any
+  edge, while the same pages' key-value blocks extracted fine — structure, not the model, was
+  the difference; (3) **1 of 875** person entities was shared across sources (Plumber names
+  people by email, Confluence by display name, TFS by full name — three disjoint node sets);
+  (4) the top-8 chunk window for the aggregate question was consumed by one overview page plus
+  seven chunks of a single 323-person roster that carries **no team column at all**, so the
+  model answered correctly from bad input. Shipped: table-preserving extraction, `ingest/
+  tables.py`, email→person aliasing, `catalog.graph_relations` + the `graph_relations` agent
+  tool + prompt guidance, and the `graph_neighbors` hub direction-grouping fix — all detailed
+  in the bullets above. `GRAPH_EXTRACTOR_VERSION` 3→**4**. Suite: **801 passed** (+19), 13
+  skipped. Also confirmed by measurement and worth keeping: **cross-source joining already
+  works** — every source pair meets on shared entities (TFS↔Confluence 459, Plumber↔TFS 146,
+  `package:appriver.core.logging` known to all 7 sources), and **45% of the entities a newly
+  ingested web page touches already exist** in the graph and join automatically via entity-key
+  parity plus the 1,472 `same_as` bridges. No API or frontend change (Swagger/Postman/Bruno
+  untouched). **Not yet verified live: the new edges on the real corpus** — the table extractor
+  only fires on ingest, so it needs a clean Plumber re-sync, which will also shed the **363
+  ASP.NET error pages** (half that corpus) that predate the crawl-identity dedupe work; and
+  **395 `graph_pending` rows** are waiting on `qj drain-graph`.
 
 ## Next steps (agreed with user)
 

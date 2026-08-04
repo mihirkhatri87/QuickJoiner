@@ -262,7 +262,7 @@
             "method": "GET",
             "url": "{{baseUrl}}/api/connectors/types"
           },
-          "description": "The catalog of connector types and each type's configurable fields (required / secret flags) plus supported `modes`. Use it to fill `options` on the next request. A type may also carry `next_step` \u2014 what to do AFTER saving, for connectors that aren't usable the moment they're created (OneDrive needs an interactive Microsoft 365 sign-in, which can only happen once the connector exists)."
+          "description": "The catalog of connector types and each type's configurable fields (required / secret flags) plus supported `modes`. Use it to fill `options` on the next request. A type may also carry `next_step` \u2014 what to do AFTER saving, for connectors that aren't usable the moment they're created (OneDrive needs an interactive Microsoft 365 sign-in, which can only happen once the connector exists). Each field carries `multiline` \u2014 true for prose fields a UI should render as a textarea. Every type has one: `extraction_prompt`, an optional description of what this source's documents contain, which guides knowledge-graph extraction for it (needs `graph.extract_triples` on in /api/settings)."
         },
         {
           "name": "Create a 'files' connector",

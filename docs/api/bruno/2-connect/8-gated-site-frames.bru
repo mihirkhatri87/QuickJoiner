@@ -1,0 +1,23 @@
+meta {
+  name: Gated site — remote sign-in screencast (SSE)
+  type: http
+  seq: 8
+}
+
+get {
+  url: {{baseUrl}}/api/connectors/{{scrapeConnector}}/browser/session/frames
+}
+
+docs {
+  Only relevant when the sign-in started via request 7 came back with `mode: "remote"` —
+  i.e. QuickJoiner has no display of its own (Docker/cloud), so it runs the login page
+  headless and streams it here as polled JPEG frames instead of opening a window.
+
+  Server-Sent Events: one `meta` event first (`{width, height}` — the actual frame size,
+  so a viewer never hardcodes a viewport), then a `frame` event roughly every 200ms
+  (`{data: "<base64 jpeg>"}`), ending with `done`. 404 if no remote sign-in is running for
+  this connector.
+
+  A Bruno request can't drive input/canvas rendering — this call is here mainly to confirm
+  the stream opens; see the QuickJoiner web UI's RemoteBrowserModal for the actual viewer.
+}

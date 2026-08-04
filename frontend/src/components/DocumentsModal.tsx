@@ -63,6 +63,24 @@ export function shortName(doc: IngestedDoc): string {
   return parts[parts.length - 1] || doc.uri;
 }
 
+/** The part of a document's uri BELOW its group folder, decoded for reading — e.g.
+ * `Details?id=100&project=AppRiver.SecureTide` under `https://plumber.internal/`.
+ *
+ * Titles are not identifiers: a crawled app commonly serves one static <title> for every
+ * page, so 200 genuinely different URLs rendered as 200 identical-looking rows and there
+ * was no way to see what had actually been ingested (reported live). Returns "" when it
+ * would merely repeat the name already shown. */
+export function relativeUri(doc: IngestedDoc, folder: string): string {
+  const rest = folder && doc.uri.startsWith(folder) ? doc.uri.slice(folder.length) : doc.uri;
+  let shown = rest;
+  try {
+    shown = decodeURI(rest);
+  } catch {
+    /* a malformed escape — show it raw rather than dropping the row's only identifier */
+  }
+  return shown && shown !== shortName(doc) ? shown : "";
+}
+
 /** Documents grouped by folder, folders in path order — the shape the table renders and
  * the reason folder-level labelling has somewhere to live. `sourceType === "confluence"`
  * groups by space instead of by the (per-page-unique) path. */
@@ -881,11 +899,19 @@ export function DocumentsModal({
                             )}
                             <span
                               title={doc.uri}
-                              className="min-w-0 max-w-[300px] truncate text-[12.5px] text-ink"
+                              className="min-w-0 max-w-[300px] flex-shrink-0 truncate text-[12.5px] text-ink"
                             >
                               {shortName(doc)}
                             </span>
-                            <span className="font-mono text-[9.5px] text-faint">
+                            {relativeUri(doc, group.folder) && (
+                              <span
+                                title={doc.uri}
+                                className="min-w-0 truncate font-mono text-[10.5px] text-faint"
+                              >
+                                {relativeUri(doc, group.folder)}
+                              </span>
+                            )}
+                            <span className="flex-shrink-0 font-mono text-[9.5px] text-faint">
                               {doc.chunks} chunk{doc.chunks === 1 ? "" : "s"}
                             </span>
                             {doc.labels.map((l) => (

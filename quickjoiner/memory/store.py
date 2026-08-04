@@ -20,6 +20,7 @@ from __future__ import annotations
 import re
 import sqlite3
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -56,6 +57,84 @@ class SearchHit:
     uri: str
     title: str
     kind: str
+
+
+class _NullStage:
+    """A stage that measures nothing — what production `search()` calls get."""
+
+    __slots__ = ()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        return False
+
+
+_NULL_STAGE = _NullStage()
+
+
+class NullTrace:
+    """No-op stopwatch. `search(trace=None)` uses this, so the hot path pays only an
+    empty `with` block per stage (~1µs total against a ~17ms search) and no branches
+    clutter the search body."""
+
+    __slots__ = ()
+
+    def stage(self, name: str):
+        return _NULL_STAGE
+
+    def count(self, name: str, value: int) -> None:
+        pass
+
+
+NULL_TRACE = NullTrace()
+
+
+class SearchTrace(NullTrace):
+    """Per-stage stopwatch for ONE `search()` call — the measurement seam `qj bench`
+    uses to say *where* a query's latency goes (embed / dense / sparse / fuse /
+    rerank / gate) rather than only how long it took in total.
+
+    Deliberately opt-in and caller-supplied: nothing in the product passes one, so
+    benchmarking cannot change what production does. Times are milliseconds; a stage
+    entered more than once accumulates (the sparse-rescore dense lookup is a second
+    `_dense` call, and it should be attributed to its own stage, not double-counted).
+    """
+
+    __slots__ = ("stages", "counts")
+
+    def __init__(self) -> None:
+        self.stages: dict[str, float] = {}
+        self.counts: dict[str, int] = {}
+
+    def stage(self, name: str) -> "_Stage":
+        return _Stage(self, name)
+
+    def count(self, name: str, value: int) -> None:
+        self.counts[name] = value
+
+    def _record(self, name: str, elapsed_ms: float) -> None:
+        self.stages[name] = round(self.stages.get(name, 0.0) + elapsed_ms, 4)
+
+    @property
+    def total_ms(self) -> float:
+        return round(sum(self.stages.values()), 4)
+
+
+class _Stage:
+    __slots__ = ("_trace", "_name", "_t0")
+
+    def __init__(self, trace: SearchTrace, name: str) -> None:
+        self._trace, self._name = trace, name
+
+    def __enter__(self) -> "_Stage":
+        self._t0 = time.perf_counter()
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        self._trace._record(self._name, (time.perf_counter() - self._t0) * 1000)
+        return False
 
 
 @dataclass
@@ -109,6 +188,13 @@ class KnowledgeStore:
     @property
     def embedder(self) -> Embedder:
         return self._embedder
+
+    def set_retrieval(self, retrieval: RetrievalConfig | None, reranker=None) -> None:
+        """Adopt changed query-side settings without reopening LanceDB or the FTS
+        sidecar — these knobs are read per search, so a live settings change applies
+        to the very next query (see AppContext.apply_config)."""
+        self._retrieval = retrieval or RetrievalConfig()
+        self._reranker = reranker
 
     # ---------------------------------------------------------------- FTS side
     def _open_fts(self, workspace: Path) -> sqlite3.Connection | None:
@@ -444,13 +530,16 @@ class KnowledgeStore:
         return q.limit(limit).to_list()
 
     def search(self, query: str, top_k: int = 8, min_score: float = 0.0,
-               scope: "SearchScope | None" = None) -> list[SearchHit]:
+               scope: "SearchScope | None" = None,
+               trace: "NullTrace | None" = None) -> list[SearchHit]:
         table = self._table()
         if table is None:
             return []
+        trace = trace or NULL_TRACE
         query = normalize_query(query)
         r = self._retrieval
-        vector = self._embedder.embed_query(query)
+        with trace.stage("embed_query"):
+            vector = self._embedder.embed_query(query)
 
         hybrid = r.hybrid and self._fts is not None
         fetch = max(top_k * r.candidate_multiplier, top_k) if hybrid else top_k
@@ -458,10 +547,12 @@ class KnowledgeStore:
         # dense leg — rows keyed by chunk id, score = cosine similarity
         by_id: dict[str, dict] = {}
         dense_ids: list[str] = []
-        for row in self._dense(table, vector, fetch, scope=scope):
-            row["_score"] = 1.0 - float(row.get("_distance", 1.0))
-            by_id[row["id"]] = row
-            dense_ids.append(row["id"])
+        with trace.stage("dense"):
+            for row in self._dense(table, vector, fetch, scope=scope):
+                row["_score"] = 1.0 - float(row.get("_distance", 1.0))
+                by_id[row["id"]] = row
+                dense_ids.append(row["id"])
+        trace.count("dense_candidates", len(dense_ids))
 
         if not hybrid:
             ordered = dense_ids
@@ -487,52 +578,63 @@ class KnowledgeStore:
                     sql += " AND (" + " OR ".join(parts) + ")"
                 sql += " ORDER BY rank LIMIT ?"
                 params.append(fetch)
-                with self._fts_lock:
-                    fts_rows = self._fts.execute(sql, tuple(params)).fetchall()
-                for title, text, id_, doc_id, source_id, uri, kind, _rank in fts_rows:
-                    sparse_ids.append(id_)
-                    by_id.setdefault(
-                        id_,
-                        {"id": id_, "doc_id": doc_id, "source_id": source_id, "uri": uri,
-                         "title": title, "kind": kind, "text": text},
-                    )
-            ordered = rrf_fuse([dense_ids, sparse_ids], r.rrf_k)
+                with trace.stage("sparse"):
+                    with self._fts_lock:
+                        fts_rows = self._fts.execute(sql, tuple(params)).fetchall()
+                    for title, text, id_, doc_id, source_id, uri, kind, _rank in fts_rows:
+                        sparse_ids.append(id_)
+                        by_id.setdefault(
+                            id_,
+                            {"id": id_, "doc_id": doc_id, "source_id": source_id, "uri": uri,
+                             "title": title, "kind": kind, "text": text},
+                        )
+            trace.count("sparse_candidates", len(sparse_ids))
+            with trace.stage("fuse"):
+                ordered = rrf_fuse([dense_ids, sparse_ids], r.rrf_k)
 
             # sparse-only candidates still need their cosine score (the grounding
             # gate is always dense) — one targeted, prefiltered vector lookup
             missing = [i for i in ordered if "_score" not in by_id[i]]
+            trace.count("sparse_only", len(missing))
             if missing:
-                for row in self._dense(table, vector, len(missing), id_filter=missing, scope=scope):
-                    by_id[row["id"]]["_score"] = 1.0 - float(row.get("_distance", 1.0))
+                with trace.stage("sparse_rescore"):
+                    for row in self._dense(table, vector, len(missing), id_filter=missing,
+                                           scope=scope):
+                        by_id[row["id"]]["_score"] = 1.0 - float(row.get("_distance", 1.0))
+        trace.count("fused", len(ordered))
 
         # optional second-stage ranking over the fused head
         if self._reranker is not None and len(ordered) > 1:
             head = ordered[: r.rerank_candidates]
+            trace.count("reranked", len(head))
             try:
-                reordered = self._reranker.rank(query, [by_id[i]["text"] for i in head])
+                with trace.stage("rerank"):
+                    reordered = self._reranker.rank(query, [by_id[i]["text"] for i in head])
                 ordered = [head[j] for j in reordered] + ordered[len(head):]
             except Exception:
                 pass  # reranking is best-effort; RRF order stands
 
         hits = []
-        for id_ in ordered:
-            row = by_id[id_]
-            score = float(row.get("_score", 0.0))
-            if score < min_score:
-                continue
-            hits.append(
-                SearchHit(
-                    text=row["text"],
-                    score=score,
-                    doc_id=row["doc_id"],
-                    source_id=row["source_id"],
-                    uri=row["uri"],
-                    title=row.get("title", "") or "",
-                    kind=row.get("kind", "doc") or "doc",
+        with trace.stage("gate"):
+            for id_ in ordered:
+                row = by_id[id_]
+                score = float(row.get("_score", 0.0))
+                if score < min_score:
+                    continue
+                hits.append(
+                    SearchHit(
+                        text=row["text"],
+                        score=score,
+                        doc_id=row["doc_id"],
+                        source_id=row["source_id"],
+                        uri=row["uri"],
+                        title=row.get("title", "") or "",
+                        kind=row.get("kind", "doc") or "doc",
+                    )
                 )
-            )
-            if len(hits) >= top_k:
-                break
+                if len(hits) >= top_k:
+                    break
+        trace.count("hits", len(hits))
         return hits
 
     def close(self) -> None:

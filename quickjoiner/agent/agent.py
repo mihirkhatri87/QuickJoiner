@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Callable
 
-from quickjoiner.llm.base import AgentTool, LLMProvider, Message
+from quickjoiner.llm.base import AgentTool, LLMProvider, Message, TokenUsage
 
 MAX_TOOL_ROUNDS = 10
 
@@ -43,6 +43,12 @@ class OnboardingAgent:
         # score chains; candidate answers read their displayed confidence from HERE
         # (server-computed), never from the model's self-reported number.
         self._score_ledger = score_ledger
+        # What the most recent ask() cost: token usage summed over every round of the
+        # turn, and how many model rounds it took. An agent is built per request, so
+        # this is per-turn state, not shared. Read by `qj bench`; nothing depends on it,
+        # and a provider that reports no usage simply leaves the counts at zero.
+        self.last_usage = TokenUsage()
+        self.last_rounds = 0
 
     def ask(
         self,
@@ -54,6 +60,7 @@ class OnboardingAgent:
         messages: list[Message] = list(history or [])
         messages.append({"role": "user", "content": question})
         specs = [t.spec for t in self._tools.values()]
+        self.last_usage, self.last_rounds = TokenUsage(), 0
 
         on_stream = None
         if on_event:
@@ -63,6 +70,7 @@ class OnboardingAgent:
             result = self._provider.chat(
                 messages, system=self._system, tools=specs, on_stream=on_stream
             )
+            self._account(result)
             if not result.tool_calls:
                 if result.text and result.text.strip():
                     messages.append({"role": "assistant", "content": result.text})
@@ -114,6 +122,7 @@ class OnboardingAgent:
         # instead of emitting an unhelpful canned message.
         try:
             final = self._provider.chat(messages, system=self._system, tools=None, on_stream=on_stream)
+            self._account(final)
             if final.text and final.text.strip():
                 messages.append({"role": "assistant", "content": final.text})
                 return self._finalize(final.text, messages, on_event), messages
@@ -122,6 +131,17 @@ class OnboardingAgent:
         fallback = "I wasn't able to finish answering that from the sources I have."
         messages.append({"role": "assistant", "content": fallback})
         return fallback, messages
+
+    def _account(self, result) -> None:
+        """Add one round's token usage to this turn's running total (bench visibility)."""
+        u = result.usage
+        self.last_rounds += 1
+        self.last_usage = TokenUsage(
+            prompt=self.last_usage.prompt + u.prompt,
+            completion=self.last_usage.completion + u.completion,
+            cached=self.last_usage.cached + u.cached,
+            cache_write=self.last_usage.cache_write + u.cache_write,
+        )
 
     def _finalize(self, text: str, messages: list[Message],
                   on_event: EventCallback | None) -> str:

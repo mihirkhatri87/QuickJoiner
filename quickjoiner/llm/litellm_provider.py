@@ -43,7 +43,9 @@ from typing import Any
 import httpx
 
 from quickjoiner.config import LLMConfig
-from quickjoiner.llm.base import ChatResult, LLMProvider, Message, StreamCallback, ToolCall, ToolSpec
+from quickjoiner.llm.base import (
+    ChatResult, LLMProvider, Message, StreamCallback, TokenUsage, ToolCall, ToolSpec,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -189,19 +191,40 @@ def _retry_delay(attempt: int, retry_after: str | None = None) -> float:
     return delay
 
 
-def _log_usage(usage: dict[str, Any] | None) -> None:
-    """DEBUG-log token usage. cached= is prompt_tokens_details.cached_tokens — the
-    automatic-prefix-cache hit counter on vLLM-style backends; if it stays 0 across a
-    tool loop the prompt prefix is not byte-stable (or the server has caching off)."""
+def _token_usage(usage: dict[str, Any] | None) -> TokenUsage:
+    """Map an OpenAI-compatible usage block onto the neutral TokenUsage (pure).
+
+    cached = prompt_tokens_details.cached_tokens — the automatic-prefix-cache hit
+    counter on vLLM-style backends; if it stays 0 across a tool loop the prompt prefix
+    is not byte-stable (or the server has caching off). Absent/garbage fields count as
+    0 rather than raising: usage is observability, and must never fail a real answer.
+    """
     if not usage:
-        return
+        return TokenUsage()
+
+    def _int(value: Any) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
     details = usage.get("prompt_tokens_details") or {}
-    logger.debug(
-        "litellm usage: prompt=%s completion=%s cached=%s",
-        usage.get("prompt_tokens"),
-        usage.get("completion_tokens"),
-        details.get("cached_tokens"),
+    return TokenUsage(
+        prompt=_int(usage.get("prompt_tokens")),
+        completion=_int(usage.get("completion_tokens")),
+        cached=_int(details.get("cached_tokens")),
     )
+
+
+def _log_usage(usage: dict[str, Any] | None) -> TokenUsage:
+    """DEBUG-log token usage and return it in neutral form."""
+    tokens = _token_usage(usage)
+    if usage:
+        logger.debug(
+            "litellm usage: prompt=%s completion=%s cached=%s",
+            tokens.prompt, tokens.completion, tokens.cached,
+        )
+    return tokens
 
 
 class LiteLLMProvider(LLMProvider):
@@ -288,7 +311,7 @@ class LiteLLMProvider(LLMProvider):
 
     def _chat_once(self, payload: dict[str, Any]) -> ChatResult:
         data = self._post_json(payload)
-        _log_usage(data.get("usage"))
+        tokens = _log_usage(data.get("usage"))
         choice = (data.get("choices") or [{}])[0]
         message = choice.get("message") or {}
         return ChatResult(
@@ -296,6 +319,7 @@ class LiteLLMProvider(LLMProvider):
             tool_calls=_tool_calls_from_message(message),
             thinking=message.get("reasoning_content") or "",
             stop_reason=choice.get("finish_reason"),
+            usage=tokens,
         )
 
     def _chat_stream(self, payload: dict[str, Any], on_stream: StreamCallback) -> ChatResult:
@@ -338,12 +362,12 @@ class LiteLLMProvider(LLMProvider):
                 time.sleep(_retry_delay(attempt))
                 continue
             break
-        _log_usage(usage)
         return ChatResult(
             text=acc["text"],
             tool_calls=_tool_calls_from_acc(acc["tool_calls"]),
             thinking=acc["thinking"],
             stop_reason=finish,
+            usage=_log_usage(usage),
         )
 
     @staticmethod
