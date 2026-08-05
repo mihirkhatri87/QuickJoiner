@@ -670,7 +670,7 @@ class SyncManager:
             self.ctx.catalog.set_sync_state(job.source_id, "since", started)
             job.stats = {"added": stats.added, "updated": stats.updated,
                          "skipped": stats.skipped, "chunks": stats.chunks,
-                         "errors": len(stats.errors)}
+                         "errors": len(stats.errors), "ingested": job.ingested}
             job.phase, job.phase_done, job.phase_total = "", None, None
             self._log(job, f"✓ done — {stats.summary()}")
             self._autogenerate(job, source)
@@ -678,12 +678,17 @@ class SyncManager:
         except SyncStopped:
             job.state = "stopped"
             job.phase, job.phase_done, job.phase_total = "", None, None
+            # A stopped run still did real work, and it is the run you most want throughput
+            # from (a long crawl someone interrupted). Recording what it actually ingested
+            # is the difference between a measurable partial run and a blank history row.
+            job.stats = {"ingested": job.ingested, "partial": True}
             if job.cleanup_on_stop:
                 self._purge(job)
             self._log(job, f"⏹ sync stopped — {job.ingested} document(s) ingested.")
         except Exception as exc:  # noqa: BLE001 — surface any failure on the job, never crash the thread
             job.state = "error"
             job.error = str(exc)
+            job.stats = {"ingested": job.ingested, "partial": True}
             self._log(job, f"✗ error: {exc}")
         finally:
             hb_stop.set()

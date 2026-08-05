@@ -177,13 +177,17 @@ function FeedbackModal({
   onLearned?: () => void;
 }) {
   const [text, setText] = useState("");
+  // Private by default (knowledge scopes): a correction typed in the moment is one person's
+  // view until they say otherwise, and a wrong one shared becomes citable org truth for
+  // everyone. In open mode / signed out this changes nothing — there is no owner.
+  const [share, setShare] = useState(false);
   const [state, setState] = useState<"idle" | "busy" | "done" | "error">("idle");
   const submit = async () => {
     const fact = text.trim();
     if (!fact || state === "busy") return;
     setState("busy");
     try {
-      await api.learn(fact, question || "Answer feedback");
+      await api.learn(fact, question || "Answer feedback", share);
       setState("done");
       onLearned?.();
       setTimeout(onClose, 900);
@@ -216,9 +220,27 @@ function FeedbackModal({
             placeholder="e.g. The correct owner of the release calendar is Priya, not Sam…"
             className="w-full resize-none rounded-sm bg-fill px-3.5 py-2.5 font-sans text-[13.5px] leading-normal text-ink outline-none placeholder:text-faint focus:shadow-[0_0_0_1.5px_var(--accent-soft)]"
           />
+          <label className="mt-3 flex cursor-pointer items-start gap-2 text-[12px] leading-relaxed text-muted">
+            <input
+              type="checkbox"
+              checked={share}
+              onChange={(e) => setShare(e.target.checked)}
+              className="mt-0.5 accent-[var(--accent)]"
+            />
+            <span>
+              Share with everyone in this workspace
+              <span className="block text-[11.5px] text-faint">
+                Off by default — kept to you, and only you can cite it.
+              </span>
+            </span>
+          </label>
           <div className="mt-3 flex items-center justify-end gap-2">
             {state === "error" && <span className="mr-auto text-[11.5px] text-danger">Could not save — try again.</span>}
-            {state === "done" && <span className="mr-auto text-[11.5px] text-gold">Learned — thank you.</span>}
+            {state === "done" && (
+              <span className="mr-auto text-[11.5px] text-gold">
+                Learned {share ? "and shared" : "privately"} — thank you.
+              </span>
+            )}
             <button onClick={onClose} className="rounded-full px-3.5 py-1.5 text-[12px] text-muted transition hover:text-ink">
               Cancel
             </button>

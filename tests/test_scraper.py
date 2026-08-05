@@ -486,3 +486,83 @@ def test_http_client_honors_verify_tls(tmp_path):
     )
     assert relaxed._ignore_https_errors() is True
     assert relaxed._get_client() is not None
+
+
+# ---------------------------------------------------------- server error pages
+
+ASPNET_ERROR = """<html><head><title>Error</title></head><body>
+<h1 class="text-danger">Error.</h1>
+<h2 class="text-danger">An error occurred while processing your request.</h2>
+<p>Request ID: 00-8f2a1c9b4d-00</p>
+<h3>Development Mode</h3>
+<p>Swapping to the <strong>Development</strong> environment displays detailed
+information about the error that occurred.</p>
+</body></html>"""
+
+
+def test_aspnet_error_page_is_recognised_not_ingested():
+    """Measured on a real crawl: 363 of 728 ingested documents were this exact page,
+    fetched with a 200 because ASP.NET Core renders it in place."""
+    from quickjoiner.connectors.browser.scraper import looks_like_error_page, page_document
+
+    doc = page_document("https://app.corp/Details?id=9", ASPNET_ERROR)
+    assert doc is not None  # it is long enough to pass the 80-char content floor
+    assert looks_like_error_page(doc.text, doc.title)
+
+
+def test_a_real_page_about_errors_is_not_mistaken_for_one():
+    """A runbook or an API error-code reference mentions these phrases legitimately. The
+    brevity requirement is what separates them: an error page has no content by design."""
+    from quickjoiner.connectors.browser.scraper import looks_like_error_page
+
+    runbook = ("Handling a 500 - Internal Server Error in the payments service.\n"
+               + "When the gateway reports an internal server error, first check the "
+                 "circuit breaker state and the upstream health probe. " * 20)
+    assert len(runbook) > 1500
+    assert not looks_like_error_page(runbook, "Runbook: internal server error")
+
+
+def test_an_ordinary_short_page_is_not_an_error_page():
+    from quickjoiner.connectors.browser.scraper import looks_like_error_page
+
+    assert not looks_like_error_page("Team Caffeine owns the billing service.", "Caffeine")
+
+
+def test_crawl_skips_error_pages_still_follows_their_links_and_reports_the_count(tmp_path):
+    from quickjoiner.connectors.browser.scraper import WebScrapeConnector
+
+    good = ('<html><body><h1>Team Caffeine</h1><p>%s</p>'
+            '<a href="https://app.corp/b">b</a></body></html>' % ("Members and duties. " * 10))
+    pages = {
+        "https://app.corp/a": ASPNET_ERROR.replace("</body>",
+                                                   '<a href="https://app.corp/b">b</a></body>'),
+        "https://app.corp/b": good,
+    }
+    stages: list[str] = []
+    conn = WebScrapeConnector("web_scrape:t", {"start_urls": ["https://app.corp/a"],
+                                               "respect_robots": False}, tmp_path)
+    conn._stage = lambda name, done=None, total=None: stages.append(name)
+
+    docs = list(conn._crawl(["https://app.corp/a"], set(), ["https://app.corp/"], 10,
+                            fetch=lambda u: pages.get(u, "")))
+    # The error page is dropped, but its link was still followed — the page failed, the
+    # site did not.
+    assert [d.uri for d in docs] == ["https://app.corp/b"]
+    assert any("skipped 1 page(s) that returned a server error" in s for s in stages)
+    assert any("https://app.corp/a" in s for s in stages)
+
+
+def test_scraped_pages_preserve_tables_as_markdown_rows():
+    """The crawler does its own extraction, so it needs the same table renderer the
+    document extractor uses — otherwise the table work reaches every source EXCEPT the
+    scraped pages that motivated it."""
+    from quickjoiner.connectors.browser.scraper import page_document
+
+    html = ("<html><body><h1>Autobots</h1><p>Members:</p><table>"
+            "<tr><th>Name</th><th>Email</th><th>Location</th></tr>"
+            "<tr><td>Caleb Spring</td><td></td><td>Dallas</td></tr></table>"
+            "<p>" + ("filler " * 30) + "</p></body></html>")
+    doc = page_document("https://app.corp/TeamDetails?team=Autobots", html)
+    assert "| Name | Email | Location |" in doc.text
+    # The blank email is preserved, so Location cannot shift into the Email column.
+    assert "| Caleb Spring |  | Dallas |" in doc.text

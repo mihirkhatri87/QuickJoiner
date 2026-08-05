@@ -370,12 +370,43 @@ class _SqlCatalog:
         except Exception:  # noqa: BLE001
             pass
 
+    def set_source_ownership(self, source_id: str, owner: str | None, shared: bool) -> None:
+        """Set who owns an INGESTION BUCKET and whether it is shared.
+
+        `write_source`/`save_config` own this for configured connectors; this is the same
+        step for the buckets they don't cover — a per-user note bucket has no SourceConfig
+        to carry its ownership, and `upsert_source` deliberately preserves (never sets) it.
+        """
+        self._write(
+            "UPDATE sources SET owner = ?, shared = ? WHERE id = ?",
+            (owner, 1 if shared else 0, source_id),
+        )
+
     def list_sources(self) -> list[dict]:
         return self._read_all(
             """SELECT s.*, COUNT(d.doc_id) AS doc_count
                FROM sources s LEFT JOIN documents d ON d.source_id = s.id
                GROUP BY s.id ORDER BY s.name"""
         )
+
+    def visible_source_ids(self, user: str | None) -> list[str]:
+        """Every source id `user` may read — the knowledge-scope key.
+
+        Same rule as `auth.visible`, but over **all** source rows rather than the configured
+        connectors `list_source_configs` returns: an ingestion bucket (taught notes, uploads,
+        distilled conversations) is a source too, and once a taught note can be private it is
+        exactly the row that has to be filtered. Ownerless rows are the commons, so the
+        pre-auth corpus keeps reading as commons with no migration.
+
+        Callers only apply this when auth is enabled — see `AppContext.visible_source_ids`,
+        which returns None in open mode so single-user behaviour stays byte-identical.
+        A source_id with no row here is NOT visible: a filter that fails open is not a filter.
+        """
+        rows = self._read_all(
+            "SELECT id FROM sources WHERE owner IS NULL OR shared = 1 OR owner = ?",
+            (user,),
+        )
+        return [r["id"] for r in rows]
 
     def delete_source(self, source_id: str) -> None:
         self._write("DELETE FROM sources WHERE id = ?", (source_id,))
@@ -898,7 +929,32 @@ class _SqlCatalog:
             (needle,),
         )
 
-    def search_entities(self, query: str, limit: int = 10) -> list[dict]:
+    def _visible_entity_filter(self, visible_source_ids: "list[str] | None",
+                               column: str = "e.id") -> tuple[str, list]:
+        """`(sql_fragment, params)` keeping only entities the asker can actually reach.
+
+        An entity is a NAME — "person:Jane Q" — and a name is disclosure on its own, so
+        filtering edges is not enough: autocomplete and the graph search box would still
+        offer names mined solely from a private document. Reachable means "at least one
+        edge citing a visible document, or an evidence-free derived edge" — the same
+        definition `_evidence_visible` uses, so the two can't drift apart.
+
+        Correlated EXISTS rather than a join: `entities` is the larger table and this runs
+        per keystroke on the autocomplete path, so it must short-circuit on the first hit.
+        """
+        if visible_source_ids is None:
+            return "", []
+        clause, vis = self._evidence_visible(visible_source_ids)
+        return (
+            f""" AND EXISTS (
+                    SELECT 1 FROM edges g
+                    LEFT JOIN documents d ON d.doc_id = g.evidence_doc_id
+                    WHERE (g.src = {column} OR g.dst = {column}){clause})""",
+            vis,
+        )
+
+    def search_entities(self, query: str, limit: int = 10,
+                        visible_source_ids: "list[str] | None" = None) -> list[dict]:
         """Entity autocomplete: name/alias substring match (case-insensitive),
         ranked by how connected the entity is. Powers the graph view's
         search-as-you-type — a lighter-weight sibling to resolve_entity's exact
@@ -906,21 +962,29 @@ class _SqlCatalog:
         needle = f"%{query.strip().lower()}%"
         if needle == "%%":
             return []
+        vis_clause, vis = self._visible_entity_filter(visible_source_ids)
         return self._read_all(
             """SELECT e.id, e.name, e.type,
                       (SELECT COUNT(*) FROM edges g WHERE g.src = e.id OR g.dst = e.id) AS degree
                FROM entities e
-               WHERE LOWER(e.name) LIKE ?
-                  OR e.id IN (SELECT entity_id FROM entity_aliases WHERE alias LIKE ?)
-               ORDER BY degree DESC LIMIT ?""",
-            (needle, needle, limit),
+               WHERE (LOWER(e.name) LIKE ?
+                  OR e.id IN (SELECT entity_id FROM entity_aliases WHERE alias LIKE ?))"""
+            + vis_clause + " ORDER BY degree DESC LIMIT ?",
+            (needle, needle, *vis, limit),
         )
 
-    def bridge_entities(self, limit: int = 20) -> list[dict]:
+    def bridge_entities(self, limit: int = 20,
+                        visible_source_ids: "list[str] | None" = None) -> list[dict]:
         """Entities touched by edges whose evidence documents come from more than
         one distinct source — the graph's actual cross-source correlation, and a
         far more useful "where do I start?" list than an arbitrary graph slice.
-        Ordered by how many sources touch it, then by degree."""
+        Ordered by how many sources touch it, then by degree.
+
+        Filtered evidence changes the ANSWER here, not just the rows: an entity bridging a
+        readable source and a private one is a one-source entity as far as this asker is
+        concerned, and the `HAVING > 1` must be judged on what they can see.
+        """
+        clause, vis = self._evidence_visible(visible_source_ids)
         return self._read_all(
             """SELECT e.id, e.name, e.type,
                       COUNT(DISTINCT d.source_id) AS source_count,
@@ -930,13 +994,14 @@ class _SqlCatalog:
                    SELECT src AS entity_id, evidence_doc_id FROM edges
                    UNION ALL
                    SELECT dst AS entity_id, evidence_doc_id FROM edges
-               ) touch ON touch.entity_id = e.id
-               JOIN documents d ON d.doc_id = touch.evidence_doc_id
+               ) g ON g.entity_id = e.id
+               JOIN documents d ON d.doc_id = g.evidence_doc_id
+               WHERE 1 = 1""" + clause + """
                GROUP BY e.id, e.name, e.type
                HAVING COUNT(DISTINCT d.source_id) > 1
                ORDER BY source_count DESC, degree DESC
                LIMIT ?""",
-            (limit,),
+            (*vis, limit),
         )
 
     _EDGE_SELECT = """SELECT g.src, g.rel, g.dst, g.detail, g.evidence_doc_id,
@@ -949,16 +1014,45 @@ class _SqlCatalog:
                       LEFT JOIN entities t ON t.id = g.dst
                       LEFT JOIN documents d ON d.doc_id = g.evidence_doc_id"""
 
-    def graph_neighbors(self, entity_id: str) -> list[dict]:
+    @staticmethod
+    def _evidence_visible(visible_source_ids: "list[str] | None") -> tuple[str, list]:
+        """`(sql_fragment, params)` keeping only edges whose evidence document the acting
+        user may read — the graph-side twin of `SearchScope`, so an answer can't be assembled
+        out of relationships drawn from a source the asker cannot open.
+
+        `None` means no restriction (open mode) and returns an empty fragment, so the
+        single-user query text is byte-identical to before. An empty list is unsatisfiable
+        and renders `1 = 0` rather than the invalid `IN ()`.
+
+        **An edge with no evidence document survives the filter.** That is not an oversight:
+        `same_as` identity bridges are derived from entity names and deliberately carry an
+        empty `evidence_doc_id` (never citable, corroboration 0), so they cite nothing and
+        can leak no document text. Dropping them would silently degrade the graph for every
+        user the moment auth is switched on. An edge whose evidence row is genuinely missing
+        joins to NULL and IS filtered out — a visibility filter must fail closed.
+        """
+        if visible_source_ids is None:
+            return "", []
+        if not visible_source_ids:
+            return " AND 1 = 0", []
+        marks = ",".join("?" * len(visible_source_ids))
+        return (f" AND (g.evidence_doc_id = '' OR d.source_id IN ({marks}))",
+                list(visible_source_ids))
+
+    def graph_neighbors(self, entity_id: str,
+                        visible_source_ids: "list[str] | None" = None) -> list[dict]:
         """Every edge touching the entity, with far-node names and the evidence
         document's title/uri joined in (for citations)."""
+        clause, vis = self._evidence_visible(visible_source_ids)
         return self._read_all(
-            self._EDGE_SELECT + " WHERE g.src = ? OR g.dst = ? ORDER BY g.rel, g.dst",
-            (entity_id, entity_id),
+            self._EDGE_SELECT + " WHERE (g.src = ? OR g.dst = ?)" + clause
+            + " ORDER BY g.rel, g.dst",
+            (entity_id, entity_id, *vis),
         )
 
     def graph_relations(self, rel: str, src_type: str | None = None,
-                        dst_type: str | None = None, limit: int = 400) -> list[dict]:
+                        dst_type: str | None = None, limit: int = 400,
+                        visible_source_ids: "list[str] | None" = None) -> list[dict]:
         """Every edge of one relation shape, optionally constrained by the entity type on
         each end — the ENUMERATION read the graph could not previously serve.
 
@@ -979,37 +1073,52 @@ class _SqlCatalog:
         if dst_type:
             sql += " AND t.type = ?"
             params.append(dst_type)
+        clause, vis = self._evidence_visible(visible_source_ids)
+        sql += clause
+        params.extend(vis)
         sql += " ORDER BY t.name, s.name LIMIT ?"
         params.append(max(1, limit))
         return self._read_all(sql, tuple(params))
 
-    def edge_corroboration(self, src: str, rel: str, dst: str) -> dict:
+    def edge_corroboration(self, src: str, rel: str, dst: str,
+                           visible_source_ids: "list[str] | None" = None) -> dict:
         """How many distinct evidence docs, and distinct sources, assert one exact
         edge — the corroboration inputs to plan 06's score_edge. No new storage:
         the (src, rel, dst, evidence_doc_id) PK already keeps one row per
-        corroborating document."""
+        corroborating document.
+
+        Counts only evidence the asker may read: confidence is shown to a person, and a
+        number inflated by documents they cannot open would be a claim we can't back up.
+        """
+        clause, vis = self._evidence_visible(visible_source_ids)
         row = self._read_one(
             """SELECT COUNT(DISTINCT g.evidence_doc_id) AS doc_count,
                       COUNT(DISTINCT d.source_id) AS source_count
                FROM edges g LEFT JOIN documents d ON d.doc_id = g.evidence_doc_id
-               WHERE g.src = ? AND g.rel = ? AND g.dst = ? AND g.evidence_doc_id <> ''""",
-            (src, rel, dst),
+               WHERE g.src = ? AND g.rel = ? AND g.dst = ? AND g.evidence_doc_id <> ''"""
+            + clause,
+            (src, rel, dst, *vis),
         )
         return {"doc_count": (row or {}).get("doc_count") or 0,
                 "source_count": (row or {}).get("source_count") or 0}
 
-    def entity_evidence(self, entity_id: str, limit: int = 3) -> list[dict]:
+    def entity_evidence(self, entity_id: str, limit: int = 3,
+                        visible_source_ids: "list[str] | None" = None) -> list[dict]:
         """Titles/kinds of the evidence docs behind edges touching this entity —
         the context the entity-resolution adjudicator judges merges from
         (plan 06 §1.D: bare name strings alone made the LLM default to NONE)."""
+        # An inner JOIN already excludes evidence-less edges here, so the shared clause's
+        # `evidence_doc_id = ''` arm can never widen this read.
+        clause, vis = self._evidence_visible(visible_source_ids)
         return self._read_all(
             """SELECT DISTINCT d.title, d.kind FROM edges g
                JOIN documents d ON d.doc_id = g.evidence_doc_id
-               WHERE g.src = ? OR g.dst = ? ORDER BY d.title LIMIT ?""",
-            (entity_id, entity_id, limit),
+               WHERE (g.src = ? OR g.dst = ?)""" + clause + " ORDER BY d.title LIMIT ?",
+            (entity_id, entity_id, *vis, limit),
         )
 
-    def graph_path(self, src_id: str, dst_id: str, max_hops: int = 3) -> list[dict] | None:
+    def graph_path(self, src_id: str, dst_id: str, max_hops: int = 3,
+                   visible_source_ids: "list[str] | None" = None) -> list[dict] | None:
         """Shortest chain of edges linking two entities (undirected BFS, hop-capped),
         each hop carrying names + evidence. [] if src == dst; None if unconnected
         within reach — the tool reports that as not-learned, never invents a link.
@@ -1023,7 +1132,7 @@ class _SqlCatalog:
         save that was never the actual bottleneck."""
         if src_id == dst_id:
             return []
-        rows = self._read_all(self._EDGE_SELECT)
+        rows = self._read_all(*self._edge_scan(visible_source_ids))
         adjacency: dict[str, list[dict]] = {}
         for r in rows:
             adjacency.setdefault(r["src"], []).append(r)
@@ -1055,8 +1164,19 @@ class _SqlCatalog:
                 frontier.append((nxt, hops + 1))
         return None
 
+    def _edge_scan(self, visible_source_ids: "list[str] | None") -> tuple[str, tuple]:
+        """The whole-edge-table read the two path searches share, visibility-filtered.
+
+        Filtering here rather than after the BFS is what keeps a "no known path" answer
+        honest: a chain is only reported when EVERY hop rests on evidence the asker may
+        read, so the graph never routes an answer through a document they cannot open.
+        """
+        clause, vis = self._evidence_visible(visible_source_ids)
+        return self._EDGE_SELECT + (" WHERE 1 = 1" + clause if clause else ""), tuple(vis)
+
     def graph_path_candidates(self, src_id: str, dst_id: str, max_hops: int = 3,
-                              max_candidates: int = 3) -> list[list[dict]]:
+                              max_candidates: int = 3,
+                              visible_source_ids: "list[str] | None" = None) -> list[list[dict]]:
         """Up to `max_candidates` MATERIALLY DIFFERENT chains linking two entities,
         in nondecreasing hop order — so a 1-hop claim from meeting notes and a 3-hop
         chain through an architecture doc both surface instead of shortest silently
@@ -1080,7 +1200,7 @@ class _SqlCatalog:
         connection into a false "no path"."""
         if src_id == dst_id:
             return []
-        rows = self._read_all(self._EDGE_SELECT)
+        rows = self._read_all(*self._edge_scan(visible_source_ids))
         adjacency: dict[str, list[dict]] = {}
         for r in rows:
             adjacency.setdefault(r["src"], []).append(r)
@@ -1140,66 +1260,110 @@ class _SqlCatalog:
                 break
         return out
 
-    def graph_snapshot(self, entity_id: str | None = None, limit: int = 400) -> dict:
+    def graph_snapshot(self, entity_id: str | None = None, limit: int = 400,
+                       visible_source_ids: "list[str] | None" = None) -> dict:
         """Nodes + edges for /api/graph: one entity's neighborhood, or the whole
         graph capped at `limit` edges.
 
-        The whole-graph case is sampled *fairly across entity TYPES* (and across
-        src within a type), not just the alphabetically-first `limit` rows. Two
-        failure modes this avoids: (1) a plain `ORDER BY src LIMIT n` lets one
-        high-degree entity consume the whole budget (renders as a single star);
-        (2) a per-src cap alone still front-loads whichever type sorts first and
-        is numerous — after a GitLab sync the hundreds of `branch:` entities
-        (sorting before every other type) ate the entire 400-edge budget via
-        belongs_to/for_ticket, hiding the services/deps/deploys/code that are
-        fully present. So each src_type gets an even share (`per_type_cap`), and
-        within a type a round-robin over src spreads that share across many
-        entities — a representative multi-type view at any `limit`."""
+        The whole-graph case can only ever draw a fraction of a real graph (400 of
+        109,003 edges on the live corpus), so *which* fraction is the whole design,
+        and the answer arrived in three corrections:
+
+        1. A plain `ORDER BY src LIMIT n` lets one high-degree entity consume the
+           whole budget — it renders as a single star.
+        2. A per-src cap alone still front-loads whichever entity TYPE sorts first
+           and is numerous: after a GitLab sync the hundreds of `branch:` entities
+           ate the entire budget via belongs_to/for_ticket, hiding the services,
+           deps, deploys and code that were fully present. Hence the even per-type
+           share, still applied below.
+        3. Both of those pick edges without regard to whether their *other* end is
+           also drawn, so the budget fills with dangling leaves. Measured on the live
+           109k-edge graph: 656 nodes for 392 edges, **91% of them degree-1** — a field
+           of stubs, which is exactly what "nothing is connected" looks like. So a
+           **connected core** is chosen first (the best-connected entities, evenly
+           across types) and only edges with BOTH ends inside it are returned: 174
+           nodes, 309 edges, **40% degree-1**, all 14 entity types still present. The
+           budget is a ceiling, not a target — 309 edges that connect read better than
+           392 that mostly don't. It is also 2.3x faster (2058ms -> 883ms), because the
+           expensive join now runs against a small id list.
+
+        Returns `totals` + `truncated` alongside the sample, so a caller can say what
+        it left out instead of presenting a fraction as the whole organization."""
         if entity_id:
-            rows = self.graph_neighbors(entity_id)[:limit]
+            rows = self.graph_neighbors(
+                entity_id, visible_source_ids=visible_source_ids)[:limit]
         else:
-            # Balance the sample across entity TYPES, then across src within a type. A plain
-            # per-src cap still front-loads whichever type sorts first alphabetically and is
-            # numerous — e.g. after GitLab sync the 329 `branch:` entities (sorting before
-            # every other type) consumed the entire 400-edge budget via belongs_to/for_ticket,
-            # rendering the whole graph as branches+tickets and hiding services/deps/deploys/
-            # code that are fully present. So: each src_type gets an even share of the budget
-            # (per_type_cap), and within a type the round-robin over src (rn_src) spreads it
-            # across many entities rather than one dominant node.
+            # How many entity types there are sets every per-type share below — the
+            # even split is what keeps one numerous type (329 `branch:` entities after a
+            # GitLab sync) from consuming the whole budget and hiding the rest.
             tcount = self._read_one(
                 "SELECT COUNT(DISTINCT s.type) AS n FROM edges g LEFT JOIN entities s ON s.id = g.src"
             )
             n_types = max(1, (tcount["n"] if tcount else 0) or 1)
-            per_type_cap = max(5, limit // n_types)
+            # Entities per type to build the core from. Fewer, better-connected entities beat
+            # more, barely-connected ones: at `limit` edges the view can only ever show a
+            # fraction of a real graph, and a fraction that hangs together is readable while
+            # the same budget spread thinner is not.
+            per_type_entities = max(6, limit // n_types)
+            per_src_cap = max(3, limit // (n_types * 2))
+            vis_clause, vis = self._evidence_visible(visible_source_ids)
+            # Resolved as its own query rather than a CTE: SQLite re-evaluates a CTE joined
+            # twice, which measured 900ms+ on a 109k-edge graph even though computing the
+            # degrees alone is 92ms. Two indexed steps with the ids passed in is both faster
+            # and portable — no engine-specific MATERIALIZED hint.
+            core = [r["id"] for r in self._read_all(
+                """SELECT ranked.id FROM (
+                       SELECT t.id, ROW_NUMBER() OVER (
+                                  PARTITION BY e.type ORDER BY t.d DESC, t.id
+                              ) AS rn
+                       FROM (
+                           SELECT id, SUM(d) AS d FROM (
+                               SELECT src AS id, COUNT(*) AS d FROM edges GROUP BY src
+                               UNION ALL
+                               SELECT dst AS id, COUNT(*) AS d FROM edges GROUP BY dst
+                           ) both_ends GROUP BY id
+                       ) t JOIN entities e ON e.id = t.id
+                   ) ranked WHERE ranked.rn <= ?""",
+                (per_type_entities,),
+            )]
+            if not core:
+                return {"nodes": [], "edges": [],
+                        "totals": self.graph_totals(visible_source_ids),
+                        "truncated": False}
+            ph = ",".join("?" for _ in core)
             rows = self._read_all(
                 f"""SELECT src, rel, dst, detail, evidence_doc_id,
                            src_name, src_type, dst_name, dst_type,
                            evidence_title, evidence_uri, evidence_kind
                     FROM (
-                        SELECT src, rel, dst, detail, evidence_doc_id, src_name, src_type,
-                               dst_name, dst_type, evidence_title, evidence_uri, evidence_kind,
+                        SELECT g.src, g.rel, g.dst, g.detail, g.evidence_doc_id,
+                               s.name AS src_name, s.type AS src_type,
+                               t.name AS dst_name, t.type AS dst_type,
+                               d.title AS evidence_title, d.uri AS evidence_uri,
+                               d.kind AS evidence_kind,
                                ROW_NUMBER() OVER (
-                                   PARTITION BY src_type ORDER BY rn_src, src, rel, dst
+                                   PARTITION BY g.src ORDER BY g.rel, g.dst
+                               ) AS rn_src,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY s.type ORDER BY g.src, g.rel, g.dst
                                ) AS rn_type
-                        FROM (
-                            SELECT g.src, g.rel, g.dst, g.detail, g.evidence_doc_id,
-                                   s.name AS src_name, s.type AS src_type,
-                                   t.name AS dst_name, t.type AS dst_type,
-                                   d.title AS evidence_title, d.uri AS evidence_uri,
-                                   d.kind AS evidence_kind,
-                                   ROW_NUMBER() OVER (
-                                       PARTITION BY g.src ORDER BY g.rel, g.dst
-                                   ) AS rn_src
-                            FROM edges g
-                            LEFT JOIN entities s ON s.id = g.src
-                            LEFT JOIN entities t ON t.id = g.dst
-                            LEFT JOIN documents d ON d.doc_id = g.evidence_doc_id
-                        ) capped
-                    ) typed
-                    WHERE rn_type <= ?
+                        FROM edges g
+                        LEFT JOIN entities s ON s.id = g.src
+                        LEFT JOIN entities t ON t.id = g.dst
+                        LEFT JOIN documents d ON d.doc_id = g.evidence_doc_id
+                        -- BOTH ends in the core, deliberately. Taking edges that merely
+                        -- start in the core fills the budget with dangling leaves: measured
+                        -- 91% degree-1 nodes that way versus 40% here, for a picture
+                        -- that hangs together. The budget is a ceiling, not a target:
+                        -- 309 edges that connect beat 392 that mostly don't.
+                        -- (The '%' here is safe only because PostgresCatalog._pg
+                        -- escapes it; psycopg would otherwise read it as a placeholder.)
+                        WHERE g.src IN ({ph}) AND g.dst IN ({ph}){vis_clause}
+                    ) picked
+                    WHERE rn_src <= ? AND rn_type <= ?
                     ORDER BY src_type, rn_type
                     LIMIT ?""",
-                (per_type_cap, limit),
+                (*core, *core, *vis, per_src_cap, max(5, limit // n_types), limit),
             )
         nodes: dict[str, dict] = {}
         edges = []
@@ -1217,14 +1381,56 @@ class _SqlCatalog:
             ent = self._read_one("SELECT * FROM entities WHERE id = ?", (entity_id,))
             if ent:
                 nodes[entity_id] = {"id": ent["id"], "name": ent["name"], "type": ent["type"]}
-        return {"nodes": list(nodes.values()), "edges": edges}
+        # What was left out, stated. A whole-graph view can only ever draw a fraction of a
+        # real graph — 400 of 109,003 edges on the live corpus — and returning that fraction
+        # with no totals lets it read as the entire organization. Same no-silent-caps rule
+        # the crawler and the graph tools follow.
+        totals = self.graph_totals(visible_source_ids)
+        return {
+            "nodes": list(nodes.values()),
+            "edges": edges,
+            "totals": totals,
+            "truncated": len(edges) < totals["edges"],
+        }
 
-    def graph_expand(self, seed_doc_ids: list[str], limit: int = 5) -> list[dict]:
+    def graph_totals(self, visible_source_ids: "list[str] | None" = None) -> dict:
+        """How big the graph actually is — the denominator for any sampled view.
+
+        Counted over what the asker may read, so the "sample of N" the toolbar renders is
+        the size of THEIR graph. A global total here would both overstate their view and
+        quietly disclose how much they cannot see.
+        """
+        clause, vis = self._evidence_visible(visible_source_ids)
+        if not clause:
+            e = self._read_one("SELECT COUNT(*) AS n FROM edges")
+            n = self._read_one("SELECT COUNT(*) AS n FROM entities")
+            return {"edges": (e["n"] if e else 0) or 0, "entities": (n["n"] if n else 0) or 0}
+        # `_evidence_visible` names `g` and `d`, so the filtered counts join the same way
+        # the reads do — one definition of "visible edge", not a second one drifting here.
+        base = ("FROM edges g LEFT JOIN documents d ON d.doc_id = g.evidence_doc_id "
+                "WHERE 1 = 1" + clause)
+        e = self._read_one(f"SELECT COUNT(*) AS n {base}", tuple(vis))
+        n = self._read_one(
+            f"""SELECT COUNT(*) AS n FROM (
+                    SELECT g.src AS id {base} UNION SELECT g.dst AS id {base}
+                ) reachable""",
+            (*vis, *vis),
+        )
+        return {"edges": (e["n"] if e else 0) or 0, "entities": (n["n"] if n else 0) or 0}
+
+    def graph_expand(self, seed_doc_ids: list[str], limit: int = 5,
+                     visible_source_ids: "list[str] | None" = None) -> list[dict]:
         """Documents one graph hop from the seed documents: the entities the seeds
         evidence, then OTHER documents that evidence edges touching those entities.
         This is the graph-expansion retrieval channel — it surfaces cross-source
         evidence the vector search missed. Each row carries the relation, the two
-        entity names, and the related document's title/uri for citation."""
+        entity names, and the related document's title/uri for citation.
+
+        Every row returned here is a citable document, so `visible_source_ids` matters more
+        than anywhere else in the graph: this is the one read that hands whole documents back
+        to the answer path. The seeds are already visible (they are grounded hits), but their
+        one-hop neighbours need not be.
+        """
         if not seed_doc_ids:
             return []
         dph = ",".join("?" for _ in seed_doc_ids)
@@ -1252,6 +1458,7 @@ class _SqlCatalog:
         ]
         seed_entities = list(dict.fromkeys([*seed_entities, *partners]))
         eph = ",".join("?" for _ in seed_entities)
+        clause, vis = self._evidence_visible(visible_source_ids)
         rows = self._read_all(
             f"""SELECT g.rel, g.evidence_doc_id AS doc_id, g.detail,
                        s.name AS src_name, t.name AS dst_name,
@@ -1262,9 +1469,9 @@ class _SqlCatalog:
                 LEFT JOIN documents d ON d.doc_id = g.evidence_doc_id
                 WHERE (g.src IN ({eph}) OR g.dst IN ({eph}))
                   AND g.evidence_doc_id <> ''
-                  AND g.evidence_doc_id NOT IN ({dph})
+                  AND g.evidence_doc_id NOT IN ({dph}){clause}
                 ORDER BY g.rel, g.dst""",
-            (*seed_entities, *seed_entities, *seed_doc_ids),
+            (*seed_entities, *seed_entities, *seed_doc_ids, *vis),
         )
         seen: set[str] = set()
         out: list[dict] = []

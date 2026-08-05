@@ -25,9 +25,10 @@ when memory has nothing relevant.
   `/qj learn from this onedrive document <url>` in chat — and only that is learned. Word,
   PowerPoint, Excel, PDF, CSV, Markdown, **zip archives** and many other text formats are all
   extracted; a later sync keeps what you taught it up to date without going looking for more.
-  ⚠ Note: learned documents join the **shared** memory every user of that workspace can search
-  and cite — including a file that was shared privately with you. Per-user knowledge scopes are
-  the next thing on the roadmap.
+  ⚠ Note: a OneDrive connector you keep **private** (the signed-in default) is now yours alone
+  — nobody else can search, cite, or even see its documents' names in autocomplete or the graph.
+  Use `--share` (CLI) or the share toggle on the connector to open it to the workspace. See
+  **Who can read what** below.
 - **Ask about a file (per-question attachments)** — click 📎 or drag files onto the chat to attach
   **Word, PowerPoint, Excel, PDF, Markdown, text, JSON, HTML, or code** as *context for that
   question*. Slide decks are read properly — labels inside **grouped diagrams**, SmartArt and
@@ -215,6 +216,7 @@ No external systems required — teach a fact, then ask about it:
 
 ```powershell
 qj learn "Deploys go out Tuesdays via Octopus; Priya owns the release calendar."
+qj learn --share "Release calendar lives in Confluence."   # teach EVERYONE, not just you
 qj learn C:\work\platform-docs        # ingest a folder / single file / URL
 qj learn C:\work\Onboarding.docx      # Word/PowerPoint/Excel/PDF/Markdown are extracted too
 
@@ -450,6 +452,40 @@ scheduler.
 
 ---
 
+## Who can read what (knowledge scopes)
+
+QuickJoiner starts in **open mode** — no accounts, everything shared. It stays that way until
+you add the first user (`qj users add`, or the first user created in the UI, who becomes the
+admin). Nothing below changes anything for a single-user workspace.
+
+Once auth is on, **each connector and each taught note is either commons or owned**:
+
+| What it is | Who can search, cite, and see its names |
+| --- | --- |
+| A connector with no owner | everyone (the commons) |
+| A connector you created with `--share` | everyone |
+| A connector you created **privately** (the signed-in default) | only you |
+| A fact you taught with `qj learn "…"` | only you |
+| A fact you taught with `qj learn --share "…"` | everyone |
+
+"Only you" means it genuinely: another user's questions never retrieve those documents, the
+knowledge graph won't route an answer through relationships that rest on them, their entity
+names are not offered in autocomplete or the graph search box, they don't inflate any
+confidence count, and the graph's "sample of N" is counted over that person's own view. A
+question that could only be answered from a source you can't read gets an honest **"I haven't
+learned that yet"** — never a partial answer built from something you're not allowed to see.
+
+Sharing is opt-in for a reason: a correction typed in the moment is one person's view, and a
+wrong one taught to the commons becomes citable org truth for everyone. In chat, the
+thumbs-down "help QuickJoiner learn" box has a **Share with everyone** checkbox (off by
+default), and the agent's `remember` tool only shares when you say so.
+
+⚠ Being unreadable is not yet the same as being invisible to the *ingest* side: a private
+document can still influence which entities exist in the graph and how they resolve, even
+though nobody else can read, cite, or enumerate it. The ingest-time merge guard and the
+promotion flow (personal → org by review) are the remaining pieces — see
+[docs/CLOUD_ROADMAP.md](docs/CLOUD_ROADMAP.md) Y1.8.
+
 ## Knowledge-debt backlog (gaps)
 
 Every refusal is a signal about what the org still needs to teach the tool. QuickJoiner logs each
@@ -524,7 +560,10 @@ expansion — so you can see *where* the time goes rather than only how long it 
 how you decide whether they're worth it on your corpus: on a 56k-chunk workspace the cross-encoder
 reranker alone is ~77ms per candidate, which at the default depth of 24 is most of a query.
 `--agent` adds end-to-end answer latency and tokens per answer, including how much of the prompt
-your provider served from cache.
+your provider served from cache. It also reports **ingest throughput** (documents per minute,
+overall and per connector) — read from the syncs you have actually run rather than by running
+one, since a benchmark sync would mostly measure your network on the day. That means it needs
+real runs in the window to report anything, and says so plainly when there are none.
 
 Embeddings run locally via fastembed (`BAAI/bge-small-en-v1.5` by default; switch
 `embedding.provider` to `ollama` to use `nomic-embed-text`). These models are trained for
@@ -563,9 +602,10 @@ qj eval docs/evals/multi-hop-crosssource.yaml   # shipped multi-hop / cross-sour
 qj bench my-bench.yaml --init          # write a starter bench pack (an eval set works too)
 qj bench my-bench.yaml [--agent]       # SPEED + COST: where each query's milliseconds go
                                        #   (embed / dense / sparse / fuse / rerank / gate,
-                                       #   p50+p95) and embedder chunks/sec; --agent adds
-                                       #   time-to-first-token, answer time and tokens per
-                                       #   answer (incl. how much the prompt cache saved)
+                                       #   p50+p95), embedder chunks/sec, and ingest docs/min
+                                       #   read from your real sync history (--sync-days N);
+                                       #   --agent adds time-to-first-token, answer time and
+                                       #   tokens per answer (incl. prompt-cache savings)
 qj bench my-bench.yaml --compare old.json  # before/after table; non-zero exit if anything got
                                            #   >20% slower or more expensive (CI merge gate)
 qj extract report.pptx                 # what can QuickJoiner actually read from this file?

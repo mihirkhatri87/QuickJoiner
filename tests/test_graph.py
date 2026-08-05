@@ -653,3 +653,60 @@ def test_end_to_end_contextual_codegraph_expansion(store, catalog):
     assert "git:platform · pay.py" in out           # contextual breadcrumb on the grounded hit
     assert "RELATED via knowledge graph" in out
     assert "ledger.py" in out                        # sibling surfaced via shared repo node
+
+
+# ---------------------------------------------- whole-graph snapshot connectivity
+
+def test_graph_snapshot_samples_a_connected_core_not_a_field_of_stubs(catalog):
+    """Regression, measured on the live 109k-edge graph: the old round-robin took edge #1
+    from every source before edge #2 from any, which maximises spread and therefore
+    MINIMISES connectivity — 91% of the sampled nodes had exactly one edge, so the whole
+    view rendered as disconnected pairs. The sample must hang together to be readable."""
+    # Two hubs with real neighbourhoods, plus a long tail of one-edge entities that the
+    # old sampler would have preferred (they sort early and each contributes a fresh src).
+    for i in range(6):
+        catalog.upsert_entity(f"service:hub{i}", f"Hub{i}", "service", "s")
+        catalog.upsert_entity(f"repo:core{i}", f"Core{i}", "repo", "s")
+    for i in range(60):
+        catalog.upsert_entity(f"service:leaf{i:03d}", f"Leaf{i}", "service", "s")
+    edges = []
+    for i in range(6):           # a dense core: every hub touches every core repo
+        for j in range(6):
+            edges.append((f"service:hub{i}", "depends_on", f"repo:core{j}", ""))
+    for i in range(60):          # the tail: one edge each, to a repo outside the core
+        catalog.upsert_entity(f"repo:tail{i:03d}", f"Tail{i}", "repo", "s")
+        edges.append((f"service:leaf{i:03d}", "depends_on", f"repo:tail{i:03d}", ""))
+    catalog.upsert_document("d", "s", "u", "T", "doc", "h", "2026-07-31", 1)
+    catalog.replace_doc_edges("d", edges)
+
+    snap = catalog.graph_snapshot(limit=40)
+    degree: dict[str, int] = {}
+    for e in snap["edges"]:
+        degree[e["src"]] = degree.get(e["src"], 0) + 1
+        degree[e["dst"]] = degree.get(e["dst"], 0) + 1
+    stubs = sum(1 for d in degree.values() if d == 1)
+    assert snap["edges"], "the snapshot must not be empty"
+    assert stubs / len(snap["nodes"]) < 0.5, (
+        f"{stubs}/{len(snap['nodes'])} nodes have a single edge — the sample is stubs, "
+        "not a connected core"
+    )
+    # The dense core is what got picked, not the 60 one-edge leaves.
+    assert any(n["id"].startswith("service:hub") for n in snap["nodes"])
+
+
+def test_graph_snapshot_states_what_it_left_out(catalog):
+    """A whole-graph view can only draw a fraction of a real graph. Returning that
+    fraction with no denominator lets it read as the entire organization."""
+    catalog.upsert_entity("service:a", "A", "service", "s")
+    catalog.upsert_entity("repo:b", "B", "repo", "s")
+    catalog.upsert_document("d", "s", "u", "T", "doc", "h", "2026-07-31", 1)
+    catalog.replace_doc_edges("d", [("service:a", "depends_on", "repo:b", "")])
+
+    snap = catalog.graph_snapshot(limit=400)
+    assert snap["totals"] == {"edges": 1, "entities": 2}
+    assert snap["truncated"] is False  # everything fits: never claim elision that didn't happen
+
+    catalog.upsert_entity("repo:c", "C", "repo", "s")
+    catalog.replace_doc_edges("d", [("service:a", "depends_on", "repo:b", ""),
+                                    ("service:a", "depends_on", "repo:c", "")])
+    assert catalog.graph_snapshot(limit=1)["truncated"] is True

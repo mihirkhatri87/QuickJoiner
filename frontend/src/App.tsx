@@ -402,7 +402,10 @@ export default function App() {
     if (!artifact || learnState !== "idle") return;
     setLearnState("busy");
     try {
-      await api.learn(artifact.markdown, artifact.title);
+      // Shared: a crawl report describes an org system the user deliberately persisted, so
+      // the commons is the intent here — unlike a personal note or an answer correction,
+      // which stay private unless explicitly shared.
+      await api.learn(artifact.markdown, artifact.title, true);
       setLearnState("done");
       say(`Learned **${artifact.title}** into memory — ask about it any time.`);
       loadSources();

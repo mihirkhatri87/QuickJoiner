@@ -166,6 +166,11 @@ def status(workspace: Optional[Path] = WORKSPACE_OPT):
 def learn(
     target: str = typer.Argument(..., help="A file, folder, URL, or a free-text fact in quotes"),
     name: Optional[str] = typer.Option(None, help="Source name (defaults to the target)"),
+    share: bool = typer.Option(
+        False, "--share",
+        help="Teach a free-text fact to EVERYONE. Without it a note is private to you "
+             "(no effect when signed out or in open mode — there is no owner to keep it from).",
+    ),
     workspace: Optional[Path] = WORKSPACE_OPT,
 ):
     """Ingest a file/folder/URL into memory, or store free text as a taught note."""
@@ -186,15 +191,10 @@ def learn(
         for err in stats.errors[:5]:
             console.print(f"[yellow]warn:[/yellow] {err}")
     else:
-        from quickjoiner.agent.tools import build_builtin_tools
+        from quickjoiner.agent.tools import teach_fact
 
-        tools = {
-            t.spec.name: t
-            for t in build_builtin_tools(
-                ctx.store, ctx.catalog, ctx.pipeline, ctx.config.retrieval, ctx.config.gaps
-            )
-        }
-        result = tools["remember"].run(fact=target, topic=name)
+        result = teach_fact(ctx.catalog, ctx.pipeline, target, topic=name,
+                            user=_session_user(ctx), share=share)
         console.print(f"[green]{result}[/green]")
 
 
@@ -906,6 +906,11 @@ def bench_cmd(
     repeats: int = typer.Option(3, "--repeats", help="Timed runs per query (after warm-up)"),
     warmup: int = typer.Option(1, "--warmup", help="Discarded warm-up runs — the first search loads the reranker model"),
     no_embed: bool = typer.Option(False, "--no-embed", help="Skip the embedder throughput leg"),
+    sync_days: int = typer.Option(
+        7, "--sync-days",
+        help="How far back to read real sync runs for the ingest docs/min figure. Widen it if "
+             "you sync less often than weekly — nothing is re-run, it reads recorded history",
+    ),
     compare: Optional[Path] = typer.Option(
         None, "--compare",
         help="Diff this run against a previous bench report JSON; exits non-zero if a "
@@ -940,6 +945,7 @@ def bench_cmd(
             report = run_bench(
                 ctx, pack, agent_layer=agent, repeats=repeats, warmup=warmup,
                 embed=not no_embed, provider_override=provider, model_override=model,
+                sync_days=sync_days,
             )
     except (ValueError, FileNotFoundError) as exc:
         console.print(f"[red]{exc}[/red]")
@@ -979,6 +985,19 @@ def bench_cmd(
             f"{e['chunks_per_sec']} chunks/sec — {e['ms_per_chunk']:.3f} ms/chunk "
             f"at batch {e['batch']}"
         )
+
+    sync = report.get("sync", {}).get("summary", {})
+    if sync.get("runs"):
+        console.print(
+            f"Ingest [bold]{sync['docs_per_min']} docs/min[/bold] over {sync['runs']} real "
+            f"sync run(s) in the last {sync['window_days']}d ({sync['documents']} documents) — "
+            "read from history, not re-run"
+        )
+        for src, s in sync["per_source"].items():
+            console.print(f"  [dim]{src}: {s['docs_per_min']} docs/min "
+                          f"({s['samples']} run(s))[/dim]")
+    elif sync.get("note"):
+        console.print(f"[dim]Ingest throughput: {sync['note']}[/dim]")
 
     if agent and "agent" in report:
         a = report["agent"]["summary"]

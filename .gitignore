@@ -36,3 +36,8 @@ evals/
 # had silently never been committed since the initial commit). Un-ignore it explicitly.
 !docs/evals/
 !docs/evals/**
+
+# Claude Code's relocated per-user data dir (session history, memory,
+# settings, credentials, plugins) — see scripts/relocate-claude-config.ps1.
+# This holds real credentials; it must never be committed.
+.claude-home/

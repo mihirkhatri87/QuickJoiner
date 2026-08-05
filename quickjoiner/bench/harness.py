@@ -36,7 +36,7 @@ import json
 import statistics
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import yaml
@@ -355,9 +355,70 @@ def compare_reports(old: dict, new: dict) -> dict:
 
 # -- full run ----------------------------------------------------------------------
 
+def run_sync_bench(ctx, days: int = 7) -> dict:
+    """Ingest throughput (documents/minute) read from the sync history already in
+    `sync_events` — never by running a sync.
+
+    Benching ingestion by *performing* one would need a connector, its credentials and its
+    remote's mood on the day, which measures the network more than the pipeline; and a
+    synthetic sync measures a fixture. The real runs are already recorded with their start,
+    end and document count, so this reads them. Partial runs (stopped/errored) count: they
+    ingested real documents for a real duration, and excluding them would systematically
+    drop exactly the long crawls whose throughput matters most.
+
+    Honest about thin data rather than confident about noise: a source with no finished run
+    in the window reports no rate at all instead of a zero, and `samples` rides beside every
+    figure so a 1-run "median" can't be read as a trend.
+    """
+    since = (datetime.now(timezone.utc) - timedelta(days=max(1, days))).isoformat()
+    try:
+        events = ctx.catalog.list_sync_events(since, limit=500)
+    except Exception:  # history is an observability nicety; never fail a bench on it
+        return {"runs": 0, "note": "sync history unavailable"}
+
+    per_source: dict[str, list[float]] = {}
+    runs = 0
+    docs_total = 0
+    seconds_total = 0.0
+    for e in events:
+        if e["kind"] != "sync" or not e["ended_at"]:
+            continue
+        stats = json.loads(e["stats_json"]) if e["stats_json"] else {}
+        docs = stats.get("ingested")
+        if not docs:  # nothing ingested, or a run predating ingested-in-stats
+            continue
+        try:
+            elapsed = ((datetime.fromisoformat(e["ended_at"])
+                        - datetime.fromisoformat(e["started_at"])).total_seconds())
+        except (ValueError, TypeError):
+            continue
+        if elapsed < 1.0:  # too short to divide by meaningfully
+            continue
+        runs += 1
+        docs_total += docs
+        seconds_total += elapsed
+        per_source.setdefault(e["source"], []).append(docs / (elapsed / 60.0))
+
+    if not runs:
+        return {"runs": 0, "window_days": days,
+                "note": ("no completed sync runs with a document count in the window — "
+                         "run a sync, or widen --sync-days")}
+    return {
+        "runs": runs,
+        "window_days": days,
+        "documents": docs_total,
+        "docs_per_min": round(docs_total / (seconds_total / 60.0), 2),
+        "per_source": {
+            src: {"docs_per_min": round(statistics.median(rates), 2), "samples": len(rates)}
+            for src, rates in sorted(per_source.items())
+        },
+    }
+
+
 def run_bench(ctx, pack_path: Path | str, agent_layer: bool = False, repeats: int = 3,
               warmup: int = 1, agent=None, provider_override: str | None = None,
-              model_override: str | None = None, embed: bool = True) -> dict:
+              model_override: str | None = None, embed: bool = True,
+              sync_days: int = 7) -> dict:
     """Run the bench pack; save and return the JSON report."""
     from dataclasses import asdict
 
@@ -392,6 +453,9 @@ def run_bench(ctx, pack_path: Path | str, agent_layer: bool = False, repeats: in
     }
     if embed:
         report["embed"] = {"summary": run_embed_bench(ctx, repeats=repeats, warmup=warmup)}
+    # Ingest throughput, read from the sync history rather than measured by running one —
+    # always included because it costs one indexed query and closes S1's other half.
+    report["sync"] = {"summary": run_sync_bench(ctx, days=sync_days)}
     if agent_layer:
         agent_timings = run_agent_bench(ctx, queries, agent, provider_override, model_override)
         report["agent"] = {

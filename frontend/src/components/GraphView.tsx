@@ -66,7 +66,18 @@ function mergeGraphData(base: GraphData | null, incoming: GraphData): { merged: 
     const k = edgeKey(e);
     if (!edgeMap.has(k)) edgeMap.set(k, e);
   }
-  return { merged: { nodes: [...nodeMap.values()], edges: [...edgeMap.values()] }, addedIds };
+  // Totals survive a merge: expanding a neighbourhood adds to the view but does not make
+  // it the whole graph, so the denominator it is a sample OF is still the right one.
+  const totals = incoming.totals ?? base?.totals;
+  return {
+    merged: {
+      nodes: [...nodeMap.values()],
+      edges: [...edgeMap.values()],
+      totals,
+      truncated: totals ? [...edgeMap.values()].length < totals.edges : undefined,
+    },
+    addedIds,
+  };
 }
 
 type DragState =
@@ -756,6 +767,13 @@ export function GraphView() {
   const hoveredNode = hovered ? layoutRef.current.byId.get(hovered) : undefined;
   const drawnHint =
     lod.nodes.length < filtered.nodes.length ? ` · ${lod.nodes.length} in view` : "";
+  // The server samples a connected core out of a graph far too large to draw. Saying so —
+  // with the real denominator — is the difference between "this is the organization" and
+  // "this is a readable slice of it".
+  const sampledHint =
+    data?.truncated && data.totals
+      ? ` · sample of ${data.totals.edges.toLocaleString()}`
+      : "";
 
   return (
     <div className="flex min-h-0 flex-1">
@@ -796,7 +814,7 @@ export function GraphView() {
           </button>
           <span className="ml-auto font-mono text-[10.5px] uppercase tracking-[0.14em] text-faint">
             {data
-              ? `${filtered.nodes.length}/${data.nodes.length} entities · ${filtered.links.length}/${data.edges.length} relationships${drawnHint}`
+              ? `${filtered.nodes.length}/${data.nodes.length} entities · ${filtered.links.length}/${data.edges.length} relationships${drawnHint}${sampledHint}`
               : ""}
           </span>
         </div>

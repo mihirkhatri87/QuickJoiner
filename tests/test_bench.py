@@ -234,3 +234,68 @@ def test_resolve_entity_name_lookup_is_indexed_not_a_table_scan(catalog):
     assert catalog.resolve_entity("appriver.NAUTICAL.models")["id"] == "repo:appriver.nautical.models"
     assert catalog.resolve_entity("nautical models")["id"] == "repo:appriver.nautical.models"
     assert catalog.resolve_entity("no such thing") is None
+
+
+# ---------------------------------------------------------- sync throughput (S1)
+
+@pytest.fixture
+def bench_ctx(catalog, workspace):
+    """Minimal context for the sync layer: it reads the catalog's history and nothing else."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(catalog=catalog, workspace=workspace)
+
+
+def _sync_event(catalog, job_id, source, started, ended, ingested, kind="sync", state="done"):
+    catalog.record_sync_event(job_id, source, state, False, started, ended,
+                              {"ingested": ingested} if ingested is not None else None,
+                              None, kind)
+
+
+def test_sync_bench_reads_throughput_from_real_run_history(bench_ctx):
+    """Ingest throughput is READ from `sync_events`, never measured by running a sync — a
+    real sync would benchmark the remote's mood and a synthetic one would benchmark a
+    fixture."""
+    from datetime import datetime, timedelta, timezone
+
+    from quickjoiner.bench.harness import run_sync_bench
+
+    now = datetime.now(timezone.utc)
+    # 120 documents in 2 minutes = 60 docs/min.
+    _sync_event(bench_ctx.catalog, "s1", "Repo A",
+                (now - timedelta(hours=1)).isoformat(),
+                (now - timedelta(hours=1) + timedelta(minutes=2)).isoformat(), 120)
+    # 30 documents in 30 seconds = 60 docs/min, from a run someone STOPPED — it still did
+    # real work for a real duration, and excluding it would drop exactly the long crawls.
+    _sync_event(bench_ctx.catalog, "s2", "Repo B",
+                (now - timedelta(hours=2)).isoformat(),
+                (now - timedelta(hours=2) + timedelta(seconds=30)).isoformat(), 30,
+                state="stopped")
+
+    out = run_sync_bench(bench_ctx, days=7)
+    assert out["runs"] == 2
+    assert out["documents"] == 150
+    assert out["docs_per_min"] == 60.0
+    assert out["per_source"]["Repo A"] == {"docs_per_min": 60.0, "samples": 1}
+
+
+def test_sync_bench_says_so_rather_than_reporting_a_fake_zero(bench_ctx):
+    from quickjoiner.bench.harness import run_sync_bench
+
+    out = run_sync_bench(bench_ctx, days=7)
+    assert out["runs"] == 0 and "no completed sync runs" in out["note"]
+    assert "docs_per_min" not in out  # never a zero that reads as a measurement
+
+
+def test_sync_bench_ignores_cleanups_unfinished_and_instant_runs(bench_ctx):
+    from datetime import datetime, timedelta, timezone
+
+    from quickjoiner.bench.harness import run_sync_bench
+
+    now = datetime.now(timezone.utc)
+    base = (now - timedelta(minutes=30)).isoformat()
+    _sync_event(bench_ctx.catalog, "c1", "X", base,
+                (now - timedelta(minutes=29)).isoformat(), 500, kind="cleanup")
+    _sync_event(bench_ctx.catalog, "u1", "Y", base, None, 500)          # still running
+    _sync_event(bench_ctx.catalog, "z1", "Z", base, base, 500)          # 0s — undividable
+    assert run_sync_bench(bench_ctx, days=7)["runs"] == 0

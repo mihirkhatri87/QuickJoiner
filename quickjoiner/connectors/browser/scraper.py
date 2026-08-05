@@ -53,6 +53,7 @@ from bs4 import BeautifulSoup
 from quickjoiner.connectors.base import ConnectionStatus, Connector, Document, Mode
 from quickjoiner.connectors.browser.session import DESKTOP_UA
 from quickjoiner.connectors.registry import register
+from quickjoiner.ingest.extract import render_html_table
 
 DROP_TAGS = ["script", "style", "nav", "footer", "header", "aside", "form"]
 DEFAULT_MAX_PAGES = 30
@@ -147,6 +148,43 @@ def page_title(url: str, region, site_title: str) -> str:
     return heading or site_title or url
 
 
+# Text that means "this is the server telling you it failed", not content. Every entry is
+# framework boilerplate a real page would have no reason to contain verbatim — ASP.NET Core's
+# Error.cshtml, classic ASP.NET's yellow screen, IIS/nginx/Apache status pages.
+_ERROR_MARKERS = (
+    "an error occurred while processing your request",
+    "server error in '/' application",
+    "runtime error",
+    "internal server error",
+    "service unavailable",
+    "http error 5",
+    "500 - ",
+    "503 - ",
+    "the page cannot be displayed",
+    "this page isn't working",
+)
+# An error page is short by construction — it has no content, that is the point. A genuine
+# page *about* error handling (a runbook, an API's error-code reference) has substance, so
+# requiring both a marker and brevity makes a false positive need to be an error page.
+_ERROR_MAX_CHARS = 1500
+
+
+def looks_like_error_page(text: str, title: str = "") -> bool:
+    """Whether a fetched page is a server error rather than content (pure, so testable).
+
+    Deliberately stricter than `session.looks_like_login`, which only ever *reports*: this
+    one SKIPS, and a false positive silently drops a real page. So it needs a framework
+    boilerplate marker AND the brevity that makes a page contentless — and the crawl reports
+    what it skipped, so an over-eager rule shows up as a suspicious count rather than as a
+    thin corpus nobody questions.
+    """
+    body = (text or "").strip()
+    if len(body) > _ERROR_MAX_CHARS:
+        return False
+    blob = f"{title}\n{body}".lower()
+    return any(marker in blob for marker in _ERROR_MARKERS)
+
+
 def page_document(url: str, html: str) -> Document | None:
     """Extract readable text from a page; None if there is nothing worth keeping."""
     soup = BeautifulSoup(html, "html.parser")
@@ -156,6 +194,15 @@ def page_document(url: str, html: str) -> Document | None:
     for tag in soup(DROP_TAGS):
         tag.decompose()
     main = soup.find("main") or soup.find("article") or soup
+    # Tables are rendered as markdown pipe rows rather than flattened, for the reasons in
+    # ingest/extract.py: get_text() puts every cell on its own line, which loses the column
+    # a value belonged to and silently DROPS a blank cell, shifting the rest of the row.
+    # Reusing that renderer keeps one implementation — this crawler does its own extraction
+    # (it has already stripped DROP_TAGS and picked a content region), so without this call
+    # the table work would reach every source except the scraped pages that motivated it.
+    for table in main.find_all("table"):
+        if table.find("table") is None:  # leaf tables only; a wrapper is page layout
+            table.replace_with("\n" + render_html_table(table) + "\n")
     text = "\n".join(line.strip() for line in main.get_text("\n").splitlines() if line.strip())
     if len(text) < 80:  # navigation shells, login redirects, empty pages
         return None
@@ -480,6 +527,12 @@ class WebScrapeConnector(Connector):
         # render the same empty result list — 23 of one crawl's 200-page budget.
         seen_text: set[str] = set()
         duplicates = 0
+        # A server error page is not content, but it fetches with a 200 on plenty of apps
+        # (ASP.NET Core renders Error.cshtml in-place), so nothing upstream rejects it.
+        # Measured on a real crawl: 363 of 728 ingested documents were the identical
+        # "An error occurred while processing your request" page — answerable and citable.
+        errors = 0
+        first_error = ""
         while queue and len(visited) < budget:
             url, depth = queue.pop(0)
             if url in visited:
@@ -506,6 +559,10 @@ class WebScrapeConnector(Connector):
             if not html:
                 continue
             doc = page_document(url, html)
+            if doc and looks_like_error_page(doc.text, doc.title):
+                errors += 1
+                first_error = first_error or url
+                doc = None  # still follow its links: the page failed, the site did not
             if doc:
                 digest = hashlib.sha256(doc.text.encode("utf-8", errors="replace")).hexdigest()
                 if digest in seen_text:
@@ -524,6 +581,14 @@ class WebScrapeConnector(Connector):
         # identical-looking pages looks like a broken crawler rather than a filtered site.
         if duplicates:
             self._stage(f"skipped {duplicates} page(s) whose content duplicated another URL")
+        if errors:
+            # Named, never silent: a crawl that quietly drops half its pages is
+            # indistinguishable from a thin site, and this count is the signal that the
+            # site is erroring — or that the rule above is too eager.
+            self._stage(
+                f"⚠ skipped {errors} page(s) that returned a server error rather than "
+                f"content (first: {first_error})"
+            )
         if queue and len(visited) >= budget:
             self._stage(
                 f"⚠ stopped at the {budget}-page limit with {len(queue)} link(s) still queued — "

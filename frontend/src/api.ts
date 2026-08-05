@@ -105,11 +105,14 @@ export const api = {
       body: JSON.stringify({ role }),
     }),
 
-  learn: (fact: string, topic?: string) =>
+  // `share` opts a taught fact into the commons. Default false = private to the teacher
+  // (knowledge scopes) — a note taught in passing must not become citable org truth for
+  // everyone. In open mode / signed out there is no owner, so everything stays commons.
+  learn: (fact: string, topic?: string, share = false) =>
     req<{ result: string }>("/api/learn", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ fact, topic: topic ?? null }),
+      body: JSON.stringify({ fact, topic: topic ?? null, share }),
     }),
 
   // Upload documents straight into learned memory via the rolling Uploads connector. This is

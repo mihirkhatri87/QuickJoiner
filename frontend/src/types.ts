@@ -294,6 +294,11 @@ export interface GraphData {
   nodes: GraphNode[];
   edges: GraphEdge[];
   entity?: GraphNode; // present when the snapshot is focused on one entity
+  // How big the graph actually is. A whole-graph view can only ever draw a fraction of a
+  // real one (400 of 109,003 edges on a live corpus), so the denominator ships with the
+  // sample — otherwise the fraction reads as the entire organization.
+  totals?: { edges: number; entities: number };
+  truncated?: boolean;
 }
 export interface EntitySearchResult {
   id: string;

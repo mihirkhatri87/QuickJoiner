@@ -145,27 +145,91 @@ class SearchScope:
     genuinely does less work rather than retrieving everything and discarding most of it.
     Empty (the default) means the whole corpus — the unscoped behaviour, untouched.
 
-    `source_ids` and `doc_ids` are OR-ed: "this connector, plus these specific documents".
-    A tag is resolved to those two by `catalog.resolve_scope` before it reaches a store, so
-    stores never need to know what a label is.
+    Two INDEPENDENT dimensions, and the difference matters:
+
+    * `source_ids`/`doc_ids` are what the user **picked** ("ask within the Zix deck"). They
+      are OR-ed with each other, and picking nothing means the whole corpus. A tag is
+      resolved to those two by `catalog.resolve_scope` before it reaches a store, so stores
+      never need to know what a label is.
+    * `visible_source_ids` is what the acting user is **allowed** to read (knowledge scopes).
+      It is AND-ed over the picks and is never widened by picking nothing — `None` means "no
+      visibility restriction" (open mode / single user), while `[]` means this user may read
+      nothing and must therefore match no row. A picker scope naming a source the user cannot
+      see yields no hits rather than an error: the two dimensions compose, they don't argue.
     """
 
     source_ids: list[str] = field(default_factory=list)
     doc_ids: list[str] = field(default_factory=list)
+    visible_source_ids: list[str] | None = None
+
+    def has_picks(self) -> bool:
+        """Did the user narrow this question themselves? Distinct from `is_empty` because a
+        visibility-only scope filters memory but must NOT read as a picker selection (it
+        would otherwise strip the live connector tools the user never excluded)."""
+        return bool(self.source_ids or self.doc_ids)
 
     def is_empty(self) -> bool:
-        return not self.source_ids and not self.doc_ids
+        """No filtering of any kind — the unscoped fast path."""
+        return not self.has_picks() and self.visible_source_ids is None
 
     def matches(self, source_id: str, doc_id: str) -> bool:
         """Python-side twin of the SQL predicate — used by the FTS leg's safety net and by
         tests, so both engines and both legs agree on one definition of 'in scope'."""
-        return self.is_empty() or source_id in self.source_ids or doc_id in self.doc_ids
+        if self.visible_source_ids is not None and source_id not in self.visible_source_ids:
+            return False
+        return not self.has_picks() or source_id in self.source_ids or doc_id in self.doc_ids
+
+    def predicate_groups(self) -> list[list[tuple[str, list[str]]]]:
+        """The predicate as AND-ed groups of OR-ed `(column, values)` terms.
+
+        The single structural definition every backend renders — LanceDB inline SQL, the FTS
+        sidecar's `?` params and pgvector's `= ANY(%s)` differ only in how they spell a list,
+        never in what the filter means. A group whose values are empty is an unsatisfiable
+        term (`visible_source_ids=[]`), which each renderer must turn into a false predicate
+        rather than the invalid `IN ()`.
+        """
+        groups: list[list[tuple[str, list[str]]]] = []
+        if self.has_picks():
+            picked: list[tuple[str, list[str]]] = []
+            if self.source_ids:
+                picked.append(("source_id", list(self.source_ids)))
+            if self.doc_ids:
+                picked.append(("doc_id", list(self.doc_ids)))
+            groups.append(picked)
+        if self.visible_source_ids is not None:
+            groups.append([("source_id", list(self.visible_source_ids))])
+        return groups
+
+    def narrowed_to(self, visible_source_ids: "list[str] | None") -> "SearchScope":
+        """This scope restricted to what a user may read. `None` leaves it untouched."""
+        if visible_source_ids is None:
+            return self
+        return SearchScope(
+            source_ids=list(self.source_ids),
+            doc_ids=list(self.doc_ids),
+            visible_source_ids=list(visible_source_ids),
+        )
 
 
 def _sql_list(values: list[str]) -> str:
     """Quote a list for a LanceDB SQL `IN (...)`. Source ids embed a user-chosen connector
     name, so a stray quote must be escaped rather than trusted into the predicate."""
     return ", ".join("'" + str(v).replace("'", "''") + "'" for v in values)
+
+
+def _scope_clause_inline(scope: "SearchScope | None") -> str:
+    """`SearchScope` -> a LanceDB SQL clause (empty when nothing is filtered).
+
+    An empty value list renders `1 = 0`, never `IN ()`: a user who may read nothing must
+    match no row, and the invalid-SQL spelling of that would fail the search open.
+    """
+    if scope is None or scope.is_empty():
+        return ""
+    groups = []
+    for group in scope.predicate_groups():
+        terms = [f"{col} IN ({_sql_list(vals)})" if vals else "1 = 0" for col, vals in group]
+        groups.append("(" + " OR ".join(terms) + ")" if terms else "(1 = 0)")
+    return " AND ".join(groups)
 
 
 class KnowledgeStore:
@@ -516,13 +580,9 @@ class KnowledgeStore:
         clauses = []
         if id_filter:
             clauses.append(f"id IN ({_sql_list(id_filter)})")
-        if scope is not None and not scope.is_empty():
-            parts = []
-            if scope.source_ids:
-                parts.append(f"source_id IN ({_sql_list(scope.source_ids)})")
-            if scope.doc_ids:
-                parts.append(f"doc_id IN ({_sql_list(scope.doc_ids)})")
-            clauses.append("(" + " OR ".join(parts) + ")")
+        scope_clause = _scope_clause_inline(scope)
+        if scope_clause:
+            clauses.append(scope_clause)
         if clauses:
             # prefilter=True: the predicate runs BEFORE the ANN search, so a scoped question
             # searches a smaller space rather than retrieving broadly and discarding.
@@ -568,14 +628,15 @@ class KnowledgeStore:
                        "WHERE chunks_fts MATCH ?")
                 params: list = [match]
                 if scope is not None and not scope.is_empty():
-                    parts = []
-                    if scope.source_ids:
-                        parts.append(f"source_id IN ({','.join('?' * len(scope.source_ids))})")
-                        params.extend(scope.source_ids)
-                    if scope.doc_ids:
-                        parts.append(f"doc_id IN ({','.join('?' * len(scope.doc_ids))})")
-                        params.extend(scope.doc_ids)
-                    sql += " AND (" + " OR ".join(parts) + ")"
+                    for group in scope.predicate_groups():
+                        terms = []
+                        for col, vals in group:
+                            if not vals:
+                                terms.append("1 = 0")
+                                continue
+                            terms.append(f"{col} IN ({','.join('?' * len(vals))})")
+                            params.extend(vals)
+                        sql += " AND (" + (" OR ".join(terms) or "1 = 0") + ")"
                 sql += " ORDER BY rank LIMIT ?"
                 params.append(fetch)
                 with trace.stage("sparse"):

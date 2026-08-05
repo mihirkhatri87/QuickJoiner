@@ -186,11 +186,26 @@ Previously BOTH source copies preceded the install layer, so every edit re-downl
   SQLite + LanceDB files; a `postgres://` DSN ⇒ cloud `PostgresCatalog` (`pg_catalog.py`) +
   `PgVectorStore` (`pg_store.py`). `catalog.py` holds a backend-neutral `_SqlCatalog` base (all SQL,
   `?` placeholders, `ON CONFLICT … excluded` — portable to both engines); `Catalog` is the SQLite
-  adapter, `PostgresCatalog` the psycopg-pool adapter (`?`→`%s`). `base.py` has the `CatalogBackend`/
+  adapter, `PostgresCatalog` the psycopg-pool adapter. Its `_pg` translation escapes **`%`→`%%`
+  first**, then `?`→`%s` (that order, so the markers it writes are not re-escaped): psycopg reads
+  a bare `%` anywhere in the statement — **including inside a `--` comment** — as the start of a
+  placeholder and raises `incomplete placeholder`, which SQLite can never reproduce. Not
+  hypothetical: a `-- 57% degree-1 nodes` comment in `graph_snapshot` broke the whole-graph view
+  on Postgres only (2026-08-04), and that function's own comment had until then *asserted* no
+  literal `%` appears in the catalog SQL. Escaping at this one choke point covers the inline
+  query strings too, which live in method bodies and can't be enumerated — pinned by a pure
+  `test_postgres_placeholder_translation_escapes_percent_signs` in `tests/test_catalog.py` so the
+  next one is caught **without Docker**. Query *values* never pass through here (a LIKE pattern is
+  a bound parameter), so escaping statement text cannot affect a wildcard.
+  `base.py` has the `CatalogBackend`/
   `StoreBackend` Protocols. `PgVectorStore` mirrors `KnowledgeStore` on a pgvector `chunks` table
   (HNSW cosine). Cloud deps are the `cloud` extra; `docker-compose.cloud.yml` runs app+pgvector.
   Postgres path verified by `tests/test_pg_backend.py` (env-gated on `QJ_TEST_DATABASE_URL`,
-  incl. a SQLite-parity retrieval test). `store.py` (LanceDB, cosine; score = 1 − distance;
+  incl. a SQLite-parity retrieval test). ⚠ **It is env-gated, so it only runs when someone points
+  it at a real Postgres — do that whenever Docker is available.** Two defects had accumulated
+  behind that gate by 2026-08-04: the `%` bug above, and a stale test still asserting the
+  pre-2026-07-21 prune semantics (it pruned an unfinished run, which the durable-pause work
+  deliberately stopped). Static review had passed both. `store.py` (LanceDB, cosine; score = 1 − distance;
   **LanceDB disk reclamation, 2026-07-23**: LanceDB is copy-on-write — every `delete`/`add`/upsert
   writes a new table version and leaves the superseded data files + version manifests on disk, and
   **nothing pruned them**, so a workspace grew without bound across syncs / clean re-syncs / connector
@@ -994,6 +1009,29 @@ Previously BOTH source copies preceded the install layer, so every edit re-downl
   their old titles until a clean re-sync. Tests: `tests/test_scraper.py` (canonicalization
   collapse/preserve, host floor vs an over-broad prefix list, content dedupe, `<h1>` preference +
   the brand-heading false positive).
+  **Server error pages are not content (`looks_like_error_page`, 2026-08-04, AI #31).**
+  An ASP.NET Core app renders `Error.cshtml` **in place with a 200**, so nothing upstream
+  rejects it and the page lands as a real, answerable, citable document: measured **363 of
+  728** documents in the live `web_scrape` corpus were the identical *"An error occurred
+  while processing your request"* page. Content dedupe collapses them to one on the next
+  clean re-sync, but one junk document is still one too many, and a crawl that indexes its
+  own failures overstates coverage. Detection is deliberately **stricter than
+  `looks_like_login`** next door, because that one only ever *reports* while this one
+  **skips** and a false positive silently drops a real page: it needs a framework
+  boilerplate marker (`_ERROR_MARKERS` — ASP.NET/IIS/nginx/Apache phrasing a genuine page
+  has no reason to contain verbatim) **AND** brevity (`_ERROR_MAX_CHARS` 1500), so a real
+  runbook or API error-code reference — which has substance — is not mistaken for one. The
+  crawl still **follows a skipped page's links** (the page failed, the site did not) and
+  reports the count plus the first offending URL via `_stage`, per the no-silent-caps rule:
+  an over-eager rule then shows up as a suspicious number rather than as a thin corpus
+  nobody questions. Pure and unit-tested, including both false-positive guards.
+  **Scraped pages preserve tables as markdown rows.** `page_document` does its own
+  extraction (it has already stripped `DROP_TAGS` and picked a content region), so it calls
+  `ingest.extract.render_html_table` on leaf tables directly — without that call the whole
+  table-fidelity fix would reach every source *except* the scraped pages that motivated it.
+  Same two shape rules as the extractor: leaf tables only (a wrapper is page layout), and
+  `get_text()` is never let near a data table, since it drops a blank cell and shifts the
+  rest of the row into the wrong columns.
   Browser hardening lives in `browser/session.py` (`DESKTOP_UA`, `_CONTEXT_OPTS`, `_STEALTH_JS`
   masking `navigator.webdriver`) — applied to both `qj browser login` and headless fetch.
   **Credentialed sites: session-cookie capture + auth-wall detection (2026-07-30, found live
@@ -1335,7 +1373,9 @@ Previously BOTH source copies preceded the install layer, so every edit re-downl
   `catalog.resolve_scope` turns a user's picks into those ids **once, server-side**, so no LLM
   round-trip is spent working out what "the Zix deck" means — and a whole-connector tag
   resolves to a *source_id* rather than enumerating documents, keeping the predicate O(1) in
-  corpus size. `build_agent(scope=…)` additionally **withholds live connector tools for
+  corpus size. (`SearchScope` gained a second, AND-ed `visible_source_ids` dimension in
+  2026-08-04's knowledge-scopes work — see the auth bullet; picking and being permitted are
+  different kinds of narrowing and compose rather than override.) `build_agent(scope=…)` additionally **withholds live connector tools for
   sources outside the scope** (`_scoped_sources`), which is where the saved round-trips
   actually come from: the model cannot call into a system the user excluded. A scoped refusal
   is deliberately worded differently from a global one ("not in the sources you scoped to",
@@ -1366,9 +1406,67 @@ Previously BOTH source copies preceded the install layer, so every edit re-downl
   leaking via 403 — open mode is a no-op since everyone is admin). Connector-specific ops also
   require the source be visible/manageable (reuses `visible`/`can_manage`). Tests:
   `tests/test_rbac.py` (model + lockstep), role gating in `tests/test_auth.py`.
-  (PLANNED, not built: per-user **knowledge scopes** — query-time union of commons + own +
-  shared over the one store, with an ingest-time entity-merge guard and a promotion flow;
-  intake 2026-07-18 → `CLOUD_ROADMAP.md` Y1 workstream 8 / PRD W9.3. Must precede multi-user GA.)
+  **Knowledge scopes — per-user visibility over ONE communal store (2026-08-04, PRIORITIES #1,
+  Cloud Y1.8 / PRD W9.3; the enforcement core — see the roadmap for the two remainders).**
+  Ingested knowledge used to be one flat commons: right for single-user, wrong the moment the
+  OneDrive connector shipped, because a delegated Microsoft 365 token reads exactly what one
+  *person* can read — **including files shared privately with them** — and everything it learned
+  became retrievable and citable by everyone. The connector warned about that in three places;
+  a warning is not a control, and this is the control.
+  **The scope key is the existing `documents.source_id -> sources.owner/shared` chain, so there
+  is no doc-schema change and no migration.** `catalog.visible_source_ids(user)` is the one
+  definition of what a person may read (ownerless commons + shared + own), deliberately over
+  **all** source rows rather than just configured connectors — an ingestion bucket is a source
+  too, and is exactly what has to be filtered once a taught note can be private.
+  `AppContext.visible_source_ids(user)` returns **None** in open mode, which means "no
+  visibility predicate at all", so a single-user workspace's query text is byte-identical to
+  before and pays nothing.
+  **`SearchScope` grew a second, independent dimension** (`visible_source_ids`) beside the
+  picked `source_ids`/`doc_ids`. The two are **AND-ed, never OR-ed** — OR-ing would let naming
+  a source you cannot see escalate into reading it — and visibility is never widened by
+  picking nothing. `None` = unrestricted; `[]` = may read nothing and must match **no** row
+  (the naive spelling of that is `IN ()`, which is invalid SQL and would have failed the
+  filter *open*, so every renderer turns an empty list into an explicit false predicate).
+  `predicate_groups()` is the single structural definition; LanceDB inline SQL, the FTS5
+  sidecar's `?` params and pgvector's `= ANY(%s)` differ only in how they spell a list.
+  `has_picks()` is separate from `is_empty()` on purpose: a visibility-only scope filters
+  memory but must NOT read as a picker selection, or it would strip the live connector tools
+  the user never excluded — and a refusal is worded differently for the two ("not in the
+  sources you scoped to" is a lie when the user scoped nothing).
+  **Retrieval is not the only channel, and the others are where the real leaks were.** All of
+  these now carry `visible_source_ids`: `graph_neighbors` / `graph_relations` / `graph_path` /
+  `graph_path_candidates` / `graph_expand` / `edge_corroboration` / `entity_evidence` /
+  `graph_snapshot` / `graph_totals` (`_evidence_visible`, keyed on the evidence document's
+  source), plus `search_entities` / `bridge_entities` (`_visible_entity_filter`, a correlated
+  EXISTS — **an entity NAME is disclosure on its own**, so filtering edges while autocomplete
+  still completed `person:Mole` would have leaked the interesting half), the gap near-miss
+  probe (the backlog is read by everyone), and `QuestionSuggester.suggest`. Corroboration
+  counts only visible evidence — confidence is shown to a person, and a number they cannot
+  audit is a claim we can't back. Totals are counted over the asker's own graph, since a
+  global denominator both overstates their view and discloses how much is withheld.
+  Two deliberate rules inside `_evidence_visible`: an edge with **no** evidence document
+  survives (a `same_as` bridge is derived from entity names, cites nothing, and dropping every
+  bridge the moment auth is enabled would silently degrade the graph for everyone), while an
+  edge whose evidence row is **missing** is dropped — a visibility filter must fail closed.
+  **`/learn` gained ownership** (`note_source`): a taught fact lands in `notes:<user>`, owned
+  and private, unless `share=true` puts it in the historic `notes:user-taught` commons. A
+  personal note is a separate **source**, not a document flag, so it inherits filtering, graph
+  scoping, cleanup and its own plate for free. Anonymous/open-mode teaching keeps the commons
+  bucket, so every note taught before this stays exactly as readable as it was. Surfaces:
+  `share` on `POST /api/learn`, `--share` on `qj learn`, a `share` argument on the agent's
+  `remember` tool (prompt-instructed to pass it only on an explicit request), and a
+  "Share with everyone" checkbox on the thumbs-down feedback modal.
+  Tests: `tests/test_knowledge_scopes.py` (28 — written as leak tests: the AND-ing, the
+  fail-closed empty list, escalation via picking an unreadable source *or* document, every
+  graph channel, the bridge-vs-dangling-edge split, note ownership, and an end-to-end
+  two-user API test verified to FAIL with the filter disabled) + a Postgres parity test in
+  `tests/test_pg_backend.py` **actually run against pgvector**, not statically reviewed.
+  ⚠ **NOT yet built** (tracked as Cloud Y1.8 remainders): the **ingest-time entity-merge
+  guard** — personal evidence may attach to org entities but must never *trigger* a merge of
+  them, the one pollution filtering can't undo — and the **promotion flow** (personal → org
+  by review, a metadata flip rather than a copy) with its discounted `personal-note` evidence
+  class. Until the merge guard lands, a private document can still influence which entities
+  exist and how they resolve, even though it can no longer be read, cited or enumerated.
 - `quickjoiner/api/` — FastAPI. **OpenAPI/Swagger is grouped + documented** (2026-07-20): the app
   carries a top-level `description` + `openapi_tags`, and every route decorator has `tags=[...]` +
   a plain-English `summary=` (the HTML `/` route is `include_in_schema=False`). 43 endpoints across
@@ -1541,7 +1639,11 @@ Previously BOTH source copies preceded the install layer, so every edit re-downl
   its neighbours / path hops, then by degree), and **re-tile only when the camera lands on a
   new quantised tile** — so panning and zooming are one transform write, not a re-render of
   thousands of elements. What was elided is *stated* ("N in view" in the toolbar), never
-  silently dropped.
+  silently dropped. **Two elisions, two statements** (2026-08-04): the client's LOD says
+  what it isn't *drawing*, and the toolbar additionally says what the **server** never sent
+  ("· sample of 109,003", from the `totals`/`truncated` `/api/graph` now returns). They
+  survive an "expand neighbours" merge — adding to the view doesn't make it the whole graph,
+  so the denominator it is a sample OF is still the right one.
   Consequently **React owns what exists** (which nodes/edges/labels, selection, filters) and
   **the loop owns where it's drawn**: node transforms and edge endpoints are written
   imperatively and never appear in JSX, so a re-render can't fight the animation. Edge widths
@@ -1619,12 +1721,24 @@ Previously BOTH source copies preceded the install layer, so every edit re-downl
   IS a query pack), a JSON report under `<workspace>/bench/`, and a `--compare` that exits
   non-zero on regression. The house rule it serves: no speed work merges without a
   before/after bench table, exactly as no quality work merges without `qj eval --compare`.
-  Three layers: **retrieval** (no LLM, always) — per-stage p50/p95 for embed-query, dense,
+  Four layers: **retrieval** (no LLM, always) — per-stage p50/p95 for embed-query, dense,
   sparse, fuse, sparse-rescore, rerank, gate, plus alias expansion and graph expansion,
   which sit *around* `store.search` on the real `search_memory` path; **embed** (no LLM) —
-  embedder chunks/sec at a realistic batch, the ingest bottleneck S6 must beat; **agent**
+  embedder chunks/sec at a realistic batch, the ingest bottleneck S6 must beat; **sync**
+  (no LLM, always) — see below; **agent**
   (`--agent`, needs an LLM) — time to first token, full-answer time, model rounds, tool
   calls, and tokens per answer incl. cache reads.
+  **Ingest throughput is READ, not run** (`run_sync_bench`, 2026-08-04, closing S1's
+  remainder): docs/min overall and per connector, computed from the runs already recorded in
+  `sync_events` over a `--sync-days` window (default 7). Performing a sync would measure the
+  remote's mood on the day and a synthetic one would measure a fixture, while the honest
+  number for a real pull was already on disk. **Stopped and errored runs count** — they
+  ingested real documents over a real duration, and excluding them would systematically drop
+  exactly the long crawls whose throughput matters most, so `SyncManager` now records
+  `stats["ingested"]` on those paths too (it previously wrote stats only on success, leaving a
+  partial run as a blank history row). Runs under a second are skipped as too short to divide
+  by, and a window with **no** finished run reports that fact rather than a confident zero.
+  Costs one indexed query, so it is always in the report.
   **Measurement seam:** `store.search(trace=SearchTrace())` (both backends + the
   `StoreBackend` Protocol). Opt-in and caller-supplied — nothing in the product passes
   one, so benchmarking cannot change what production does; `trace=None` gets a `NullTrace`
@@ -2848,6 +2962,49 @@ Post-phase additions (2026-07-07, all tested — suite: **89 passed**):
   only fires on ingest, so it needs a clean Plumber re-sync, which will also shed the **363
   ASP.NET error pages** (half that corpus) that predate the crawl-identity dedupe work; and
   **395 `graph_pending` rows** are waiting on `qj drain-graph`.
+- Three backlog items closed, and the Postgres gate finally opened (2026-08-04, working the
+  top of `docs/PRIORITIES.md`). **(1) AI #31 — error pages are no longer ingested as content**
+  (`looks_like_error_page`): an ASP.NET app renders its error page with a 200, so 363 of 728
+  documents in the live crawl were the same failure message, answerable and citable. Detection
+  is deliberately stricter than its `looks_like_login` sibling because this one *skips* rather
+  than reports. **(2) S1's remainder — ingest throughput** (`run_sync_bench` + `--sync-days`),
+  read from the runs already in `sync_events` rather than by performing one; `SyncManager` now
+  records `ingested` on stopped/errored runs too, since a long interrupted crawl is exactly the
+  run whose throughput you want. **(3) FE F0's density budget, server half** — the whole-graph
+  view was spending its budget on edges whose other end it never drew. Measured before changing
+  anything and again after, on the real 109k-edge graph: **656 nodes / 392 edges / 91%
+  degree-1 → 174 / 309 / 40%**, all 14 entity types kept, and 2.3x faster (2058ms → 883ms);
+  `totals` + `truncated` now ship with the sample so the toolbar can say "· sample of 109,003".
+  **The part worth remembering** is what running the env-gated Postgres suite found the moment
+  Docker was available — it had not been run since 2026-07-10, and two defects had accumulated
+  behind the gate. One was a genuine production bug in code that had passed static review: a
+  `-- 57% degree-1` **SQL comment** broke every whole-graph query on Postgres, because psycopg
+  reads a bare `%` anywhere in a statement as a placeholder. The other was a stale test still
+  asserting pre-2026-07-21 prune semantics. Both are now guarded — the `%` escape moved into
+  `_pg` itself (so it covers the inline SQL that cannot be enumerated) with a **pure** test that
+  runs without Docker. Rule of thumb this earns: *"statically reviewed only" on a second backend
+  means untested, and env-gated suites rot silently — run them whenever the gate can be opened.*
+  Suite: **813 passed**, 14 skipped (all 14 pg tests pass when pointed at a real pgvector).
+- Knowledge scopes — the enforcement core (2026-08-04, **PRIORITIES #1**, the item gating
+  multi-user GA). Design and the two deliberate remainders are in the `auth.py` bullet above.
+  Worth keeping from building it: **the retrieval half was already done** (2026-07-25's
+  `SearchScope` filters both hybrid legs on both backends), so the work was almost entirely
+  the *other* channels — the graph, entity autocomplete, corroboration counts, sampled
+  totals, the gaps backlog. Filtering search alone would have produced a feature that looks
+  finished and leaks: an entity NAME mined from a private document is disclosure on its own,
+  and `graph_relations` — the enumeration read — would have been the single most efficient
+  way to dump a private source's relationships.
+  Two design points earned their keep immediately. **Picking and being permitted are
+  different kinds of narrowing**, so they AND rather than share one list; the escalation
+  test (name the private source in the picker) is the one that proves it. And the empty
+  allow-list renders as an explicit false predicate because the obvious spelling, `IN ()`,
+  is invalid SQL — the failure mode would have been failing *open*, silently, for exactly
+  the user who may read nothing.
+  Verified rather than asserted: the end-to-end two-user API test was **run with the filter
+  disabled and confirmed to fail**, and the Postgres parity test was **executed against a
+  real pgvector container**, not statically reviewed — per the rule the previous session
+  earned the hard way. Suite: **841 passed** (+28), 14 skipped; 15/15 pg tests green;
+  frontend typecheck + build green.
 
 ## Next steps (agreed with user)
 
@@ -2866,17 +3023,37 @@ Post-phase additions (2026-07-07, all tested — suite: **89 passed**):
    `Document.metadata["graph"]` from deps.py dependency maps + ticket-key regex over every
    doc (`pipeline.ticket_keys`, stoplisted); edges replaced per evidence doc,
    `delete_document` cascades; `graph_neighbors` agent tool with alias resolution + prompt
-   guidance; `GET /api/graph?entity=&limit=` snapshot; tests/test_graph.py).
+   guidance; `GET /api/graph?entity=&limit=` snapshot — which since 2026-08-04 also carries
+   `totals` + `truncated`, so a caller can state what the sample left out; tests/test_graph.py).
    **`graph_snapshot` whole-graph sampling is TYPE-BALANCED (2026-07-23):** the view can only draw
    ~`limit` (400) of tens of thousands of edges, so it samples — and the sample must be
    representative. A per-src cap alone still front-loads whichever entity type sorts first and is
    numerous: after the GitLab sync the hundreds of `branch:` entities (sorting before every other
    type) consumed the entire 400-edge budget via belongs_to/for_ticket, so the whole graph rendered
    as branches+tickets and hid the services/deps/deploys/code that were fully present (the "graph
-   looks like a subset" report). Fixed by giving each `src_type` an even share (`per_type_cap =
-   limit // n_types`) and round-robining across src within a type — a representative multi-type view
-   (services/repos/deps/deploys/branches/MRs together) at any limit. Portable window-function SQL
-   (both backends); regression-tested (`test_graph_snapshot_balances_across_types_not_one_numerous_type`).
+   looks like a subset" report). Fixed by giving each `src_type` an even share and round-robining
+   across src within a type — a representative multi-type view (services/repos/deps/deploys/
+   branches/MRs together) at any limit.
+   **Extended to a CONNECTED CORE + stated totals (2026-08-04, FE F0's server half):** balancing
+   fixed *which types* appear but not *whether they connect* — edges were picked without regard to
+   whether their other end was also drawn, so the budget filled with dangling leaves and the view
+   read as "nothing is connected" on a graph that is in fact dense. Measured on the live
+   109k-edge graph: 656 nodes for 392 edges, **91% of them degree-1** — a field of stubs. Now the
+   best-connected entities are chosen first, still evenly across types, and only edges with **both
+   ends inside that core** are returned: **174 nodes, 309 edges, 40% degree-1**, with all 14 entity
+   types still represented. The budget is a ceiling, not a target — 309 edges that connect read
+   better than 392 that mostly don't — and it is **2.3x faster besides (2058ms → 883ms)**, since
+   the expensive join now runs against a small id list rather than the whole edge table. The degree ranking is resolved as its **own query** rather than a CTE:
+   SQLite re-evaluates a CTE joined twice (measured 900ms+ on the 109k-edge graph against 92ms to
+   compute the degrees alone), so two indexed steps with the ids passed in is both faster and
+   portable — no engine-specific `MATERIALIZED` hint. `graph_totals()` + a `truncated` flag ship
+   **with** the sample (`/api/graph` passes them straight through; the GraphView toolbar renders
+   "· sample of 109,003") — the same no-silent-caps rule the crawler and graph tools follow, since
+   400 of 109,003 edges returned bare reads as the whole organization. Portable window-function SQL
+   (both backends, and Postgres-verified — see the `%`-escaping note under `pg_catalog` below);
+   regression-tested (`test_graph_snapshot_balances_across_types_not_one_numerous_type`,
+   `…_samples_a_connected_core_not_a_field_of_stubs`, `…_states_what_it_left_out`, plus
+   `test_pg_whole_graph_snapshot_and_relation_enumeration`).
    ~~Phase B~~ DONE 2026-07-11: `graph_path` (undirected BFS, evidence per hop — catalog +
    agent tool + `GET /api/graph/path`); Jira issue docs assert ticket→part_of→project/epic,
    Octopus asserts service entities + service→deploys→environment; React "Knowledge" view

@@ -12,15 +12,40 @@ from quickjoiner.ingest.pipeline import IngestPipeline
 from quickjoiner.llm.base import AgentTool, ToolSpec
 from quickjoiner.memory.catalog import Catalog
 from quickjoiner.memory.expansion import expand_query
-from quickjoiner.memory.store import KnowledgeStore
+from quickjoiner.memory.store import KnowledgeStore, SearchScope
 
 USER_TAUGHT_SOURCE = "notes:user-taught"
 
 
-def teach_fact(catalog: Catalog, pipeline: IngestPipeline, fact: str, topic: str | None = None) -> str:
+def note_source(user: str | None, share: bool) -> tuple[str, str]:
+    """Which note bucket a taught fact lands in: `(source_id, display name)`.
+
+    A personal note is a **separate source**, not a flag on a document, because visibility is
+    keyed on `documents.source_id -> sources.owner/shared` — so one private bucket per user
+    gets filtering, graph scoping, cleanup and the connector plate for free, with no
+    doc-schema change.
+
+    Sharing is opt-in per the knowledge-scopes model: a wrong personal "fact" taught in
+    passing must not become citable org truth for 200 people. Anonymous/open-mode teaching
+    keeps the historic commons bucket, so single-user workspaces are unchanged and every
+    note taught before this existed stays exactly as readable as it was.
+    """
+    if share or not user:
+        return USER_TAUGHT_SOURCE, "User-taught notes"
+    return f"notes:{user}", f"Notes from {user}"
+
+
+def teach_fact(catalog: Catalog, pipeline: IngestPipeline, fact: str, topic: str | None = None,
+               user: str | None = None, share: bool = False) -> str:
     """Store one user-taught fact as a note document. Shared by the agent's
     `remember` tool, `qj learn "<free text>"`, and POST /api/learn."""
-    catalog.upsert_source(USER_TAUGHT_SOURCE, "User-taught notes", "notes")
+    source_id, display = note_source(user, share)
+    catalog.upsert_source(source_id, display, "notes")
+    if source_id != USER_TAUGHT_SOURCE:
+        # upsert_source deliberately preserves ownership (a sync must never reset a source
+        # to commons), so a new personal bucket needs its owner set explicitly — otherwise
+        # it would default to the ownerless commons and the note would be world-readable.
+        catalog.set_source_ownership(source_id, owner=user, shared=False)
     slug = re.sub(r"[^a-z0-9]+", "-", (topic or fact[:40]).lower()).strip("-") or "note"
     # Content-derived (not wall-clock) suffix: keeps the URI stable + unique so the
     # same fact is idempotent, and — since contextual chunking embeds the URI in each
@@ -33,8 +58,9 @@ def teach_fact(catalog: Catalog, pipeline: IngestPipeline, fact: str, topic: str
         text=fact,
         kind="note",
     )
-    stats = pipeline.ingest([doc], USER_TAUGHT_SOURCE)
-    return f"Remembered ({stats.summary()})."
+    stats = pipeline.ingest([doc], source_id)
+    where = "shared with everyone" if source_id == USER_TAUGHT_SOURCE else "private to you"
+    return f"Remembered — {where} ({stats.summary()})."
 
 
 def build_builtin_tools(
@@ -45,17 +71,34 @@ def build_builtin_tools(
     gaps: GapsConfig | None = None,
     score_ledger: dict[str, float] | None = None,
     scope=None,
+    user: str | None = None,
 ) -> list[AgentTool]:
-    """`scope` (memory.store.SearchScope) narrows every memory read for this turn to the
-    connectors/documents the user picked — filtered inside the vector + FTS query, so a
-    scoped question does strictly less work and can't drift onto unrelated sources."""
+    """`scope` (memory.store.SearchScope) narrows every memory read for this turn — to the
+    connectors/documents the user picked, AND to what the acting user is allowed to read
+    (knowledge scopes). Filtered inside the vector + FTS query, so a scoped question does
+    strictly less work and can't drift onto unrelated — or unreadable — sources.
+
+    The two dimensions are deliberately distinguished below: a refusal is worded differently
+    when the USER narrowed the question (`has_picks`) than when visibility did, because the
+    user chose the first and must not be told the second is their doing.
+    """
+    visible = None if scope is None else scope.visible_source_ids
+
     def _capture_gap(query: str) -> None:
         """Log a refusal as a knowledge gap. Fire-and-forget: any failure here must
-        never change what search_memory returns to the agent."""
+        never change what search_memory returns to the agent.
+
+        The near-miss probe carries the visibility filter but NOT the user's picks: a gap is
+        a fact about what the org hasn't learned, so a document the asker simply didn't pick
+        is still a legitimate near miss — while one they may not read must never surface its
+        title here, since the gaps backlog is read by everyone.
+        """
         if not (gaps and gaps.enabled):
             return
         try:
-            near = store.search(query, top_k=3, min_score=0.0)
+            near = store.search(query, top_k=3, min_score=0.0,
+                                scope=SearchScope(visible_source_ids=visible)
+                                if visible is not None else None)
             nearest = [
                 {"source_id": h.source_id, "title": h.title, "score": round(h.score, 4)}
                 for h in near
@@ -73,7 +116,8 @@ def build_builtin_tools(
             return ""
         try:
             related = catalog.graph_expand(
-                list({h.doc_id for h in hits}), retrieval.graph_expansion_limit
+                list({h.doc_id for h in hits}), retrieval.graph_expansion_limit,
+                visible_source_ids=visible,
             )
         except Exception:
             return ""
@@ -100,7 +144,7 @@ def build_builtin_tools(
                             min_score=retrieval.min_score, scope=scope)
         if not hits:
             _capture_gap(query)  # log the user's ORIGINAL query as the gap, not the expanded one
-            if scope is not None and not scope.is_empty():
+            if scope is not None and scope.has_picks():
                 # A scoped refusal is a different fact from a global one, and saying which is
                 # the difference between "we never learned this" and "not in what you picked".
                 return (
@@ -142,8 +186,8 @@ def build_builtin_tools(
         )
         return "\n".join(lines)
 
-    def remember(fact: str, topic: str | None = None) -> str:
-        return teach_fact(catalog, pipeline, fact, topic)
+    def remember(fact: str, topic: str | None = None, share: bool = False) -> str:
+        return teach_fact(catalog, pipeline, fact, topic, user=user, share=share)
 
     def list_sources() -> str:
         sources = catalog.list_sources()
@@ -173,7 +217,8 @@ def build_builtin_tools(
 
     def _hop_score(r) -> float:
         """Server-side confidence for one edge row: evidence shape + corroboration."""
-        c = catalog.edge_corroboration(r["src"], r["rel"], r["dst"])
+        c = catalog.edge_corroboration(r["src"], r["rel"], r["dst"],
+                                       visible_source_ids=visible)
         return score_edge(_evidence_class(r), c["doc_count"], c["source_count"])
 
     def _format_edge(r, flag_weak: bool = False) -> str:
@@ -197,7 +242,7 @@ def build_builtin_tools(
                 f"NO_RESULTS: nothing named {entity!r} in the knowledge graph. "
                 "Try the exact repo/package name or a known alias, or use search_memory."
             )
-        rows = catalog.graph_neighbors(ent["id"])
+        rows = catalog.graph_neighbors(ent["id"], visible_source_ids=visible)
         if not rows:
             return (f"{ent['name']} ({ent['type']}) is known but has no recorded "
                     "relationships yet. Use search_memory for unstructured facts.")
@@ -242,7 +287,8 @@ def build_builtin_tools(
 
     def graph_relations(rel: str, src_type: str | None = None,
                         dst_type: str | None = None) -> str:
-        rows = catalog.graph_relations(rel, src_type, dst_type, limit=_RELATIONS_LIMIT + 1)
+        rows = catalog.graph_relations(rel, src_type, dst_type, limit=_RELATIONS_LIMIT + 1,
+                                       visible_source_ids=visible)
         if not rows:
             filters = ", ".join(
                 f"{k}={v}" for k, v in (("src_type", src_type), ("dst_type", dst_type)) if v
@@ -299,7 +345,8 @@ def build_builtin_tools(
         if ent_a["id"] == ent_b["id"]:
             return f"{ent_a['name']} and {b!r} resolve to the same entity ({ent_a['id']})."
         chains = catalog.graph_path_candidates(ent_a["id"], ent_b["id"], max_hops,
-                                               max_candidates=3)
+                                               max_candidates=3,
+                                               visible_source_ids=visible)
         if not chains:
             retry_hint = (
                 f" Try again with a higher max_hops before concluding that — {max_hops} may "
@@ -384,13 +431,23 @@ def build_builtin_tools(
                 name="remember",
                 description=(
                     "Permanently store a fact the user taught you about the organization "
-                    "(process, convention, person, decision) so future questions can use it."
+                    "(process, convention, person, decision) so future questions can use it. "
+                    "Stored privately to this user by default; pass share=true ONLY when they "
+                    "say it is for everyone, because a shared note becomes citable org truth "
+                    "for every user of the workspace."
                 ),
                 input_schema={
                     "type": "object",
                     "properties": {
                         "fact": {"type": "string", "description": "The fact to remember, self-contained"},
                         "topic": {"type": "string", "description": "Short topic label"},
+                        "share": {
+                            "type": "boolean",
+                            "description": (
+                                "True only if the user explicitly wants everyone in the "
+                                "workspace to be able to read and cite this. Default false."
+                            ),
+                        },
                     },
                     "required": ["fact"],
                 },

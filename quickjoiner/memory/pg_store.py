@@ -155,14 +155,19 @@ class PgVectorStore:
         not after)."""
         if scope is None or scope.is_empty():
             return "", []
-        parts, params = [], []
-        if scope.source_ids:
-            parts.append("source_id = ANY(%s)")
-            params.append(list(scope.source_ids))
-        if scope.doc_ids:
-            parts.append("doc_id = ANY(%s)")
-            params.append(list(scope.doc_ids))
-        return "(" + " OR ".join(parts) + ")", params
+        groups, params = [], []
+        for group in scope.predicate_groups():
+            terms = []
+            for col, vals in group:
+                # An empty list is unsatisfiable, and `= ANY('{}')` is already exactly that
+                # in Postgres — but spell it out so the intent survives a later edit.
+                if not vals:
+                    terms.append("FALSE")
+                    continue
+                terms.append(f"{col} = ANY(%s)")
+                params.append(list(vals))
+            groups.append("(" + (" OR ".join(terms) or "FALSE") + ")")
+        return " AND ".join(groups), params
 
     def search(self, query: str, top_k: int = 8, min_score: float = 0.0,
                scope=None, trace: "NullTrace | None" = None) -> list[SearchHit]:

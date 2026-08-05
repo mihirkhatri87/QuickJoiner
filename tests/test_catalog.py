@@ -87,6 +87,26 @@ def test_sync_events_upsert_list_and_prune(catalog):
     assert len(catalog.list_sync_events("2000-01-01T00:00:00+00:00")) == 2
 
 
+def test_postgres_placeholder_translation_escapes_percent_signs():
+    """The `?` -> `%s` swap must escape any literal `%` in the statement first.
+
+    psycopg reads a bare `%` anywhere in the SQL — a `--` comment included — as the start
+    of a placeholder and raises `incomplete placeholder`, a failure the SQLite adapter can
+    never reproduce. A `-- 57% degree-1 nodes` comment in `graph_snapshot` broke the
+    whole-graph view on Postgres only, and the Postgres suite is env-gated, so this pure
+    test is what catches the next one without Docker. `_pg` is a staticmethod and the
+    module imports psycopg lazily, so this runs anywhere.
+    """
+    from quickjoiner.memory.pg_catalog import PostgresCatalog
+
+    assert PostgresCatalog._pg("SELECT ? -- 57% here") == "SELECT %s -- 57%% here"
+    # The markers this function writes are not themselves re-escaped.
+    assert PostgresCatalog._pg("WHERE a = ? AND b = ?") == "WHERE a = %s AND b = %s"
+    # Escaping at this choke point is what covers the inline query strings too — they live
+    # in method bodies and cannot be enumerated, which is why the guard belongs here and
+    # not in a scan over the SQL.
+
+
 def test_prune_never_drops_an_unfinished_paused_run(catalog):
     """A deliberately-paused sync (ended_at IS NULL) must survive the retention window so it
     can be resumed after a restart, however long the laptop was closed. list_unfinished_syncs

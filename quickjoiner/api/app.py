@@ -159,6 +159,10 @@ class RoleUpdate(BaseModel):
 class LearnRequest(BaseModel):
     fact: str
     topic: str | None = None
+    # Private to the teacher unless they say otherwise — a note taught in passing must not
+    # silently become citable org truth for everyone (knowledge scopes). Open mode has no
+    # user to own it, so everything stays commons there exactly as before.
+    share: bool = False
 
 
 class UploadLocalRequest(BaseModel):
@@ -1101,22 +1105,35 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
             )
         return rows
 
-    def _resolve_scope(req_scope):
+    def _resolve_scope(req_scope, user: str | None = None):
         """`ScopeRequest` -> `(SearchScope | None, prompt_note)`.
+
+        Two independent narrowings land here and only the first is the user's doing: what
+        they PICKED, and what they are allowed to READ. They are AND-ed (see
+        `SearchScope.narrowed_to`), so picking a source you cannot see returns nothing
+        rather than escalating.
 
         The note matters as much as the filter: a model that doesn't know it is looking at a
         slice will report "not learned" as if it had searched everything. Telling it the
-        scope is what keeps a scoped refusal honest.
+        scope is what keeps a scoped refusal honest. Only the PICKED narrowing is described
+        — a visibility boundary is not the user's choice and telling the model to offer
+        "search everything instead" would promise something it can't deliver.
         """
         from quickjoiner.memory.store import SearchScope
 
+        # NB `allowed`, not `visible` — module-level `visible()` is the per-source predicate
+        # imported from auth, and shadowing it here would be a quiet trap for the next edit.
+        allowed = ctx.visible_source_ids(user)
         if req_scope is None:
-            return None, ""
+            return (None if allowed is None
+                    else SearchScope(visible_source_ids=allowed)), ""
         source_ids, doc_ids = ctx.catalog.resolve_scope(
             req_scope.source_ids, req_scope.tags, req_scope.doc_ids)
-        scope = SearchScope(source_ids=source_ids, doc_ids=doc_ids)
+        scope = SearchScope(source_ids=source_ids, doc_ids=doc_ids).narrowed_to(allowed)
         if scope.is_empty():
             return None, ""
+        if not scope.has_picks():
+            return scope, ""
         described = ", ".join(
             [*(s.split(":", 1)[-1] for s in source_ids),
              *(f"tag '{t}'" for t in req_scope.tags),
@@ -1132,12 +1149,17 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
         return scope, note
 
     def _source_visible(source_id: str, user: str | None) -> bool:
-        """A source_id (`type:name`) is readable if it isn't a configured connector (an
-        ingestion bucket is commons) or its config says this user may see it."""
-        name = source_id.split(":", 1)[-1]
-        cfg = next((s for s in ctx.config.sources if f"{s.type}:{s.name}" == source_id
-                    or s.name == name), None)
-        return cfg is None or visible(cfg, user, auth.enabled)
+        """Is this `type:name` source readable by `user`?
+
+        Was "a configured connector's config decides, and every ingestion bucket is
+        commons" — true until a taught note could be private. Buckets carry real
+        owner/shared columns now, so the catalog's own rule is the single answer for both
+        kinds and this can't drift from what the stores filter on.
+        """
+        allowed = ctx.visible_source_ids(user)
+        if allowed is None:  # open mode — nothing is restricted
+            return True
+        return source_id in allowed
 
     def _labelled(source_id: str, rows: list[dict]) -> list[dict]:
         """Attach each document's applicable labels. Labels are prefix RULES, so they are
@@ -1383,7 +1405,8 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
         fact = req.fact.strip()
         if not fact:
             raise HTTPException(status_code=400, detail="Nothing to learn: empty fact")
-        return {"result": teach_fact(ctx.catalog, ctx.pipeline, fact, req.topic)}
+        return {"result": teach_fact(ctx.catalog, ctx.pipeline, fact, req.topic,
+                                     user=user, share=bool(req.share))}
 
     def _ingest_upload_path(path: Path, progress_cb=None) -> dict:
         """Ingest one file that already lives in the uploads folder into the rolling uploads
@@ -1535,11 +1558,14 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
         return {"resolved": len(req.gap_ids)}
 
     @api.get("/api/suggest", tags=["Ask & search"], summary="Deterministic question-autocomplete suggestions computed live from the knowledge graph — powers the composer typeahead.")
-    def suggest(q: str = "", limit: int = 6):
+    def suggest(q: str = "", limit: int = 6,
+                authorization: str | None = Header(default=None)):
         """Question autocomplete as the user types — keyless/deterministic, drawn
         from the knowledge graph (entity-templated questions), past questions, and
         source-aware starters. Fast enough for per-keystroke use (no LLM)."""
-        return {"suggestions": suggester.suggest(q, limit=max(1, min(limit, 10)))}
+        return {"suggestions": suggester.suggest(
+            q, limit=max(1, min(limit, 10)),
+            visible_source_ids=ctx.visible_source_ids(_user(authorization)))}
 
     @api.post("/api/scrape", tags=["Ask & search"], summary="Crawl a URL into a single cited report WITHOUT ingesting it (learning is explicit). Streams SSE: status / delta / answer / done.")
     def scrape(req: ScrapeRequest, authorization: str | None = Header(default=None)):
@@ -1612,7 +1638,8 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
         return StreamingResponse(stream(), media_type="text/event-stream")
 
     @api.get("/api/graph/path", tags=["Knowledge graph"], summary="Find evidence-cited path(s) between two entities. Surfaces materially different chains with per-chain confidence when they exist.")
-    def graph_path(a: str, b: str, max_hops: int = 3):
+    def graph_path(a: str, b: str, max_hops: int = 3,
+                   authorization: str | None = Header(default=None)):
         """Shortest recorded relationship chain between two entities (alias-resolved),
         each hop with its evidence document. 404 on unknown entity; path=null when
         no chain is recorded within max_hops."""
@@ -1621,7 +1648,10 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
         for raw, ent in ((a, ent_a), (b, ent_b)):
             if ent is None:
                 raise HTTPException(status_code=404, detail=f"No entity {raw!r} in the graph")
-        path = ctx.catalog.graph_path(ent_a["id"], ent_b["id"], max_hops)
+        path = ctx.catalog.graph_path(
+            ent_a["id"], ent_b["id"], max_hops,
+            visible_source_ids=ctx.visible_source_ids(_user(authorization)),
+        )
         def _node(e):
             return {"id": e["id"], "name": e["name"], "type": e["type"]}
         return {"a": _node(ent_a), "b": _node(ent_b),
@@ -1633,17 +1663,20 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
                 ]}
 
     @api.get("/api/graph", tags=["Knowledge graph"], summary="Graph snapshot — the whole graph (capped, fairly sampled across sources) or, with ?entity=, one entity's neighborhood with per-edge evidence.")
-    def graph(entity: str | None = None, limit: int = 400):
+    def graph(entity: str | None = None, limit: int = 400,
+              authorization: str | None = Header(default=None)):
         """Knowledge-graph snapshot: one entity's neighborhood (name/alias/id
         resolved) or the whole graph capped at `limit` edges. Every edge carries
         its evidence document for citations."""
+        visible = ctx.visible_source_ids(_user(authorization))
         if entity:
             ent = ctx.catalog.resolve_entity(entity)
             if ent is None:
                 raise HTTPException(status_code=404, detail=f"No entity {entity!r} in the graph")
             return {"entity": {"id": ent["id"], "name": ent["name"], "type": ent["type"]},
-                    **ctx.catalog.graph_snapshot(ent["id"], limit)}
-        return ctx.catalog.graph_snapshot(None, limit)
+                    **ctx.catalog.graph_snapshot(ent["id"], limit,
+                                                 visible_source_ids=visible)}
+        return ctx.catalog.graph_snapshot(None, limit, visible_source_ids=visible)
 
     @api.get("/api/graph/pending", tags=["Knowledge graph"], summary="How many ingested documents still have unmined relationships (deferred LLM triple extraction that never resolved), broken down by source.")
     def graph_pending(authorization: str | None = Header(default=None)):
@@ -1678,17 +1711,21 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
         return {"job": job.summary()}
 
     @api.get("/api/graph/search", tags=["Knowledge graph"], summary="Entity autocomplete over the graph (name/alias substring, ranked by connectivity).")
-    def graph_search(q: str, limit: int = 10):
+    def graph_search(q: str, limit: int = 10,
+                     authorization: str | None = Header(default=None)):
         """Entity autocomplete for the graph view's search box — substring match
         over names/aliases, not the exact resolve /api/graph does."""
-        return ctx.catalog.search_entities(q, limit)
+        return ctx.catalog.search_entities(
+            q, limit, visible_source_ids=ctx.visible_source_ids(_user(authorization)))
 
     @api.get("/api/graph/bridges", tags=["Knowledge graph"], summary="Entities that bridge multiple sources — the cross-source connective tissue of the evidence graph.")
-    def graph_bridges(limit: int = 20):
+    def graph_bridges(limit: int = 20,
+                      authorization: str | None = Header(default=None)):
         """Entities touched by more than one source's edges — cross-source
         correlation, and a much better "where do I start?" list than a slice of
         the raw graph."""
-        return ctx.catalog.bridge_entities(limit)
+        return ctx.catalog.bridge_entities(
+            limit, visible_source_ids=ctx.visible_source_ids(_user(authorization)))
 
     @api.get("/api/documents/{doc_id}/file", tags=["Briefs & repo docs"], summary="Return the local file content backing a citation, when the source keeps a real checkout (git clone / local files). 404 when there's no local file.")
     def document_file(doc_id: str):
@@ -1713,7 +1750,9 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
         return {"path": str(path), "title": doc["title"], "text": text}
 
     @api.get("/api/search", tags=["Ask & search"], summary="Hybrid semantic + keyword search over learned memory. Returns scored hits with source URIs — the retrieval layer beneath the agent, without an LLM call.")
-    def search(q: str, top_k: int = 8):
+    def search(q: str, top_k: int = 8, authorization: str | None = Header(default=None)):
+        from quickjoiner.memory.store import SearchScope
+
         search_q = q
         if ctx.config.retrieval.alias_expansion:
             try:
@@ -1722,7 +1761,13 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
                 search_q = expand_query(ctx.catalog, q)
             except Exception:  # expansion is best-effort; never break a search on it
                 search_q = q
-        hits = ctx.store.search(search_q, top_k=top_k, min_score=ctx.config.retrieval.min_score)
+        # Same visibility rule as chat: this endpoint returns chunk text, so it would
+        # otherwise be the plain way around every filter the agent path applies.
+        allowed = ctx.visible_source_ids(_user(authorization))
+        hits = ctx.store.search(
+            search_q, top_k=top_k, min_score=ctx.config.retrieval.min_score,
+            scope=None if allowed is None else SearchScope(visible_source_ids=allowed),
+        )
         return [
             {"score": round(h.score, 3), "title": h.title, "uri": h.uri, "kind": h.kind,
              "text": h.text[:500]}
@@ -1904,7 +1949,7 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
                 # Resolve the picked scope (connectors / documents / tags) into the concrete
                 # ids the stores filter on. Done once, server-side, before any search — the
                 # model is never asked to work out what "the Zix deck" means.
-                search_scope, scope_note = _resolve_scope(req.scope)
+                search_scope, scope_note = _resolve_scope(req.scope, user)
                 extra = "\n\n".join(
                     s for s in (manager.system_context(session), att_block, scope_note) if s)
                 # Built inside the worker so provider setup errors (e.g. missing

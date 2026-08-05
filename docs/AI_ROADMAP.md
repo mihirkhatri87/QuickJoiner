@@ -34,7 +34,7 @@ An item listed under a tier below is genuinely unbuilt.
 | Axis | Measured today? | Instruments | Biggest known gap |
 |---|---|---|---|
 | **Quality** (grounded, cited, multi-hop, honest refusal) | ✅ | `qj eval [--agent]`, `--calibrate`, `--compare`, hop_coverage | No per-claim verification at answer time (#13); no temporal model (#11) |
-| **Speed** (latency to first token / full answer / sync) | ✅ **queries**, ❌ sync | `qj bench [--agent] --compare` — per-stage p50/p95, embedder chunks/sec | Rerank is 83% of a query (S4); a real sync's docs/min still isn't benched (S1 remainder) |
+| **Speed** (latency to first token / full answer / sync) | ✅ | `qj bench [--agent] --compare` — per-stage p50/p95, embedder chunks/sec, ingest docs/min | Rerank is 83% of a query (S4). Ingest throughput is read from real run history, so it needs runs in the window to report anything |
 | **Cost** (tokens per answer, LLM calls per sync, index size) | ✅ **per answer** | `qj bench --agent` — tokens/answer + cache-hit rate via `ChatResult.usage` | 22.4k tokens/answer with 0 cache reads on the live backend (S5); index size still unmeasured (S2) |
 
 The first bench run replaced two years of guessing with numbers, and immediately found a
@@ -60,8 +60,20 @@ How each works is documented in `CLAUDE.md` — the source of truth for current 
   tokens per answer; `--compare` is the >20% relative regression gate. Seams added for it:
   `store.search(trace=)` on both backends and `ChatResult.usage`/`TokenUsage` on all three
   providers. Paid for itself on its first run — see the S-track baseline above and the
-  36k-row entity table scan it exposed. Sync throughput is NOT covered; that remainder is
-  listed in the S-track as live work.
+  36k-row entity table scan it exposed. **Completed 2026-08-04** with ingest throughput
+  (docs/min overall and per connector), read from the real runs already recorded in
+  `sync_events` rather than by performing a sync: running one measures the remote's mood on
+  the day and a synthetic one measures a fixture, while the honest number was already on
+  disk. Stopped and errored runs count — they ingested real documents over a real duration,
+  and excluding them would systematically drop the long crawls whose throughput matters
+  most — so `SyncManager` now records `ingested` on those paths too. A window with no
+  finished run reports that, never a zero.
+- **#31 Skip server error pages during a crawl** — `scraper.looks_like_error_page`
+  (2026-08-04). Framework boilerplate markers AND brevity, so a genuine page *about* errors
+  is not dropped; the crawl still follows a failed page's links (the page failed, the site
+  did not) and reports the count it skipped, so an over-eager rule shows as a suspicious
+  number rather than a thin corpus. Trigger: 363 of 728 documents in the live `web_scrape`
+  corpus were the identical ASP.NET error page, ingested as answerable, citable content.
 - **#1 Contextual chunk enrichment** — deterministic breadcrumb form (2026-07-13).
   Remaining upgrade folded into #10.
 - **#3 Threshold calibration per workspace** — `qj eval --calibrate/--apply/--compare` (2026-07-17).
@@ -114,16 +126,6 @@ How each works is documented in `CLAUDE.md` — the source of truth for current 
   mechanism — no new signature concept was needed.)
 
 ### Tier 1 — highest leverage, low risk
-31. **Skip server error pages during a crawl** — *adopt, small.* Found 2026-07-31 while
-   diagnosing the table work: **363 of 728** documents in the live `web_scrape` corpus are
-   the identical ASP.NET *"Error. An error occurred while processing your request"* page,
-   ingested as real, answerable, citable content. The shipped content-dedupe collapses them
-   to one on the next clean re-sync, but one junk document in memory is still one too many,
-   and a crawl that silently indexes its own failures overstates coverage. Detect from
-   content markers and skip — deliberately the same shape as `looks_like_login`
-   (`browser/session.py`), which already solved the sibling problem of a page that returns
-   200 while containing nothing the crawl wanted. Must report the count it skipped, per the
-   no-silent-caps rule, so a broken crawl looks broken rather than thin.
 2. **AST-aware code chunking** (tree-sitter) — *adopt*. Functions/classes as chunk units
    with imports+signature context; symbol manifest feeds the graph. Target: large uplift on
    code questions. Externally validated by **Understand-Anything** (2026-07-23 scan), which
@@ -289,12 +291,6 @@ which rerank 83%, sparse 4%, graph expansion 4%, dense 2%; embedder 112 chunks/s
 agent layer (gpt-oss-120b via litellm) first token 22.3s, full answer 32.7s, 22.4k
 tokens/answer over 3 rounds, **0 cache reads**. Beat those numbers or explain why not.
 
-- **S1 remainder — sync throughput** — *not built*. `qj bench` measures query latency and
-  embedder throughput, not a real sync's docs/min. Deliberately deferred rather than faked:
-  a synthetic sync benchmarks a connector's fixture, not the network-bound reality, and the
-  honest number for a real pull is already recorded per run in `sync_events`. Wire that
-  history into the report (documents ÷ elapsed, per connector) rather than inventing a
-  synthetic sync. Small, and gates S6's before/after claim.
 - **S2 — ANN & vector economy at scale** — *adopt*. IVF tuning past `ann_min_rows`,
   scalar/binary quantization for large corpora, measured on S1 **and** the eval pack
   (gate: zero grounded-recall loss — a faster index that changes the gate's inputs is a

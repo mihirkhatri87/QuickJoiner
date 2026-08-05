@@ -94,7 +94,7 @@ class AppContext:
         ledger: dict[str, float] = {}
         tools = build_builtin_tools(
             self.store, self.catalog, self.pipeline, self.config.retrieval, self.config.gaps,
-            score_ledger=ledger, scope=scope,
+            score_ledger=ledger, scope=scope, user=user,
         )
         tools.extend(build_ops_tools(self))
         tools.extend(self.connector_tools(self._scoped_sources(sources, scope)))
@@ -170,6 +170,21 @@ class AppContext:
 
         enabled = Auth(self.catalog).enabled
         return [s for s in self.config.sources if visible(s, user, enabled)]
+
+    def visible_source_ids(self, user: str | None) -> list[str] | None:
+        """The source ids `user` may READ, or None when nothing is restricted.
+
+        None is the open-mode / single-user answer and means "apply no visibility filter at
+        all" — distinct from `[]`, which means this user may read nothing. Every memory read
+        narrows its scope through this (see `SearchScope.narrowed_to`), so a private source's
+        documents stop being retrievable, citable and graph-reachable for everyone else
+        rather than merely being hidden from the connector list.
+        """
+        from quickjoiner.auth import Auth
+
+        if not Auth(self.catalog).enabled:
+            return None
+        return self.catalog.visible_source_ids(user)
 
 
 def _make_triple_extractor(config: Config):

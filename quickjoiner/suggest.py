@@ -223,7 +223,15 @@ class QuestionSuggester:
     def __init__(self, catalog: Any):
         self.catalog = catalog
 
-    def suggest(self, prefix: str, limit: int = 6) -> list[str]:
+    def suggest(self, prefix: str, limit: int = 6,
+                visible_source_ids: "list[str] | None" = None) -> list[str]:
+        """`visible_source_ids` is the acting user's knowledge scope (None = unrestricted).
+
+        Autocomplete offers ENTITY NAMES, so it is a disclosure surface in its own right: a
+        service or person mined only from a document you may not read must not be completed
+        for you. Past questions are deliberately NOT filtered — a gap is a question someone
+        asked and the org hasn't answered, which is shared knowledge-debt, not content.
+        """
         prefix = (prefix or "").strip()
         p = prefix.lower()
         if not prefix:
@@ -248,14 +256,15 @@ class QuestionSuggester:
                 candidates.append((s, _P_STARTER_OTHER, 0.0))
 
         # 3) Entity-templated questions for whatever noun the user is naming.
-        for text, score in self._entity_templated(prefix):
+        for text, score in self._entity_templated(prefix, visible_source_ids):
             candidates.append((text, _P_ENTITY, score))
 
         return rank_suggestions(prefix, candidates, limit)
 
     # -- candidate sources ----------------------------------------------------
 
-    def _entity_templated(self, prefix: str) -> list[tuple[str, float]]:
+    def _entity_templated(self, prefix: str,
+                          visible_source_ids: "list[str] | None" = None) -> list[tuple[str, float]]:
         needles = extract_needle_tokens(prefix)
         if not needles:
             return []
@@ -263,6 +272,11 @@ class QuestionSuggester:
         merged: dict[str, dict] = {}
         for tok in needles:
             try:
+                hits = self.catalog.search_entities(
+                    tok, limit=8, visible_source_ids=visible_source_ids)
+            except TypeError:
+                # A catalog stub predating the knowledge-scope parameter (tests use small
+                # fakes). Unrestricted is the pre-scope behaviour, so degrade to it.
                 hits = self.catalog.search_entities(tok, limit=8)
             except Exception:
                 hits = []

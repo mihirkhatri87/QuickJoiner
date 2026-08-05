@@ -18,6 +18,15 @@ labelling (`DocumentsModal`), and a **scope chip** in the composer (`ScopePicker
 limits a question to chosen connectors/tags/documents — resolved client-side into ids so
 scoping costs no LLM round-trip.
 
+And (2026-08-04) the **density budget**, both halves. The client half (2026-07-24) draws only
+what is in view and says "N in view"; the server half now picks a **connected core** — the
+best-connected entities, evenly across entity types — and returns only edges with *both* ends
+inside it, instead of spending the budget on edges whose other end is never drawn. Measured on
+the live 109k-edge graph: **91% → 40% degree-1 nodes** (656 nodes/392 edges → 174/309, all 14
+entity types kept), and 2.3x faster. `/api/graph` ships `totals` + `truncated` with the sample and the
+toolbar reads "· sample of 109,003", so a fraction of a graph can no longer read as the whole
+organization.
+
 Debt, named:
 1. **Zero automated FE tests** (the pan-crash bug proved the cost).
 2. All server state is hand-rolled `useState` + fetch in `App.tsx` (~450 lines) — no cache,
@@ -47,14 +56,6 @@ Debt, named:
   the canvas must never blank the app again (learned that live).
 - **CI**: typecheck + lint (eslint@ts, prettier) + vitest + Playwright smoke on PR; build
   artifact uploaded.
-- **GraphView density budget — server half still open.** `/api/graph?limit=400` divides its
-  budget evenly across distinct source entities, so a big graph arrives as stubs: on the live
-  AppRiver workspace (1,571 source entities) that is a **5-edge cap per node, ~2.8% of 14,172
-  edges**, which reads as "nothing is connected" on a graph that is in fact dense. Still to do:
-  make the *API* budget adaptive (raise the default; scale the per-entity cap with
-  viewport/zoom) and say what the API elided ("showing 400 of 14,172 edges"). The client half
-  shipped 2026-07-24 — viewport LOD draws only what is in view and reports "N in view", and
-  entity search/expand already fetch a full neighbourhood and fit the camera to it.
 
 ## Phase F1 — Product hardening (with R3 "Team product")
 
@@ -75,7 +76,7 @@ Debt, named:
 - **Layer-grouped GraphView** (AI #29): color/cluster graph nodes by architectural layer
   (API / Service / Data / UI / Utility / Infra) from the server-supplied entity `layer`
   attribute, so a dense multi-repo graph reads as an architecture rather than a node soup.
-  Builds on F0's density-budget work; the layer is a data attribute, so the canvas/adapter
+  Builds on the shipped density budget; the layer is a data attribute, so the canvas/adapter
   split (rule 3) is preserved — legend + optional per-layer collapse, no renderer-owned logic.
 - **Persona picker + active-persona chip** (AI #30): a persona selector in account/settings
   (new-joiner principal / junior dev / PM / power user) and a small **always-visible chip in

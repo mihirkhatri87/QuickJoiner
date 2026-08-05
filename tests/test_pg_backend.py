@@ -92,6 +92,50 @@ def test_pg_source_ownership_and_buckets(pg):
     assert "git:repo" in rows and "notes:user-taught" in rows  # list_sources shows both
 
 
+def test_pg_knowledge_scopes_filter_identically_to_sqlite(pg):
+    """Knowledge scopes are a SECURITY filter, so "statically reviewed on Postgres" is not
+    good enough — this executes the visibility predicate on the real engine, on every read
+    shape it takes: `IN (...)` over documents, the `EXISTS` entity reachability subquery,
+    and the AND-ed group rendering in `PgVectorStore._scope_sql` (`= ANY(%s)`, which is a
+    different spelling from SQLite's and could diverge silently)."""
+    from quickjoiner.memory.store import SearchScope
+
+    catalog, store = pg
+    catalog.upsert_source("files:handbook", "Handbook", "files")
+    catalog.upsert_source("notes:ada", "Ada's notes", "notes")
+    catalog.set_source_ownership("notes:ada", owner="ada", shared=False)
+    catalog.upsert_document("d-pub", "files:handbook", "u1", "Public", "doc", "h1", None, 1)
+    catalog.upsert_document("d-sec", "notes:ada", "u2", "Private", "doc", "h2", None, 1)
+
+    assert set(catalog.visible_source_ids("ada")) == {"files:handbook", "notes:ada"}
+    assert catalog.visible_source_ids("bob") == ["files:handbook"]
+
+    catalog.upsert_entity("svc:gateway", "gateway", "service")
+    catalog.upsert_entity("person:mole", "Mole", "person")
+    catalog.replace_doc_edges("d-sec", [("person:mole", "works_on", "svc:gateway", "")])
+    assert catalog.graph_neighbors("svc:gateway") != []
+    assert catalog.graph_neighbors("svc:gateway",
+                                   visible_source_ids=["files:handbook"]) == []
+    # A name is disclosure on its own, so entity autocomplete carries the same filter.
+    assert catalog.search_entities("mole") != []
+    assert catalog.search_entities("mole", visible_source_ids=["files:handbook"]) == []
+    assert catalog.graph_totals(["files:handbook"])["edges"] == 0
+
+    for doc_id, source_id in (("d-pub", "files:handbook"), ("d-sec", "notes:ada")):
+        store.upsert_document(doc_id=doc_id, source_id=source_id, uri=f"u://{doc_id}",
+                              title="Gateway routing", kind="doc",
+                              chunks=["the gateway routes mail through securetide"])
+    assert {h.source_id for h in store.search("gateway routes mail", top_k=10)} == \
+        {"files:handbook", "notes:ada"}
+    as_bob = store.search("gateway routes mail", top_k=10,
+                          scope=SearchScope(visible_source_ids=["files:handbook"]))
+    assert as_bob and {h.source_id for h in as_bob} == {"files:handbook"}
+    # Naming an unreadable source in the picker must not escalate into reading it.
+    assert store.search("gateway routes mail", top_k=10,
+                        scope=SearchScope(source_ids=["notes:ada"],
+                                          visible_source_ids=["files:handbook"])) == []
+
+
 def test_pg_users_tokens(pg):
     catalog, _ = pg
     assert catalog.count_users() == 0
@@ -162,6 +206,38 @@ def test_pg_knowledge_graph_roundtrip(pg):
     assert catalog.graph_snapshot()["edges"] == []
 
 
+def test_pg_whole_graph_snapshot_and_relation_enumeration(pg):
+    """The two newest graph reads run the most engine-sensitive SQL in the catalog —
+    `graph_snapshot`'s whole-graph branch (nested window functions over a degree
+    aggregation, then a dynamically-sized `IN (...)` list) and `graph_relations`'
+    optional type constraints. Both are shared `?`-SQL in `_SqlCatalog`, so this is the
+    only place the Postgres half of them is executed at all."""
+    catalog, _ = pg
+    catalog.upsert_document("dt", "web:cat", "u", "Team page", "doc", "h", None, 1)
+    for eid, name, typ in [("team:acadia", "Acadia", "team"), ("person:ann", "Ann", "person"),
+                           ("person:bo", "Bo", "person"), ("repo:api", "api", "repo")]:
+        catalog.upsert_entity(eid, name, typ)
+    catalog.replace_doc_edges("dt", [
+        ("person:ann", "works_on", "team:acadia", ""),
+        ("person:bo", "works_on", "team:acadia", ""),
+        ("team:acadia", "owns", "repo:api", ""),
+    ])
+
+    snap = catalog.graph_snapshot(limit=400)
+    assert {(e["src"], e["rel"], e["dst"]) for e in snap["edges"]} == {
+        ("person:ann", "works_on", "team:acadia"),
+        ("person:bo", "works_on", "team:acadia"),
+        ("team:acadia", "owns", "repo:api"),
+    }
+    # The denominator ships with the sample on both backends, so a caller can say what it left out.
+    assert snap["totals"] == {"edges": 3, "entities": 4} and snap["truncated"] is False
+    assert catalog.graph_snapshot(limit=1)["truncated"] is True
+
+    members = catalog.graph_relations("works_on", src_type="person", dst_type="team")
+    assert [r["src_name"] for r in members] == ["Ann", "Bo"]
+    assert catalog.graph_relations("works_on", src_type="repo") == []  # type constraint bites
+
+
 def test_pg_gaps_roundtrip(pg):
     catalog, _ = pg
     catalog.log_gap("how do we deploy with octopus", 0.31,
@@ -208,7 +284,11 @@ def test_pg_sync_events_roundtrip(pg):
     catalog.record_sync_event("sync-1-abc", "handbook", "done", False, "2026-07-20T10:00:00+00:00",
                               ended_at="2026-07-20T10:04:00+00:00",
                               stats={"added": 3, "updated": 0, "skipped": 1, "chunks": 9, "errors": 0})
-    catalog.record_sync_event("sync-0-old", "handbook", "done", True, "2026-07-01T09:00:00+00:00")
+    # Finished, so prunable. An old run with no `ended_at` is a *paused* one and is kept
+    # however old it gets, so it can still be resumed after a restart — the SQLite suite
+    # pins that separately in `test_prune_never_drops_an_unfinished_paused_run`.
+    catalog.record_sync_event("sync-0-old", "handbook", "done", True, "2026-07-01T09:00:00+00:00",
+                              ended_at="2026-07-01T09:05:00+00:00")
 
     rows = catalog.list_sync_events("2026-07-20T00:00:00+00:00")
     assert len(rows) == 1 and rows[0]["state"] == "done"  # upserted in place, older run filtered out

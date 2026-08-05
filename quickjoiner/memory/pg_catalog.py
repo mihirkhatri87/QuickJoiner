@@ -42,8 +42,20 @@ class PostgresCatalog(_SqlCatalog):
 
     @staticmethod
     def _pg(sql: str) -> str:
-        # No literal '?' or '%' appears in the catalog SQL, so this swap is safe.
-        return sql.replace("?", "%s")
+        """Translate the shared `?`-SQL to psycopg's `%s` form.
+
+        `%` is escaped FIRST (and the `?` swap therefore second, so the `%s` markers this
+        very function writes are not re-escaped). psycopg treats a bare `%` anywhere in the
+        statement — including inside a `--` comment — as the start of a placeholder and
+        raises `incomplete placeholder`, which the SQLite adapter never sees. That is not a
+        hypothetical: a `-- 57% degree-1 nodes` comment in `graph_snapshot`'s query broke
+        the whole-graph view on Postgres only, and it took running these tests against a
+        real Postgres to find, because this comment previously asserted that no literal `%`
+        appears in the catalog SQL. It does now, so the escape is done rather than assumed.
+        Query *values* never pass through here — a LIKE pattern is a bound parameter — so
+        escaping the statement text cannot affect a wildcard.
+        """
+        return sql.replace("%", "%%").replace("?", "%s")
 
     def _write(self, sql: str, params: tuple = ()) -> None:
         with self._pool.connection() as conn:

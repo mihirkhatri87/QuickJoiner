@@ -47,6 +47,19 @@ Workstreams (each is a PR-able epic):
 7. **DR/backup**: PITR on RDS, S3 versioning, weekly restore drill in CI (restore → run
    grounding smoke suite against the restored copy — *backups that answer questions*).
 8. **Knowledge scopes — the personal-layer union** (intake 2026-07-18; also PRD W9.3).
+   **The enforcement core shipped 2026-08-04** — (a) the visibility predicate, (b) graph
+   reads, (d) aliases/suggester/gaps, and (e) `/learn` ownership are all built, tested as
+   leak tests, and verified on both backends; how it works is documented in CLAUDE.md's
+   `auth.py` bullet and README's "Who can read what". **REMAINING here, and both are real:**
+   **(c) the ingest-time merge guard** — personal evidence may attach to org entities but
+   must never *trigger* a merge of them, since a wrong merge rewrites canonical ids globally
+   and is the one pollution filtering cannot undo; a private document today still influences
+   which entities exist and how they resolve, even though nobody else can read, cite or
+   enumerate it. **(f) the promotion flow** — personal → org via review, a metadata flip
+   rather than a copy (the onboarding flywheel), plus a discounted `personal-note` evidence
+   class so personal-vs-org contradictions surface with both citations (invariant I2) instead
+   of being silently averaged. The description below is the original intake, kept for the
+   design rationale.
    **Urgency raised 2026-07-24 by the OneDrive/SharePoint connector** (`PRIORITIES.md` #2):
    it is per-user by construction — a delegated Microsoft 365 token reads exactly what that
    person can read, *including files shared privately with them* — but everything it learns

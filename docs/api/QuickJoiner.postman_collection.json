@@ -510,6 +510,7 @@
         },
         {
           "name": "Teach a fact",
+          "description": "`share` (default false) decides who can read and cite the note. False keeps it private to the signed-in teacher (its own `notes:<user>` source); true teaches the commons, readable and citable by every user of the workspace. In open mode there is no signed-in user to own a note, so everything stays commons regardless.",
           "request": {
             "method": "POST",
             "header": [
@@ -520,7 +521,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"fact\": \"Deployments run through Octopus on Fridays.\"\n}"
+              "raw": "{\n  \"fact\": \"Deployments run through Octopus on Fridays.\",\n  \"share\": false\n}"
             },
             "url": "{{baseUrl}}/api/learn"
           }
