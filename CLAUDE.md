@@ -19,8 +19,8 @@ with citations — or says "I haven't learned that yet."
   answers AND "I haven't learned that yet" refusal. Still no `ANTHROPIC_API_KEY`; scripted-provider
   tests remain the coverage for the Anthropic path. Playwright IS installed (playwright 1.61.0 +
   Chromium 149, verified headless launch 2026-07-07) — `qj browser login` works.
-- **Node for the frontend**: nvm-windows has v22.23.1 but it's NOT on PATH (symlink never
-  activated). Prepend per command: `$env:Path = "$env:LOCALAPPDATA\nvm\v22.23.1;$env:Path"`,
+- **Node for the frontend**: nvm-windows has v22.22.3 but it's NOT on PATH (PATH resolves to
+  an old v16.10.0). Prepend per command: `$env:Path = "$env:APPDATA\nvm\v22.22.3;$env:Path"`,
   then `npm run build` in `frontend/` (slow machine: build ≈ 2–5 min; don't kill it early).
 
 ## Commands
@@ -1675,7 +1675,17 @@ Previously BOTH source copies preceded the install layer, so every edit re-downl
   no side panel; citations are inline superscripts with a native hover tooltip = the source; a
   per-answer **hover toolbar** — download .md, view **cited-sources modal** (also opened by the
   grounded stamp), 👍/👎; 👎 opens a **feedback modal** that teaches the correction via
-  `/api/learn` (`onLearned` refreshes status/gaps); streaming caret), `Rail` (compact fixed-top /
+  `/api/learn` (`onLearned` refreshes status/gaps); streaming caret), plus a **Download
+  conversation** button at the top of the chat pane exporting the whole open conversation to
+  one markdown file — questions, answers, tool calls, candidates, and each turn's **reasoning
+  trace as a collapsible GFM `<details>` block**, with a per-turn sources list whose `[n]`
+  numbering is harvested by re-running the same `CiteBook`/`renderMarkdown` pass the UI renders
+  with (so exported numbers cannot drift from the inline superscripts). **Client-side only, and
+  honest about one limit:** thinking traces are never persisted server-side
+  (`GET /api/sessions/{id}` returns only `role`/`content`), so a reloaded page or a conversation
+  reopened from the Rail exports its Q&A **without** traces — only turns generated live in the
+  current tab carry them. Backend persistence of the trace is a genuine follow-up, not built.
+  `Rail` (compact fixed-top /
   independently-scrolling conversations / pinned-bottom systems layout with `min-h-0`; per-row
   **delete** on hover + **Clear all** in the Conversations header → `DELETE /api/sessions[/{id}]`,
   clear-all confirmed + project-scoped to what's shown; each **Connected systems** row shows a
@@ -3221,6 +3231,23 @@ Post-phase additions (2026-07-07, all tested — suite: **89 passed**):
   (+2), 15 skipped. Not yet verified against the live 334-relationship case that triggered the
   report — the fix is unit-tested (cap skip + the unchanged `graph_relations` 400-row contract),
   not yet observed end-to-end against the real corpus.
+- Whole-conversation markdown export (2026-08-07, user request: "I want the ability to
+  download the entire conversation including thinking trace", plus a follow-up asking for
+  the trace to be collapsible in the md as well). Shipped as a **Download conversation**
+  button in the chat pane — design in the `Chat` frontend bullet above. Worth recording is
+  what scoping the feature turned up: **thinking traces are never persisted anywhere
+  server-side.** They arrive as SSE `thinking` events and live only in the browser tab's
+  `Msg.thinking` state; `get_session` returns only `role`/`content`. So the export is
+  deliberately client-side and states its own limit rather than implying a fidelity it
+  cannot deliver — a reloaded page exports Q&A with no traces. The collapsible ask is met
+  with GFM `<details>`/`<summary>`, which mirrors the in-app disclosure and renders natively
+  in GitHub/VS Code/Obsidian (a plain-text viewer shows the literal tags — inherent to
+  markdown, not worked around). The sources list re-runs the app's own `CiteBook` pass
+  rather than reimplementing citation numbering, so exported `[n]` and inline `[n]` cannot
+  disagree. Frontend-only: no API, schema, or Python change, so Swagger/Postman/Bruno are
+  untouched. Verified by typecheck + build + a real browser export (no frontend unit-test
+  suite exists — manual/Playwright verification is this repo's established practice).
+  Spec: `docs/superpowers/specs/2026-08-07-download-conversation-design.md`.
 
 ## Next steps (agreed with user)
 

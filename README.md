@@ -395,6 +395,12 @@ A React app (Vite + TypeScript + Tailwind) with:
   and 👍/👎 — a 👎 asks what was wrong and **learns the correction into memory**. Refusals are shown
   as "not learned yet". Answers render full markdown (tables, task/nested lists, blockquotes, code,
   links, and live mermaid diagrams).
+- **Download a conversation** — the **Download conversation** button at the top of the chat
+  pane saves the whole exchange as one markdown file: every question and answer, the tools
+  each answer used, its cited sources, and the model's reasoning trace in a collapsible
+  section. Note that reasoning traces are only captured for turns you watched happen in that
+  browser tab — reloading the page or reopening an older conversation exports the questions
+  and answers without them.
 - **Projects and resumable conversations**, with automatic history compression.
 - **Knowledge gaps** — a badge in the rail opens the knowledge-debt backlog (below).
 - **Waypoints** — the interactive knowledge graph view. Drag to pan (throw the pointer and it
