@@ -38,6 +38,16 @@ const REFUSAL = /haven'?t learned|not (yet )?learned|don'?t (yet )?have|no.*(lea
  * view sources, like/dislike → learn from feedback), and the citation superscripts
  * carry native hover tooltips (title=source) — no dedicated side panel. */
 
+/** A fence guaranteed to survive its own content: CommonMark closes a fenced block
+ * only on a run of backticks at least as long as the opener, so a trace that itself
+ * contains ``` needs a longer fence. Without this, an inner run closes the block early
+ * and the trailing fence opens a new one — swallowing the </details> and every later
+ * turn into one unterminated code block. */
+function safeFence(content: string): string {
+  const longest = (content.match(/`+/g) ?? []).reduce((max, run) => Math.max(max, run.length), 0);
+  return "`".repeat(Math.max(3, longest + 1));
+}
+
 /** Derive a context-appropriate .md filename from the answer's first heading/line. */
 function answerFilename(text: string): string {
   const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
@@ -99,12 +109,13 @@ function messageToMarkdown(m: Msg): string {
     // GitHub, VS Code preview, Obsidian. Mirrors the app's own collapsed-by-default
     // reasoning trace. Blank lines around the body are required for the markdown
     // inside to render rather than being treated as raw HTML content.
+    const fence = safeFence(m.thinking);
     out.push("<details>");
     out.push("<summary>Reasoning trace</summary>");
     out.push("");
-    out.push("```");
+    out.push(fence);
     out.push(m.thinking);
-    out.push("```");
+    out.push(fence);
     out.push("");
     out.push("</details>");
     out.push("");
