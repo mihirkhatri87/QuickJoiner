@@ -56,6 +56,127 @@ function downloadMarkdown(text: string) {
   URL.revokeObjectURL(a.href);
 }
 
+/** Filename for a whole-conversation export, slugged from the first question asked. */
+function conversationFilename(messages: Msg[]): string {
+  const first = messages.find((m) => m.role === "user")?.text ?? "";
+  const cleaned = first.replace(/https?:\/\/\S+/g, "").replace(/[*_`~#>[\]()【】]/g, "").trim();
+  const slug = cleaned.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60);
+  return `quickjoiner-conversation${slug ? `-${slug}` : ""}.md`;
+}
+
+/** One message as a markdown section. Optional fields are skipped when absent, so a
+ * plain turn produces no empty headings. Two Msg fields are deliberately NOT exported
+ * because neither is content: `streaming`/`streamText` (in-flight transport state — a
+ * mid-stream turn simply exports whatever text has landed) and `learning` (a transient
+ * ingest progress bar, meaningless in a file). */
+function messageToMarkdown(m: Msg): string {
+  const out: string[] = [];
+
+  if (m.role === "user") {
+    out.push("### Q");
+    out.push("");
+    out.push(m.text ?? "");
+    if (m.attachments?.length) {
+      out.push("");
+      // Filenames only — the bytes may since have been swept by the retention job.
+      out.push(`_Attached: ${m.attachments.map((a) => a.filename).join(", ")}_`);
+    }
+    return out.join("\n");
+  }
+
+  if (m.role === "error") {
+    out.push("### Error");
+    out.push("");
+    out.push(m.text ?? "(unknown error)");
+    return out.join("\n");
+  }
+
+  out.push("### A");
+  out.push("");
+
+  if (m.thinking) {
+    // <details>/<summary> is GFM-standard: renders as a native disclosure widget in
+    // GitHub, VS Code preview, Obsidian. Mirrors the app's own collapsed-by-default
+    // reasoning trace. Blank lines around the body are required for the markdown
+    // inside to render rather than being treated as raw HTML content.
+    out.push("<details>");
+    out.push("<summary>Reasoning trace</summary>");
+    out.push("");
+    out.push("```");
+    out.push(m.thinking);
+    out.push("```");
+    out.push("");
+    out.push("</details>");
+    out.push("");
+  }
+
+  if (m.tools?.length) {
+    out.push(`_Tools used: ${m.tools.join(", ")}_`);
+    out.push("");
+  }
+
+  const body = m.answer ?? m.text ?? "";
+  out.push(body);
+
+  if (m.candidates?.length) {
+    out.push("");
+    out.push("**Alternative answers considered**");
+    out.push("");
+    for (const c of m.candidates) {
+      const conf = c.confidence == null ? "unscored" : c.confidence.toFixed(2);
+      out.push(`- **${c.rank}.** ${c.summary} _(confidence: ${conf})_`);
+    }
+  }
+
+  if (m.artifact) {
+    out.push("");
+    out.push(`_Generated document: ${m.artifact.title}_`);
+  }
+
+  // Sources: harvested by running the SAME numbering pass the UI runs at render time,
+  // so the [n] markers already inline in `body` and this list can never disagree. The
+  // returned nodes are discarded — creating React elements runs no component.
+  if (body) {
+    const book = new CiteBook();
+    renderMarkdown(body, book);
+    if (book.refs.length) {
+      out.push("");
+      out.push("**Sources**");
+      out.push("");
+      book.refs.forEach((ref, i) => out.push(`${i + 1}. ${ref}`));
+    }
+  }
+
+  return out.join("\n");
+}
+
+/** The whole conversation as one markdown document. */
+function conversationToMarkdown(messages: Msg[]): string {
+  const stamp = new Date().toISOString().replace("T", " ").slice(0, 16);
+  const parts = [
+    "# QuickJoiner conversation",
+    "",
+    `_Exported ${stamp}_`,
+    "",
+    "---",
+    "",
+  ];
+  parts.push(messages.map(messageToMarkdown).join("\n\n---\n\n"));
+  parts.push("");
+  return parts.join("\n");
+}
+
+function downloadConversation(messages: Msg[]) {
+  const blob = new Blob([conversationToMarkdown(messages)], {
+    type: "text/markdown;charset=utf-8",
+  });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = conversationFilename(messages);
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
 function fmtDeleted(deletedAt?: string | null): string {
   if (!deletedAt || deletedAt === "gone") return "This file was removed and can no longer be downloaded.";
   const d = new Date(deletedAt);
@@ -515,6 +636,17 @@ export function Chat({
   return (
     <div className="scroll-thin flex-1 overflow-y-auto px-5 py-8 md:px-10">
       <div className="mx-auto flex max-w-[1100px] flex-col gap-9">
+        <div className="flex items-center justify-end">
+          <button
+            type="button"
+            onClick={() => downloadConversation(messages)}
+            title="Download this conversation as markdown (includes reasoning traces)"
+            className="inline-flex items-center gap-1.5 rounded-full bg-fill px-3 py-1.5 font-mono text-[10.5px] uppercase tracking-[0.12em] text-muted transition hover:bg-fill2 hover:text-ink"
+          >
+            <Download size={12} />
+            Download conversation
+          </button>
+        </div>
         {memo && (
           <details className="rounded-sm bg-accent-soft px-4 py-3">
             <summary className="cursor-pointer text-[11px] font-semibold uppercase tracking-[0.14em] text-accent">
