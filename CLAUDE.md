@@ -65,6 +65,14 @@ qj bench <pack.yaml> [--init] [--agent]       # speed/cost: per-stage retrieval 
 qj drain-graph [name]                         # mine relationships for already-ingested docs whose
                                               #   deferred extraction never resolved (a moving-window
                                               #   connector never re-yields them, so no sync retries it)
+qj regraph [name] [--with-triples] [-y]       # rebuild the knowledge graph from documents ALREADY
+                                              #   ingested — no re-fetch, no re-chunk, no re-embed.
+                                              #   For when the graph extractors changed but the
+                                              #   documents did not. Deterministic by default (no
+                                              #   LLM); --with-triples also re-mines relationships
+                                              #   (one model call per doc). Docs ingested before
+                                              #   their connector's payload was persisted keep their
+                                              #   existing edges instead of being rebuilt.
 ```
 
 Workspace layout: `catalog.db` (SQLite — **config settings + connector sources now live here**,
@@ -367,7 +375,22 @@ Previously BOTH source copies preceded the install layer, so every edit re-downl
   AFTER the `<img>` pass so an image inside a cell still contributes its caption and
   still reaches the vision seam. Each row is also a self-contained line, which chunks and
   embeds far better than a vertical stream of orphaned cells. Consumed by
-  `ingest/tables.py`. **Office shape-tree recursion
+  `ingest/tables.py`.
+  **A header row may trail off into spacer columns (`_HEADER_BLANK_TOLERANCE`, 2026-08-05,
+  user-reported).** Header detection accepted `<th>` or a first row where EVERY cell was
+  populated — and a real catalogue roster's header ends in an empty actions/spacer column
+  (`Name | Role | … | Location | `), so `all(rows[0])` was false and the header was demoted
+  to a data row. The table then rendered **headerless**, which is silent and total: with no
+  header there are no column names, so `_column_types` types nothing and `ingest/tables.py`
+  emits zero edges from a complete member table. Measured on the live Plumber corpus: the
+  Caffeine page's 7 members produced **0** person→team edges and 0 email aliases; with the
+  fix, 4+ `works_on` edges and the emails as person aliases. The rule is now "mostly
+  populated" — at least 2 filled cells AND no more than `_HEADER_BLANK_TOLERANCE` (2) blanks
+  — which is deliberately a *tolerance*, not a licence: a wide data row carrying two values
+  still fails it and leaves the table headerless, because promoting a data row would delete
+  it from the body entirely. Pinned both ways in `tests/test_tables.py`
+  (`…_spacer_column_is_still_a_header`, `…_mostly_empty_first_row_is_data_not_a_header`).
+  **Office shape-tree recursion
   (2026-07-24, user-reported):** `slide.shapes` yields only TOP-LEVEL shapes, so every label
   inside a **grouped** diagram was dropped — silently, with the extraction still reporting
   success. A PowerPoint architecture diagram is precisely a group of labelled boxes, so an
@@ -542,6 +565,44 @@ Previously BOTH source copies preceded the install layer, so every edit re-downl
   Settings → Knowledge graph panel that appears only when the queue is non-empty. Tests:
   `tests/test_triples.py` (faithful vs text-only rebuild, scoping, orphan sweep, missing-text
   left queued, breadcrumb strip), `tests/test_sync_manager.py`, `tests/test_api.py`.
+  **Rebuilding the graph without re-fetching or re-embedding (`rebuild_graph`, 2026-08-06,
+  user request — CLI `qj regraph`, `POST /api/graph/rebuild`, a per-connector action + a
+  Settings panel in the UI):** the case is "the graph extractors changed, the documents did
+  not". A re-sync re-downloads everything and re-embeds whatever text shifted to reach the
+  same edges; this walks the documents already in the catalog, re-reads the text that was
+  actually indexed (the same `_stored_texts` path the drain uses, breadcrumb stripped) and
+  re-runs the very same `_sync_graph`, so a rebuilt graph is built by exactly the code an
+  ingest would have used. `replace_doc_edges` is a delete-then-insert keyed on
+  `evidence_doc_id`, so iterating every document is **self-purging per document** — no
+  source-scoped edge delete is needed (and none exists: `edges` has no `source_id`).
+  ⚠ **Why this is not simply "delete the edges and redo them", measured before building it:**
+  a connector's own structural claims — ADO dev-links and work-item hierarchy, GitLab
+  MR/branch joins, Jira issue links, Octopus deployments — are computed while **FETCHING**,
+  so skipping the fetch is precisely what loses them. On the live 100,341-edge graph,
+  **27% of all edges** (5,432 in connector-only relations plus 21,803 tracker-sourced
+  `part_of`/`related_to`/`deploys`) could not be re-derived from stored text, and
+  `documents.metadata_json` held only the `display` block — **zero** documents persisted a
+  graph payload. So two things ship together: `documents.graph_json` captures
+  `Document.metadata["graph"]` at ingest (and backfills onto UNCHANGED documents via
+  `_capture_graph_payload`, which is why `GRAPH_EXTRACTOR_VERSION` went 4→**5** — the edges
+  did not change, the bump exists purely to carry the payload onto an existing corpus with
+  no re-embed); and each document then takes one of two reported paths —
+  **faithful** (payload present ⇒ authoritative replace) or **preserved** (no payload ⇒ its
+  existing edges are read back via `catalog.edges_for_document` and handed back through the
+  same `metadata["graph"]` channel, so entity resolution and remapping treat them identically
+  to a live payload). The cost of preserving is stated rather than hidden: for those
+  documents a rebuild can add and correct but **cannot remove**, until that source syncs once.
+  A document whose chunks are gone is `missing_text` and left exactly as it was — rebuilding
+  it into an empty graph would delete real edges over missing input. `with_triples=False` is
+  the default and spends **no LLM calls** (`_sync_graph` gained `defer_triples` to bypass the
+  `graph_pending` branch); `with_triples=True` re-queues one model call per document, which on
+  the live 19,538-document corpus is ~12 hours, so it is opt-in everywhere and the CLI
+  confirms first. Ends with `gc_orphan_entities` + `refresh_same_as_bridges` (both
+  best-effort — an untidy rebuilt graph beats a failed one). Tests: `tests/test_regraph.py`
+  (13, incl. the preserve guarantee verified to fail with preservation disabled, payload
+  capture + backfill-without-re-embed, missing-text left alone, scoping, version stamping,
+  and that the default path calls no extractor) + 4 route tests; all new catalog methods
+  **verified on pgvector**, not statically reviewed.
   `triples.py` holds the shared triple vocab + `parse_triples` + `triples_to_graph`
   (**re-exported from `sessions.py`** for back-compat) and `extract_doc_triples(provider,…)` — optional
   LLM relationship extraction over prose docs, config-gated by `graph.extract_triples` (OFF by default:
@@ -1285,6 +1346,42 @@ Previously BOTH source copies preceded the install layer, so every edit re-downl
   for format and discarded). `agent.py::_finalize` emits the `candidates` SSE event + strips
   the block from the returned prose (history keeps raw text; exception-proof; no-block turns
   are byte-for-byte unchanged).
+  **Per-source breakdown (`divergence.py`, pure, 2026-08-05, user-reported):** "list all
+  teams and their members" is answerable from a catalogue, from Confluence charters and from
+  TFS, and the user got one merged answer with no sign the alternatives existed. The
+  knowledge graph returns a **union** of typed edges, so no single system necessarily claims
+  the merged line — and nothing could reveal that until the evidence document's `source_id`
+  was carried on the edge row (`evidence_source_id`, one column added to the existing LEFT
+  JOIN in `_EDGE_SELECT`; portable, no schema change, **verified on pgvector**, not just
+  statically reviewed). `membership_by_source(rows)` re-derives what each system asserted for
+  ONE `graph_relations` group; the tool appends a `per <system>:` breakdown and a note.
+  **Two things measurement killed, and they are the point of this entry.**
+  (1) **The obvious retrieval-side rule does not work and was removed, not tuned.** "Several
+  sources have competitive hits ⇒ several systems each answer this" was built first, then
+  measured on the real 11-connector corpus: it fired on **80% of ordinary questions**, and a
+  threshold sweep (score band × minimum documents per source) found **no setting separating
+  the classes** — recall 1.00 came with 75% false positives, and forcing noise to 6% cost all
+  recall. "What does X depend on" legitimately draws on TFS + a repo + a wiki *jointly
+  building one answer*, which from provenance alone is identical to three systems each
+  answering alone. The signal is absent, so `search_memory` announces nothing; the
+  `[source: …]` label already on every chunk carries it for free.
+  (2) **A naming variant is not a disagreement, and differing coverage is not a conflict.**
+  The first graph-side cut compared raw names and flagged groups CONTESTED: measured, three
+  of the top hits were one team spelled two ways (`AppRiver\SecureCloud 2.0\Caffeine` vs
+  `Caffeine`), so `fold_member` compares last path segments — which alone took
+  `owns team->project` from 2 "conflicts" to **0**. And three systems listing different
+  services in an environment are covering different parts, not contradicting each other, so
+  the wording states the lists differ and explicitly says **you cannot tell disagreement from
+  partial coverage** — it never calls a system wrong. Final rates on the real graph: 5%
+  (`works_on`), 1% (`owns team->repo`), 0% (`owns team->project`), 9% (`deploys`).
+  `ledger_entries_for_hits` still runs on every grounded search, **invisibly** — it renders
+  nothing and changes no answer, and exists so a candidate the model does offer carries a
+  real number instead of **"unscored"**, which before this was true of everything except a
+  graph path (only `graph_path` populated the ledger). Best-effort throughout: scoring can
+  never break a search. Tests: `tests/test_divergence.py` (14, incl. every silence case —
+  one system, matching membership, spelling variants, a `same_as` bridge with no evidence
+  source — the no-announcement guarantee on `search_memory`, and an end-to-end split
+  verified to fail with the provenance column blanked).
   **operational tools = the agent-tool bridge** (`ops.py`: scrape_website /
   list_connector_types / add_connector / sync_source — same service functions as the UI
   slash commands; prompt requires explicit user confirmation before add_connector, secrets
@@ -1851,7 +1948,20 @@ Previously BOTH source copies preceded the install layer, so every edit re-downl
   renders mentions to display names, expands macros, and renders tables. The `sync`/webhook `expand`
   is `body.view,version`. **Needs a Confluence re-sync** to re-ingest existing pages (hash changes ⇒
   re-embed). Tests: `test_confluence_view_body_captures_rendered_user_mentions` +
-  `test_confluence_page_document_falls_back_to_storage`. NOTE: hyperlinks in the body (inter-page,
+  `test_confluence_page_document_falls_back_to_storage`.
+  **Confluence renders its tables through `render_html_table` too (2026-08-05,
+  user-reported).** `body.view` renders a table into real HTML, but `page_document` then
+  flattened it with `get_text()` — so the 2026-07-31 table-fidelity work reached every
+  source EXCEPT Confluence, and a Team Charter's roster arrived as a vertical stream of
+  cells with nothing tying a role to the person holding it. The blank-cell failure is the
+  visible one: a charter whose "Product Owner" row has no name rendered as
+  `Product Owner / Delivery Manager / Etheria Hill`, so the next person absorbs both roles
+  and the honest answer to "who is on Caffeine" was **one name out of eight** — exactly
+  what the user reported. Now leaf tables are rendered to pipe rows before flattening,
+  same two shape rules as the extractor. **Needs a Confluence re-sync** (text changes ⇒
+  hash changes ⇒ re-embed). Test:
+  `test_confluence_renders_tables_as_rows_so_a_roster_stays_readable`.
+  NOTE: hyperlinks in the body (inter-page,
   and links to GitLab/TFS) are still stripped to text and are **not** turned into graph edges — the
   cross-source link-graph is a designed-not-built enhancement (see below / `docs/KNOWLEDGE_GRAPH.md`).
   **Confluence batch prefetch** (2026-07-22): `sync` prefetches the NEXT page batch on a worker
@@ -3005,6 +3115,77 @@ Post-phase additions (2026-07-07, all tested — suite: **89 passed**):
   real pgvector container**, not statically reviewed — per the rule the previous session
   earned the hard way. Suite: **841 passed** (+28), 14 skipped; 15/15 pg tests green;
   frontend typecheck + build green.
+
+- Team rosters were never actually readable — two silent table defects (2026-08-05,
+  user-reported: "list all teams and their team members… the confluence charter for
+  caffeine still didn't return all team members, just Etheria"). Diagnosed against the
+  live workspace rather than guessed, which split one complaint into two unrelated bugs
+  in two different files, each individually sufficient to lose a whole roster.
+  **(1) Confluence never rendered its tables** — the 2026-07-31 table-fidelity work
+  landed in `ingest/extract.py` and `browser/scraper.py` but not in `confluence.py`,
+  which kept flattening with `get_text()`. The stored chunk for the Caffeine charter
+  read `Product Owner / Delivery Manager / Etheria Hill / Team Lead / Liu Maumasi …` —
+  the empty Product Owner name is dropped, so Etheria sits directly under two role
+  labels and every later pairing is off by one. Answering "just Etheria" was the model
+  reading that faithfully; the information had already been destroyed at ingest.
+  **(2) The Plumber roster's header was demoted to a data row** — it ends in an empty
+  spacer column, and header detection required every cell populated, so the table
+  rendered headerless and `ingest/tables.py` typed no columns: **0 edges from 7
+  members**, and `person:*` → `team:caffeine` was empty in the live graph (verified by
+  query, not inferred). Both fixed, both regression-tested, and **both tests confirmed
+  to fail with their fix reverted** — the header one needed the both-ways guard too,
+  since a tolerance that promotes any sparse row would delete real data from the body.
+  Suite: **844 passed** (+3), 15 skipped. **Needs a re-sync of Confluence and Plumber**
+  to take effect — the text changes, so the hash changes and both re-ingest normally; no
+  `GRAPH_EXTRACTOR_VERSION` bump (that is for extractor changes the document text does
+  *not* reflect, and would force needless rework across 21k documents).
+  **The second half of the report — "there are 3 ways to answer this and I got one" — was
+  a design gap, not a regression, and was built in the same session** (user chose it over
+  a prompt-only nudge): see the `agent/divergence.py` bullet above. Established first by
+  reading the code rather than the docs: the `candidates` carousel is wired end to end
+  (parser → SSE → `CandidateCarousel`) and was never dead, but `prompts.py` gated emission
+  on *"Only when the user explicitly asks for multiple interpretations/options/angles…
+  Otherwise never emit that block"*, no tool compared source provenance, and only
+  `graph_path` wrote to the confidence ledger — so even a well-formed search-derived
+  candidate would have rendered "unscored". The counter-intuitive half is the graph one:
+  `prompts.py` correctly routes "list all X with their Y" to `graph_relations`, whose
+  answer is a **union** of every system's assertions — so `Caffeine (3)` was printed while
+  *neither* system actually claimed all three people.
+  ⚠ **The first implementation of this was wrong in two ways and was corrected in the same
+  session, only because it was measured against the real corpus afterwards** — the
+  detail is in the architecture bullet, and the lesson generalises: a plausible heuristic
+  over provenance fired on **80% of ordinary questions** (no threshold separated the
+  classes — it was deleted, not tuned), and comparing raw entity names reported naming
+  variants as conflicts. Every test passed both before and after that correction, exactly
+  as with the alias-expansion index bug: **a suite proves a feature does what it says, never
+  that what it says is worth saying.** New behaviour that fires on a judgement call needs a
+  base-rate measurement on real data before it ships, not just green tests. The same pass
+  also caught that the **env-gated Postgres suite had been skipped** for a change to shared
+  `_EDGE_SELECT` SQL — Docker was available and the house rule says run it; 15/15 pass and
+  `evidence_source_id` was verified to actually populate there, not merely to select.
+
+- Graph rebuild without re-fetching or re-embedding (2026-08-06, user request: "since our
+  chunking mechanism hardly changes we don't need to retrieve things again — rather we just
+  need to rebuild the graph… available everywhere: CLI, API and UI"). Shipped as
+  `qj regraph [name] [--with-triples]`, `POST /api/graph/rebuild` (+
+  `GET /api/graph/rebuild/preview`), a **Rebuild graph** action on every connector plate, and
+  a workspace-wide one in Settings → Knowledge graph; job kind `regraph`, sentinel source
+  `"knowledge graph"`, mutually exclusive with every other job in both directions. Design and
+  the two reported paths are in the `ingest/pipeline.py` bullet.
+  **The measurement that changed the design, taken before writing any of it:** the obvious
+  implementation — walk the documents, re-derive edges from stored text, replace — would have
+  silently destroyed **27% of the live 100,341-edge graph**, because a connector's structural
+  claims are computed while FETCHING and **zero** documents persisted them (`metadata_json`
+  held only the `display` block). That is the whole reason `documents.graph_json` and the
+  faithful-vs-preserved split exist. Presented to the user with the three options and the
+  measured cost of each; they chose never-destructive, so a document with no stored payload
+  has its existing edges carried across and the rebuild can add and correct there but not
+  remove — stated in the preview, the job log, the CLI and the UI rather than left to be
+  discovered. `GRAPH_EXTRACTOR_VERSION` 4→5 carries the payload onto the existing corpus on
+  the next ordinary sync with no re-embed, after which rebuilds become fully authoritative.
+  Suite: **875 passed** (+17), 15 skipped; the preserve guarantee verified to fail with
+  preservation disabled; all new catalog methods and the new column **run against real
+  pgvector**, per the rule the earlier session in this file learned the hard way.
 
 ## Next steps (agreed with user)
 

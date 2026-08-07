@@ -125,7 +125,54 @@ class IngestStats:
 # this one only self-heals for documents whose stored TEXT already carries markdown tables —
 # HTML ingested before extract.py started preserving them has a different hash and re-embeds
 # on its next sync anyway, which is when its tables first exist to be mined.
-GRAPH_EXTRACTOR_VERSION = 4
+# v5 (2026-08-06) = capture the connector's own `metadata["graph"]` payload onto the document
+# (`documents.graph_json`). Nothing about the EDGES changes here; the bump exists so an
+# ordinary sync backfills that payload onto already-ingested documents without re-embedding,
+# which is what lets `regraph` later rebuild them faithfully instead of text-only.
+GRAPH_EXTRACTOR_VERSION = 5
+
+
+@dataclass
+class RegraphStats:
+    """Outcome of a graph rebuild (see `IngestPipeline.rebuild_graph`)."""
+    documents: int = 0     # documents whose graph was rebuilt
+    faithful: int = 0      # ...of which carried the connector's stored graph payload
+    preserved: int = 0     # ...of which did not, so their existing edges were carried across
+    missing_text: int = 0  # no chunks left to read: left exactly as they were
+    orphans: int = 0       # graph nodes swept once nothing cited them any more
+    queued_triples: int = 0  # documents re-queued for LLM relationship mining
+    errors: list[str] = field(default_factory=list)
+
+    def summary(self) -> str:
+        parts = [f"{self.documents} documents rebuilt"]
+        if self.faithful:
+            parts.append(f"{self.faithful} rebuilt in full")
+        if self.preserved:
+            parts.append(f"{self.preserved} with un-derivable edges preserved")
+        if self.missing_text:
+            parts.append(f"{self.missing_text} skipped (no stored text)")
+        if self.queued_triples:
+            parts.append(f"{self.queued_triples} queued for relationship mining")
+        if self.orphans:
+            parts.append(f"{self.orphans} orphan graph nodes removed")
+        if self.errors:
+            parts.append(f"{len(self.errors)} errors")
+        return ", ".join(parts)
+
+
+def _graph_payload(doc: Document) -> str:
+    """The connector's own structural graph claims for a document, as stored JSON.
+
+    Empty string when the connector asserted nothing, so "" reads as "never captured" and a
+    connector that genuinely has no structural claims costs no storage.
+    """
+    graph = (doc.metadata or {}).get("graph")
+    if not graph:
+        return ""
+    try:
+        return json.dumps(graph)
+    except (TypeError, ValueError):  # a connector handing back something unserializable
+        return ""
 
 
 def _doc_id(source_id: str, uri: str) -> str:
@@ -264,6 +311,12 @@ class IngestPipeline:
             display = (doc.metadata or {}).get("display")
             if display is not None:
                 self._catalog.update_document_metadata(doc_id, json.dumps(display))
+            # Capture the connector's own structural claims the same way, and for the same
+            # reason: they are computed while FETCHING, so a later graph rebuild that skips
+            # the fetch cannot re-derive them. Backfilling here is what lets an ordinary
+            # sync turn an already-ingested corpus into one `regraph` can rebuild
+            # faithfully — no re-embed, one cheap UPDATE per document.
+            self._capture_graph_payload(doc, doc_id)
             if stale_graph and not graph_pending:
                 # graph_pending docs get their version stamped when the pending drains;
                 # a pure version-refresh has no pending work, so stamp it now.
@@ -314,6 +367,7 @@ class IngestPipeline:
             chunk_count=written,
             graph_version=GRAPH_EXTRACTOR_VERSION,  # freshly built with the current extractors
             metadata_json=json.dumps((doc.metadata or {}).get("display") or {}),
+            graph_json=_graph_payload(doc),  # so a later rebuild needs no connector round-trip
         )
         self._sync_graph(doc, doc_id, source_id, text, pending)
         stats.chunks += written
@@ -322,7 +376,18 @@ class IngestPipeline:
         else:
             stats.updated += 1
 
-    def _sync_graph(self, doc: Document, doc_id: str, source_id: str, text: str, pending: list) -> None:
+    def _capture_graph_payload(self, doc: Document, doc_id: str) -> None:
+        """Persist a connector's structural claims for an UNCHANGED document (backfill).
+
+        Only writes when the connector actually asserted something, so a document that
+        legitimately has no structural claims is not rewritten on every sync.
+        """
+        payload = _graph_payload(doc)
+        if payload:
+            self._catalog.set_document_graph_payload(doc_id, payload)
+
+    def _sync_graph(self, doc: Document, doc_id: str, source_id: str, text: str, pending: list,
+                    defer_triples: bool = True) -> None:
         """Compute this document's knowledge-graph assertions: structured graph
         metadata (dependency maps), ticket keys, and code structure are all fast
         and deterministic, so they're persisted immediately. Optional LLM triple
@@ -381,7 +446,8 @@ class IngestPipeline:
             alias_rows.extend(tbl_aliases)
             edges.extend(tbl_edges)
 
-        if self._triple_extractor is not None and not is_code and self._triples_apply(doc, text):
+        if (defer_triples and self._triple_extractor is not None and not is_code
+                and self._triples_apply(doc, text)):
             _add_source_entity()
             # Written now (fast, synchronous) so it survives a crash/kill between
             # here and _resolve_pending_triples actually persisting this doc's
@@ -399,6 +465,117 @@ class IngestPipeline:
 
         self._persist_graph(doc_id, entities, alias_rows, edges, source_id,
                             doc.title, doc.kind)
+
+    # -------------------------------------------------------------- regraph
+    def rebuild_graph(self, source_id: str | None = None, control: Any = None,
+                      log: Callable[[str], None] | None = None,
+                      with_triples: bool = False) -> RegraphStats:
+        """Rebuild the knowledge graph from ALREADY-INGESTED state — no connector round-trip,
+        no re-chunk, no re-embed.
+
+        The case this exists for: the graph extractors change, but the documents did not.
+        Re-syncing to pick that up re-fetches everything (hours on a real corpus) and
+        re-embeds anything whose text shifted, when the only thing that needed to change was
+        the edges. This walks the documents already in the catalog, re-reads the text that
+        was actually indexed (the same `_stored_texts` path the drain uses, breadcrumb
+        stripped), and re-runs the very same `_sync_graph`, so a rebuilt graph is built by
+        exactly the code an ingest would have used.
+
+        **Why this is not simply "delete the edges and redo them".** A connector's own
+        structural claims — ADO dev-links and work-item hierarchy, GitLab MR/branch joins,
+        Jira issue links, Octopus deployments — are computed while FETCHING, and skipping the
+        fetch is precisely what loses them. Measured on a real 100k-edge graph, **27% of all
+        edges** could not be re-derived from stored text. So each document takes one of two
+        paths, and which one is reported rather than blurred:
+
+          * **faithful** — `documents.graph_json` holds what the connector asserted, so the
+            rebuild is complete and `replace_doc_edges` may authoritatively replace.
+          * **preserved** — the payload was never captured (the document predates it), so the
+            document's existing edges are read back and carried across. `replace_doc_edges`
+            is a delete-then-insert, so anything not handed back would be deleted; passing
+            them through means a rebuild can ADD and correct but never silently destroys a
+            claim it is unable to make. The cost, stated plainly because it is real: an edge
+            that SHOULD disappear will not, for these documents, until the source syncs once
+            and the payload lands.
+
+        `with_triples=False` (the default) rebuilds only the deterministic layer — code
+        structure, pub/sub, dependency maps, ticket keys, tables and the connector payload.
+        That is the fast path, needs no LLM, and is what a change to those extractors calls
+        for. `with_triples=True` additionally re-queues each qualifying document for LLM
+        relationship mining, which is one model call per document; on a 20k-document corpus
+        that is hours, so it is opt-in rather than the default.
+        """
+        stats = RegraphStats()
+        rows = (self._catalog.documents_for_source(source_id) if source_id
+                else self._catalog.all_documents())
+        if not rows:
+            return stats
+        if log:
+            scope = source_id or "every source"
+            mode = "with relationship mining" if with_triples else "deterministic only"
+            log(f"{scope}: rebuilding the graph for {len(rows)} document(s) ({mode})")
+
+        by_source: dict[str, list[dict]] = {}
+        for row in rows:
+            by_source.setdefault(row["source_id"], []).append(row)
+
+        for src, group in by_source.items():
+            texts = self._stored_texts(group)
+            pending: list = []
+            for i, row in enumerate(group):
+                if control is not None:
+                    control.check()
+                    control.stage("graph rebuild", stats.documents, len(rows))
+                doc_id = row["doc_id"]
+                text = texts.get(doc_id, "")
+                if not text.strip():
+                    # Its chunks are gone. Leaving it exactly as it is beats rebuilding it
+                    # into an empty graph, which would delete real edges over missing input.
+                    stats.missing_text += 1
+                    continue
+                try:
+                    metadata: dict = {}
+                    stored = (row.get("graph_json") or "").strip()
+                    if stored:
+                        metadata["graph"] = json.loads(stored)
+                        stats.faithful += 1
+                    else:
+                        existing = self._catalog.edges_for_document(doc_id)
+                        if existing:
+                            # Hand the connector's un-derivable claims back through the same
+                            # path they arrived by, so entity resolution and remapping treat
+                            # them identically to a live payload.
+                            metadata["graph"] = {"entities": [], "aliases": [],
+                                                 "edges": existing}
+                        stats.preserved += 1
+                    doc = Document(uri=row["uri"] or "", title=row["title"] or "",
+                                   text=text, kind=row["kind"] or "doc", metadata=metadata)
+                    before = len(pending)
+                    self._sync_graph(doc, doc_id, src, text, pending,
+                                     defer_triples=with_triples)
+                    if len(pending) > before:
+                        stats.queued_triples += 1
+                    else:
+                        # Nothing deferred, so this document is finished now — stamp it so an
+                        # ordinary sync does not redo the same work.
+                        self._catalog.set_document_graph_version(doc_id, GRAPH_EXTRACTOR_VERSION)
+                    stats.documents += 1
+                except Exception as exc:  # one bad document never fails the whole rebuild
+                    stats.errors.append(f"{row.get('uri') or doc_id}: {exc}")
+            if pending:
+                self._resolve_pending_triples(pending, src, control)
+
+        # Edges moved, so nodes can be left dangling and the derived bridge layer is stale.
+        # Both are best-effort: a rebuilt graph that is merely untidy still beats a failure.
+        try:
+            stats.orphans = self._catalog.gc_orphan_entities()
+        except Exception:
+            pass
+        try:
+            self._catalog.refresh_same_as_bridges()
+        except Exception:
+            pass
+        return stats
 
     # ---------------------------------------------------------------- drain
     def drain_pending_graph(self, source_id: str | None = None, control: Any = None,

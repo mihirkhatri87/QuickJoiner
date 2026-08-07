@@ -40,7 +40,7 @@ export default function App() {
   // The sync log viewer lives here, not inside the settings drawer, so a running sync
   // stays reachable (from the bell menu or the rail) with the drawer closed.
   const [syncView, setSyncView] = useState<
-    { name: string; clean: boolean; autoStart: boolean; kind: "sync" | "cleanup" } | null
+    { name: string; clean: boolean; autoStart: boolean; kind: "sync" | "cleanup" | "regraph" } | null
   >(null);
   const [historyOpen, setHistoryOpen] = useState(false);
   const flowRef = useRef<Flow | null>(null); // active conversational flow (wizard, follow-up questions)
@@ -129,7 +129,7 @@ export default function App() {
   }, [activeCount, loadStatus, loadSources]);
 
   const openSync = useCallback(
-    (name: string, clean: boolean, autoStart = false, kind: "sync" | "cleanup" = "sync") => {
+    (name: string, clean: boolean, autoStart = false, kind: "sync" | "cleanup" | "regraph" = "sync") => {
       setSyncView({ name, clean, autoStart, kind });
     },
     [],

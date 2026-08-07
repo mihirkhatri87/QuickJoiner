@@ -156,6 +156,14 @@ _MIGRATION_STATEMENTS = [
     # predate this column drain with only what their stored text still yields — stated
     # plainly in the drain's log rather than passed off as a complete rebuild.
     "ALTER TABLE graph_pending ADD COLUMN graph_json TEXT NOT NULL DEFAULT ''",
+    # The connector's OWN structural graph claims for a document (2026-08-06), kept so the
+    # graph can be rebuilt from stored state without a connector round-trip. These edges —
+    # ADO dev-links and work-item hierarchy, GitLab MR/branch joins, Jira issue links,
+    # Octopus deployments — are computed while FETCHING, so skipping the fetch is exactly
+    # what loses them: measured on a real 100k-edge graph, 27% of all edges could not be
+    # re-derived from stored text. Default '' means "never captured", which `regraph`
+    # reports as text-only rather than silently treating as "this document has no edges".
+    "ALTER TABLE documents ADD COLUMN graph_json TEXT NOT NULL DEFAULT ''",
     # Expression index for resolve_entity's case-insensitive name lookup (2026-07-31,
     # found by `qj bench`). Without it `WHERE id = ? OR LOWER(name) = ?` cannot use an
     # index for the second branch, so every call SCANNED the whole entities table —
@@ -434,6 +442,34 @@ class _SqlCatalog:
             "SELECT * FROM documents WHERE source_id = ? ORDER BY uri", (source_id,)
         )
 
+    def all_documents(self) -> list[dict]:
+        """Every ingested document, grouped by source — the work-list for a whole-workspace
+        graph rebuild. Ordered by source so a rebuild can process one source at a time and
+        report progress against it."""
+        return self._read_all("SELECT * FROM documents ORDER BY source_id, uri")
+
+    def count_documents(self, source_id: str | None = None) -> int:
+        """How many documents a graph rebuild would walk — read before starting one, so the
+        UI/CLI can say what it is about to do instead of opening an unbounded job."""
+        if source_id:
+            row = self._read_one(
+                "SELECT COUNT(*) AS n FROM documents WHERE source_id = ?", (source_id,))
+        else:
+            row = self._read_one("SELECT COUNT(*) AS n FROM documents")
+        return int(row["n"]) if row else 0
+
+    def documents_missing_graph_payload(self, source_id: str | None = None) -> int:
+        """Documents with no stored connector payload — the ones a rebuild can only preserve
+        rather than rebuild authoritatively. Surfaced up front so "27% of your edges cannot
+        be re-derived" is something the user is told, not something they discover."""
+        if source_id:
+            row = self._read_one(
+                "SELECT COUNT(*) AS n FROM documents WHERE source_id = ? AND graph_json = ''",
+                (source_id,))
+        else:
+            row = self._read_one("SELECT COUNT(*) AS n FROM documents WHERE graph_json = ''")
+        return int(row["n"]) if row else 0
+
     def document_source(self, doc_id: str) -> str | None:
         row = self._read_one("SELECT source_id FROM documents WHERE doc_id = ?", (doc_id,))
         return row["source_id"] if row else None
@@ -522,18 +558,38 @@ class _SqlCatalog:
 
     def upsert_document(self, doc_id, source_id, uri, title, kind, content_hash,
                         updated_at, chunk_count, graph_version: int = 0,
-                        metadata_json: str = "{}") -> None:
+                        metadata_json: str = "{}", graph_json: str = "") -> None:
         self._write(
-            """INSERT INTO documents (doc_id, source_id, uri, title, kind, content_hash, updated_at, chunk_count, graph_version, metadata_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """INSERT INTO documents (doc_id, source_id, uri, title, kind, content_hash, updated_at, chunk_count, graph_version, metadata_json, graph_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(doc_id) DO UPDATE SET
                    source_id=excluded.source_id, uri=excluded.uri, title=excluded.title,
                    kind=excluded.kind, content_hash=excluded.content_hash,
                    updated_at=excluded.updated_at, chunk_count=excluded.chunk_count,
-                   graph_version=excluded.graph_version, metadata_json=excluded.metadata_json""",
+                   graph_version=excluded.graph_version, metadata_json=excluded.metadata_json,
+                   graph_json=excluded.graph_json""",
             (doc_id, source_id, uri, title, kind, content_hash, updated_at or _now(),
-             chunk_count, graph_version, metadata_json),
+             chunk_count, graph_version, metadata_json, graph_json),
         )
+
+    def set_document_graph_payload(self, doc_id: str, graph_json: str) -> None:
+        """Store the connector's own structural graph claims for a document.
+
+        Standalone so an UNCHANGED document can have its payload captured on an ordinary
+        sync with no re-embed — the backfill path that turns a corpus ingested before this
+        column existed into one `regraph` can rebuild faithfully."""
+        self._write("UPDATE documents SET graph_json = ? WHERE doc_id = ?", (graph_json, doc_id))
+
+    def edges_for_document(self, doc_id: str) -> list[tuple]:
+        """This document's current edges as `(src, rel, dst, detail)` tuples.
+
+        Read back by `regraph` for a document whose connector payload was never captured, so
+        the claims it cannot re-derive are carried across the rebuild instead of deleted —
+        `replace_doc_edges` is a delete-then-insert, so anything not handed back is gone."""
+        rows = self._read_all(
+            "SELECT src, rel, dst, detail FROM edges WHERE evidence_doc_id = ?", (doc_id,)
+        )
+        return [(r["src"], r["rel"], r["dst"], r["detail"] or "") for r in rows]
 
     def update_document_metadata(self, doc_id: str, metadata_json: str) -> None:
         """Cheap standalone update of a document's display metadata (see
@@ -1008,7 +1064,7 @@ class _SqlCatalog:
                              s.name AS src_name, s.type AS src_type,
                              t.name AS dst_name, t.type AS dst_type,
                              d.title AS evidence_title, d.uri AS evidence_uri,
-                             d.kind AS evidence_kind
+                             d.kind AS evidence_kind, d.source_id AS evidence_source_id
                       FROM edges g
                       LEFT JOIN entities s ON s.id = g.src
                       LEFT JOIN entities t ON t.id = g.dst

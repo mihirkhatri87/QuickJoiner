@@ -871,6 +871,34 @@ def test_confluence_view_body_captures_rendered_user_mentions():
     assert "Kasper Vervaecke" in doc.text and "Team Lead" in doc.text
 
 
+def test_confluence_renders_tables_as_rows_so_a_roster_stays_readable():
+    """Found live: a charter's Members table flattened to a vertical stream of cells, so
+    the role and the person it belonged to were no longer connected — and a row with a
+    blank name vanished, making the NEXT person read as though they held both roles. The
+    answer to "who is on Caffeine" came back as one name out of eight."""
+    from quickjoiner.connectors.confluence import page_document
+
+    page = {
+        "id": "1",
+        "title": "Caffeine - Team Charter",
+        "body": {"view": {"value": (
+            "<table><tr><th>Role</th><th>Name</th></tr>"
+            "<tr><td>Product Owner</td><td></td></tr>"
+            "<tr><td>Delivery Manager</td><td>Etheria Hill</td></tr>"
+            "<tr><td>Team Lead</td><td>Liu Maumasi</td></tr>"
+            "</table>"
+        )}},
+        "version": {"when": "2026-06-30T00:00:00Z"},
+        "_links": {"webui": "/x"},
+    }
+    text = page_document("https://acme.atlassian.net/wiki", page).text
+    assert "| Team Lead | Liu Maumasi |" in text
+    # The empty Product Owner row keeps its blank cell instead of disappearing and
+    # letting the next person's name slide up into it.
+    assert "| Product Owner |  |" in text
+    assert "| Delivery Manager | Etheria Hill |" in text
+
+
 def test_confluence_page_document_falls_back_to_storage():
     # A webhook payload may carry only storage; page_document must still read it.
     from quickjoiner.connectors.confluence import page_document

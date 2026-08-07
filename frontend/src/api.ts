@@ -371,6 +371,25 @@ export const api = {
       `/api/graph/drain${sourceId ? `?source_id=${encodeURIComponent(sourceId)}` : ""}`,
       { method: "POST" },
     ),
+  // What a graph rebuild would actually cover, asked before committing to one. `documents`
+  // is how many would be walked; `missing_payload` how many cannot be rebuilt authoritatively
+  // — their connector payload was never captured, so their existing edges are preserved
+  // instead (a stale one there survives until that source syncs once).
+  graphRebuildPreview: (sourceId?: string) =>
+    req<{ documents: number; missing_payload: number; extraction_enabled: boolean }>(
+      `/api/graph/rebuild/preview${sourceId ? `?source_id=${encodeURIComponent(sourceId)}` : ""}`,
+    ),
+  // Rebuild the knowledge graph from documents already ingested — nothing is re-fetched from
+  // the connector, re-chunked or re-embedded. For when the extractors changed but the
+  // documents didn't. `withTriples` also re-runs LLM relationship mining (one model call per
+  // document — hours on a large corpus), which is why it defaults off. Background job
+  // (sentinel source "knowledge graph" when unscoped); 409 while another job runs.
+  rebuildGraph: (sourceId?: string, withTriples = false) =>
+    req<{ job: SyncJob }>(
+      `/api/graph/rebuild?with_triples=${withTriples}` +
+        (sourceId ? `&source_id=${encodeURIComponent(sourceId)}` : ""),
+      { method: "POST" },
+    ),
   // Sync activity over a rolling window (running + finished), newest first. Survives a
   // page reload and a server restart — the backend persists it. Backs the bell menu.
   notifications: (hours = 24) => req<NotificationsResponse>(`/api/notifications?hours=${hours}`),

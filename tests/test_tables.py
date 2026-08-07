@@ -122,6 +122,41 @@ def test_team_page_yields_membership_edges_and_email_aliases():
     assert {e[2] for e in entities} == {"person", "team"}
 
 
+def test_a_header_ending_in_a_spacer_column_is_still_a_header():
+    """Measured on the live catalogue: the real roster's header row ends in an empty
+    actions/spacer cell, so requiring EVERY header cell to be populated demoted it to a
+    data row. The table then rendered headerless, every column went untyped, and seven
+    members produced zero edges — the same silent nothing the flattened table did."""
+    html = (b"<html><body><p>Members:</p><table>"
+            b"<tr><td>Name</td><td>Role</td><td>Email</td><td></td></tr>"
+            b"<tr><td>Liu Maumasi</td><td>Dev</td><td>lm@corp.com</td><td></td></tr>"
+            b"</table></body></html>")
+    text = extract_text(html, "team.html")
+    assert "| Name | Role | Email |" in text
+
+    _ents, aliases, edges = extract_table_graph(
+        text, "https://plumber.example.corp/TeamDetails?id=46&team=Caffeine",
+        "web_scrape:Plumber", "Caffeine",
+    )
+    assert ("person:liu maumasi", "works_on", "team:caffeine") in [
+        (s, r, d) for s, r, d, _ in edges
+    ]
+    assert ("lm@corp.com", "person:liu maumasi") in aliases
+
+
+def test_a_mostly_empty_first_row_is_data_not_a_header():
+    """The tolerance is for a header that trails off, not a licence to promote any row:
+    a wide row carrying two values is data and must leave the table headerless."""
+    html = (b"<html><body><table>"
+            b"<tr><td>Caffeine</td><td>Dallas</td><td></td><td></td><td></td></tr>"
+            b"<tr><td>Decaf</td><td>Austin</td><td></td><td></td><td></td></tr>"
+            b"</table></body></html>")
+    text = extract_text(html, "x.html")
+    assert "| Caffeine | Dallas |" in text
+    # Promoted to a header it would have vanished from the body entirely.
+    assert "| Decaf | Austin |" in text
+
+
 def test_a_team_column_relates_each_row_without_any_url_subject():
     text = ("Team Members\n| Name | Email | Team |\n| --- | --- | --- |\n"
             "| Leif Thillet | lt@corp.com | Black Team |\n")

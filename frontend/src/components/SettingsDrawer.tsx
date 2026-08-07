@@ -5,6 +5,7 @@ import {
   FileText,
   Inbox,
   Lock,
+  Network,
   Plug,
   RefreshCw,
   RotateCcw,
@@ -35,6 +36,16 @@ const CHAT_KEYS = [
 ];
 const EMBEDDING_KEYS = ["provider", "model", "instruct"];
 
+/** Opens the shared sync log viewer (owned by App, so it outlives this drawer). `kind`
+ * picks which job `autoStart` starts, and titles the panel either way — a "regraph" is
+ * started here (it needs a source_id and the with-triples choice) and then attached to. */
+type OpenSync = (
+  source: string,
+  clean: boolean,
+  autoStart?: boolean,
+  kind?: "sync" | "cleanup" | "regraph",
+) => void;
+
 export function SettingsDrawer({
   open,
   onClose,
@@ -48,8 +59,7 @@ export function SettingsDrawer({
   onChanged: () => void;
   onOpenArtifact?: (a: { title: string; markdown: string }) => void;
   syncJobs: SyncJob[];
-  /** Opens the shared sync log viewer (owned by App, so it outlives this drawer). */
-  onOpenSync: (source: string, clean: boolean, autoStart?: boolean, kind?: "sync" | "cleanup") => void;
+  onOpenSync: OpenSync;
 }) {
   const [auth, setAuth] = useState<AuthStatus>({ enabled: false, user: null, role: "viewer" });
   const [status, setStatus] = useState("");
@@ -149,7 +159,7 @@ function DangerZone({
   locked: boolean;
   onFlash: (m: string, ok?: boolean) => void;
   onChanged: () => void;
-  onOpenSync: (source: string, clean: boolean) => void;
+  onOpenSync: OpenSync;
 }) {
   const [confirming, setConfirming] = useState(false);
   const [typed, setTyped] = useState("");
@@ -316,10 +326,18 @@ function Group({
   );
 }
 
-/** Documents that were ingested but never had their relationships mined — a connector that
- * pulls a moving window (recent sprints) never re-provides them, so nothing retries the
- * deferred extraction on its own. Shown here rather than left invisible, with the one
- * action that finishes them. Silent when the queue is empty (the normal state). */
+/** The two graph-maintenance actions, which answer opposite problems.
+ *
+ * MINE finishes documents that were ingested but never had their relationships mined — a
+ * connector pulling a moving window (recent sprints) never re-provides them, so nothing
+ * retries the deferred extraction on its own. That queue is normally empty, so it shows
+ * only when there is something in it.
+ *
+ * REBUILD is the other direction: the documents are fine, the extractors changed. It re-runs
+ * them over what is already ingested — no connector round-trip, no re-chunking, no
+ * re-embedding — which is worth offering whether or not anything is queued. So this panel
+ * now always renders; it just stays quiet when there is nothing to be alarmed about.
+ */
 function PendingRelationships({
   locked,
   onFlash,
@@ -327,20 +345,27 @@ function PendingRelationships({
 }: {
   locked: boolean;
   onFlash: (m: string, ok?: boolean) => void;
-  onOpenSync: (source: string, clean: boolean) => void;
+  onOpenSync: OpenSync;
 }) {
   const [pending, setPending] = useState<{ total: number; extraction_enabled: boolean } | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [preview, setPreview] = useState<
+    { documents: number; missing_payload: number; extraction_enabled: boolean } | null
+  >(null);
+  const [withTriples, setWithTriples] = useState(false);
+  const [busy, setBusy] = useState<"" | "mine" | "rebuild">("");
 
-  const load = () => api.graphPending().then(setPending).catch(() => setPending(null));
+  const load = () => {
+    api.graphPending().then(setPending).catch(() => setPending(null));
+    // Best-effort: without the preview the rebuild block simply doesn't offer itself, rather
+    // than offering an action whose scope we can't state.
+    api.graphRebuildPreview().then(setPreview).catch(() => setPreview(null));
+  };
   useEffect(() => {
     load();
   }, []);
 
-  if (!pending || pending.total === 0) return null;
-
   const drain = async () => {
-    setBusy(true);
+    setBusy("mine");
     try {
       const { job } = await api.drainGraph();
       onFlash("Mining relationships — watch its progress in the log.", true);
@@ -348,35 +373,99 @@ function PendingRelationships({
     } catch (e) {
       onFlash(String((e as Error).message), false);
     } finally {
-      setBusy(false);
+      setBusy("");
       load();
     }
   };
 
+  const rebuild = async () => {
+    setBusy("rebuild");
+    try {
+      // Guarded on extraction_enabled as well as the checkbox: a box left ticked from before
+      // extraction was turned off must not quietly ask for an LLM pass that can't run.
+      const { job } = await api.rebuildGraph(undefined, withTriples && Boolean(preview?.extraction_enabled));
+      onFlash("Rebuilding the knowledge graph — watch its progress in the log.", true);
+      onOpenSync(job.source, false, false, "regraph");
+    } catch (e) {
+      onFlash(String((e as Error).message), false);
+    } finally {
+      setBusy("");
+      load();
+    }
+  };
+
+  const n = (v: number) => v.toLocaleString();
+
   return (
-    <div className="mt-2.5 rounded-sm border border-[var(--border)] bg-fill px-3 py-2.5">
-      <div className="text-[12px] text-ink">
-        <span className="font-mono tabular-nums text-gold">{pending.total}</span> ingested document
-        {pending.total === 1 ? " has" : "s have"} unmined relationships
-      </div>
-      <p className="mt-1 text-[11px] leading-relaxed text-muted">
-        Their extraction was deferred at ingest and never resolved — a connector that pulls a
-        moving window (recent sprints) never re-provides them, so no sync will retry it. Mining
-        re-reads the text already indexed for them; no connector round-trip, one LLM call each.
-      </p>
-      {pending.extraction_enabled ? (
-        <div className="mt-2">
-          <Button onClick={drain} disabled={busy || locked}>
-            {busy ? "starting…" : "Mine now"}
-          </Button>
+    <>
+      {pending && pending.total > 0 && (
+        <div className="mt-2.5 rounded-sm border border-[var(--border)] bg-fill px-3 py-2.5">
+          <div className="text-[12px] text-ink">
+            <span className="font-mono tabular-nums text-gold">{n(pending.total)}</span> ingested
+            document{pending.total === 1 ? " has" : "s have"} unmined relationships
+          </div>
+          <p className="mt-1 text-[11px] leading-relaxed text-muted">
+            Their extraction was deferred at ingest and never resolved — a connector that pulls a
+            moving window (recent sprints) never re-provides them, so no sync will retry it. Mining
+            re-reads the text already indexed for them; no connector round-trip, one LLM call each.
+          </p>
+          {pending.extraction_enabled ? (
+            <div className="mt-2">
+              <Button onClick={drain} disabled={busy !== "" || locked}>
+                {busy === "mine" ? "starting…" : "Mine now"}
+              </Button>
+            </div>
+          ) : (
+            <p className="mt-2 text-[11px] text-gold">
+              Turn on relationship extraction above (and save) before mining — nothing could resolve
+              them otherwise.
+            </p>
+          )}
         </div>
-      ) : (
-        <p className="mt-2 text-[11px] text-gold">
-          Turn on relationship extraction above (and save) before mining — nothing could resolve
-          them otherwise.
-        </p>
       )}
-    </div>
+
+      {preview && (
+        <div className="mt-2.5 rounded-sm border border-[var(--border)] bg-fill px-3 py-2.5">
+          <div className="text-[12px] text-ink">Rebuild the graph from ingested documents</div>
+          <p className="mt-1 text-[11px] leading-relaxed text-muted">
+            Re-runs the graph extractors over documents already in memory. Nothing is re-fetched
+            from its connector, re-chunked or re-embedded — this is for when the extractors changed
+            but the documents did not.
+          </p>
+          <div className="mt-1.5 font-mono text-[10.5px] tabular-nums text-faint">
+            {n(preview.documents)} document{preview.documents === 1 ? "" : "s"} ·{" "}
+            <span className={preview.missing_payload > 0 ? "text-gold" : undefined}>
+              {n(preview.missing_payload)} cannot be rebuilt in full
+            </span>
+          </div>
+          {preview.missing_payload > 0 && (
+            <p className="mt-1 text-[11px] leading-relaxed text-muted">
+              Those never had their connector payload captured, so their existing edges are
+              <em className="not-italic text-gold"> preserved</em> rather than authoritatively
+              rebuilt — a stale edge among them survives until that source syncs once.
+            </p>
+          )}
+          {preview.extraction_enabled ? (
+            <Toggle
+              checked={withTriples}
+              onChange={setWithTriples}
+              label="Also re-mine relationships with the LLM"
+              hint="One model call per document — hours on a large corpus. Left off, the rebuild is deterministic-only (dependencies, code structure, tables, ticket references) and quick."
+            />
+          ) : (
+            <p className="mt-2 text-[11px] leading-relaxed text-faint">
+              Rebuilds the deterministic edges only (dependencies, code structure, tables, ticket
+              references) — LLM relationship extraction is off above.
+            </p>
+          )}
+          <div className="mt-2">
+            <Button onClick={rebuild} disabled={busy !== "" || locked}>
+              {busy === "rebuild" ? "starting…" : "Rebuild graph"}
+            </Button>
+          </div>
+        </div>
+      )}
+    </>
   );
 }
 
@@ -617,7 +706,7 @@ function WorkspaceSettings({
   locked: boolean;
   onFlash: (m: string, ok?: boolean) => void;
   onChanged: () => void;
-  onOpenSync: (source: string, clean: boolean) => void;
+  onOpenSync: OpenSync;
 }) {
   const [s, setS] = useState<Settings | null>(null);
   const [defs, setDefs] = useState<SettingDefaults | null>(null);
@@ -952,7 +1041,7 @@ function Connectors({
   onChanged: () => void;
   onOpenArtifact?: (a: { title: string; markdown: string }) => void;
   syncJobs: SyncJob[];
-  onOpenSync: (source: string, clean: boolean, autoStart?: boolean, kind?: "sync" | "cleanup") => void;
+  onOpenSync: OpenSync;
 }) {
   const [rows, setRows] = useState<ConnectorRow[] | null>(null);
   const [types, setTypes] = useState<ConnectorType[]>([]);
@@ -1114,7 +1203,7 @@ function UploadsPlate({
 }: {
   c: ConnectorRow;
   job?: SyncJob;
-  onOpenSync: (source: string, clean: boolean, autoStart?: boolean, kind?: "sync" | "cleanup") => void;
+  onOpenSync: OpenSync;
 }) {
   const [pmsg, setPmsg] = useState("");
   const [pok, setPok] = useState(true);
@@ -1150,7 +1239,15 @@ function UploadsPlate({
             )}
           >
             <span className={cn("h-[6px] w-[6px] rounded-full", paused ? "bg-gold" : "animate-pulse bg-accent")} />
-            {paused ? "paused" : retrying ? "retrying" : job?.kind === "cleanup" ? "cleaning" : "syncing"}
+            {paused
+              ? "paused"
+              : retrying
+                ? "retrying"
+                : job?.kind === "cleanup"
+                  ? "cleaning"
+                  : job?.kind === "regraph"
+                    ? "rebuilding"
+                    : "syncing"}
           </button>
         )}
       </div>
@@ -1522,13 +1619,14 @@ function ConnectorPlate({
   reload: () => void;
   onOpenArtifact?: (a: { title: string; markdown: string }) => void;
   job?: SyncJob;
-  onOpenSync: (source: string, clean: boolean, autoStart?: boolean, kind?: "sync" | "cleanup") => void;
+  onOpenSync: OpenSync;
 }) {
   const [pmsg, setPmsg] = useState("");
   const [pok, setPok] = useState(true);
   const [armed, setArmed] = useState(false);
   const [briefing, setBriefing] = useState(false);
   const [armedWipe, setArmedWipe] = useState(false);
+  const [regraphing, setRegraphing] = useState(false);
   const [editing, setEditing] = useState(false);
   const paused = job?.state === "paused";
   const retrying = job?.state === "retrying";
@@ -1590,7 +1688,9 @@ function ConnectorPlate({
                   ? "stopping"
                   : job?.kind === "cleanup"
                     ? "cleaning"
-                    : "syncing"}
+                    : job?.kind === "regraph"
+                      ? "rebuilding"
+                      : "syncing"}
           </button>
         )}
         <span
@@ -1700,6 +1800,33 @@ function ConnectorPlate({
           }}
         >
           <Eraser size={15} className={armedWipe ? "text-danger" : ""} />
+        </IconButton>
+        {/* Rebuild is the opposite of a clean re-sync: the documents stay exactly as they are
+            and only their graph edges are recomputed. Started here rather than through
+            autoStart because it needs the source_id, then attached to like any other job. */}
+        <IconButton
+          className="disabled:opacity-35 disabled:hover:bg-transparent disabled:hover:text-muted"
+          disabled={syncing || regraphing}
+          title={
+            syncing
+              ? "A sync is already running for this source"
+              : "Rebuild graph — re-run the graph extractors over this connector's ingested documents. Nothing is re-fetched from the source, re-chunked or re-embedded. Documents whose connector payload was never captured keep their existing edges instead."
+          }
+          onClick={async () => {
+            setRegraphing(true);
+            flash("rebuilding this connector's graph…");
+            try {
+              const { job: r } = await api.rebuildGraph(`${c.type}:${c.name}`);
+              flash("Rebuilding the graph — watch its progress in the log.");
+              onOpenSync(r.source, false, false, "regraph");
+            } catch (e) {
+              flash(String((e as Error).message), false);
+            } finally {
+              setRegraphing(false);
+            }
+          }}
+        >
+          <Network size={15} className={regraphing ? "animate-pulse text-accent" : ""} />
         </IconButton>
         {isRepo && (
           <IconButton

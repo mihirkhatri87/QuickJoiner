@@ -1,0 +1,31 @@
+meta {
+  name: Preview a graph rebuild
+  type: http
+  seq: 8
+}
+
+get {
+  url: {{baseUrl}}/api/graph/rebuild/preview
+  body: none
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{token}}
+}
+
+docs {
+  Sizing + honesty read for `POST /api/graph/rebuild`, so the cost and the limits are known
+  before starting the job.
+
+  Returns `{documents, missing_payload, extraction_enabled}`:
+  - `documents` — how many documents the rebuild would walk.
+  - `missing_payload` — how many of those were ingested before their connector's structural
+    claims (ADO dev-links/hierarchy, GitLab MR joins, Jira issue links, Octopus deployments)
+    were persisted. A rebuild can ADD to and correct those, but cannot authoritatively
+    replace them, so their existing edges are preserved instead. Sync a source once to make
+    its documents fully rebuildable.
+  - `extraction_enabled` — whether `with_triples=true` is available at all.
+
+  Add `?source_id=azure_devops:TFS` to scope it to one source.
+}

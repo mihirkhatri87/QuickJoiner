@@ -38,6 +38,7 @@ _DONE = object()  # sentinel pushed to subscribers when a job ends
 _HISTORY_RETENTION_DAYS = 7  # rolling window kept in sync_events (UI asks for 24h of it)
 RESET_SOURCE = "all memory"  # sentinel "source" name for the workspace-wide memory-reset job
 DRAIN_SOURCE = "graph relationships"  # ...and for the workspace-wide graph-pending drain
+REGRAPH_SOURCE = "knowledge graph"  # ...and for rebuilding the graph from ingested documents
 
 # Self-healing auto-retry on a transient NETWORK failure mid-sync. A raised exception kills
 # the connector's generator (a Python generator can't resume past a raise), so "resume" means
@@ -66,7 +67,9 @@ class SyncJob:
     source_name: str
     source_id: str
     state: str = "running"  # running | paused | retrying | stopping | stopped | done | error
-    kind: str = "sync"  # sync | cleanup (purge, no re-pull) | reset | drain (graph-only)
+    # sync | cleanup (purge, no re-pull) | reset | drain (finish deferred graph work)
+    # | regraph (rebuild the graph from ingested documents — no re-fetch, no re-embed)
+    kind: str = "sync"
     clean: bool = False
     cleanup_on_stop: bool = False
     # A paused sync reconstructed after a process restart (see revive_paused): no live worker
@@ -236,6 +239,8 @@ class SyncManager:
                 raise RuntimeError("A memory reset is running — wait for it to finish")
             if self.is_running(DRAIN_SOURCE):
                 raise RuntimeError("A relationship drain is running — wait for it to finish")
+            if self.is_running(REGRAPH_SOURCE):
+                raise RuntimeError("A graph rebuild is running — wait for it to finish")
             source = next((s for s in self.ctx.config.sources if s.name == source_name), None)
             if source is None:
                 raise KeyError(f"No configured source {source_name!r}")
@@ -266,6 +271,8 @@ class SyncManager:
                 raise RuntimeError("A memory reset is running — wait for it to finish")
             if self.is_running(DRAIN_SOURCE):
                 raise RuntimeError("A relationship drain is running — wait for it to finish")
+            if self.is_running(REGRAPH_SOURCE):
+                raise RuntimeError("A graph rebuild is running — wait for it to finish")
             self._counter += 1
             job = SyncJob(id=f"cleanup-{self._counter}-{uuid.uuid4().hex[:8]}",
                           source_name=source_name, source_id=source_id, kind="cleanup")
@@ -356,6 +363,82 @@ class SyncManager:
         self._record(job)
         threading.Thread(target=self._run_drain, args=(job,), daemon=True).start()
         return job
+
+    def start_regraph(self, source_id: str | None = None,
+                      with_triples: bool = False) -> SyncJob:
+        """Rebuild the knowledge graph from already-ingested documents — no connector
+        round-trip, no re-embed. See `IngestPipeline.rebuild_graph` for what it can and
+        cannot reconstruct.
+
+        A job rather than a click for the same reason the drain is: it walks every document
+        of the scope, and with `with_triples` it is one LLM call per document. Refuses while
+        anything else is in flight, and syncs refuse while it runs — it replaces edges for
+        documents across sources, so an overlapping sync would give one document two writers.
+        """
+        if with_triples and not getattr(self.ctx.pipeline, "extracts_triples", False):
+            raise RuntimeError(
+                "LLM relationship extraction is off — enable graph.extract_triples "
+                "(Settings → Knowledge graph), or rebuild without relationship mining"
+            )
+        with self._lock:
+            active = self.active_sources()
+            if active:
+                raise RuntimeError(
+                    f"A job is running ({', '.join(active)}) — wait before rebuilding the graph"
+                )
+            self._counter += 1
+            job = SyncJob(id=f"regraph-{self._counter}-{uuid.uuid4().hex[:8]}",
+                          source_name=REGRAPH_SOURCE, source_id=source_id or "",
+                          kind="regraph")
+            self._jobs[REGRAPH_SOURCE] = job
+        self._record(job)
+        threading.Thread(target=self._run_regraph, args=(job, with_triples),
+                         daemon=True).start()
+        return job
+
+    def _run_regraph(self, job: SyncJob, with_triples: bool) -> None:
+        control = self._build_control(job)
+        try:
+            scope = job.source_id or None
+            total = self.ctx.catalog.count_documents(scope)
+            unbacked = self.ctx.catalog.documents_missing_graph_payload(scope)
+            mode = "with relationship mining" if with_triples else "deterministic extractors only"
+            self._log(job, f"🕸 rebuilding the graph for {total} document(s) ({mode}) — "
+                           "no re-fetch, no re-embed")
+            if unbacked:
+                # Said BEFORE the work, not discovered afterwards: for these documents the
+                # rebuild can add and correct but not authoritatively replace.
+                self._log(job, f"ℹ {unbacked} document(s) have no stored connector payload — "
+                               "their existing edges are preserved rather than rebuilt; "
+                               "sync that source once to make them fully rebuildable")
+            stats = self.ctx.pipeline.rebuild_graph(
+                source_id=scope, control=control,
+                log=lambda line: self._log(job, line), with_triples=with_triples,
+            )
+            job.stats = {
+                "documents": stats.documents, "faithful": stats.faithful,
+                "preserved": stats.preserved, "missing_text": stats.missing_text,
+                "queued_triples": stats.queued_triples, "orphans": stats.orphans,
+                "errors": stats.errors[:20],
+            }
+            job.ingested = stats.documents
+            if stats.missing_text:
+                self._log(job, f"ℹ {stats.missing_text} document(s) have no stored text left "
+                               "to read — left exactly as they were, not rebuilt empty")
+            self._log(job, f"✓ {stats.summary()}")
+            job.state = "done"
+        except SyncStopped:
+            job.state = "stopped"
+            self._log(job, "■ stopped — documents already rebuilt keep their new graph; "
+                           "the rest are unchanged")
+        except Exception as exc:  # noqa: BLE001
+            job.state = "error"
+            job.error = str(exc)
+            self._log(job, f"✗ graph rebuild failed: {exc}")
+        finally:
+            job.ended_at = _now()
+            self._record(job)
+            self._close(job)
 
     def _run_drain(self, job: SyncJob) -> None:
         control = self._build_control(job)

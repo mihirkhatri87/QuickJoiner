@@ -159,6 +159,10 @@ _ROUTES: list[tuple[str, str, str, Optional[str]]] = [
     # Draining spends LLM calls and rewrites edges across sources — the same tier as
     # running a sync, not a read.
     ("POST", "/api/graph/drain", "sync:run", None),
+    ("GET", "/api/graph/rebuild/preview", "graph:read", None),
+    # Rebuilding rewrites edges across sources (and optionally spends LLM calls), so it sits
+    # at the sync tier too — reading what it WOULD do stays a plain graph read above.
+    ("POST", "/api/graph/rebuild", "sync:run", None),
     # Knowledge gaps
     ("GET", "/api/gaps", "gaps:read", None),
     ("POST", "/api/gaps/resolve", "gaps:write", None),

@@ -45,6 +45,29 @@ query latency). That is the argument for the measurement-gate rule above, in one
 
 ### Shipped (graduated)
 How each works is documented in `CLAUDE.md` — the source of truth for current behavior.
+
+- **Graph rebuild from ingested state** — `IngestPipeline.rebuild_graph`,
+  `documents.graph_json`, `SyncManager.start_regraph`, `qj regraph`,
+  `POST /api/graph/rebuild` (+ preview), connector-plate and Settings UI (2026-08-06).
+  Re-runs the graph extractors over already-indexed text: no connector round-trip, no
+  re-chunk, no re-embed, for when the extractors change but the documents do not.
+  Measured before building: a naive replace-from-text rebuild would have destroyed **27%**
+  of a real 100k-edge graph, because connector-supplied structural edges are computed during
+  the fetch and none were persisted — hence the payload column and the reported
+  faithful-vs-preserved split, which is never destructive.
+
+- **Per-source breakdown — showing what each system separately asserts** —
+  `agent/divergence.py`, `evidence_source_id` on `catalog._EDGE_SELECT`, `per <system>:`
+  groups in `graph_relations`, plus retrieval-side score-ledger seeding (2026-08-05). The
+  graph returns a **union**, so no single system necessarily claims the merged line and
+  nothing revealed that. Two negative results worth keeping: the equivalent **retrieval-side**
+  rule was built, measured at an **80% false-fire rate** on the real corpus, swept across
+  thresholds, found to have **no separating setting**, and removed rather than tuned — several
+  sources contributing to one answer is indistinguishable from several sources each answering;
+  and comparing raw entity names flagged naming variants as conflicts, so names are folded
+  before comparison. Final rates: 0–9% of groups by relation. The wording never claims a
+  system is wrong, because differing coverage and genuine disagreement are indistinguishable
+  here too.
 - **Structured table extraction + the graph enumeration read** — `ingest/tables.py`,
   `extract.render_html_table`, `catalog.graph_relations` + the `graph_relations` agent tool
   (2026-07-31). Tables are preserved as markdown rows rather than flattened (a blank cell

@@ -6,6 +6,11 @@ import hashlib
 import re
 
 from quickjoiner.agent.confidence import classify_evidence, score_chain, score_edge
+from quickjoiner.agent.divergence import (
+    ledger_entries_for_hits,
+    membership_by_source as _membership_by_source,
+    render_membership_split as _render_membership_split,
+)
 from quickjoiner.config import GapsConfig, RetrievalConfig
 from quickjoiner.connectors.base import Document
 from quickjoiner.ingest.pipeline import IngestPipeline
@@ -165,7 +170,24 @@ def build_builtin_tools(
         expansion = _graph_expansion(hits)
         if expansion:
             parts.append(expansion)
+        _seed_ledger(hits)
         return "\n\n---\n\n".join(parts)
+
+    def _seed_ledger(hits) -> None:
+        """Give this turn's retrieved sources a server-side confidence score.
+
+        Renders nothing and changes no answer — it exists so that a candidate the model
+        offers from memory carries a real number instead of "unscored", which before this
+        was true of everything except a graph path. Best-effort: scoring must never break
+        a search.
+        """
+        if score_ledger is None:
+            return
+        try:
+            for ref, conf in ledger_entries_for_hits(hits).items():
+                score_ledger[ref] = max(score_ledger.get(ref, 0.0), conf)
+        except Exception:
+            pass
 
     def list_gaps() -> str:
         if not (gaps and gaps.enabled):
@@ -307,6 +329,7 @@ def build_builtin_tools(
         if src_type or dst_type:
             head += f" ({src_type or 'any'} -> {dst_type or 'any'})"
         lines = [f"{head}, grouped by the thing on the right:"]
+        contested = 0
         for dst, group in grouped.items():
             names = sorted({(r["src_name"] or r["src"]) for r in group})
             evidence = sorted({(r["evidence_title"] or r["evidence_uri"] or "")
@@ -314,6 +337,24 @@ def build_builtin_tools(
             cite = f" [evidence: {'; '.join(evidence[:2])}]" if evidence else ""
             lines.append(f"\n{dst} ({len(names)}):{cite}")
             lines.append("  " + ", ".join(names))
+            # The merged line above is the UNION of what every system asserted, so no
+            # single system necessarily claims all of it. Break the group down by the
+            # source of its evidence only when the systems list different members —
+            # annotating groups they agree on would bury the interesting ones in noise.
+            split = _membership_by_source(group)
+            if split:
+                contested += 1
+                lines.extend(_render_membership_split(dst, split))
+        if contested:
+            lines.append(
+                f"\n{contested} group(s) above carry a per-source breakdown: the systems "
+                "list DIFFERENT members, and the first line is their union, which no single "
+                "system asserts on its own. A difference may mean the systems genuinely "
+                "disagree, or simply that each covers a different part — you cannot tell "
+                "which from this tool, so do not call one of them wrong. Report the union "
+                "AND what each system says, cite each separately, and note which system is "
+                "the system of record for this kind of fact if you know it."
+            )
         if truncated:
             lines.append(
                 f"\n⚠ truncated at {_RELATIONS_LIMIT} relationships — there are more. Narrow "

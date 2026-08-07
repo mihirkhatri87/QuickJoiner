@@ -358,10 +358,15 @@ qj sync            # incremental pull from every source
 qj sync pay-jira   # or just one source
 qj resync pay-jira # purge that source (docs, vectors, graph) and re-sync from scratch
 qj test pay-jira   # credential / reachability check
+qj regraph         # rebuild the knowledge graph from documents already ingested —
+qj regraph pay-jira #  no re-fetch, no re-chunk, no re-embed (add --with-triples to
+                   #  also re-mine LLM relationships: one model call per document)
 # A plain `sync` never re-embeds unchanged content, and now also REBUILDS the knowledge
 # graph for re-fetched docs when the graph extractors have been upgraded — so a graph-only
 # improvement lands on your next ordinary sync (no re-embed), and a full `resync` is only
 # needed to re-embed changed extraction or reach docs an incremental pull no longer re-fetches.
+# `regraph` is the third option: when the extractors changed but the DOCUMENTS did not, it
+# rebuilds the edges alone, without contacting the connector at all.
 ```
 
 Secrets use env indirection (`token=env:GITHUB_TOKEN`) — literal secrets are never stored.
@@ -541,6 +546,22 @@ later sync to retry. Settings → **Knowledge graph** shows that queue whenever 
 one button to finish it; `qj drain-graph [source]` and `POST /api/graph/drain` do the same from the
 CLI/API. It re-reads the text already indexed for those documents — no connector round-trip — and
 tells you plainly which ones it could rebuild in full versus only re-mine from stored text.
+
+**Rebuilding the graph without re-syncing.** When the graph extractors improve but your documents
+haven't changed, you don't need to pull everything down again: `qj regraph [source]`,
+`POST /api/graph/rebuild`, the **Rebuild graph** button on any connector plate, or the workspace-wide
+one in Settings → Knowledge graph all re-run the extractors over the text already indexed — no
+re-fetch, no re-chunking, no re-embedding. It is deterministic and needs no LLM by default;
+`--with-triples` also re-mines relationships, which is one model call per document (hours on a large
+corpus), so it is opt-in and asks first.
+
+One honest limit, shown before the job starts and again in its log: a connector's *own* structural
+claims — Azure DevOps dev-links and work-item hierarchy, GitLab merge-request joins, Jira issue
+links, Octopus deployments — are worked out while **fetching**, so a rebuild that skips the fetch
+cannot re-derive them. Documents ingested before QuickJoiner started saving those claims therefore
+keep their existing edges rather than having them rebuilt: a rebuild can add and correct there, but
+not remove. Sync that source once (no re-embedding — it only backfills what the connector asserts)
+and its documents become fully rebuildable.
 
 Retrieval quality is tuned for this too: **contextual chunking** prepends each chunk with its
 `source · title · path` breadcrumb (and markdown sub-chunks keep their section heading) so a

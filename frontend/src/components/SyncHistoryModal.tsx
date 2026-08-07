@@ -33,6 +33,7 @@ function runLine(n: SyncJob): string {
   if (n.state === "interrupted") return "server restarted before it finished";
   if (n.kind === "reset" && n.state === "done") return "all memory wiped · connectors kept";
   if (n.kind === "cleanup" && n.state === "done") return "documents, vectors and graph removed";
+  if (n.kind === "regraph" && n.state === "done" && !n.stats) return "graph rebuilt from ingested documents";
   if (n.stats && "documents" in n.stats) {
     const s = n.stats;
     return `${s.documents} mined` + (s.text_only ? ` · ${s.text_only} partial` : "") +
@@ -107,7 +108,9 @@ export function SyncHistoryModal({
                   ? "reset"
                   : n.kind === "drain"
                     ? "drain"
-                    : tone.label}
+                    : n.kind === "regraph"
+                      ? "rebuild"
+                      : tone.label}
             </span>
             {live && n.percent != null && (
               <span className="font-mono text-[10px] tabular-nums text-accent">{n.percent}%</span>

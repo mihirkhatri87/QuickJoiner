@@ -13,8 +13,10 @@ export interface SyncJob {
   /** "sync" pulls documents in; "cleanup" purges what a source taught us; "reset" wipes ALL
    * ingested memory across the workspace (source is the sentinel "all memory"); "drain"
    * mines relationships for already-ingested documents whose connector never re-yields them
-   * (source is the sentinel "graph relationships"). */
-  kind: "sync" | "cleanup" | "reset" | "drain";
+   * (source is the sentinel "graph relationships"); "regraph" re-runs the graph extractors
+   * over documents already ingested — no connector re-fetch, no re-chunk, no re-embed
+   * (source is the sentinel "knowledge graph" when it covers every source). */
+  kind: "sync" | "cleanup" | "reset" | "drain" | "regraph";
   clean: boolean;
   /** Sync jobs report ingest counts; a drain reports what it recovered. */
   stats:

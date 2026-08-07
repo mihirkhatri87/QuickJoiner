@@ -503,6 +503,67 @@ def resync(
     sync(name=name, clean=True, workspace=workspace)
 
 
+@app.command("regraph")
+def regraph(
+    name: Optional[str] = typer.Argument(None, help="Source name to rebuild (default: every source)"),
+    with_triples: bool = typer.Option(
+        False, "--with-triples",
+        help="Also re-mine LLM relationships — one model call per document (hours on a "
+             "large corpus). Off by default: the deterministic rebuild needs no LLM.",
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """Rebuild the knowledge graph from documents already ingested — no re-fetch, no re-embed.
+
+    For when the graph extractors changed but the documents did not. A re-sync would
+    re-download everything and re-embed anything whose text shifted, when all that needed to
+    change was the edges; this re-runs the extractors over the text already indexed.
+
+    Caveat, reported per run rather than buried: a connector's own structural claims (ADO
+    dev-links and hierarchy, GitLab MR joins, Jira issue links, Octopus deployments) are
+    computed while FETCHING. Documents ingested before those were persisted cannot have them
+    re-derived, so their existing edges are PRESERVED instead of rebuilt — the rebuild can
+    add and correct there, but not remove. Sync a source once to make its documents fully
+    rebuildable.
+    """
+    from quickjoiner.connectors.registry import create_connector
+
+    ctx = _context(workspace)
+    if with_triples and not ctx.pipeline.extracts_triples:
+        console.print("[yellow]LLM relationship extraction is off — set graph.extract_triples "
+                      "(Settings → Knowledge graph), or drop --with-triples.[/yellow]")
+        raise typer.Exit(1)
+    source_id = None
+    if name is not None:
+        source = next((s for s in ctx.visible_sources(_session_user(ctx)) if s.name == name), None)
+        if source is None:
+            console.print(f"[red]No configured source named {name!r}[/red]")
+            raise typer.Exit(1)
+        source_id = create_connector(source, ctx.workspace).source_id
+    total = ctx.catalog.count_documents(source_id)
+    if not total:
+        console.print("[green]Nothing ingested in that scope — nothing to rebuild.[/green]")
+        return
+    unbacked = ctx.catalog.documents_missing_graph_payload(source_id)
+    scope = name or "every source"
+    console.print(f"Rebuilding the graph for [bold]{total}[/bold] document(s) in {scope} "
+                  f"({'with' if with_triples else 'without'} relationship mining).")
+    if unbacked:
+        console.print(f"[yellow]{unbacked} document(s) have no stored connector payload — "
+                      "their existing edges will be preserved, not rebuilt. Sync that source "
+                      "once to make them fully rebuildable.[/yellow]")
+    if with_triples and not yes:
+        typer.confirm(f"That is ~{total} LLM calls. Continue?", abort=True)
+    stats = ctx.pipeline.rebuild_graph(
+        source_id=source_id, with_triples=with_triples,
+        log=lambda line: console.print(f"[dim]{line}[/dim]"),
+    )
+    console.print(f"[green]done:[/green] {stats.summary()}")
+    for err in stats.errors[:5]:
+        console.print(f"[yellow]warn:[/yellow] {err}")
+
+
 @app.command("drain-graph")
 def drain_graph(
     name: Optional[str] = typer.Argument(None, help="Source name to scope the drain to (default: every source)"),

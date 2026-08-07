@@ -9,6 +9,7 @@ from typing import Any, Iterator
 from quickjoiner.connectors.base import ConnectionStatus, Connector, Document, Mode
 from quickjoiner.connectors.registry import register
 from quickjoiner.connectors.util import get_json, resolve_secret
+from quickjoiner.ingest.extract import render_html_table
 from quickjoiner.llm.base import AgentTool, ToolSpec
 
 PAGE_SIZE = 50
@@ -29,6 +30,14 @@ def page_document(base_url: str, page: dict[str, Any]) -> Document:
     # storage when view is absent (e.g. a webhook payload that only carries storage).
     html = (body.get("view", {}) or {}).get("value") or (body.get("storage", {}) or {}).get("value", "")
     soup = BeautifulSoup(html, "html.parser")
+    # Render tables as markdown pipe rows before flattening, for the reason in
+    # ingest/extract.py: get_text() puts every cell on its own line, so a Members table
+    # arrives as a vertical stream of roles and names with nothing tying one to the other
+    # — which is why a charter's team roster produced no person→team edges and retrieved
+    # as an unreadable column of orphaned cells. Leaf tables only; a wrapper is layout.
+    for table in soup.find_all("table"):
+        if table.find("table") is None:
+            table.replace_with("\n" + render_html_table(table) + "\n")
     text = "\n".join(line.strip() for line in soup.get_text("\n").splitlines() if line.strip())
     link = page.get("_links", {}).get("webui", "")
     updated = page.get("version", {}).get("when")

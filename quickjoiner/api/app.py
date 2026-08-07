@@ -1710,6 +1710,40 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
             raise HTTPException(status_code=409, detail=str(exc))
         return {"job": job.summary()}
 
+    @api.get("/api/graph/rebuild/preview", tags=["Knowledge graph"], summary="What a graph rebuild would walk: how many documents, and how many of those cannot be rebuilt in full because their connector payload was never captured (their existing edges are preserved instead).")
+    def graph_rebuild_preview(source_id: str | None = None,
+                              authorization: str | None = Header(default=None)):
+        """Sizing + honesty read for `POST /api/graph/rebuild`, so the cost and the limits
+        are known before the job starts rather than discovered in its log. `missing_payload`
+        counts documents ingested before their connector's structural claims were persisted:
+        a rebuild can add to and correct those, but cannot authoritatively replace them."""
+        _user(authorization)
+        return {
+            "documents": ctx.catalog.count_documents(source_id),
+            "missing_payload": ctx.catalog.documents_missing_graph_payload(source_id),
+            "extraction_enabled": bool(getattr(ctx.pipeline, "extracts_triples", False)),
+        }
+
+    @api.post("/api/graph/rebuild", tags=["Knowledge graph"], summary="Rebuild the knowledge graph from documents already ingested — no connector round-trip, no re-chunk, no re-embed. Runs as a background job (returns {job}, source \"knowledge graph\"). 409 while any other job is running.")
+    def graph_rebuild(source_id: str | None = None, with_triples: bool = False,
+                      authorization: str | None = Header(default=None)):
+        """Re-run the graph extractors over the text already indexed, for every document in
+        scope. Use it when the extractors changed but the documents did not — a re-sync would
+        re-fetch and re-embed to achieve the same edges.
+
+        `with_triples=false` (default) rebuilds only the deterministic layer and needs no LLM.
+        `with_triples=true` also re-queues LLM relationship mining: one model call per
+        document, so hours on a large corpus, and 409 if `graph.extract_triples` is off.
+        Refuses (409) while another job is in flight — it writes edges across sources."""
+        user = _user(authorization)
+        _require_user(user)
+        _require("sync:run", user)
+        try:
+            job = syncs.start_regraph(source_id, with_triples=with_triples)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        return {"job": job.summary()}
+
     @api.get("/api/graph/search", tags=["Knowledge graph"], summary="Entity autocomplete over the graph (name/alias substring, ranked by connectivity).")
     def graph_search(q: str, limit: int = 10,
                      authorization: str | None = Header(default=None)):

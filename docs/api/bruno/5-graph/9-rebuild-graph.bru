@@ -1,0 +1,39 @@
+meta {
+  name: Rebuild the knowledge graph
+  type: http
+  seq: 9
+}
+
+post {
+  url: {{baseUrl}}/api/graph/rebuild?with_triples=false
+  body: none
+  auth: none
+}
+
+params:query {
+  with_triples: false
+}
+
+headers {
+  Authorization: Bearer {{token}}
+}
+
+docs {
+  Rebuilds the knowledge graph from documents ALREADY ingested — no connector round-trip, no
+  re-chunk, no re-embed. Use it when the graph extractors changed but the documents did not:
+  a re-sync would re-download everything and re-embed whatever shifted, to reach the same
+  edges.
+
+  Starts a background job (source `knowledge graph`); watch it with
+  `GET /api/sync/knowledge graph/logs`. 409 while another job is running — it writes edges
+  across sources.
+
+  `with_triples=false` (default) rebuilds only the deterministic layer (code structure,
+  pub/sub, dependency maps, ticket keys, tables, and the connector's stored payload) and
+  needs no LLM. `with_triples=true` also re-queues LLM relationship mining — one model call
+  per document, so hours on a large corpus — and 409s when `graph.extract_triples` is off.
+
+  Add `?source_id=azure_devops:TFS` to scope it to one source. Call
+  `GET /api/graph/rebuild/preview` first to see how many documents can only be preserved
+  rather than rebuilt in full.
+}

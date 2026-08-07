@@ -618,6 +618,53 @@ def test_drain_refuses_while_a_job_runs(api_workspace, monkeypatch):
     assert client.post("/api/graph/drain").status_code == 409
 
 
+def test_graph_rebuild_preview_reports_what_cannot_be_rebuilt_in_full(client):
+    """A rebuild skips the fetch, and a connector's structural claims are computed DURING
+    the fetch — so the preview says up front how many documents can only be preserved."""
+    client.post("/api/sync/handbook")
+    _wait_sync(client, "handbook")
+    preview = client.get("/api/graph/rebuild/preview").json()
+    assert preview["documents"] > 0
+    assert "missing_payload" in preview and "extraction_enabled" in preview
+
+    scoped = client.get("/api/graph/rebuild/preview?source_id=files:handbook").json()
+    assert scoped["documents"] > 0
+    assert client.get("/api/graph/rebuild/preview?source_id=files:nope").json()["documents"] == 0
+
+
+def test_graph_rebuild_runs_as_a_job_without_re_embedding(client):
+    client.post("/api/sync/handbook")
+    _wait_sync(client, "handbook")
+    before = client.get("/api/status").json()["stats"]
+
+    r = client.post("/api/graph/rebuild")
+    assert r.status_code == 200
+    job = r.json()["job"]
+    assert job["kind"] == "regraph" and job["source"] == "knowledge graph"
+    done = _wait_job(client, "knowledge graph")
+    assert done["state"] == "done"
+    assert done["stats"]["documents"] > 0
+    # The whole point: documents and chunks are untouched — only edges were rebuilt.
+    assert client.get("/api/status").json()["stats"] == before
+
+
+def test_graph_rebuild_with_triples_refuses_when_extraction_is_off(client):
+    """The deterministic rebuild needs no LLM, so only the opt-in half is gated."""
+    client.post("/api/sync/handbook")
+    _wait_sync(client, "handbook")
+    assert client.post("/api/graph/rebuild?with_triples=true").status_code == 409
+    assert client.post("/api/graph/rebuild?with_triples=false").status_code == 200
+
+
+def test_graph_rebuild_refuses_while_a_job_runs(api_workspace, monkeypatch):
+    """It replaces edges for documents across sources, so it must not race a sync."""
+    import quickjoiner.sync_manager as sm
+
+    client = TestClient(create_app(api_workspace))
+    monkeypatch.setattr(sm.SyncManager, "active_sources", lambda self: ["handbook"])
+    assert client.post("/api/graph/rebuild").status_code == 409
+
+
 def test_reset_memory_refuses_while_a_job_runs(client, monkeypatch):
     """Reset clears every source, so it must not race an in-flight job."""
     import quickjoiner.sync_manager as sm

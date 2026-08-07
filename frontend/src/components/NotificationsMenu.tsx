@@ -63,6 +63,11 @@ function toneFor(n: SyncJob) {
     if (n.state === "done") return { ...base, label: "relationships mined" };
     return base;
   }
+  if (n.kind === "regraph") {
+    if (running) return { ...base, label: "rebuilding graph" };
+    if (n.state === "done") return { ...base, label: "graph rebuilt" };
+    return base;
+  }
   if (n.kind !== "cleanup") return base;
   if (running) return { ...base, label: "cleaning up" };
   if (n.state === "done") return { ...base, label: "cleaned up" };
@@ -73,6 +78,7 @@ function detail(n: SyncJob): string {
   const cleanup = n.kind === "cleanup";
   const reset = n.kind === "reset";
   const drain = n.kind === "drain";
+  const regraph = n.kind === "regraph";
   // A live run leads with its stage + %, so the menu answers "how far along?" at a glance.
   const stage = n.phase ? `${n.phase}${n.percent != null ? ` · ${n.percent}%` : ""}` : "";
   if (n.state === "retrying") return stage ? `network error · ${stage}` : "network error · retrying";
@@ -81,12 +87,15 @@ function detail(n: SyncJob): string {
     if (stage) return stage;
     if (reset) return `wiping all memory · started ${ago(n.started_at)}`;
     if (drain) return `mining queued documents · started ${ago(n.started_at)}`;
+    if (regraph) return `re-reading ingested documents · started ${ago(n.started_at)}`;
     return `${cleanup ? "forgetting this source" : "started"} ${ago(n.started_at)}`;
   }
   if (n.state === "error") return n.error || "failed";
   if (n.state === "interrupted") return "server restarted before it finished";
   if (reset && n.state === "done") return "all documents, vectors and graph wiped · connectors kept";
   if (cleanup && n.state === "done") return "documents, vectors and graph edges removed";
+  // A rebuild touches only the graph — say so, so it can't be read as a re-ingest.
+  if (regraph && n.state === "done" && !n.stats) return "graph rebuilt · nothing re-fetched or re-embedded";
   if (n.stats && "documents" in n.stats) {
     const s = n.stats;
     return `${s.documents} document${s.documents === 1 ? "" : "s"} mined` +

@@ -677,6 +677,44 @@
             ],
             "url": "{{baseUrl}}/api/graph/drain"
           }
+        },
+        {
+          "name": "Preview a graph rebuild",
+          "description": "Sizing + honesty read for the rebuild below. Returns `{documents, missing_payload, extraction_enabled}`. `missing_payload` counts documents ingested before their connector's structural claims (ADO dev-links/hierarchy, GitLab MR joins, Jira issue links, Octopus deployments) were persisted \u2014 a rebuild can add to and correct those but cannot authoritatively replace them, so their existing edges are preserved. Sync a source once to make its documents fully rebuildable. Add `?source_id=...` to scope it.",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/graph/rebuild/preview"
+          }
+        },
+        {
+          "name": "Rebuild the knowledge graph",
+          "description": "Rebuilds the graph from documents ALREADY ingested \u2014 no connector round-trip, no re-chunk, no re-embed. For when the graph extractors changed but the documents did not. Starts a background job (source `knowledge graph`); watch it via `GET /api/sync/knowledge graph/logs`. 409 while another job runs. `with_triples=false` (default) is the deterministic rebuild and needs no LLM; `with_triples=true` also re-queues relationship mining \u2014 one model call per document, hours on a large corpus \u2014 and 409s when graph.extract_triples is off. Add `?source_id=...` to scope it.",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/graph/rebuild?with_triples=false",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "graph", "rebuild"],
+              "query": [
+                {
+                  "key": "with_triples",
+                  "value": "false"
+                }
+              ]
+            }
+          }
         }
       ]
     },

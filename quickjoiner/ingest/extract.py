@@ -656,6 +656,7 @@ def _extract_xlsx(data: bytes, image_handler: ImageHandler | None = None) -> str
 # stream of orphaned cells. `ingest/tables.py` then mines these rows for graph edges.
 _MAX_TABLE_ROWS = 500        # a rendered table past this is truncated, and says so
 _MAX_CELL_CHARS = 300        # one runaway cell can't dominate the document
+_HEADER_BLANK_TOLERANCE = 2  # header labels may trail off into spacer/actions columns
 
 
 def _cell_text(cell) -> str:
@@ -707,11 +708,16 @@ def render_html_table(table) -> str:
         rows = rows[:_MAX_TABLE_ROWS]
     rows = [r + [""] * (width - len(r)) for r in rows]
 
-    # A header row is one made of <th>, else the first row when it is fully populated
-    # (a data-first table with no <th> still reads correctly with its first row as header).
+    # A header row is one made of <th>, else the first row when it is MOSTLY populated.
+    # "Fully populated" was too strict: a real header ending in a spacer/actions column
+    # (`Name | Role | Email | `) has one empty cell and was demoted to a data row, leaving
+    # the table headerless — so every column went untyped and `ingest/tables.py` extracted
+    # nothing from it. Measured on a live team-roster page: 0 edges from 7 members.
     first_tr = table.find("tr")
     has_th = bool(first_tr and first_tr.find("th"))
-    header, body = (rows[0], rows[1:]) if (has_th or all(rows[0])) else ([""] * width, rows)
+    filled = sum(1 for c in rows[0] if c)
+    looks_like_header = filled >= 2 and filled >= width - _HEADER_BLANK_TOLERANCE
+    header, body = (rows[0], rows[1:]) if (has_th or looks_like_header) else ([""] * width, rows)
 
     out = ["| " + " | ".join(header) + " |",
            "| " + " | ".join(["---"] * width) + " |"]

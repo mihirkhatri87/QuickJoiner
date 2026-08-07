@@ -156,7 +156,9 @@ export function Rail({
                   ? `${job.percent}%`
                   : job?.kind === "cleanup"
                     ? "cleaning…"
-                    : "syncing…"
+                    : job?.kind === "regraph"
+                      ? "rebuilding…"
+                      : "syncing…"
                 : s.documents}
         </span>
       </Row>

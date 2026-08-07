@@ -35,8 +35,10 @@ export function SyncLogModal({
   clean: boolean;
   autoStart: boolean;
   /** Which job to start when autoStart is set; also picks the panel's title. Watching an
-   * existing job streams the same per-source log endpoint either way. */
-  kind?: "sync" | "cleanup" | "drain";
+   * existing job streams the same per-source log endpoint either way. "regraph" is only
+   * ever attached to, never auto-started: its caller owns the source_id and the
+   * with-triples choice, so it starts the job and passes this in to title the panel. */
+  kind?: "sync" | "cleanup" | "drain" | "regraph";
   onClose: () => void;
   onJobChange?: () => void;
 }) {
@@ -176,9 +178,10 @@ export function SyncLogModal({
   const jobKind = job?.kind ?? kind;
   // Cleanup and reset are short, all-or-nothing purges — neither is pausable or stoppable.
   const isPurge = jobKind === "cleanup" || jobKind === "reset";
-  // A drain pauses and stops like a sync, but there is no partial data to clean up on stop:
-  // whatever it didn't get to simply stays queued for the next run.
-  const isDrain = jobKind === "drain";
+  // A drain and a graph rebuild pause and stop like a sync, but neither leaves partial data
+  // to clean up on stop: a drain's remainder simply stays queued, and a rebuild only ever
+  // replaced edges for the documents it already walked. So both get a plain Stop.
+  const noPartialData = jobKind === "drain" || jobKind === "regraph";
   const canPause = !isPurge && job?.state === "running";
   // The connector logs this line via _stage when a crawl hits auth walls (scraper.py).
   const needsSignIn = !active && lines.some((l) => l.includes("returned a sign-in page"));
@@ -245,9 +248,11 @@ export function SyncLogModal({
                 ? "Cleanup"
                 : jobKind === "drain"
                   ? "Mining relationships"
-                  : (job?.clean ?? clean)
-                    ? "Clean re-sync"
-                    : "Sync"}{" "}
+                  : jobKind === "regraph"
+                    ? "Rebuilding graph"
+                    : (job?.clean ?? clean)
+                      ? "Clean re-sync"
+                      : "Sync"}{" "}
             · {name}
           </div>
           <div className="ml-auto flex-shrink-0 font-mono text-[10px] uppercase tracking-[0.12em] text-faint">
@@ -354,7 +359,7 @@ export function SyncLogModal({
                 {!isPurge && (
                   <Button
                     variant="danger"
-                    onClick={() => (isDrain ? doStop(false) : setConfirmStop(true))}
+                    onClick={() => (noPartialData ? doStop(false) : setConfirmStop(true))}
                     disabled={stopping}
                   >
                     Stop
