@@ -105,6 +105,34 @@ def test_agent_caps_large_tool_output_before_feeding_back():
     assert tool_msg["content"].endswith("[tool output truncated]")
 
 
+def _named_big_tool(name, size):
+    return AgentTool(
+        spec=ToolSpec(name=name, description="dumps a lot", input_schema={"type": "object", "properties": {}}),
+        fn=lambda **kw: "x" * size,
+    )
+
+
+def test_uncapped_tool_bypasses_the_char_cap():
+    """graph_relations et al already bound themselves to a fixed shape (e.g. 400
+    relationships) and state their own truncation in the returned text. Regression for
+    "you missed some teams": the outer char cap used to re-truncate their already-complete,
+    already-honest output, silently dropping data below whatever the tool itself reported."""
+    provider = ScriptedProvider(
+        [
+            ChatResult(text="", tool_calls=[ToolCall(id="c1", name="graph_relations", input={})]),
+            ChatResult(text="answer"),
+        ]
+    )
+    agent = OnboardingAgent(
+        provider, [_named_big_tool("graph_relations", 500_000)], system="sys",
+        tool_result_max_chars=1000, uncapped_tools=frozenset({"graph_relations"}),
+    )
+    agent.ask("q")
+    tool_msg = [m for m in provider.calls[1]["messages"] if m["role"] == "tool"][0]
+    assert len(tool_msg["content"]) == 500_000  # untouched — not capped, not truncated
+    assert not tool_msg["content"].endswith("[tool output truncated]")
+
+
 def test_agent_makes_final_tool_free_turn_when_round_limit_hit():
     """A model that loops on tool calls forever should still get one last tool-free turn
     to answer (or properly refuse) from what it gathered — not a canned limit message."""

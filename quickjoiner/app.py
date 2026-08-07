@@ -17,6 +17,15 @@ from quickjoiner.memory.factory import create_catalog, create_store
 from quickjoiner.memory.reranker import create_reranker
 
 
+# graph_relations/graph_neighbors/graph_path each bound themselves to a small, fixed
+# shape (400 relationships / a hub sample / <=3 path chains) with no model-controllable
+# size parameter, and each states its own truncation explicitly in the text it returns.
+# Exempt from OnboardingAgent's blanket live_tool_result_max_chars cap — see the
+# uncapped_tools comment in agent/agent.py for why applying that cap here anyway
+# silently re-truncates an already-complete, already-honest result.
+_UNCAPPED_TOOLS = frozenset({"graph_relations", "graph_neighbors", "graph_path"})
+
+
 @dataclass
 class AppContext:
     workspace: Path
@@ -106,6 +115,7 @@ class AppContext:
             provider, tools, system,
             tool_result_max_chars=self.config.chat.live_tool_result_max_chars,
             score_ledger=ledger,
+            uncapped_tools=_UNCAPPED_TOOLS,
         )
 
     def _scoped_sources(self, sources: list | None, scope) -> list | None:

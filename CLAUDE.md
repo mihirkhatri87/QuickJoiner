@@ -1407,7 +1407,25 @@ Previously BOTH source copies preceded the install layer, so every edit re-downl
   (`agent.py`, max 10 rounds —
   **each live tool result is capped to `chat.live_tool_result_max_chars` (default 24000) before
   re-entering the model context**, so an unbounded connector tool like the full Octopus dashboard
-  can't overflow the window and make the provider reject the follow-up turn; on hitting the round
+  can't overflow the window and make the provider reject the follow-up turn — **except
+  `graph_relations`/`graph_neighbors`/`graph_path` (`AppContext._UNCAPPED_TOOLS`, 2026-08-07,
+  user-reported "you missed some teams")**: those three already bound themselves to a small,
+  fixed shape (400 relationships / a hub sample / ≤3 path chains) with no model-controllable size
+  parameter, and each states its own truncation explicitly in the text it returns. The blanket
+  char cap doesn't know that — it slices by raw length regardless — so a `graph_relations` call
+  that returned a complete, correctly-labelled 334-row list (under its own 400 cap, so its own
+  "truncated" flag never fired) was still chopped mid-list by the outer cap, replacing its honest
+  "not truncated" state with a generic `[tool output truncated]` marker and silently dropping
+  whichever teams fell after the char cutoff — the model then reported a subset as if it were
+  complete. `OnboardingAgent._cap(output, tool_name)` now skips the char cap for tool names in
+  `uncapped_tools`; `search_memory` and the live connector/ops/control tools are deliberately NOT
+  exempted (`search_memory`'s `top_k` is model-controllable, so it has no comparable hard bound —
+  it stays the case this cap exists for). Tests: `tests/test_agent_loop.py`
+  (`test_uncapped_tool_bypasses_the_char_cap`). Suite: **878 passed** (+2), 15 skipped, pre-existing
+  Postgres env-gate unchanged. Not yet observed live against the reported 334-relationship
+  question — the fix is verified at the unit level (cap is skipped for exempted tool names, and
+  `graph_relations`'s own 400-row/truncation-notice contract is unchanged and separately tested);
+  on hitting the round
   limit the agent makes **one final tool-free turn** so a model that loops on searches still
   answers or properly refuses from what it gathered, instead of a canned "hit the limit" message.
   **Empty-completion guard (2026-07-23):** a round that returns NO tool call AND blank text — a
@@ -3186,6 +3204,23 @@ Post-phase additions (2026-07-07, all tested — suite: **89 passed**):
   Suite: **875 passed** (+17), 15 skipped; the preserve guarantee verified to fail with
   preservation disabled; all new catalog methods and the new column **run against real
   pgvector**, per the rule the earlier session in this file learned the hard way.
+- Double truncation on `graph_relations`/`graph_neighbors`/`graph_path` fixed (2026-08-07,
+  user-reported: "I only presented a subset of the teams found... graph_relations returned 334
+  relationships and was truncated"). Traced to the agent loop, not the graph tools: `agent.py`'s
+  `_cap()` applies the flat `chat.live_tool_result_max_chars` (24000) char cap to EVERY tool
+  result, with no awareness that these three tools already implement their own bounded,
+  self-describing truncation contract (`graph_relations`: capped at 400 rows, "truncated at N —
+  there are more" only when it actually is). The 334-row case was under that 400 cap — the tool's
+  own truncation flag correctly never fired — but the raw rendered text still exceeded 24000
+  chars, so the outer cap sliced it anyway, replacing the honest "complete" state with a generic
+  `[tool output truncated]` marker and dropping teams past the cutoff with no signal the model
+  could act on. Fixed by exempting these three tools from the outer cap
+  (`AppContext._UNCAPPED_TOOLS`, `OnboardingAgent(uncapped_tools=...)`) — full design in the
+  `agent/` architecture bullet above, including why `search_memory` is deliberately NOT exempted
+  (its `top_k` is model-controllable, so it has no comparable hard bound). Suite: **878 passed**
+  (+2), 15 skipped. Not yet verified against the live 334-relationship case that triggered the
+  report — the fix is unit-tested (cap skip + the unchanged `graph_relations` 400-row contract),
+  not yet observed end-to-end against the real corpus.
 
 ## Next steps (agreed with user)
 

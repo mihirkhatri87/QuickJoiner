@@ -26,6 +26,7 @@ class OnboardingAgent:
         system: str,
         tool_result_max_chars: int = 24000,
         score_ledger: dict[str, float] | None = None,
+        uncapped_tools: frozenset[str] = frozenset(),
     ):
         self._provider = provider
         # Sorted by name so the tool-spec list is byte-stable across requests and
@@ -39,6 +40,16 @@ class OnboardingAgent:
         # unbounded connector tool (e.g. the whole Octopus dashboard) can't overflow
         # the context window and make the provider reject the next turn.
         self._tool_result_max_chars = tool_result_max_chars
+        # Tools exempt from that cap: ones that already bound themselves to a small,
+        # fixed shape (a relationship count, a hub sample, a handful of path chains)
+        # with NO model-controllable size parameter, and that state their own
+        # truncation explicitly in the text they return ("truncated at N — there are
+        # more..."). Capping their output a second time by raw character count can
+        # slice a complete, honestly-labelled result mid-list and silently drop real
+        # data with no signal beyond a generic "[tool output truncated]" — the
+        # user-reported "you missed some teams" bug, where graph_relations returned a
+        # correct, untruncated 334-row list that the outer cap then chopped anyway.
+        self._uncapped_tools = uncapped_tools
         # Per-request evidence-ref -> confidence map the graph tools populate as they
         # score chains; candidate answers read their displayed confidence from HERE
         # (server-computed), never from the model's self-reported number.
@@ -106,7 +117,7 @@ class OnboardingAgent:
                         output = tool.run(**call.input)
                     except Exception as exc:
                         output = f"Error running {call.name}: {exc}"
-                output = self._cap(output)
+                output = self._cap(output, call.name)
                 messages.append(
                     {
                         "role": "tool",
@@ -174,7 +185,9 @@ class OnboardingAgent:
         except Exception:
             return text
 
-    def _cap(self, output: str) -> str:
+    def _cap(self, output: str, tool_name: str) -> str:
+        if tool_name in self._uncapped_tools:
+            return output
         limit = self._tool_result_max_chars
         if limit and len(output) > limit:
             return output[:limit] + "\n…[tool output truncated]"
