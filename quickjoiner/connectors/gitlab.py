@@ -13,7 +13,7 @@ from urllib.parse import quote
 import re
 
 from quickjoiner.connectors.base import ConnectionStatus, Connector, Document, Mode
-from quickjoiner.connectors.live_tools import bounded, clamp, make_resolver, read_tool
+from quickjoiner.connectors.live_tools import bounded, cite, clamp, make_resolver, read_tool
 from quickjoiner.connectors.registry import register
 from quickjoiner.connectors.util import as_bool, get_json, prefetch_pages, resolve_secret
 from quickjoiner.llm.base import AgentTool, ToolSpec
@@ -520,7 +520,8 @@ class GitLabConnector(Connector):
                            + "\n".join(
                 f"- {head}{it.get('iid')} [{it.get('state', '?')}] {it.get('title', '')}"
                 + (f" (branch {it.get('source_branch')})" if it.get("source_branch") else "")
-                + f" — {(it.get('author') or {}).get('username', '?')}  {it.get('web_url', '')}"
+                + f" — {(it.get('author') or {}).get('username', '?')}"
+                + cite(f"{head}{it.get('iid')} {it.get('title', '')}", it.get("web_url"))
                 for it in items))
 
         def list_merge_requests(project=None, state="opened", max_results=30):
@@ -542,7 +543,8 @@ class GitLabConnector(Connector):
             return bounded(f"{len(items)} {st} merge requests in {disp} (newest first):\n" + "\n".join(
                 f"- !{m.get('iid')} [{m.get('state', '?')}] {m.get('title', '')}"
                 + (f" (branch {m.get('source_branch')})" if m.get("source_branch") else "")
-                + f" — {(m.get('author') or {}).get('username', '?')}  {m.get('web_url', '')}"
+                + f" — {(m.get('author') or {}).get('username', '?')}"
+                + cite(f"!{m.get('iid')} {m.get('title', '')}", m.get("web_url"))
                 for m in items))
 
         def get_merge_request(iid, project=None):
@@ -597,7 +599,8 @@ class GitLabConnector(Connector):
                 return f"No {st} issues in {disp}."
             return bounded(f"{len(items)} {st} issues in {disp} (newest first):\n" + "\n".join(
                 f"- #{i.get('iid')} [{i.get('state', '?')}] {i.get('title', '')} — "
-                f"{(i.get('author') or {}).get('username', '?')}  {i.get('web_url', '')}"
+                f"{(i.get('author') or {}).get('username', '?')}"
+                + cite(f"#{i.get('iid')} {i.get('title', '')}", i.get("web_url"))
                 for i in items))
 
         def pipeline_status(ref, project=None, max_results=5):
@@ -613,7 +616,8 @@ class GitLabConnector(Connector):
             if not items:
                 return f"No pipelines for '{branch}' in {disp}."
             return bounded(f"Pipelines for '{branch}' in {disp} (newest first):\n" + "\n".join(
-                f"- #{p.get('id')} [{p.get('status', '?')}] {p.get('updated_at', '')}  {p.get('web_url', '')}"
+                f"- #{p.get('id')} [{p.get('status', '?')}] {p.get('updated_at', '')}"
+                + cite(f"pipeline #{p.get('id')} ({p.get('status', '?')})", p.get("web_url"))
                 for p in items))
 
         def pipeline_jobs(pipeline_id, project=None):
@@ -625,7 +629,8 @@ class GitLabConnector(Connector):
                 return f"No jobs for pipeline #{pipeline_id}."
             return bounded(f"Pipeline #{pipeline_id} jobs (by stage):\n" + "\n".join(
                 f"- [{j.get('status', '?')}] {j.get('stage', '?')}/{j.get('name', '?')} "
-                f"(job {j.get('id')})  {j.get('web_url', '')}" for j in jobs))
+                f"(job {j.get('id')})" + cite(f"job {j.get('name', j.get('id'))}", j.get("web_url"))
+                for j in jobs))
 
         def job_log(job_id, project=None):
             api, h, disp, err = _pick(project)

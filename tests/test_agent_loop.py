@@ -1,3 +1,5 @@
+import json
+
 from quickjoiner.agent.agent import MAX_TOOL_ROUNDS, OnboardingAgent
 from quickjoiner.llm.base import AgentTool, ChatResult, LLMProvider, ToolCall, ToolSpec
 
@@ -241,3 +243,166 @@ def test_candidates_postprocessing_never_raises(monkeypatch):
     agent = OnboardingAgent(provider, [_echo_tool()], system="sys")
     answer, _ = agent.ask("q", on_event=lambda t, d: None)
     assert answer == _ANSWER_WITH_BLOCK  # exception swallowed, answer unchanged
+
+
+# -- trace events -------------------------------------------------------------
+
+def _events(agent, question="q"):
+    seen = []
+    agent.ask(question, on_event=lambda kind, data: seen.append((kind, data)))
+    return seen
+
+
+def test_tool_events_carry_arguments_and_outcome_in_order():
+    """The reasoning-trace timeline is built entirely from these events, so each call
+    must name what it was actually doing (its arguments) and how it came back, and the
+    two must arrive in that order and pair up by id."""
+    provider = ScriptedProvider(
+        [
+            ChatResult(text="", tool_calls=[ToolCall(id="c1", name="echo", input={"value": "hi"})]),
+            ChatResult(text="answer"),
+        ]
+    )
+    seen = _events(OnboardingAgent(provider, [_echo_tool()], system="sys"))
+    kinds = [k for k, _ in seen]
+    assert kinds.index("tool_call") < kinds.index("tool_result")
+
+    call = json.loads(dict(seen)["tool_call"])
+    assert call == {"id": "c1", "name": "echo", "args": {"value": "hi"}}
+    result = json.loads(dict(seen)["tool_result"])
+    assert result == {"id": "c1", "name": "echo", "ok": True,
+                      "summary": "echoed:hi", "chars": len("echoed:hi")}
+
+
+def test_a_failing_tool_is_reported_as_not_ok():
+    """A trace that renders a crashed call as a normal step would misrepresent the run."""
+    boom = AgentTool(
+        spec=ToolSpec(name="boom", description="raises", input_schema={"type": "object", "properties": {}}),
+        fn=lambda **kw: (_ for _ in ()).throw(RuntimeError("nope")),
+    )
+    provider = ScriptedProvider(
+        [
+            ChatResult(text="", tool_calls=[ToolCall(id="c1", name="boom", input={})]),
+            ChatResult(text="answer"),
+        ]
+    )
+    result = json.loads(dict(_events(OnboardingAgent(provider, [boom], system="sys")))["tool_result"])
+    assert result["ok"] is False and "nope" in result["summary"]
+
+
+def test_event_payloads_are_bounded_but_state_the_true_size():
+    """A single tool result can be 24k chars and an argument arbitrarily long; neither
+    should be pushed down the SSE stream in full just to render a line of trace. The
+    preview is clipped, and `chars` carries the real length so a clipped preview can
+    never be mistaken for the whole output."""
+    provider = ScriptedProvider(
+        [
+            ChatResult(text="", tool_calls=[ToolCall(id="c1", name="dump", input={"q": "y" * 5_000})]),
+            ChatResult(text="answer"),
+        ]
+    )
+    agent = OnboardingAgent(provider, [_big_tool(50_000)], system="sys", tool_result_max_chars=10_000)
+    seen = dict(_events(agent))
+
+    args = json.loads(seen["tool_call"])["args"]
+    assert len(args["q"]) < 500 and args["q"].endswith("…")
+
+    result = json.loads(seen["tool_result"])
+    assert len(result["summary"]) < 1_000
+    # `chars` measures the output as the MODEL received it — i.e. after `_cap`, whose
+    # own truncation marker rides inside it. The trace reports the run as it happened,
+    # not a pre-cap size the model never saw.
+    tool_msg = [m for m in provider.calls[1]["messages"] if m["role"] == "tool"][0]
+    assert result["chars"] == len(tool_msg["content"]) > len(result["summary"])
+
+
+def _cited_tool(name, out):
+    return AgentTool(
+        spec=ToolSpec(name=name, description="d", input_schema={"type": "object", "properties": {}}),
+        fn=lambda **kw: out,
+    )
+
+
+_HIT = ("[source: Caffeine - Team Charter | uri: https://wiki/Caffeine | kind: page | "
+        "score: 0.81]\nMembers: Liu Maumasi (TL).")
+
+
+def test_sources_event_carries_the_uri_behind_each_cited_title():
+    """The tools already hand the MODEL a uri per hit; without this event the client
+    only ever sees the label the model chose to write, so a citation of a readable
+    title has nothing to link to."""
+    provider = ScriptedProvider(
+        [
+            ChatResult(text="", tool_calls=[ToolCall(id="c1", name="search_memory", input={"query": "teams"})]),
+            ChatResult(text="Caffeine has 1 member [Caffeine - Team Charter]."),
+        ]
+    )
+    seen = _events(OnboardingAgent(provider, [_cited_tool("search_memory", _HIT)], system="sys"))
+    (refs,) = [json.loads(d) for k, d in seen if k == "sources"]
+    assert refs[0]["label"] == "Caffeine - Team Charter"
+    assert refs[0]["uri"] == "https://wiki/Caffeine"
+    assert refs[0]["snippet"].startswith("Members: Liu Maumasi")
+
+
+def test_a_source_already_announced_is_not_sent_again():
+    """Round after round of searching returns the same documents; re-sending them would
+    grow the stream quadratically and duplicate every entry in the sources list."""
+    provider = ScriptedProvider(
+        [
+            ChatResult(text="", tool_calls=[ToolCall(id="c1", name="search_memory", input={})]),
+            ChatResult(text="", tool_calls=[ToolCall(id="c2", name="search_memory", input={})]),
+            ChatResult(text="answer"),
+        ]
+    )
+    seen = _events(OnboardingAgent(provider, [_cited_tool("search_memory", _HIT)], system="sys"))
+    batches = [json.loads(d) for k, d in seen if k == "sources"]
+    assert len(batches) == 1 and len(batches[0]) == 1
+
+
+def test_a_tool_result_with_no_citable_sources_emits_no_event():
+    """A refusal, or a graph tool whose evidence carries no uri, must not produce an
+    empty sources batch for the client to render."""
+    provider = ScriptedProvider(
+        [
+            ChatResult(text="", tool_calls=[ToolCall(id="c1", name="search_memory", input={})]),
+            ChatResult(text="I haven't learned that yet."),
+        ]
+    )
+    tool = _cited_tool("search_memory", "NO_RESULTS: nothing relevant found in learned memory.")
+    seen = _events(OnboardingAgent(provider, [tool], system="sys"))
+    assert not [k for k, _ in seen if k == "sources"]
+
+
+def test_a_cloned_repo_file_ref_carries_a_browsable_link_not_its_identity():
+    """A git file's uri is "<clone-url>::<path>", which begins with https:// and would
+    otherwise be offered to the reader as a link straight to a 404. `link` is where it
+    actually opens; `uri` stays the identity the tools reported."""
+    hit = ("[source: Connector/Program.cs | uri: "
+           "https://gitlab.otxlab.net/zix/dev/appriver.connector.git::Source/Program.cs "
+           "| kind: code | score: 0.7]\nnamespace AppRiver;")
+    provider = ScriptedProvider(
+        [
+            ChatResult(text="", tool_calls=[ToolCall(id="c1", name="search_memory", input={})]),
+            ChatResult(text="See [Connector/Program.cs]."),
+        ]
+    )
+    seen = _events(OnboardingAgent(provider, [_cited_tool("search_memory", hit)], system="sys"))
+    (ref,) = json.loads(dict(seen)["sources"])
+    assert "::" in ref["uri"]  # identity preserved
+    assert ref["link"] == (
+        "https://gitlab.otxlab.net/zix/dev/appriver.connector/-/blob/HEAD/Source/Program.cs")
+
+
+def test_a_ref_with_no_browsable_address_carries_no_link_at_all():
+    """A local file and a distilled conversation open nothing; offering either as a link
+    is a dead click, so the field is simply absent."""
+    hit = "[source: handbook.md | uri: file:///C:/docs/handbook.md | kind: doc | score: 0.8]\nLeave policy"
+    provider = ScriptedProvider(
+        [
+            ChatResult(text="", tool_calls=[ToolCall(id="c1", name="search_memory", input={})]),
+            ChatResult(text="answer"),
+        ]
+    )
+    seen = _events(OnboardingAgent(provider, [_cited_tool("search_memory", hit)], system="sys"))
+    (ref,) = json.loads(dict(seen)["sources"])
+    assert ref["uri"].startswith("file://") and "link" not in ref

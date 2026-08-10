@@ -1316,6 +1316,206 @@ def onedrive_learn_cmd(
     console.print(f"[green]{name}:[/green] {stats.summary()}")
 
 
+skills_app = typer.Typer(
+    help="Packaged expertise in the open Agent Skills format (the layout Claude Code and "
+         "GitHub Copilot read). Install one, see whether it is ready, and supply your own "
+         "credentials for the ones that reach a real system.")
+app.add_typer(skills_app, name="skills")
+
+
+def _skills(ctx):
+    """(configs, secret store, acting user) — the three things every skills command needs."""
+    return ctx.skill_configs(), ctx.secret_store(), _session_user(ctx)
+
+
+@skills_app.command("list")
+def skills_list(workspace: Optional[Path] = WORKSPACE_OPT):
+    """Every discovered skill, and whether it is ready to run for you."""
+    from quickjoiner.skills import runnable
+
+    ctx = _context(workspace)
+    configs, store, user = _skills(ctx)
+    if not configs:
+        console.print(
+            "No skills yet. Install one with [bold]qj skills install <folder-or-zip>[/bold], "
+            "or drop a folder containing SKILL.md into "
+            f"[dim]{ctx.workspace / 'skills'}[/dim].")
+        return
+    for c in configs:
+        ok, missing = runnable(c, store, user)
+        state = "[green]ready[/green]" if ok else f"[yellow]needs {', '.join(missing)}[/yellow]"
+        if not c.enabled:
+            state = "[dim]disabled[/dim]"
+        console.print(f"- [bold]{c.name}[/bold] ({c.scope}, {c.skill.origin}) — {state}")
+        if c.description:
+            console.print(f"    [dim]{c.description[:160]}[/dim]")
+
+
+@skills_app.command("show")
+def skills_show(
+    name: str = typer.Argument(..., help="Skill name"),
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """Print a skill's instructions — exactly what the agent is given when it opens one."""
+    from quickjoiner.skills import skill_body
+
+    ctx = _context(workspace)
+    configs, _store, _user = _skills(ctx)
+    config = next((c for c in configs if c.name == name), None)
+    if config is None:
+        console.print(f"[red]No skill named '{name}'.[/red] See [bold]qj skills list[/bold].")
+        raise typer.Exit(1)
+    console.print(skill_body(config.skill))
+    if config.skill.references:
+        console.print(f"\n[dim]references: {', '.join(config.skill.references)}[/dim]")
+    if config.skill.scripts:
+        console.print(f"[dim]scripts: {', '.join(config.skill.scripts)}[/dim]")
+
+
+@skills_app.command("install")
+def skills_install(
+    source: Path = typer.Argument(..., help="A .zip, or a folder containing SKILL.md"),
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """Install a skill into this workspace.
+
+    A folder is zipped in memory first, so both forms go through the same containment and
+    size guards rather than a second, laxer copy path.
+    """
+    import io
+    import zipfile
+
+    from quickjoiner.skills import InstallError, install_zip
+
+    ctx = _context(workspace)
+    if source.is_dir():
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for p in sorted(source.rglob("*")):
+                if p.is_file():
+                    zf.write(p, p.relative_to(source).as_posix())
+        data, fallback = buf.getvalue(), source.name
+    elif source.is_file():
+        data, fallback = source.read_bytes(), source.stem
+    else:
+        console.print(f"[red]Not a file or folder: {source}[/red]")
+        raise typer.Exit(1)
+
+    try:
+        installed = install_zip(ctx.workspace, data, fallback)
+    except InstallError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+
+    config = next((c for c in ctx.skill_configs() if c.name == installed.name), None)
+    verb = "Replaced" if installed.replaced else "Installed"
+    console.print(f"[green]{verb} '{installed.name}'[/green] ({installed.files} files) "
+                  f"in {installed.path}")
+    if config and config.required_env:
+        console.print(
+            f"It reads [bold]{', '.join(config.required_env)}[/bold], so it runs with each "
+            "user's own values. Set yours with "
+            f"[bold]qj skills set-secret {config.required_env[0]}[/bold].")
+
+
+@skills_app.command("remove")
+def skills_remove(
+    name: str = typer.Argument(..., help="Skill name"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation"),
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """Remove a workspace-installed skill. A skill found in your personal ~/.claude/skills
+    belongs to that tooling, not to QuickJoiner, and is refused."""
+    from quickjoiner.skills import uninstall
+
+    ctx = _context(workspace)
+    config = next((c for c in ctx.skill_configs() if c.name == name), None)
+    if config is None:
+        console.print(f"[red]No skill named '{name}'.[/red]")
+        raise typer.Exit(1)
+    if config.skill.origin != "workspace":
+        console.print(
+            f"[yellow]'{name}' was found in {config.skill.origin} storage, not this "
+            "workspace — it is not QuickJoiner's to delete.[/yellow]")
+        raise typer.Exit(1)
+    if not yes and not typer.confirm(f"Remove skill '{name}' and its files?"):
+        raise typer.Exit(1)
+    if not uninstall(ctx.workspace, name):
+        console.print(f"[red]Could not remove '{name}'.[/red]")
+        raise typer.Exit(1)
+    try:
+        ctx.catalog.delete_skill_config(name)
+    except Exception:
+        pass
+    console.print(f"[green]Removed '{name}'.[/green]")
+
+
+@skills_app.command("secrets")
+def skills_secrets(workspace: Optional[Path] = WORKSPACE_OPT):
+    """Which credential names you have set, and which each skill still needs.
+
+    Names only — there is no command, endpoint or log line anywhere that prints a value.
+    """
+    from quickjoiner.skills import WORKSPACE_OWNER, runnable
+
+    ctx = _context(workspace)
+    configs, store, user = _skills(ctx)
+    console.print(f"[bold]Set workspace-wide:[/bold] {', '.join(store.keys(WORKSPACE_OWNER)) or '(none)'}")
+    if user:
+        console.print(f"[bold]Set by you ({user}):[/bold] {', '.join(store.keys(user)) or '(none)'}")
+    for c in configs:
+        if not c.required_env:
+            continue
+        ok, missing = runnable(c, store, user)
+        console.print(f"- {c.name}: needs {', '.join(c.required_env)} — "
+                      + ("[green]all set[/green]" if ok
+                         else f"[yellow]missing {', '.join(missing)}[/yellow]"))
+
+
+@skills_app.command("set-secret")
+def skills_set_secret(
+    key: str = typer.Argument(..., help="Environment variable name, e.g. DEPLOY_TOKEN"),
+    value: Optional[str] = typer.Option(
+        None, "--value", help="The value (omit to be prompted without echo — preferred, "
+                              "since a value passed here lands in your shell history)"),
+    shared: bool = typer.Option(
+        False, "--shared",
+        help="Store workspace-wide (a shared endpoint or tenant id everyone inherits) "
+             "instead of as your own. Your own value still overrides it."),
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """Store one credential, encrypted, for the skills that require it."""
+    from quickjoiner.skills import WORKSPACE_OWNER, SecretsUnavailable
+
+    ctx = _context(workspace)
+    user = _session_user(ctx)
+    secret = value if value is not None else typer.prompt(f"Value for {key}", hide_input=True)
+    owner = WORKSPACE_OWNER if shared else (user or WORKSPACE_OWNER)
+    try:
+        ctx.secret_store().set(owner, key, secret)
+    except (SecretsUnavailable, ValueError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    where = "workspace-wide" if shared else (f"for {user}" if user else "for this workspace")
+    console.print(f"[green]Stored {key} {where}.[/green]")
+
+
+@skills_app.command("unset-secret")
+def skills_unset_secret(
+    key: str = typer.Argument(..., help="Environment variable name"),
+    shared: bool = typer.Option(False, "--shared", help="Remove the workspace-wide value"),
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """Remove one stored credential."""
+    from quickjoiner.skills import WORKSPACE_OWNER
+
+    ctx = _context(workspace)
+    user = _session_user(ctx)
+    owner = WORKSPACE_OWNER if shared else (user or WORKSPACE_OWNER)
+    ctx.secret_store().delete(owner, key)
+    console.print(f"[green]Removed {key}.[/green]")
+
+
 browser_app = typer.Typer(help="Persistent browser profile for user-credential fallback (SSO/MFA logins).")
 app.add_typer(browser_app, name="browser")
 

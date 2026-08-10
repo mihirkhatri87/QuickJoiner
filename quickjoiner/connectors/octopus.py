@@ -21,6 +21,7 @@ from typing import Any, Iterator
 
 from quickjoiner.connectors.base import ConnectionStatus, Connector, Document, Mode
 from quickjoiner.connectors.files import read_documents_parallel
+from quickjoiner.connectors.live_tools import cite
 from quickjoiner.connectors.registry import register
 from quickjoiner.connectors.util import as_bool, get_json, resolve_secret
 from quickjoiner.llm.base import AgentTool, ToolSpec
@@ -200,6 +201,12 @@ class OctopusConnector(Connector):
     def _name_map(self, endpoint: str) -> dict[str, str]:
         return {i["Id"]: i.get("Name", i["Id"]) for i in self._paged(endpoint)}
 
+    def _slug_map(self, endpoint: str) -> dict[str, str]:
+        """Id -> slug, for building the same project URL the ingested project documents
+        use — so a project named on the LIVE dashboard cites to exactly the page a
+        remembered one does."""
+        return {i["Id"]: i.get("Slug") or i["Id"] for i in self._paged(endpoint)}
+
     def sync(self, state: dict[str, str]) -> Iterator[Document]:
         server, headers = self._server(), self._headers()
 
@@ -255,7 +262,25 @@ class OctopusConnector(Connector):
                 return "No deployments on the dashboard."
             project_names = self._name_map("projects")
             env_names = self._name_map("environments")
-            return dashboard_document(self._server(), items, project_names, env_names).text
+            slugs = self._slug_map("projects")
+            server = self._server()
+            # Formatted here rather than reusing dashboard_document().text on purpose: the
+            # citation markers belong in LIVE tool output only. That document's text is
+            # chunked and embedded, and markers inside it would later be read back out of
+            # search results as if the stored page were itself citing sources.
+            lines = []
+            for i in items:
+                pid = i.get("ProjectId")
+                pname = project_names.get(pid, pid or "?")
+                ename = env_names.get(i.get("EnvironmentId"), i.get("EnvironmentId", "?"))
+                slug = slugs.get(pid)
+                lines.append(
+                    f"- {pname} in {ename}: {i.get('ReleaseVersion', '?')} — {i.get('State', '?')}"
+                    f" ({i.get('CompletedTime') or i.get('QueueTime') or ''})"
+                    + cite(f"Octopus project: {pname}",
+                           f"{server}/app#/projects/{slug}" if slug and server else None)
+                )
+            return "\n".join(lines)
 
         return [
             AgentTool(

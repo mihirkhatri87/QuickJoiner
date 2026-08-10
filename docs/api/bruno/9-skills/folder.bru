@@ -1,0 +1,29 @@
+meta {
+  name: 9-skills
+  seq: 10
+}
+
+docs {
+  # Skills — packaged expertise, and each person's own credentials
+
+  A skill is a folder holding `SKILL.md` (YAML frontmatter + markdown), optionally with
+  `references/` and `scripts/`. It is the open Agent Skills format Claude Code and GitHub
+  Copilot both read, so a skill written for either works here unmodified.
+
+  Two tiers, because they are genuinely different acts:
+
+  * **Using** one is open to everybody, and so is supplying **your own** credentials for it.
+  * **Installing / removing / re-scoping** one is **admin only** — a skill may bundle scripts,
+    and a script runs with the server's own privileges.
+
+  A skill whose scripts read credentials is registered as **user-scoped** on arrival: it will
+  not run until the calling person supplies those values, and it never falls back to whatever
+  the server happens to hold under the same names. So `GET /api/skills` answers "is this ready
+  **for me**", not "does this exist".
+
+  Secrets are encrypted at rest and **write-only**: no endpoint anywhere reads a value back
+  out, so the list request returns names only.
+
+  Set `skillZip` (a .zip containing SKILL.md), `skillName` and `skillSecretKey` in the
+  environment before running this folder.
+}

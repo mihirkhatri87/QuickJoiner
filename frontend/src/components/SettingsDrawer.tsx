@@ -19,6 +19,7 @@ import { api, token } from "../api";
 import type { AuthStatus, BrowserSessionStatus, ConnectorRow, ConnectorType, OAuthStatus, SettingDefaults, Settings, SyncJob, UserRow } from "../types";
 import { EditConnectorModal } from "./EditConnectorModal";
 import { RemoteBrowserModal } from "./RemoteBrowserModal";
+import { SkillsPanel } from "./SkillsPanel";
 import { Button, cn, Field, IconButton, schedLabel, Select, SYNC_OPTIONS, TextArea, TextInput } from "./ui";
 
 const ALL_MODES = ["pull", "hooks", "live", "browser", "scrape"];
@@ -132,6 +133,11 @@ export function SettingsDrawer({
           <Section title="Connectors">
             <Connectors auth={auth} onFlash={flash} onChanged={onChanged} onOpenArtifact={onOpenArtifact}
                         syncJobs={syncJobs} onOpenSync={onOpenSync} />
+          </Section>
+
+          <Section title="Skills">
+            <SkillsPanel isAdmin={auth.role === "admin"} signedOut={auth.enabled && !auth.user}
+                         onFlash={flash} />
           </Section>
 
           {auth.role === "admin" && (

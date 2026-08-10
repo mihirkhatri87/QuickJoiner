@@ -50,6 +50,13 @@ qj onedrive login|status|logout <name>        # Microsoft 365 device-code sign-i
 qj onedrive learn <name> <url-or-path>...     #   connector; `learn` ingests ONLY what you point
                                               #   at (nothing is crawled). Web UI: Sign in with
                                               #   Microsoft on the connector plate.
+qj skills list|show <name>                    # packaged expertise (open Agent Skills format).
+qj skills install <folder-or-zip>             #   `list` marks each one ready / needs-N FOR YOU;
+qj skills remove <name> [-y]                  #   install/remove are admin acts (a skill may
+qj skills secrets                             #   carry scripts). `secrets` shows which values
+qj skills set-secret KEY [--value V]          #   you've set and which are missing — NAMES only,
+    [--shared]                                #   never values; --shared = workspace-wide default
+qj skills unset-secret KEY [--shared]         #   that anyone's own value still overrides.
 qj browser login <url> / qj browser status [url]  # Playwright profile for credential-gated
                                               #   sites; `login` captures session cookies and
                                               #   VERIFIES the sign-in took (exit 1 if not),
@@ -1428,6 +1435,111 @@ Previously BOTH source copies preceded the install layer, so every edit re-downl
   on hitting the round
   limit the agent makes **one final tool-free turn** so a model that loops on searches still
   answers or properly refuses from what it gathered, instead of a canned "hit the limit" message.
+  **Trace events — the run as an ordered timeline (2026-08-08, user request):**
+  `tool_call` used to carry the bare tool NAME, and nothing carried the outcome, so the UI
+  could show *that* `search_memory` ran but never what it searched for or what came back —
+  and reasoning arrived on a separate channel, so the ordering between the two was lost.
+  `tool_call` now carries `{id, name, args}` and a new **`tool_result`** carries
+  `{id, name, ok, summary, chars}`, paired by `id` and emitted around the same `tool.run`
+  call, so `thinking` / `tool_call` / `tool_result` interleave in the real order the run
+  happened — which is the whole contract the step-by-step trace UI is built on. Both are
+  **display-only**: the model still receives the full (or `_cap`-limited) output, so nothing
+  here can change an answer. Bounded on purpose (`_ARG_PREVIEW_CHARS` 400 per argument,
+  `_RESULT_PREVIEW_CHARS` 800) — a single result can be 24k chars and there is no reason to
+  push it down the wire twice — and `chars` states the true size so a clipped preview is never
+  mistaken for the whole output. `chars` measures the output **as the model received it**
+  (after `_cap`, whose own truncation marker rides inside it), not a pre-cap size the model
+  never saw. Tests: `tests/test_agent_loop.py` (pairing + ordering, a raising tool reported
+  `ok: false`, and the bounds with the true size).
+  **Citable sources reach the CLIENT, so a citation can be a link (`agent/refs.py`,
+  2026-08-08, user request — "in ROVO sources appear as clickable links to the actual
+  pages"):** `search_memory` has always handed the MODEL a uri per hit
+  (`[source: <label> | uri: <uri> | kind: <kind> | score: <n>]`), and the client saw none
+  of it — the answer text carries only whatever label the model chose to write. So a
+  citation of a readable title had nothing to link to, while a citation of the raw URL was
+  clickable but unreadable. `parse_source_refs` (pure) reads those headers back out of each
+  tool result and the agent emits them as a **`sources`** event (`{label, uri, kind?,
+  score?, snippet}`), additive per turn and deduped by `(label, uri)` so repeated searches
+  don't re-send the same documents. Both header shapes parse — the `search_memory` block
+  form and the graph-expansion `- [source: … | uri: …]` bullet, which has no kind/score.
+  The snippet is the source's own opening text: bounded, word-boundary cut, stopped at the
+  next hit's separator so one source can't quote another's, and with the
+  **contextual-chunking breadcrumb stripped** (`[<source_id> · <title> · <uri>]` is
+  provenance for the vector, and as an excerpt it merely repeats the title and link shown
+  beside it). A header with an empty uri is still returned — worth naming in the panel,
+  simply not linkable.
+  **The graph tools cite with a uri too (`_evidence_ref`, same day, user-reported "I don't
+  see citations as links" on a question the first cut had left half-broken):** an edge row
+  already carried `evidence_uri`, but the renderer preferred the title in an `or` chain and
+  **discarded the url** — so the SAME document behaved differently depending on which tool
+  cited it, and a question routed to `graph_relations` (which is exactly what "list all
+  teams with their members" is) had most of its citations resolve to nothing. Measured on
+  the live corpus: **5 of 11 citations linked before, 9 of 12 after**, with refs announced
+  per turn rising 13 → 69. All three evidence sites now render
+  `[evidence: <title> | uri: <uri>]`, and `graph_relations` emits **one bracket per
+  document** instead of a semicolon list inside one — a list cannot be parsed into
+  (label, uri) pairs, and it also invited the model to cite a run-on string naming two
+  pages. Evidence with no uri (a `same_as` bridge, a code-graph file path) still renders
+  bare and is deliberately NOT matched: there is nothing to link to.
+  **`weblinks.py` — identity is not an address (2026-08-08, user request: work items,
+  pipelines, MRs and *code files* should all be citable links).** A document's `uri` is
+  what identifies it, and three shapes are not browsable: a cloned repo file is
+  `<clone-url>::<path>` — which **begins with `https://`**, so any scheme-only check
+  offers it and it 404s with total confidence (a real regression the first cut shipped);
+  `file://` is blocked by browsers from an http page, so it fails silently; and
+  `conversation://` is internal. `citable_link(uri)` (pure) returns the URL to open or
+  **None**, and the ref carries it as a separate **`link`** field — `uri` stays identity,
+  and the client links on `link`, never on `uri` looking like a URL. Repo files are
+  rebuilt from each forge's own web layout (`/-/blob/<ref>/` GitLab, `/blob/<ref>/`
+  GitHub, `/src/<ref>/` Bitbucket, `?path=` Azure DevOps), from either an https or an scp
+  (`git@host:group/repo.git`) remote, with embedded credentials stripped so a token can
+  never reach a rendered link. **`HEAD` is the ref** — the connector's `branch` option is
+  usually blank ("whatever the remote's default is") and all three forges resolve HEAD to
+  the default branch. An **unrecognised host yields None rather than a guessed path**:
+  every forge spells its blob URL differently, so inventing one 404s while looking
+  authoritative. Verified on the real corpus — **1200 git documents across 3 repos, all
+  deriving clean blob URLs, zero malformed** — and the derived (project, path, ref)
+  triples were confirmed to name **files that actually exist** via the GitLab API, since
+  a plain HEAD request only 302s to sign-in and proves nothing.
+  **Live tools became citable the same way (`live_tools.cite`)**: they answer the
+  enumeration questions memory can't, but a bare "!123 Fix login" resolves to nothing, so
+  their citations could never link the way an ingested document's could. `cite(label,
+  url)` emits the same `[source: <label> | uri: <url>]` marker `search_memory` does — one
+  parser reads both — wired into GitLab MR/issue/commit/pipeline/job lists (which already
+  had `web_url`) and Azure DevOps work items + builds (whose URLs are **constructed** from
+  `org_url`, matching the ones the ingested work-item documents already carry, so a live
+  hit and a learned hit cite identically). It returns `""` when there is no url: a marker
+  with nothing behind it is noise in the model's context and promises a link that cannot
+  exist. Delimiters in a label are neutralised, since ticket titles routinely contain
+  `|` and `[]`. Applied to **GitLab, Azure DevOps and Octopus** live tools; the Octopus
+  dashboard tool formats its own lines rather than reusing `dashboard_document().text`,
+  because that document's text is chunked and embedded and a marker inside it would later
+  be read back out of search results as though the stored page were itself citing sources
+  — markers belong in live tool output only. Tests: `tests/test_weblinks.py` (14).
+  **Measured before building any of it, which changed the scope:** Octopus (995/995) and
+  web-scraped pages (565/565) already carried real URLs and were *already* linking, so the
+  only genuine gap was the Octopus live tool. What the audit did surface was a
+  **misattribution risk**: 23 of the live crawl's documents share the title
+  "Home page - AppRiver.ContinuousDelivery" (they predate the `<h1>` title fix, which only
+  takes effect on re-ingest), and label matching was first-wins — so citing that title
+  linked to whichever of the 23 happened to arrive first. `CiteBook` now indexes a label
+  to EVERY distinct page retrieved under it: one ⇒ link, several ⇒ **ambiguous**, no
+  inline link, and the sources panel lists all the candidates with a note. The same map
+  also indexes the **head of a `"<name>: <description>"` title**, since models cite the
+  head (observed live: `[Octopus deployment dashboard]` against a title ending
+  `: current state per project/environment`) — safe precisely BECAUSE collisions register
+  as ambiguity, so "Octopus project", which prefixes hundreds of documents, resolves to
+  nothing rather than to an arbitrary one. `-` is deliberately not a separator: it appears
+  inside real titles far too often ("MailStore - Team Charter").
+  ⚠ **`candidates._REF` had to move in lockstep** — its evidence branch captured to `]`,
+  so the new `| uri:` tail would have been folded into the ref NAME and every candidate
+  citing a title would have silently stopped resolving. Both branches now stop at the
+  first `|`. That one-bracket-per-document change also broke the snippet and was caught
+  only by looking at the rendered panel: the text following the first bracket is the
+  SECOND bracket, so the excerpt showed raw `[evidence: … | uri: …]` markup — `_snippet`
+  now drops leading sibling citations and stops at the next one. Tests:
+  `tests/test_source_refs.py` (14, incl. the graph-evidence regression, the no-uri guard
+  and the sibling-citation excerpt) + agent-level emission/dedupe/silence tests.
   **Empty-completion guard (2026-07-23):** a round that returns NO tool call AND blank text — a
   reasoning model (gpt-oss) that emitted only a thinking channel, or an empty completion — no longer
   returns that blank ("qj ended with no response"); it breaks to the same final tool-free turn, and
@@ -1500,6 +1612,91 @@ Previously BOTH source copies preceded the install layer, so every edit re-downl
   documents plus every tag. `POST /api/chat` takes an optional `scope`; omitting it is
   byte-identical to the old request. Tests: `tests/test_scoping.py` (17). NB this is also the
   filtering machinery per-user knowledge scopes (PRIORITIES #2) needs.
+- `quickjoiner/skills/` — **Agent Skills: packaged expertise, in the open format Claude Code and
+  GitHub Copilot both read** (2026-08-07, user request). Connectors teach the system what the org
+  knows; a skill teaches it **how the org works** — the query syntax for a log index, which ticket
+  fields a team actually uses, a release runbook. A skill is a folder with `SKILL.md` (YAML
+  frontmatter + markdown), optionally `references/` and `scripts/`. Format compatibility is a
+  design constraint, not a bonus: a skill written for either tool works here unmodified and stays
+  working there, so nothing here is QuickJoiner-specific and the two QuickJoiner additions
+  (`requires_env`, `scope`) are **optional frontmatter keys**, which the other runtimes ignore.
+  `loader.py` — discovery + parsing, deliberately side-effect-free (it runs on every request that
+  builds an agent, so one malformed folder must never take the catalogue down: `load_skill`
+  returns None rather than raising). `discover(roots)` reads `<workspace>/skills` (the portable
+  root, where uploads land) then `~/.claude/skills` and `~/.copilot/skills`, first origin winning
+  a name clash so a workspace skill deliberately shadows a personal one rather than the order
+  depending on the filesystem. **`detect_env` is a SUGGESTION, never a declaration** — it reads
+  a skill's scripts for environment reads so a person adopting an existing skill is shown "this
+  looks like it needs TFS_PAT" instead of having to read them. Two things keep it usable rather
+  than noise, both found against a real library: the read pattern is **scoped to the language**
+  (`${NAME}` is a shell env read but JavaScript template interpolation, and matching it everywhere
+  turned one real skill into 90 lines of local variable names), and `_SYSTEM_ENV` drops what the
+  OS provides (LOCALAPPDATA and ProgramFiles were the two most common reads across the whole set).
+  It still cannot tell a credential from a tuning flag — measured on the real `tfs-control` skill,
+  it proposes 9 values of which 4 have defaults — which is exactly why the admin PATCH exists and
+  why the UI offers the extras as "add them if they are credentials".
+  `registry.py` — **the folder seeds QuickJoiner's configuration; the `skills` table is
+  authoritative thereafter.** An uploaded skill's frontmatter is written by whoever wrote the
+  skill, so an admin must be able to narrow or widen it without editing files on the server; the
+  scope survives rediscovery and reinstallation. On first sight, scripts reading no credentials ⇒
+  **open** (anyone), any credential ⇒ **user-scoped** (only someone who supplied their own).
+  `secrets.py` — per-user values layered **user > workspace > process env**, so a shared
+  `OCTOPUS_URL` sits at workspace level while each person supplies their own `OCTOPUS_API_KEY`.
+  **Encrypted at rest** (Fernet, key in `<workspace>/secrets.key`), unlike connector options which
+  are stored plaintext and merely masked on read — the difference is deliberate, since these are
+  individual people's own credentials and a workspace database gets copied for backups and bug
+  reports; a copied `catalog.db` alone yields nothing. Honest about the limit: anyone with BOTH
+  the database and the key file can decrypt, and the server must be able to, so this is protection
+  against a leaked copy, not against someone with the machine. **The rule that matters most:
+  `resolve(..., include_process_env=False)` for a user-scoped skill** — a credential the SERVER
+  holds is not this person's, and falling back to it would run the skill as somebody else while
+  looking like success, so the value is reported missing and the agent names it.
+  `runner.py` — the one part that executes code, so its rules are narrow and stated: the script is
+  resolved and confined to the skill folder (the name comes from a model), **no shell** (argv
+  list, so a filename can never become a command), wall-clock timeout + truncated output, and
+  **secret values are never echoed** — a failure names only the KEYS that were missing. What it is
+  NOT is a sandbox: a script runs with the server's privileges, which is why authoring is an admin
+  act while *using* a skill is open to everybody.
+  `install.py` — a skill arrives as a zip (the shape GitHub, Claude Code and Copilot all hand
+  you). Every member is resolved and checked to stay inside the target (a naive `extractall`
+  writes `../../etc/…`), symlink entries are dropped since they are a path escape that survives
+  the name check, and member count / per-member / total-uncompressed size are bounded — the same
+  decompression-bomb shape `ingest/extract`'s archive path already guards. **Unsafe members are
+  filtered BEFORE the common root is computed, not just before writing** — found by probing a
+  mixed archive rather than by the suite: one stray `/etc/passwd` entry made the top-level folders
+  disagree, defeated root detection, and rejected an otherwise perfectly valid skill with a
+  misleading "no SKILL.md" for an archive that plainly had one. Containment was never at risk;
+  usability was. Extraction **stages
+  then swaps**, so a failure part-way leaves the installed skill intact rather than a half-written
+  folder discovery would happily load; a reinstall **replaces the folder outright** so a script the
+  new version no longer mentions cannot survive to be run, while the stored configuration for that
+  name is untouched. `uninstall` only ever writes under the workspace root: a skill found in a
+  personal `~/.claude/skills` belongs to that person's own tooling (409 from the API, "disable it
+  instead").
+  `tools.py` — **progressive disclosure is what makes a large library affordable**: only NAME and
+  DESCRIPTION ride the system prompt (`catalogue_prompt`, bounded at `MAX_DESCRIPTION_CHARS` 280
+  — measured on a real library, one skill's description alone ran to ~1,000 characters and seven
+  of them would have cost more prompt than most answers), and the body is fetched only when the
+  model decides a skill applies. Four tools: `open_skill` (the body), `read_skill_file` (one
+  bundled reference), `run_skill_script`, and `my_skill_secrets` — the last exists so the agent
+  can answer "why can't you do that?" by naming the variables the person must set instead of
+  failing vaguely. **An unavailable skill is still LISTED**, marked so, for the same reason:
+  hiding it would leave the agent unable to explain a capability the person can see in the UI.
+  Wired in `AppContext.build_agent` via `skill_tools(user)`, best-effort — a broken skill folder
+  or secret store costs the skills feature, never the whole agent. API: `GET /api/skills` (rows
+  carry per-CALLER `ready`/`missing`), `POST /api/skills` (multipart .zip), `PATCH`/`DELETE
+  /api/skills/{name}`, and `GET`/`POST`/`DELETE /api/skills/secrets…`. RBAC adds three caps
+  rather than the usual read/write pair, because "configure the library" and "set my own password
+  for a skill" are genuinely different acts: `skills:read` + `skills:secrets` are **viewer**-tier
+  (using a skill and supplying your own credentials are open to everybody — the point of the
+  feature), `skills:write` is **admin**-only. UI: `frontend/src/components/SkillsPanel.tsx`, a
+  Settings → Skills section; the credential form is write-only throughout (a key already set shows
+  as "yours"/"workspace" with a Replace box, never a populated field that would imply we could
+  read it back). Tests: `tests/test_skills.py` (30 — written as security tests: a scoped skill
+  never borrowing the server's credentials, one user's secrets not enabling another, a
+  model-supplied path escaping neither `read_skill_file` nor `run_skill_script` nor the installer,
+  a value never readable back out, admin configuration surviving rediscovery AND reinstall) + 8 in
+  `tests/test_api.py` (per-caller readiness, the admin/viewer split, workspace-vs-personal scope).
 - `quickjoiner/auth.py` — opt-in local auth. `Auth` over the catalog: PBKDF2 password hashing,
   bearer tokens (sha256-hashed at rest in `auth_tokens`), `users` table (with a **`role`
   column**). **Open mode until the first user exists** (no login, everything shared = pre-auth
@@ -1584,9 +1781,11 @@ Previously BOTH source copies preceded the install layer, so every edit re-downl
   exist and how they resolve, even though it can no longer be read, cited or enumerated.
 - `quickjoiner/api/` — FastAPI. **OpenAPI/Swagger is grouped + documented** (2026-07-20): the app
   carries a top-level `description` + `openapi_tags`, and every route decorator has `tags=[...]` +
-  a plain-English `summary=` (the HTML `/` route is `include_in_schema=False`). 43 endpoints across
-  11 tag groups (Status / Authentication / Connectors / Sync & ingestion / Ask & search / Knowledge
-  graph / Knowledge gaps / Sessions & projects / Briefs & repo docs / Settings / Webhooks). Interactive
+  a plain-English `summary=` (the HTML `/` route is `include_in_schema=False`). **83 operations
+  across 12 tag groups** (Status / Authentication / Connectors / Sync & ingestion / Ask & search /
+  Knowledge graph / Knowledge gaps / Sessions & projects / Briefs & repo docs / Settings / Skills /
+  Webhooks) — counted from `app.openapi()`, not from memory; the previously-stated "43 across 11"
+  had been stale for many endpoints. Interactive
   docs at **`/docs`** (Swagger UI — note: pulls its JS/CSS from a CDN, so blank offline; `/openapi.json`
   is self-contained), **`/redoc`**. Import-ready **Postman + Bruno runbooks** for the end-to-end flow
   live in `docs/api/` (all common config in one place: Postman collection Variables / Bruno `Local`
@@ -1675,10 +1874,54 @@ Previously BOTH source copies preceded the install layer, so every edit re-downl
   no side panel; citations are inline superscripts with a native hover tooltip = the source; a
   per-answer **hover toolbar** — download .md, view **cited-sources modal** (also opened by the
   grounded stamp), 👍/👎; 👎 opens a **feedback modal** that teaches the correction via
-  `/api/learn` (`onLearned` refreshes status/gaps); streaming caret), plus a **Download
+  `/api/learn` (`onLearned` refreshes status/gaps); streaming caret),
+  **`components/ThinkingTrace.tsx` — the reasoning trace as a step-by-step timeline
+  (2026-08-08, user request, modelled on Confluence ROVO's):** the run genuinely IS a
+  sequence — think, call a tool, read what came back, think again — and the SSE stream
+  delivers those events in that order, but the old view threw the ordering away, putting
+  reasoning in one `<pre>` blob and tool calls in a separate row of pills that showed only
+  function names. `Msg.trace: TraceStep[]` is now the canonical ordered record (`thought` |
+  `action` | `note`), built by three pure reducers (`appendThought` merges consecutive
+  reasoning deltas so a run of them stays ONE step; `startAction`; `finishAction`, which
+  pairs on `id` and falls back to the trailing unfinished call of the same name so a
+  provider that rewrites ids can't leave a step spinning forever). Each step is a row on a
+  vertical rail — icon, bold title, one-line detail, chevron to expand into the full
+  arguments and the result preview. **Two honesty rules govern the file**, since a trace
+  that embellishes is worse than none: thought titles are the model's OWN segmentation
+  (`splitThought` splits on its `**bold**`/`##` markers — which is what makes our output
+  look like ROVO's when the model provides them; a blob with no markers stays one step
+  titled "Reasoning", never an invented summary), and a result preview always states its
+  true size. `actionLabel` hand-writes phrasing for the ~13 built-in tools and *derives* it
+  for the ~60 connector live tools from their `<system>_<verb>_<noun>` naming
+  (`gitlab_list_merge_requests` → "Listing merge requests in GitLab"), so a tool this file
+  has never heard of still reads as English rather than a bare symbol. The `/scrape` crawl
+  log feeds the same timeline via `pushNote` (one row per progress line) instead of the old
+  concatenated blob. Note the rail line uses **`bg-hair`, not `bg-border`** — at 0.07 alpha
+  the border token is invisible against the panel fill, and a timeline whose connecting line
+  can't be seen is just a list.
+  **`CiteBook` resolves a cited label to the page behind it (2026-08-08, same request):**
+  constructed with the turn's `sources`, it exposes `source(ref)` / `href(ref)` /
+  `entries()`, so a citation superscript becomes a real anchor and the sources modal leads
+  with the readable title (linked, with its excerpt and uri beneath) instead of a raw ref
+  string. **Matching is normalized EQUALITY only** (case, typographic dashes, whitespace
+  runs, surrounding punctuation) — models paraphrase titles freely and fuzzy matching would
+  silently point a citation at a document the answer was never about; an unlinked citation
+  is the honest failure, and the repo's own rule is that a wrong link is worse than none.
+  A ref that is itself a URL still links to itself, preserving the behaviour that already
+  worked. `parts(ref)` handles the model putting several sources in one bracket
+  ("[A, B]"), which resolves to nothing as a whole: it splits on `,`/`;` **only when EVERY
+  part resolves** to a retrieved source — so a real title containing a comma ("Jan 6, 2026
+  retro") cannot be torn apart, and a bracket naming a page plus something we never
+  retrieved (a Confluence *space*, observed live) stays honestly unlinked rather than
+  half-linked. The chip links only when exactly one source resolves (one destination, one
+  link); the modal and the export list every named source.
+  Plus a **Download
   conversation** button at the top of the chat pane exporting the whole open conversation to
-  one markdown file — questions, answers, tool calls, candidates, and each turn's **reasoning
-  trace as a collapsible GFM `<details>` block**, with a per-turn sources list whose `[n]`
+  one markdown file — questions, answers, candidates, and each turn's **reasoning timeline as
+  a collapsible GFM `<details>` block** (numbered steps, each tool's arguments as a bullet
+  list and its result in a `safeFence`d block stating the true size — `traceToMarkdown`
+  derives from the SAME `Msg.trace`, so the file and the screen cannot drift apart), with a
+  per-turn sources list whose `[n]`
   numbering is harvested by re-running the same `CiteBook`/`renderMarkdown` pass the UI renders
   with (so exported numbers cannot drift from the inline superscripts). **Client-side only, and
   honest about one limit:** thinking traces are never persisted server-side
@@ -1785,7 +2028,8 @@ Previously BOTH source copies preceded the install layer, so every edit re-downl
   selecting a node shrank the canvas and lurched the whole graph sideways — it now floats over
   the canvas (the minimap slides clear of it).
 - `quickjoiner/export.py` — markdown → md/html/csv/pptx (`--format` on `qj ask` / `qj brief`);
-  SSE chat events: `thinking` / `delta` / `tool_call` / `candidates` / `answer` / `error` / `done`.
+  SSE chat events: `thinking` / `delta` / `tool_call` / `tool_result` / `sources` / `candidates` /
+  `answer` / `error` / `done`.
 - `quickjoiner/sessions.py` — `SessionManager`: persistent sessions + projects (catalog tables
   `projects` / `chat_sessions`, messages stored as JSON snapshots). Token optimization: history
   over `chat.compress_after_est_tokens` is folded into a rolling summary at a **user-turn
@@ -3248,6 +3492,130 @@ Post-phase additions (2026-07-07, all tested — suite: **89 passed**):
   untouched. Verified by typecheck + build + a real browser export (no frontend unit-test
   suite exists — manual/Playwright verification is this repo's established practice).
   Spec: `docs/superpowers/specs/2026-08-07-download-conversation-design.md`.
+- Reasoning trace rebuilt as a step-by-step timeline (2026-08-08, user request: "when I ask a
+  question to Confluence ROVO I see this kind of thinking visualization instead of our flat
+  text based — can we implement something like this?", with a saved page and two screenshots
+  of ROVO's, then "each step is expandable that shows details" and "incorporate this in the
+  download conversation flow as well"). Design in the `agent/` and frontend architecture
+  bullets above. **The gap was mostly in what the backend never sent, not in the CSS:** reading
+  ROVO's saved page showed its trace is a timeline of reasoning interleaved with actions, each
+  naming its argument ("Reading URL: https://…/Caffeine+-+Team+Charter") — while our
+  `tool_call` event carried the bare tool NAME and `call.input` was dropped on the floor, with
+  no event at all for the outcome. So no amount of frontend work could have produced this: the
+  arguments and results had to start being sent (`tool_call` → `{id, name, args}`, new
+  `tool_result` → `{id, name, ok, summary, chars}`), and the ordering between reasoning and
+  actions had to be preserved rather than split across two UI regions.
+  Worth keeping: the reason our steps get ROVO-like titles at all is that reasoning models
+  emit their own `**bold**` section markers, and `splitThought` uses THOSE — the alternative
+  (summarizing each step with a model) would have been a second inference per step and would
+  have put invented words in a panel whose entire job is to show what actually happened. A
+  blob with no markers stays one honest "Reasoning" step. Verified on the real 22,139-doc
+  workspace with gemma4:cloud, not only against a scripted provider: the live panel showed the
+  model's genuine reasoning about the grounding rules followed by its real
+  `graph_relations(works_on, person→team)` call, and the exported markdown carried the same
+  numbered steps with each tool's arguments and its result stated as "first 800 of 14,485
+  characters". The scripted run additionally covers what a real run wouldn't reliably produce
+  — a failing tool (rendered gold with a warning, `ok: false`) and an unknown tool name (still
+  readable via the derived label). Suite: **879 passed** (+3), 15 skipped. Frontend rebuilt.
+- Citations became links (2026-08-08, same session, user request: "in ROVO sources appear as
+  clickable links to the actual pages/urls — can we implement citation that way so the citation
+  chips are individually clickable and then compiled sources also give links?"). Design in the
+  `agent/refs.py` and `CiteBook` bullets above. **The information was never missing, only
+  undelivered:** every retrieval hit already carried its uri to the model, so this is a new SSE
+  `sources` event and a resolver, not new retrieval. Two decisions are the substance of it, both
+  following the repo's existing rule that a wrong citation is worse than an absent one —
+  normalized-equality matching only (no fuzzy title matching), and the all-or-nothing split for a
+  bracket naming several sources. Both were vindicated live on the real corpus rather than in
+  theory: one run cited two *genuinely different* Confluence pages with near-identical titles
+  ("Caffeine Team Charter" p5149196848 vs "Caffeine - Team Charter" p5108498435) and each chip
+  linked to its own page; another cited a page plus its Confluence **space**, which is not a
+  document we hold, and stayed honestly unlinked instead of half-linked. Measured on your
+  workspace: 4 of 5 chips linked in one run, 3 of 4 in another, the unlinked ones being exactly
+  the refs that name no retrieved document. Also fixed while building it: the sources excerpt led
+  with the contextual-chunking breadcrumb, so it repeated the title and URL shown beside it
+  instead of the document's first words. Suite: **893 passed** (+14), 15 skipped.
+  **Follow-up the same session, and the lesson worth keeping:** the user reported citations
+  still not linking, and they were right — I had shipped this having verified it only on
+  `search_memory`-grounded answers, and closed out by NAMING the graph-evidence gap as a
+  follow-up rather than measuring how much of real traffic it covered. It was most of it:
+  the org-structure questions this product exists to answer route to `graph_relations`, so
+  the feature was half-working for its most important case. The uri was already on the row
+  and was being thrown away by an `or` chain — a one-line-shaped fix I had reasoned past
+  instead of checking. **A known gap stated in a doc is not the same as a measured one**;
+  had I probed the raw SSE for one graph-routed question — which took two minutes once I
+  actually did it — the split would have been obvious before shipping.
+  Their other suspicion ("is this because the answer is cached?") was also half right in a
+  way worth recording: their tab was running the pre-fix JS bundle, so ZERO citations
+  linked in that conversation while other conversations (loaded after the rebuild, and
+  search-grounded) linked fine. **A frontend change needs a hard reload before the report
+  it produces can be trusted** — worth asking about first, since it cleanly separates "not
+  deployed" from "not working".
+  **Still not linkable, deliberately:** a cited title that this turn's tools did NOT return
+  (the model carrying it from a distilled `conversation://` doc, as observed live for
+  "Black Team - Charter" / "Warehouse - Team Charter" — both real documents with real
+  urls). Resolving those against the catalog by title would link them, and is the wrong
+  call: a citation claims provenance, so linking one the turn never retrieved lends it
+  credibility it has not earned — the same rule `candidates.filter_resolvable` already
+  enforces. A `conversation://` uri is likewise never linked (it opens nothing).
+  Final measurement on the reported question, in the browser: **8 of 10 chips linked**,
+  then 7 of 8 on a re-ask — the unlinked ones being exactly the charters that turn's tools
+  did not return.
+  **Extended the same day to live tools and code files** (user: "tfs work items/pipelines/
+  boards should appear as links, gitlab apis should also result in pure citable links, and
+  for git repos I need links to actual code files based on the base path of the git repo").
+  Design in the `weblinks.py` / `live_tools.cite` bullets above. Investigating it turned up
+  a regression the citation work had itself introduced: a cloned repo file's uri begins
+  with its clone url, so `href()` gating on "looks like a URL" was rendering **1200
+  documents' citations as confidently broken links** — gating on a server-computed `link`
+  is what fixes it, and is why identity and address are now separate fields.
+  **Then Octopus and web pages** (user: "now let's fix octopus related sources citation,
+  web pages citations as well") — where auditing first showed both were *already* linking
+  (995/995 and 565/565), so the work that mattered was the Octopus live tool plus the two
+  resolution rules the audit exposed: ambiguous titles and head-of-title citations, both
+  detailed above. Suite: **914 passed** (+18), 15 skipped.
+- Agent Skills — packaged expertise, per-user credentials (2026-08-09, user request; the
+  session that started it disconnected mid-build and this completed it). Design in the
+  `quickjoiner/skills/` bullet above. Connectors teach the system what the org knows; a
+  skill teaches it **how the org works**, which nothing before this covered.
+  **Format compatibility was treated as a constraint rather than a feature**: the two
+  QuickJoiner-specific ideas (what a skill requires, who supplies it) are optional
+  frontmatter keys the other runtimes ignore, so a skill stays portable in both directions.
+  That decision paid for itself immediately — pointing discovery at the real
+  `~/.copilot/skills` folder on this machine picked up **8 existing skills unmodified**, and
+  they became the test corpus for everything else.
+  **The security shape is the substance**, and each rule below is enforced in code and
+  pinned by a test written as a leak test: a user-scoped skill resolves its environment with
+  `include_process_env=False`, so it can never borrow the server's credentials and silently
+  act as somebody else — it refuses and names the missing value; a model-supplied path
+  escapes neither `read_skill_file`, `run_skill_script` nor the zip installer; a stored value
+  is never readable back out by any screen, endpoint, CLI command or log line; and installing
+  is admin-tier while *using* a skill and supplying your own credentials are viewer-tier,
+  because a script runs with the server's privileges and this is explicitly not a sandbox.
+  **What measuring against a real library changed.** Environment detection first matched
+  `${NAME}` everywhere and turned one skill into 90 lines of local JavaScript variables, so
+  the pattern is now scoped per language; `LOCALAPPDATA`/`ProgramFiles` were the most common
+  reads across the whole set, hence `_SYSTEM_ENV`. It still cannot distinguish a credential
+  from a tuning flag — the real `tfs-control` skill proposes 9 values of which 4 have
+  defaults — which is precisely why detection is presented as a **suggestion** and the admin
+  PATCH is the gate. One description alone ran to ~1,000 characters, which is what set
+  `MAX_DESCRIPTION_CHARS`: only names and descriptions ride every prompt, so seven such
+  skills would have cost more prompt than most answers.
+  Verified live end-to-end against ollama `gemma4:cloud`, not only with a scripted provider:
+  asked "how should I search our application logs?", the model chose
+  `open_skill('query-logs')` unprompted, read the body and answered from it; asked to use a
+  skill whose credentials were absent, it called `my_skill_secrets` and replied naming
+  **exactly the one value genuinely missing** (the other two having been inherited from the
+  workspace layer — the layering working as designed). Browser-verified in Chromium against
+  a scratch workspace: Settings → Skills listed 9 skills at "3 of 9 ready for you", the
+  scoped plate showed its two credential boxes, saving both flipped the badge to READY and
+  the summary to "4 of 9", with no console errors.
+  Suite: **952 passed** (+38), 15 skipped. `cryptography` added to `pyproject.toml` — it was
+  imported by `secrets.py` and only incidentally installed here, so a fresh install would
+  have failed to store a credential at all.
+  ⚠ **Not verified: `run_skill_script` against a real credentialed system.** The runner is
+  covered by tests (env layering, containment, refusal) and the real skills on this machine
+  are PowerShell/Node against TFS/Octopus/Mongo endpoints this environment cannot reach, so
+  no script has yet been run end-to-end with live credentials through the agent.
 
 ## Next steps (agreed with user)
 

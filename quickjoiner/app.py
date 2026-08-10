@@ -110,13 +110,61 @@ class AppContext:
         # Self-control tools (plan 08): full API control from chat, gated by the acting user's
         # RBAC role (derived from role_of when not given). Scoped, confirmed, and permission-checked.
         tools.extend(build_control_tools(self, user, role))
-        system = SYSTEM_PROMPT + (f"\n\n{extra_system}" if extra_system else "")
+        # Skills: packaged expertise from the open Agent Skills format. Only names +
+        # descriptions ride the prompt; bodies, references and scripts are fetched on
+        # demand, and a user-scoped skill runs only with THIS user's own credentials.
+        skills_prompt, skill_tools = self.skill_tools(user)
+        tools.extend(skill_tools)
+        system = SYSTEM_PROMPT + (f"\n\n{skills_prompt}" if skills_prompt else "")
+        system += f"\n\n{extra_system}" if extra_system else ""
         return OnboardingAgent(
             provider, tools, system,
             tool_result_max_chars=self.config.chat.live_tool_result_max_chars,
             score_ledger=ledger,
             uncapped_tools=_UNCAPPED_TOOLS,
         )
+
+    def skill_roots(self) -> list[tuple[Path, str]]:
+        """Where skills are looked for, most authoritative first.
+
+        The workspace folder is the portable one — it travels with the deployment and is
+        what an upload writes into. The personal Claude Code / Copilot folders are read
+        too, so a skill already written for those tools works here with no copying; they
+        simply don't exist on a container host, where the workspace folder is the whole
+        story. A same-named workspace skill deliberately shadows a personal one.
+        """
+        roots = [(self.workspace / "skills", "workspace")]
+        home = Path.home()
+        roots.append((home / ".claude" / "skills", "personal (claude)"))
+        roots.append((home / ".copilot" / "skills", "personal (copilot)"))
+        return roots
+
+    def skill_configs(self, installed_by: str = "") -> list:
+        """Every discovered skill joined to QuickJoiner's stored configuration for it."""
+        from quickjoiner.skills import discover, sync_registry
+
+        return sync_registry(self.catalog, discover(self.skill_roots()), installed_by)
+
+    def secret_store(self):
+        from quickjoiner.skills import SecretStore
+
+        if getattr(self, "_secret_store", None) is None:
+            self._secret_store = SecretStore(self.catalog, self.workspace)
+        return self._secret_store
+
+    def skill_tools(self, user: str | None) -> tuple[str, list]:
+        """(prompt section, tools) for this user. Best-effort: a broken skill folder or
+        secret store costs the skills feature, never the whole agent."""
+        from quickjoiner.skills import build_skill_tools, catalogue_prompt
+
+        try:
+            configs = self.skill_configs()
+            if not configs:
+                return "", []
+            store = self.secret_store()
+            return catalogue_prompt(configs, user, store), build_skill_tools(configs, user, store)
+        except Exception:
+            return "", []
 
     def _scoped_sources(self, sources: list | None, scope) -> list | None:
         """The sources whose live tools this turn may use.

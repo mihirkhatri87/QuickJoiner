@@ -1,0 +1,24 @@
+meta {
+  name: List skills
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{baseUrl}}/api/skills
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}
+
+docs {
+  Every discovered skill with its scope, what it requires, and — per CALLER — whether it is
+  ready (`ready`, `missing`). A scoped skill with missing credentials is still listed rather
+  than hidden, so a client can say exactly what to set.
+
+  `detected_env` is what the skill's scripts look like they read: a suggestion for the admin
+  form, not a declaration. `required_env` is what actually gates it, and PATCH overrides it.
+}

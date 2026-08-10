@@ -30,8 +30,11 @@ _LINE = re.compile(
     r"(0(?:\.\d{1,2})?|1(?:\.0{1,2})?)\s*\|\s*sources\s*:\s*(.{1,300}?)\s*$"
 )
 # The exact shapes the built-in tools emit refs in: "[source: <label> | …]" from
-# search_memory / graph expansion, "[evidence: <title>]" from the graph tools.
-_REF = re.compile(r"\[source:\s*([^|\]]+)|\[evidence:\s*([^\]]+)\]")
+# search_memory / graph expansion, "[evidence: <title> | uri: …]" from the graph tools.
+# Both stop at the first "|": the evidence form gained a "| uri:" tail (2026-08-08) so
+# graph citations could resolve to links, and capturing to "]" would fold that tail into
+# the ref NAME — every candidate citing the title would then fail to resolve.
+_REF = re.compile(r"\[source:\s*([^|\]]+)|\[evidence:\s*([^|\]]+)")
 
 
 @dataclass(frozen=True)

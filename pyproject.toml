@@ -24,6 +24,9 @@ dependencies = [
     "python-docx>=1.1",
     "openpyxl>=3.1",
     "pypdf>=4.0",
+    # Encrypts each user's skill credentials at rest (quickjoiner/skills/secrets.py). A core
+    # dependency, not an extra: without it a user-scoped skill cannot store a value at all.
+    "cryptography>=42.0",
 ]
 
 [project.optional-dependencies]

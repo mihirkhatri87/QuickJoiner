@@ -122,6 +122,21 @@
       "key": "scrapeConnector",
       "value": "Plumber",
       "description": "A web_scrape connector with use_browser=true (a site behind a login)"
+    },
+    {
+      "key": "skillZip",
+      "value": "/absolute/path/to/a/skill.zip",
+      "description": "A .zip containing SKILL.md, for the install request"
+    },
+    {
+      "key": "skillName",
+      "value": "query-logs",
+      "description": "The skill to configure or remove"
+    },
+    {
+      "key": "skillSecretKey",
+      "value": "DEPLOY_TOKEN",
+      "description": "One environment-variable name a skill requires (your credential)"
     }
   ],
   "auth": {
@@ -488,7 +503,7 @@
         },
         {
           "name": "Ask a grounded question (SSE)",
-          "description": "Streams SSE events: thinking / delta / tool_call / candidates / answer / done. `project` and `session_id` are optional; if a session id comes back on the stream, capture it for the next call.",
+          "description": "Streams SSE events: thinking / delta / tool_call / tool_result / sources / candidates / answer / done. `project` and `session_id` are optional; if a session id comes back on the stream, capture it for the next call.\n\n`tool_call` and `tool_result` carry JSON in `data` \u2014 {id, name, args} and {id, name, ok, summary, chars} \u2014 paired by `id` and interleaved with `thinking` in the real order the run happened, so a client can render it as a step-by-step trace. `summary` is a bounded preview; `chars` is the true size of the output the model received.\n\n`sources` carries [{label, uri, link?, kind?, score?, snippet}] \u2014 the citable refs a tool result newly introduced, additive across the turn. It is what lets a citation of a readable title resolve to the page it came from and render as a link. `uri` is IDENTITY and is not always browsable (a cloned repo file is `<clone-url>::<path>`); `link` is where the citation should open, and is absent when there is no web address \u2014 link on `link`, never on `uri`.",
           "request": {
             "method": "POST",
             "header": [
@@ -705,8 +720,14 @@
             ],
             "url": {
               "raw": "{{baseUrl}}/api/graph/rebuild?with_triples=false",
-              "host": ["{{baseUrl}}"],
-              "path": ["api", "graph", "rebuild"],
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "graph",
+                "rebuild"
+              ],
               "query": [
                 {
                   "key": "with_triples",
@@ -1018,6 +1039,98 @@
           "request": {
             "method": "POST",
             "url": "{{baseUrl}}/api/memory/reset"
+          }
+        }
+      ]
+    },
+    {
+      "name": "9 \u00b7 Skills (packaged expertise)",
+      "description": "A skill is a folder holding SKILL.md (YAML frontmatter + markdown), optionally with references/ and scripts/ \u2014 the open Agent Skills format Claude Code and GitHub Copilot both read, so a skill written for either works here unmodified.\n\nTwo tiers, because they are different acts: USING one is open to everybody, and so is supplying YOUR OWN credentials for it; INSTALLING / removing / re-scoping one is admin only, because a skill may bundle scripts and a script runs with the server's privileges.\n\nA skill whose scripts read credentials is registered user-scoped on arrival: it will not run until the calling person supplies those values, and never falls back to whatever the server holds under the same names. So the list request answers 'is this ready FOR ME', not 'does this exist'. Secrets are encrypted at rest and write-only \u2014 no endpoint anywhere reads a value back out.",
+      "item": [
+        {
+          "name": "List skills (per-caller readiness)",
+          "description": "Every discovered skill with its scope, what it requires, and \u2014 for THIS caller \u2014 whether it is ready (`ready`, `missing`). A scoped skill with missing credentials is still listed rather than hidden, so a client can say exactly what to set. `detected_env` is what its scripts look like they read: a suggestion for the admin form, never the gate. `required_env` is the gate.",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/skills"
+          }
+        },
+        {
+          "name": "Install a skill (.zip, admin)",
+          "description": "multipart/form-data \u2014 pick a .zip containing SKILL.md under the `file` key (see the skillZip variable). Postman adds the multipart boundary; do not set Content-Type by hand.\n\nReplacement is total: a re-upload removes the previous folder first, so a script the new version no longer mentions cannot survive to be run. The stored configuration for that name is NOT reset \u2014 an admin's scope decision outlives the files. 400 with a stated reason for an unreadable archive, no SKILL.md, or a size/member overrun; 403 for a non-admin.",
+          "request": {
+            "method": "POST",
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": []
+                }
+              ]
+            },
+            "url": "{{baseUrl}}/api/skills"
+          }
+        },
+        {
+          "name": "Configure a skill (admin)",
+          "description": "Override what the skill's own frontmatter declares; every field is optional. `scope` is `open` (anyone may run it, no credentials) or `user` (it runs with each person's own values).\n\nThis is the correction path for detection over-reaching: a real skill's scripts read tuning flags alongside credentials and only a human can tell them apart, so trim `required_env` to what genuinely gates it. The stored row is authoritative from here on \u2014 rediscovery never overwrites it.",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"scope\": \"user\",\n  \"required_env\": [\n    \"DEPLOY_TOKEN\",\n    \"DEPLOY_URL\"\n  ],\n  \"enabled\": true\n}"
+            },
+            "url": "{{baseUrl}}/api/skills/{{skillName}}"
+          }
+        },
+        {
+          "name": "List my secret names (never values)",
+          "description": "Which names this caller has set (`mine`) and which are set workspace-wide (`workspace`). Presence, never content \u2014 no endpoint anywhere reads a stored value back out. A personal value overrides the workspace one of the same name.",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/skills/secrets"
+          }
+        },
+        {
+          "name": "Set one of my secrets",
+          "description": "Store one credential, encrypted at rest. `scope: user` (the default) is yours alone and overrides a workspace value of the same name \u2014 every signed-in user may do this, since it is their own credential and reaches nobody else's. `scope: workspace` is an admin's shared default (an endpoint URL, a tenant id) that everyone inherits, and needs the admin tier.",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"key\": \"{{skillSecretKey}}\",\n  \"value\": \"paste-the-real-value-here\",\n  \"scope\": \"user\"\n}"
+            },
+            "url": "{{baseUrl}}/api/skills/secrets"
+          }
+        },
+        {
+          "name": "Remove one of my secrets",
+          "description": "`scope=user` (default) removes yours; `scope=workspace` removes the shared one and needs the admin tier.",
+          "request": {
+            "method": "DELETE",
+            "url": "{{baseUrl}}/api/skills/secrets/{{skillSecretKey}}?scope=user"
+          }
+        },
+        {
+          "name": "Remove a skill (admin)",
+          "description": "Deletes the skill's folder from the workspace and forgets its configuration. 409 for a skill discovered under a personal ~/.claude/skills or ~/.copilot/skills \u2014 that belongs to the operator's own tooling, not to QuickJoiner; disable it with PATCH instead.",
+          "request": {
+            "method": "DELETE",
+            "url": "{{baseUrl}}/api/skills/{{skillName}}"
           }
         }
       ]

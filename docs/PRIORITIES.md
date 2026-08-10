@@ -7,8 +7,10 @@ any change to a roadmap or plan — item added, removed, shipped, re-scoped — 
 list in the same change.** A row here must always correspond to a live item in its source
 doc; shipped work is deleted from here (the source docs' Shipped ledgers are the record).
 
-Last reconciled against the roadmaps: **2026-08-04** (knowledge-scopes enforcement core
-shipped; item re-scoped to its merge-guard + promotion-flow remainder).
+Last reconciled against the roadmaps: **2026-08-09** (Agent Skills shipped — a new feature,
+so nothing graduated out; it added one row, #38, for the sandboxing it deliberately does not
+do). Prior: 2026-08-04 (knowledge-scopes enforcement core shipped; item re-scoped to its
+merge-guard + promotion-flow remainder).
 
 **Value (V)** 1–5 — user value × differentiation × strategic leverage (5 = category-defining
 or unblocks many other items; 1 = nice-to-have).
@@ -68,6 +70,7 @@ Sources: [plans](plans/STATUS.md) · [AI_ROADMAP](AI_ROADMAP.md) · [FRONTEND_RO
 | 35 | Cloud Y2 multi-tenant SaaS (schema-per-tenant, embedding service, Bedrock path, SOC 2) | 3 | 5 | 0.6 | [Cloud Y2](CLOUD_ROADMAP.md) · [PRD W9.2](PRD.md) |
 | 36 | Hierarchical memory (#17) | 2 | 4 | 0.5 | [AI #17](AI_ROADMAP.md) |
 | 37 | GPU-accelerated, resource-aware parallel ingestion (S6) — **I/O half shipped 2026-07-22**: parallel file reads (files/git) + parallel Octopus releases + network page-prefetch across jira/github/gitlab/azure_devops/confluence. REMAINING: machine profiler + auto-tuned plan, cross-doc batch embedding (CPU too), opt-in `[gpu]` CUDA provider with fallback; batched-ingest integrity preserving pause/resume/stop. Pays off at scale / re-embeds; S1's gate is now in place (ingest docs/min is read from real run history), so a before/after claim is finally measurable — needs gate recalibration | 2 | 4 | 0.5 | [AI S6](AI_ROADMAP.md) |
+| 38 | **Sandbox skill scripts** — `run_skill_script` (shipped 2026-08-09) executes a skill's bundled script as a subprocess with the SERVER's privileges: confined to the skill folder, no shell, timeout-bounded, and handed only the calling user's own resolved credentials, but able to do anything that OS user can. Installing is admin-only *because* of this, and the limitation is stated in three places rather than mitigated. Real isolation means a container or WASM runtime per script, plus a policy for what a skill may reach — genuinely heavy, and only worth it when skills are being installed by people who are not already trusted with the host. Gate: a multi-user deployment where admins ≠ operators | 2 | 5 | 0.4 | [AI_ARCHITECTURE §3.10](AI_ARCHITECTURE.md) |
 
 ## Research spikes (X-track — time-boxed, pre-registered, value uncertain by design)
 

@@ -25,10 +25,80 @@ import { Fragment } from "react";
 import type { ReactNode } from "react";
 import { MermaidBlock } from "./MermaidBlock";
 
-/** Collects citation refs across one whole answer; same ref = same number. */
+/** What a citation resolves to: the page the cited chunk actually came from, as
+ * reported by the retrieval tools (SSE `sources` event). */
+export interface CitedSource {
+  label: string;
+  /** Identity, as the retrieval tools reported it — not always browsable (a cloned repo
+   * file is `<clone-url>::<path>`, a local file is `file://…`). Shown, never linked. */
+  uri: string;
+  /** Where a citation of this document should open. Absent when it has no web address,
+   * which is why linking is gated on THIS rather than on `uri` looking like a URL. */
+  link?: string;
+  kind?: string;
+  score?: number;
+  snippet?: string;
+}
+
+/** One cited reference as the UI consumes it: the label the model wrote, the source it
+ * resolved to (when it did), and where clicking it should go. */
+export interface CiteEntry {
+  ref: string;
+  source?: CitedSource;
+  /** Every source this ref named — more than one when the model put several in a
+   * single bracket. Empty when the ref resolved to nothing. */
+  sources: CitedSource[];
+  href?: string;
+}
+
+/** A citation label is matched to a source by NORMALIZED EQUALITY only — case,
+ * surrounding punctuation and whitespace runs are ignored, nothing else. Models
+ * paraphrase titles freely, and fuzzy matching here would silently point a citation
+ * at a document it was never about; an unlinked citation is the honest failure. */
+function normLabel(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/[‐-―]/g, "-") // typographic dashes → hyphen
+    .replace(/[\s_]+/g, " ")
+    .replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, "")
+    .trim();
+}
+
+/** Collects citation refs across one whole answer; same ref = same number.
+ * Given the turn's sources it also resolves each ref to a URL, which is what makes
+ * citation chips and the sources list clickable. */
 export class CiteBook {
   refs: string[] = [];
   private seen = new Map<string, number>();
+  /** label -> every DISTINCT page retrieved under it. More than one means the title is
+   * ambiguous: a badly-titled site can serve one `<title>` for hundreds of pages (measured
+   * live: 23 documents sharing "Home page - AppRiver.ContinuousDelivery"), and picking the
+   * first would silently link a citation to a page it was never about. */
+  private byLabel = new Map<string, CitedSource[]>();
+
+  constructor(sources: CitedSource[] = []) {
+    const add = (key: string, s: CitedSource) => {
+      if (!key) return;
+      const seen = this.byLabel.get(key) ?? [];
+      // Same page reached twice is not ambiguity; a different page under the same title is.
+      if (!seen.some((x) => x.uri === s.uri)) this.byLabel.set(key, [...seen, s]);
+    };
+    for (const s of sources) {
+      if (!s?.label) continue;
+      add(normLabel(s.label), s);
+      // A model often cites the uri instead of the title; both must resolve.
+      if (s.uri) add(normLabel(s.uri), s);
+      // Many titles are "<name>: <description>" ("Octopus deployment dashboard: current
+      // state per project/environment") and models cite the head. Indexing the head is
+      // safe BECAUSE collisions register as ambiguity: a head shared by several pages —
+      // "Octopus project", which prefixes hundreds — resolves to nothing rather than to
+      // an arbitrary one. Only `:` `—` `|` count as separators; `-` appears inside real
+      // titles far too often ("MailStore - Team Charter") to treat as structure.
+      const head = s.label.split(/\s*[:—|]\s+/)[0];
+      if (head !== s.label && normLabel(head).length >= 6) add(normLabel(head), s);
+    }
+  }
+
   number(ref: string): number {
     let n = this.seen.get(ref);
     if (n === undefined) {
@@ -37,6 +107,50 @@ export class CiteBook {
       this.refs.push(ref);
     }
     return n;
+  }
+
+  /** The single source a ref denotes — undefined when nothing matches it, and also when
+   * SEVERAL distinct pages share that title, because then there is no one answer. */
+  source(ref: string): CitedSource | undefined {
+    const hits = this.byLabel.get(normLabel(ref));
+    return hits && hits.length === 1 ? hits[0] : undefined;
+  }
+
+  /** Every source a ref denotes. Normally one. Two other cases produce several: the model
+   * put multiple sources in one bracket ("[A, B]"), and an ambiguous title that several
+   * distinct pages share. Splitting on commas is only safe when EVERY part resolves to a
+   * known source: a real title containing a comma ("Jan 6, 2026 retro") has parts that
+   * resolve to nothing, so it can't be torn apart by accident. Returns [] when the ref
+   * names nothing we retrieved. */
+  parts(ref: string): CitedSource[] {
+    const direct = this.byLabel.get(normLabel(ref));
+    if (direct?.length) return direct;
+    const pieces = ref.split(/\s*[,;]\s*/).filter((p) => p.trim().length > 1);
+    if (pieces.length < 2) return [];
+    const resolved = pieces.map((p) => this.source(p));
+    return resolved.every(Boolean) ? (resolved as CitedSource[]) : [];
+  }
+
+  /** Where a citation should link. Gated on the server-computed `link`, NOT on `uri`
+   * looking like a URL: a cloned repo file's uri starts with its clone url and would
+   * otherwise render as a confidently broken link. A ref that is itself a URL links to
+   * itself even with no source match, preserving the behaviour that already worked. */
+  href(ref: string): string | undefined {
+    const link = this.source(ref)?.link;
+    if (link && /^https?:\/\//i.test(link)) return link;
+    if (/^https?:\/\//i.test(ref)) return ref;
+    return undefined;
+  }
+
+  /** Every ref this answer cited, paired with whatever is known about it. `sources`
+   * carries all of them when one bracket named several. */
+  entries(): CiteEntry[] {
+    return this.refs.map((ref) => ({
+      ref,
+      source: this.source(ref),
+      sources: this.parts(ref),
+      href: this.href(ref),
+    }));
   }
 }
 
@@ -105,21 +219,27 @@ export function renderInline(text: string, book: CiteBook, keyBase: string): Rea
         out.push(<Fragment key={key}>{m[0]}</Fragment>);
       } else {
         const n = book.number(ref);
+        const href = book.href(ref);
+        // The tooltip names the source and, when they differ, the page behind it —
+        // so hovering a chip tells you where clicking it goes.
+        const uri = book.source(ref)?.uri;
+        const tip = uri && uri !== ref ? `${ref}\n${uri}` : ref;
         const sup = (
-          <sup title={ref} className={CITE_SUP}>
+          <sup title={tip} className={CITE_SUP}>
             {n}
           </sup>
         );
-        // Clickable when the citation ref is itself a URL — opens in a new tab;
-        // hover still shows the source via the native title tooltip either way.
+        // Clickable whenever the ref resolves to a real page — either because the
+        // retrieval tools reported a uri for that title, or because the ref is itself
+        // a URL. Hover still shows the source via the native title tooltip either way.
         out.push(
-          /^https?:\/\//i.test(ref) ? (
+          href ? (
             <a
               key={key}
-              href={ref}
+              href={href}
               target="_blank"
               rel="noopener noreferrer"
-              title={ref}
+              title={tip}
               className="no-underline transition hover:brightness-110"
             >
               {sup}

@@ -70,3 +70,7 @@ login request stores the bearer token so every later request sends `Authorizatio
    folder tag covers files ingested later), and ask a question limited to that slice. The scope
    becomes a real pre-filter on both retrieval legs.
 9. **8 · Lifecycle** — clean up one connector, delete a connector, or reset all memory.
+10. **9 · Skills** — the packaged-expertise library in the open Agent Skills format: list what
+    exists and whether each one is ready **for you**, supply your own credentials for the scoped
+    ones, and (admin) install a `.zip`, re-scope what a skill requires, or remove it. Secrets are
+    write-only — the list request returns names, never values.

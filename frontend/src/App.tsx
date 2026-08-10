@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, streamChat } from "./api";
-import type { AskScope, CandidateItem, ChatAttachment, GapsResponse, ProjectRow, SessionRow, SourceRow, Status, SyncJob } from "./types";
+import type { AskScope, CandidateItem, ChatAttachment, GapsResponse, ProjectRow, SessionRow, SourceRow, Status, SyncJob, CitedSourceEvent, ToolCallEvent, ToolResultEvent } from "./types";
 import { buildCommands, startConnectFlow, type CommandCtx, type Flow } from "./commands";
 import { ArtifactModal, type Artifact } from "./components/ArtifactModal";
 import { Chat, type Msg } from "./components/Chat";
@@ -14,10 +14,22 @@ import { Rail } from "./components/Rail";
 import { SettingsDrawer } from "./components/SettingsDrawer";
 import { SyncHistoryModal } from "./components/SyncHistoryModal";
 import { SyncLogModal } from "./components/SyncLogModal";
+import { appendThought, finishAction, startAction } from "./components/ThinkingTrace";
 import { TopBar } from "./components/TopBar";
 
 const uid = () => (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()));
 const now = () => new Date().toTimeString().slice(0, 5);
+
+/** Tool events carry JSON in `data`. A malformed payload must never break the answer
+ * that is still streaming, so it degrades to no step rather than throwing. */
+function parseToolEvent<T>(data: string): T | null {
+  try {
+    const parsed = JSON.parse(data);
+    return parsed && typeof parsed === "object" ? (parsed as T) : null;
+  } catch {
+    return null;
+  }
+}
 
 export default function App() {
   const [status, setStatus] = useState<Status | null>(null);
@@ -357,9 +369,27 @@ export default function App() {
         // memory", but omitting it keeps the unscoped request byte-identical to before.
         scope: isScoped(scope) ? scope : undefined,
       }, (e) => {
-        if (e.type === "thinking") patch((m) => ({ ...m, thinking: (m.thinking || "") + e.data }));
-        else if (e.type === "tool_call") patch((m) => ({ ...m, tools: [...(m.tools || []), e.data] }));
-        else if (e.type === "delta") patch((m) => ({ ...m, streamText: (m.streamText || "") + e.data }));
+        // thinking / tool_call / tool_result arrive in the real order the run happened,
+        // and all three fold into ONE ordered trace — that ordering is the whole point:
+        // a reader can see which thought led to which search, and what it returned.
+        if (e.type === "thinking") patch((m) => ({ ...m, trace: appendThought(m.trace || [], e.data) }));
+        else if (e.type === "tool_call") {
+          const call = parseToolEvent<ToolCallEvent>(e.data);
+          // A server older than the JSON payload sent a bare tool name; keep rendering
+          // the step rather than dropping it, just without arguments.
+          const step = call ?? { id: `n${Date.now()}`, name: e.data, args: {} };
+          patch((m) => ({ ...m, trace: startAction(m.trace || [], step) }));
+        } else if (e.type === "tool_result") {
+          const res = parseToolEvent<ToolResultEvent>(e.data);
+          if (res) patch((m) => ({ ...m, trace: finishAction(m.trace || [], res) }));
+        } else if (e.type === "sources") {
+          // Additive: each batch is the refs a tool result newly introduced, so they
+          // accumulate across the turn and resolve citations in the final answer.
+          const batch = parseToolEvent<CitedSourceEvent[]>(e.data);
+          if (Array.isArray(batch) && batch.length) {
+            patch((m) => ({ ...m, sources: [...(m.sources || []), ...batch] }));
+          }
+        } else if (e.type === "delta") patch((m) => ({ ...m, streamText: (m.streamText || "") + e.data }));
         else if (e.type === "candidates") {
           try {
             const items = JSON.parse(e.data) as CandidateItem[];

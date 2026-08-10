@@ -95,6 +95,20 @@ Key defended choices:
   `ChatResult.usage` — and the first live reading was **0%** on the litellm/gpt-oss backend
   (22.4k prompt tokens re-paid every round), so on that path this is currently a designed
   capability rather than a realised saving. Anthropic's side still needs an API key to verify.
+- **Skills carry procedural knowledge, which retrieval cannot.** Memory answers *what the
+  org knows*; a skill states *how the org works* — the query syntax for a log index, the
+  workflow a release follows. That is a different kind of knowledge: it is not a passage to
+  be retrieved and cited, it is an instruction to be followed, so grounding it against
+  `min_score` would be a category error. Skills therefore sit **beside** retrieval rather
+  than inside it, in the open Agent Skills format (a folder with `SKILL.md`, optional
+  `references/` and `scripts/`) that Claude Code and GitHub Copilot also read, so an org's
+  existing skills work unmodified. Progressive disclosure is what makes a library
+  affordable: only each skill's name and description ride the prompt, and the body is
+  fetched when the model decides it applies. The multi-user consequence is the interesting
+  one — a skill that *reaches* a real system runs with **the asking person's own
+  credentials and never the server's**, so the same skill is a different capability for
+  each user, and one whose values are missing is listed as unavailable with the missing
+  names stated rather than hidden.
 - **Evals in the repo.** Retrieval metrics (recall@k, MRR, grounded-recall, refusal
   accuracy) are deterministic and LLM-free, so quality is CI-checkable — the control
   system for every enhancement below (nothing merges without an eval gate).
@@ -141,6 +155,14 @@ Each maps to a pending item in `docs/AI_ROADMAP.md` (noted in parentheses).
 9. Document ingestion is **text-first**: Word/PPT/Excel/PDF/HTML extract their text layer, but
    **images inside documents and scanned/image-only PDFs are not read** — the `ingest/extract.py`
    `ImageHandler` seam is wired for it, awaiting the vision layer (#23, plan 07).
+10. **A skill's scripts are not sandboxed.** They run as subprocesses with the server's own
+    privileges — confined to the skill folder, given no shell, bounded by a timeout, and
+    handed only the calling user's resolved credentials, but able to do anything that OS
+    user can. This is why installing a skill is an admin-only act while using one is open to
+    everybody, and it is stated rather than mitigated: real isolation means a container or a
+    WASM runtime per script, which is not built. Relatedly, `run_skill_script` has been
+    exercised against tests and a synthetic script but **not yet end-to-end against a real
+    credentialed system**.
 
 ## 4. Forward roadmap → `docs/AI_ROADMAP.md`
 

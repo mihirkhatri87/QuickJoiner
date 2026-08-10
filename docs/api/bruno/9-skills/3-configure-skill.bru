@@ -1,0 +1,39 @@
+meta {
+  name: Configure a skill (admin)
+  type: http
+  seq: 3
+}
+
+patch {
+  url: {{baseUrl}}/api/skills/{{skillName}}
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "scope": "user",
+    "required_env": ["DEPLOY_TOKEN", "DEPLOY_URL"],
+    "enabled": true
+  }
+}
+
+docs {
+  Override what the skill's own frontmatter declares. Every field is optional, so a PATCH can
+  change one thing without restating the rest.
+
+  `scope` is `open` (anyone may run it, no credentials) or `user` (it runs with each person's
+  own values). This is the correction path for detection over-reaching: a real skill's scripts
+  read tuning flags alongside credentials, and only a human can tell them apart — trim
+  `required_env` to the values that genuinely gate it.
+
+  The stored row is authoritative from here on: rediscovery never overwrites it.
+}

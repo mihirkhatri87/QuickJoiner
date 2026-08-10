@@ -1,10 +1,11 @@
-import { Check, CircleAlert, Download, Loader2, Paperclip, Quote, ScrollText, ThumbsDown, ThumbsUp, TriangleAlert, X } from "lucide-react";
+import { Check, CircleAlert, Download, ExternalLink, Loader2, Paperclip, Quote, ScrollText, ThumbsDown, ThumbsUp, TriangleAlert, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { api } from "../api";
 import type { CandidateItem, ChatAttachment } from "../types";
 import type { Artifact } from "./ArtifactModal";
 import { CandidateCarousel, type CandidateCard } from "./CandidateCarousel";
-import { CiteBook, renderInline, renderMarkdown } from "./markdown";
+import { CiteBook, renderInline, renderMarkdown, type CiteEntry, type CitedSource } from "./markdown";
+import { actionLabel, splitThought, stepCount, ThinkingTrace, type TraceStep } from "./ThinkingTrace";
 import { cn } from "./ui";
 
 export interface Msg {
@@ -13,11 +14,17 @@ export interface Msg {
   text?: string; // user bubble / error / plain agent note
   answer?: string; // final grounded answer (markdown + [citations])
   candidates?: CandidateItem[]; // validated multi-angle options (plan 06 §C)
+  /** Citable sources the retrieval tools reported this turn (SSE `sources`), used to
+   * resolve a cited title to the page it came from. Without these a citation can only
+   * be a number; with them it is a link. */
+  sources?: CitedSource[];
   artifact?: Artifact; // generated document (e.g. scrape report) viewable in the modal
   streaming?: boolean;
   streamText?: string; // live delta accumulation before the final answer arrives
-  thinking?: string;
-  tools?: string[];
+  /** The run as an ordered timeline — reasoning and tool calls interleaved exactly as
+   * they happened. Canonical: the on-screen trace and the markdown export both derive
+   * from this one list, so an exported trace cannot disagree with the rendered one. */
+  trace?: TraceStep[];
   attachments?: ChatAttachment[]; // per-question context files shown beneath the question
   /** Real progress for an in-flight "learn this permanently" ingest (chunks embedded / total)
    * — a large document can take minutes to embed on a CPU-only machine, so this replaces a
@@ -74,6 +81,68 @@ function conversationFilename(messages: Msg[]): string {
   return `quickjoiner-conversation${slug ? `-${slug}` : ""}.md`;
 }
 
+/** The run's timeline as markdown — the same steps, in the same order, with the same
+ * titles the UI shows, so the export reads as a record of what happened rather than a
+ * transcript of raw reasoning. Derived from `Msg.trace` (the single source of truth),
+ * so the file and the screen cannot drift apart. */
+function traceToMarkdown(trace: TraceStep[]): string[] {
+  const out: string[] = [];
+  let n = 0;
+  const push = (title: string, suffix = "") => {
+    n += 1;
+    out.push(`**${n} · ${title}**${suffix}`);
+    out.push("");
+  };
+
+  for (const step of trace) {
+    if (step.kind === "thought") {
+      for (const seg of splitThought(step.text)) {
+        const body = seg.body.trim();
+        if (!seg.title && !body) continue;
+        push(seg.title || "Reasoning");
+        if (body) {
+          out.push(body);
+          out.push("");
+        }
+      }
+      continue;
+    }
+
+    if (step.kind === "note") {
+      push(step.text);
+      continue;
+    }
+
+    push(actionLabel(step.tool), ` — \`${step.tool}\``);
+    for (const [key, value] of Object.entries(step.args || {})) {
+      if (value === "" || value == null) continue;
+      // Single-line so a multi-line argument can't break out of its bullet.
+      out.push(`- \`${key}\`: ${String(value).replace(/\s*\n\s*/g, " ")}`);
+    }
+    if (Object.keys(step.args || {}).length) out.push("");
+
+    const res = step.result;
+    if (res) {
+      // The preview is bounded server-side; say so with the true size rather than
+      // letting a clipped block read as the whole output.
+      const clipped = res.chars > res.summary.length;
+      out.push(
+        `_${res.ok ? "Result" : "Error"}${clipped ? ` — first ${res.summary.length} of ${res.chars.toLocaleString()} characters` : ""}:_`,
+      );
+      out.push("");
+      const fence = safeFence(res.summary);
+      out.push(fence);
+      out.push(res.summary || "(empty)");
+      out.push(fence);
+      out.push("");
+    } else {
+      out.push("_No result recorded (the turn ended before this call returned)._");
+      out.push("");
+    }
+  }
+  return out;
+}
+
 /** One message as a markdown section. Optional fields are skipped when absent, so a
  * plain turn produces no empty headings. Two Msg fields are deliberately NOT exported
  * because neither is content: `streaming`/`streamText` (in-flight transport state — a
@@ -104,25 +173,17 @@ function messageToMarkdown(m: Msg): string {
   out.push("### A");
   out.push("");
 
-  if (m.thinking) {
+  if (m.trace?.length) {
     // <details>/<summary> is GFM-standard: renders as a native disclosure widget in
     // GitHub, VS Code preview, Obsidian. Mirrors the app's own collapsed-by-default
     // reasoning trace. Blank lines around the body are required for the markdown
     // inside to render rather than being treated as raw HTML content.
-    const fence = safeFence(m.thinking);
     out.push("<details>");
-    out.push("<summary>Reasoning trace</summary>");
+    out.push(`<summary>Reasoning trace (${stepCount(m.trace)} steps)</summary>`);
     out.push("");
-    out.push(fence);
-    out.push(m.thinking);
-    out.push(fence);
+    out.push(...traceToMarkdown(m.trace));
     out.push("");
     out.push("</details>");
-    out.push("");
-  }
-
-  if (m.tools?.length) {
-    out.push(`_Tools used: ${m.tools.join(", ")}_`);
     out.push("");
   }
 
@@ -148,13 +209,26 @@ function messageToMarkdown(m: Msg): string {
   // so the [n] markers already inline in `body` and this list can never disagree. The
   // returned nodes are discarded — creating React elements runs no component.
   if (body) {
-    const book = new CiteBook();
+    // Same sources the UI resolved against, so an exported entry links to the same page
+    // its on-screen chip does.
+    const book = new CiteBook(m.sources);
     renderMarkdown(body, book);
-    if (book.refs.length) {
+    const entries = book.entries();
+    if (entries.length) {
       out.push("");
       out.push("**Sources**");
       out.push("");
-      book.refs.forEach((ref, i) => out.push(`${i + 1}. ${ref}`));
+      entries.forEach(({ ref, sources }, i) => {
+        const named = sources.length ? sources : [{ label: ref, uri: "" }];
+        // A real markdown link when the page is known, plain text when it isn't — an
+        // export must not imply a destination the app couldn't resolve either. A bracket
+        // that named several pages lists them all, as the sources panel does.
+        const rendered = named.map((s) => {
+          const title = s.label.replace(/[[\]]/g, "");
+          return /^https?:\/\//i.test(s.link || "") ? `[${title}](${s.link})` : title;
+        });
+        out.push(`${i + 1}. ${rendered.join(" · ")}`);
+      });
     }
   }
 
@@ -260,7 +334,7 @@ function IconButton({
 }
 
 /** Modal listing every source a single answer cited (replaces the side panel). */
-function SourcesModal({ refs, onClose }: { refs: string[]; onClose: () => void }) {
+function SourcesModal({ refs, onClose }: { refs: CiteEntry[]; onClose: () => void }) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-[2px]" onClick={onClose}>
       <div
@@ -276,19 +350,53 @@ function SourcesModal({ refs, onClose }: { refs: string[]; onClose: () => void }
             <X size={15} />
           </button>
         </div>
-        <ol className="scroll-thin flex flex-col gap-2 overflow-y-auto px-5 py-4">
-          {refs.map((ref, i) => {
-            const isUrl = /^https?:\/\//.test(ref);
+        <ol className="scroll-thin flex flex-col gap-3.5 overflow-y-auto px-5 py-4">
+          {refs.map((entry, i) => {
+            const { ref, sources } = entry;
+            // One numbered entry per citation, but a bracket that named several pages
+            // lists each of them — otherwise the entry would show no link at all.
+            const named = sources.length ? sources : [{ label: ref, uri: "" }];
             return (
               <li key={i} className="flex items-baseline gap-3">
-                <span className="font-mono text-[11px] font-semibold tabular-nums text-gold">{i + 1}</span>
-                {isUrl ? (
-                  <a href={ref} target="_blank" rel="noopener noreferrer" className="min-w-0 break-words font-mono text-[11.5px] leading-snug text-accent underline decoration-hair underline-offset-2 hover:decoration-accent [overflow-wrap:anywhere]">
-                    {ref}
-                  </a>
-                ) : (
-                  <span className="min-w-0 break-words font-mono text-[11.5px] leading-snug text-muted [overflow-wrap:anywhere]">{ref}</span>
-                )}
+                <span className="mt-[2px] font-mono text-[11px] font-semibold tabular-nums text-gold">{i + 1}</span>
+                <div className="flex min-w-0 flex-1 flex-col gap-2.5">
+                  {named.length > 1 && (
+                    // Either the model named several sources in one bracket, or several
+                    // distinct pages share this title. Both are listed; neither is guessed.
+                    <p className="text-[11px] text-faint">
+                      {named.length} pages match this citation — it isn&apos;t linked inline
+                      because there is no single destination.
+                    </p>
+                  )}
+                  {named.map((s, j) => {
+                    const linkable = /^https?:\/\//i.test(s.link || "");
+                    return (
+                      <div key={j} className="flex min-w-0 flex-col gap-1">
+                        {linkable ? (
+                          <a
+                            href={s.link}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-start gap-1.5 break-words text-[13px] font-semibold leading-snug text-accent underline decoration-hair underline-offset-2 hover:decoration-accent [overflow-wrap:anywhere]"
+                          >
+                            {s.label}
+                            <ExternalLink size={11} className="mt-[4px] flex-shrink-0 opacity-70" />
+                          </a>
+                        ) : (
+                          <span className="break-words text-[13px] font-semibold leading-snug text-ink [overflow-wrap:anywhere]">
+                            {s.label}
+                          </span>
+                        )}
+                        {s.snippet && (
+                          <p className="line-clamp-2 text-[12px] leading-[1.55] text-muted">{s.snippet}</p>
+                        )}
+                        {s.uri && s.uri !== s.label && (
+                          <span className="truncate font-mono text-[10.5px] text-faint">{s.uri}</span>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
               </li>
             );
           })}
@@ -399,7 +507,7 @@ function MessageActions({
   onViewSources,
 }: {
   text: string;
-  refs: string[];
+  refs: CiteEntry[];
   reaction?: Reaction;
   onReact: (r: Reaction) => void;
   onViewSources: () => void;
@@ -427,18 +535,20 @@ function MessageActions({
 function AnswerBody({
   text,
   candidates,
+  sources,
   reaction,
   onReact,
   onViewSources,
 }: {
   text: string;
   candidates?: CandidateItem[];
+  sources?: CitedSource[];
   reaction?: Reaction;
   onReact: (r: Reaction) => void;
-  onViewSources: (refs: string[]) => void;
+  onViewSources: (refs: CiteEntry[]) => void;
 }) {
   const refused = REFUSAL.test(text.slice(0, 140));
-  const book = new CiteBook();
+  const book = new CiteBook(sources);
   const blocks = renderMarkdown(text, book, { mermaid: true });
   // Candidate cards render against the SAME book, eagerly — before refs is read —
   // so their citation chips continue the answer's numbering and land in the same
@@ -449,7 +559,7 @@ function AnswerBody({
     summaryNodes: renderInline(c.summary, book, `cand${i}`),
     sourceNodes: renderInline(c.sources.map((s) => `[${s}]`).join(" "), book, `candsrc${i}`),
   }));
-  const refs = book.refs;
+  const refs = book.entries();
 
   return (
     <div>
@@ -491,7 +601,7 @@ function Message({
   m: Msg;
   reaction?: Reaction;
   onReact: (r: Reaction) => void;
-  onViewSources: (refs: string[]) => void;
+  onViewSources: (refs: CiteEntry[]) => void;
   onOpenArtifact?: (a: Artifact) => void;
 }) {
   if (m.role === "user") {
@@ -559,37 +669,9 @@ function Message({
           </div>
         </div>
       )}
-      {m.thinking && (
-        <details className="mb-3 overflow-hidden rounded-sm bg-fill" open={m.streaming}>
-          <summary className="cursor-pointer px-3.5 py-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-muted transition hover:text-ink">
-            Reasoning trace
-          </summary>
-          <pre className="max-h-[150px] overflow-y-auto whitespace-pre-wrap px-3.5 pb-3 font-mono text-[11.5px] leading-normal text-muted">
-            {m.thinking}
-          </pre>
-        </details>
-      )}
-      {m.tools && m.tools.length > 0 && (
-        <div className="mb-3 flex flex-wrap gap-1.5">
-          {m.tools.map((t, i) => (
-            <span
-              key={i}
-              title={t}
-              className="inline-flex max-w-[280px] items-center gap-1.5 truncate rounded-full bg-fill px-3 py-1 font-mono text-[10.5px] text-muted"
-            >
-              <span
-                className={cn(
-                  "h-1.5 w-1.5 flex-shrink-0 rounded-full bg-accent",
-                  m.streaming && i === m.tools!.length - 1 && "animate-pulse2",
-                )}
-              />
-              {t}
-            </span>
-          ))}
-        </div>
-      )}
+      {m.trace && m.trace.length > 0 && <ThinkingTrace trace={m.trace} streaming={m.streaming} />}
       {m.answer != null ? (
-        <AnswerBody text={m.answer} candidates={m.candidates} reaction={reaction} onReact={onReact} onViewSources={onViewSources} />
+        <AnswerBody text={m.answer} candidates={m.candidates} sources={m.sources} reaction={reaction} onReact={onReact} onViewSources={onViewSources} />
       ) : m.text != null ? (
         // plain agent note (wizard prompts, confirmations) — no grounding stamp
         <div className="text-[15px] leading-[1.75] text-ink">{renderMarkdown(m.text, new CiteBook())}</div>
@@ -624,7 +706,7 @@ export function Chat({
 }) {
   const bottom = useRef<HTMLDivElement>(null);
   const [reactions, setReactions] = useState<Record<string, Reaction>>({});
-  const [sourcesFor, setSourcesFor] = useState<string[] | null>(null);
+  const [sourcesFor, setSourcesFor] = useState<CiteEntry[] | null>(null);
   const [feedbackFor, setFeedbackFor] = useState<{ question?: string } | null>(null);
 
   useEffect(() => {

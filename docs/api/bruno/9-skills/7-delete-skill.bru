@@ -1,0 +1,22 @@
+meta {
+  name: Remove a skill (admin)
+  type: http
+  seq: 7
+}
+
+delete {
+  url: {{baseUrl}}/api/skills/{{skillName}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}
+
+docs {
+  Deletes the skill's folder from the workspace and forgets its configuration. Admin only.
+
+  409 for a skill discovered under a personal `~/.claude/skills` or `~/.copilot/skills` — that
+  belongs to the operator's own tooling, not to QuickJoiner. Disable it with PATCH instead.
+}

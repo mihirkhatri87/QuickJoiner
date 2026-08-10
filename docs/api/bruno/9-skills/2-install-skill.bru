@@ -1,0 +1,32 @@
+meta {
+  name: Install a skill (multipart, admin)
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/api/skills
+  body: multipartForm
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}
+
+body:multipart-form {
+  file: @file(/absolute/path/to/a/skill.zip)
+}
+
+docs {
+  Extracts a skill archive into `<workspace>/skills/<name>/`. Point `file` at a real .zip on
+  disk (set `skillZip` in the environment and copy it here); the client sets the multipart
+  boundary, so don't add a Content-Type header.
+
+  Replacement is total — a re-upload removes the previous folder first, so a script the new
+  version no longer mentions cannot survive to be run. QuickJoiner's stored configuration for
+  that name is NOT reset: an admin's scope decision outlives the files.
+
+  Admin only (403 otherwise). 400 with a stated reason when the archive is unreadable, has no
+  SKILL.md, or exceeds the size/member bounds.
+}

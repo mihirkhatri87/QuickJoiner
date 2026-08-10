@@ -390,17 +390,39 @@ qj serve            # http://127.0.0.1:8787
 ```
 
 A React app (Vite + TypeScript + Tailwind) with:
-- **Streaming chat** with full-width answers — citations are inline superscripts (hover to see the
-  source); each answer has a hover toolbar to **download it as markdown**, **view all cited sources**,
+- **Streaming chat** with full-width answers — citations are inline superscripts that are
+  **clickable through to the page they came from** (hover to see the source and where it goes);
+  each answer has a hover toolbar to **download it as markdown**, **view all cited sources**,
   and 👍/👎 — a 👎 asks what was wrong and **learns the correction into memory**. Refusals are shown
   as "not learned yet". Answers render full markdown (tables, task/nested lists, blockquotes, code,
   links, and live mermaid diagrams).
+- **Cited sources are links** — the sources panel lists each source by its readable title, linked
+  to the original page, with the excerpt the answer drew on and the underlying URL. This covers
+  wiki pages, work items and pipelines (TFS/Azure DevOps), merge requests, issues and CI jobs
+  (GitLab/GitHub) — found live *or* from learned memory, which cite identically — and **files in
+  a cloned repository**, which link straight to the file on your GitLab/GitHub/Bitbucket/Azure
+  DevOps server, Octopus projects and deployments, and scraped web pages. A citation is only
+  linked when its label matches a document actually retrieved this turn: if the model paraphrased
+  the title, or cited something that isn't a page we hold, it stays plain text rather than sending
+  you somewhere the answer was never about. Where several different pages share one title — some
+  sites serve the same `<title>` for hundreds of pages — the citation isn't linked inline either;
+  the sources panel lists every candidate instead of guessing one. Sources with no web address —
+  a local file, a distilled conversation — are listed but not linked, rather than offered as a
+  click that goes nowhere.
+- **Reasoning trace** — while an answer is being worked out, the panel above it shows the run
+  as a **step-by-step timeline** rather than a wall of text: the model's own reasoning and each
+  tool call, interleaved in the order they actually happened. Every step names what it did
+  ("Searching learned memory", "Reading the knowledge graph") and shows what it did it *with*
+  (the query, the URL, the relation), and expands to reveal the full arguments and a preview of
+  what came back — so you can see which thought led to which search and what that search
+  returned. A step that failed is marked. The panel follows along live and collapses once the
+  answer lands.
 - **Download a conversation** — the **Download conversation** button at the top of the chat
-  pane saves the whole exchange as one markdown file: every question and answer, the tools
-  each answer used, its cited sources, and the model's reasoning trace in a collapsible
-  section. Note that reasoning traces are only captured for turns you watched happen in that
-  browser tab — reloading the page or reopening an older conversation exports the questions
-  and answers without them.
+  pane saves the whole exchange as one markdown file: every question and answer, its cited
+  sources, and that same reasoning timeline — numbered steps with each tool's arguments and
+  result — in a collapsible section. Note that reasoning traces are only captured for turns you
+  watched happen in that browser tab — reloading the page or reopening an older conversation
+  exports the questions and answers without them.
 - **Projects and resumable conversations**, with automatic history compression.
 - **Knowledge gaps** — a badge in the rail opens the knowledge-debt backlog (below).
 - **Waypoints** — the interactive knowledge graph view. Drag to pan (throw the pointer and it
@@ -496,6 +518,65 @@ document can still influence which entities exist in the graph and how they reso
 though nobody else can read, cite, or enumerate it. The ingest-time merge guard and the
 promotion flow (personal → org by review) are the remaining pieces — see
 [docs/CLOUD_ROADMAP.md](docs/CLOUD_ROADMAP.md) Y1.8.
+
+## Skills — teaching it *how*, not just *what*
+
+Connectors teach QuickJoiner what your org knows. **Skills** teach it how your org works: the
+query syntax for your log index, the fields your team's tickets actually use, the runbook for a
+release. A skill is a folder holding `SKILL.md` — YAML frontmatter plus markdown — optionally
+with `references/` for detail and `scripts/` for things it can run.
+
+It is the **open Agent Skills format** that Claude Code and GitHub Copilot both read, so a skill
+you already wrote for either works here unmodified — and one written here stays usable there.
+QuickJoiner reads three folders: `<workspace>/skills/` (the portable one, where uploads land)
+plus your own `~/.claude/skills/` and `~/.copilot/skills/` if they exist.
+
+Only each skill's **name and description** ride in the prompt. The agent opens the full
+instructions when it decides one applies, and follows them to a bundled reference or script from
+there — so a large library costs almost nothing until it's used.
+
+### Open skills vs. per-user ones
+
+A skill that only explains something needs no credentials, and anyone can use it. A skill that
+*reaches* a real system does — and in a shared workspace those aren't one shared login:
+
+| The skill's scripts read | Scope | Who can run it |
+| --- | --- | --- |
+| nothing | **open** | everyone, no setup |
+| `DEPLOY_TOKEN`, `TFS_PAT`, … | **user** | only someone who supplied their own values |
+
+QuickJoiner decides this on first sight, from what the scripts actually read (or from an explicit
+`requires_env:` in the frontmatter). **A user-scoped skill never falls back to the server's own
+environment** — a credential the server holds is not yours, and running with it would quietly act
+as somebody else. If you haven't supplied a value, the agent says exactly which one is missing
+rather than failing vaguely.
+
+Your values are stored **encrypted at rest** (the key lives outside the database, so a copied
+`catalog.db` yields nothing on its own) and are **write-only**: no screen, endpoint, CLI command
+or log line reads one back out. An admin can set workspace-wide defaults — a shared endpoint URL,
+a tenant id — that everyone inherits and anyone can override with their own.
+
+### Using them
+
+In the UI: **Settings → Skills** lists the library, marks each one ready or *needs N*, and gives
+you a box per missing value. Admins additionally install, disable, re-scope and remove.
+
+```
+qj skills list                       # what exists, and whether it's ready for you
+qj skills show <name>                # the instructions the agent gets
+qj skills install <folder-or-zip>    # add one to this workspace
+qj skills secrets                    # which values you've set, which are still missing
+qj skills set-secret DEPLOY_TOKEN    # prompts without echo (preferred over --value)
+qj skills remove <name>
+```
+
+**Installing is admin-only, using is not.** A skill can bundle scripts, and a script runs with the
+server's own privileges — this is not a sandbox. Install what you would be willing to run
+yourself. Adding your own credentials, by contrast, is open to every user, because it is what
+makes a scoped skill work *as you*.
+
+API: `GET /api/skills`, `POST /api/skills` (multipart `.zip`), `PATCH /api/skills/{name}`,
+`DELETE /api/skills/{name}`, and `GET`/`POST`/`DELETE /api/skills/secrets…`.
 
 ## Knowledge-debt backlog (gaps)
 

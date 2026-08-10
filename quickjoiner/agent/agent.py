@@ -13,9 +13,39 @@ EventCallback = Callable[[str, str], None]
 # Event types emitted to on_event:
 #   "thinking"   - model reasoning delta (streamed)
 #   "delta"      - answer text delta (streamed)
-#   "tool_call"  - the agent is invoking a tool (detail = tool name)
+#   "tool_call"  - the agent is invoking a tool. JSON: {"id", "name", "args"} — the
+#                  arguments are what make a trace readable ("searched for X", "read
+#                  URL Y") rather than a bare list of function names.
+#   "tool_result"- that call came back. JSON: {"id", "name", "ok", "summary", "chars"}.
+#                  `summary` is a bounded PREVIEW, never the whole output: a single
+#                  result can be 24k chars and there is no reason to push that down
+#                  the wire twice. `chars` states the true size so a truncated preview
+#                  is never mistaken for the whole answer.
+#   "sources"    - JSON list of citable refs newly seen in a tool result
+#                  ({"label", "uri", "kind"?, "score"?, "snippet"}). The tools already
+#                  hand the MODEL a uri per hit; this is the same information reaching
+#                  the CLIENT, so a citation of a readable title can resolve to the page
+#                  it came from instead of being unlinkable. Additive per turn — a client
+#                  merges each batch into what it already has.
 #   "candidates" - JSON list of validated multi-angle candidate answers (plan 06 §C);
 #                  only fires when the final text carried a valid ```candidates block
+
+# Bounds for what rides the event stream. These govern DISPLAY only — the model still
+# receives the full (or `_cap`-limited) tool output, so nothing here can change an answer.
+_ARG_PREVIEW_CHARS = 400
+_RESULT_PREVIEW_CHARS = 800
+
+
+def _preview_args(args: dict) -> dict:
+    """Bound each argument value for display. A `remember` fact or a long WIQL query
+    can be arbitrarily large, and the trace only ever renders a line or two of it."""
+    out = {}
+    for key, value in (args or {}).items():
+        text = value if isinstance(value, str) else json.dumps(value, default=str)
+        if len(text) > _ARG_PREVIEW_CHARS:
+            text = text[:_ARG_PREVIEW_CHARS] + "…"
+        out[key] = text
+    return out
 
 
 class OnboardingAgent:
@@ -72,6 +102,8 @@ class OnboardingAgent:
         messages.append({"role": "user", "content": question})
         specs = [t.spec for t in self._tools.values()]
         self.last_usage, self.last_rounds = TokenUsage(), 0
+        # Refs already announced this turn, so repeated searches don't re-send them.
+        self._seen_refs: set[tuple[str, str]] = set()
 
         on_stream = None
         if on_event:
@@ -108,16 +140,27 @@ class OnboardingAgent:
             messages.append(assistant)
             for call in result.tool_calls:
                 if on_event:
-                    on_event("tool_call", call.name)
+                    on_event("tool_call", json.dumps(
+                        {"id": call.id, "name": call.name, "args": _preview_args(call.input)}))
                 tool = self._tools.get(call.name)
+                ok = True
                 if tool is None:
+                    ok = False
                     output = f"Error: unknown tool {call.name!r}"
                 else:
                     try:
                         output = tool.run(**call.input)
                     except Exception as exc:
+                        ok = False
                         output = f"Error running {call.name}: {exc}"
                 output = self._cap(output, call.name)
+                if on_event:
+                    on_event("tool_result", json.dumps({
+                        "id": call.id, "name": call.name, "ok": ok,
+                        "summary": output[:_RESULT_PREVIEW_CHARS],
+                        "chars": len(output),
+                    }))
+                    self._emit_sources(output, on_event)
                 messages.append(
                     {
                         "role": "tool",
@@ -142,6 +185,34 @@ class OnboardingAgent:
         fallback = "I wasn't able to finish answering that from the sources I have."
         messages.append({"role": "assistant", "content": fallback})
         return fallback, messages
+
+    def _emit_sources(self, output: str, on_event: EventCallback) -> None:
+        """Forward citable refs this tool result introduced, so the client can turn a
+        cited title into a link. Only the NEW ones each time — the same document is
+        returned by round after round of searching, and re-sending it would grow the
+        stream quadratically for no gain. Best-effort: a parse failure costs link
+        resolution, never the answer, so it can never propagate."""
+        try:
+            from quickjoiner.agent.refs import parse_source_refs
+            from quickjoiner.agent.weblinks import citable_link
+
+            fresh = []
+            for ref in parse_source_refs(output):
+                key = (ref["label"], ref["uri"])
+                if key in self._seen_refs:
+                    continue
+                self._seen_refs.add(key)
+                # `uri` is identity and stays as the tools reported it; `link` is where a
+                # citation should actually open — different things for a cloned repo file,
+                # and absent entirely for a local path or a distilled conversation.
+                link = citable_link(ref["uri"])
+                if link:
+                    ref["link"] = link
+                fresh.append(ref)
+            if fresh:
+                on_event("sources", json.dumps(fresh))
+        except Exception:
+            pass
 
     def _account(self, result) -> None:
         """Add one round's token usage to this turn's running total (bench visibility)."""

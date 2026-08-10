@@ -24,6 +24,29 @@ from quickjoiner.llm.base import AgentTool, ToolSpec
 MAX_TOOL_CHARS = 12000
 
 
+def cite(label: str, url: str | None) -> str:
+    """A citable marker for one live result: `[source: <label> | uri: <url>]`.
+
+    Live tools answer the ENUMERATION questions memory can't ("which MRs are open", "what
+    ran on this branch"), and the model cites what they return — but a bare "!123 Fix login"
+    is not resolvable to anything, so those citations could never become links the way an
+    ingested document's could. This is the same shape `search_memory` emits, so the one
+    citation parser reads both and a live result links exactly like a learned one.
+
+    Returns "" when there is no url: a marker with nothing behind it would add noise to the
+    model's context and promise a link that cannot exist.
+    """
+    if not url or not label:
+        return ""
+    # Neither field may contain the delimiters, or the marker stops parsing where it
+    # shouldn't. Titles with brackets/pipes are common in ticket systems.
+    clean_label = str(label).replace("|", "/").replace("[", "(").replace("]", ")").strip()
+    clean_url = str(url).split()[0].replace("]", "%5D") if str(url).strip() else ""
+    if not clean_label or not clean_url:
+        return ""
+    return f" [source: {clean_label} | uri: {clean_url}]"
+
+
 def bounded(text: str, limit: int = MAX_TOOL_CHARS) -> str:
     if text and len(text) > limit:
         return text[:limit] + "\n…[output truncated]"

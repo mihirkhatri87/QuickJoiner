@@ -114,6 +114,7 @@ _OPENAPI_TAGS = [
     {"name": "Sessions & projects", "description": "Persistent conversations and the projects that scope them."},
     {"name": "Briefs & repo docs", "description": "Generated onboarding briefs, per-repo architecture docs, and citation file views."},
     {"name": "Settings", "description": "Read/update tunable workspace config and test the LLM provider."},
+    {"name": "Skills", "description": "Packaged expertise in the open Agent Skills format: the library, per-skill scope, and each user's own credentials for the scoped ones."},
     {"name": "Webhooks", "description": "HMAC-verified push ingestion from connected sources."},
 ]
 
@@ -259,6 +260,22 @@ class SettingsUpdate(BaseModel):
 class LLMTestRequest(BaseModel):
     # Optional overrides to test unsaved provider settings from the form.
     llm: dict | None = None
+
+
+class SkillSecretRequest(BaseModel):
+    """One credential for a scoped skill. Write-only: no endpoint reads a value back."""
+    key: str
+    value: str
+    # "user" (mine, overrides the shared default) or "workspace" (an admin's shared value).
+    scope: str = "user"
+
+
+class SkillUpdateRequest(BaseModel):
+    """An admin's override of what a skill's own frontmatter declares. Every field is
+    optional so a PATCH can change one thing without restating the rest."""
+    scope: str | None = None            # "open" | "user"
+    required_env: list[str] | None = None
+    enabled: bool | None = None
 
 
 def _secret_keys(type_: str) -> set[str]:
@@ -1082,6 +1099,213 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
             "model": llm_cfg.resolved_model(),
             "message": f"Reached {llm_cfg.provider} · replied “{reply[:60] or '(empty)'}”",
         }
+
+    # -- Skills ---------------------------------------------------------------
+    #
+    # Packaged expertise in the open Agent Skills format. Reading the library and setting
+    # your OWN credentials is open to every signed-in user; installing, removing or
+    # reconfiguring a skill is admin-only, because a skill may carry scripts and a script
+    # runs with the server's privileges.
+
+    def _skill_or_404(name: str):
+        configs = ctx.skill_configs()
+        config = next((c for c in configs if c.name == name), None)
+        if config is None:
+            raise HTTPException(status_code=404, detail=f"No skill named {name!r}")
+        return config
+
+    def _skill_row(config, user: str | None) -> dict:
+        from quickjoiner.skills import detect_env, runnable
+
+        ok, missing = runnable(config, ctx.secret_store(), user)
+        return {
+            "name": config.name,
+            "description": config.description,
+            "origin": config.skill.origin,
+            "scope": config.scope,
+            "required_env": list(config.required_env),
+            "enabled": config.enabled,
+            # Whether THIS caller can run it, and what they'd have to set — the two
+            # questions the UI actually asks, answered server-side so the client never
+            # has to know the layering rules.
+            "ready": ok,
+            "missing": missing,
+            "references": list(config.skill.references),
+            "scripts": list(config.skill.scripts),
+            "warnings": list(config.skill.warnings),
+            # A suggestion for the admin form, not a declaration: what the scripts look
+            # like they read. Empty for a skill with no scripts.
+            "detected_env": list(detect_env(config.skill)),
+            "installed_by": config.installed_by,
+            # Only a workspace-installed skill is ours to delete; one discovered under a
+            # personal ~/.claude folder belongs to that person's own tooling.
+            "removable": config.skill.origin == "workspace",
+        }
+
+    @api.get("/api/skills", tags=["Skills"], summary="List every discovered skill with its scope, what it requires, and whether it is ready for the calling user.")
+    def list_skills(authorization: str | None = Header(default=None)):
+        """The skill library as this caller sees it. `ready`/`missing` are per-user: a
+        scoped skill is still listed when its credentials are absent, so the UI can say
+        what to set rather than hiding a capability the person can see elsewhere."""
+        user = _user(authorization)
+        _require("skills:read", user)
+        try:
+            configs = ctx.skill_configs(installed_by=user or "")
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Could not read skills: {exc}")
+        return {"skills": [_skill_row(c, user) for c in configs]}
+
+    @api.get("/api/skills/secrets", tags=["Skills"], summary="Which secret names the calling user has set, and which are set workspace-wide. Names only — values are never returned.")
+    def list_skill_secrets(authorization: str | None = Header(default=None)):
+        """Presence, never content: there is no endpoint anywhere that reads a stored
+        secret back out. `workspace` values are an admin's shared defaults (an endpoint
+        URL, a tenant id); `mine` are this person's own and override them."""
+        from quickjoiner.skills import WORKSPACE_OWNER
+
+        user = _user(authorization)
+        _require("skills:read", user)
+        store = ctx.secret_store()
+        try:
+            return {
+                "mine": store.keys(user or ""),
+                "workspace": store.keys(WORKSPACE_OWNER),
+            }
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Could not read secrets: {exc}")
+
+    @api.post("/api/skills/secrets", tags=["Skills"], summary="Set one secret for a skill — your own by default, or workspace-wide (admin only).")
+    def set_skill_secret(req: SkillSecretRequest, authorization: str | None = Header(default=None)):
+        """Store an encrypted value. `scope=user` (the default) is yours alone and
+        overrides a workspace value of the same name; `scope=workspace` is an admin's
+        shared default and needs the admin-tier capability."""
+        from quickjoiner.skills import WORKSPACE_OWNER, SecretsUnavailable
+
+        user = _user(authorization)
+        _require_user(user)
+        _require("skills:secrets", user)
+        scope = (req.scope or "user").strip().lower()
+        if scope not in ("user", "workspace"):
+            raise HTTPException(status_code=400, detail="scope must be 'user' or 'workspace'")
+        if scope == "workspace":
+            # Setting a value everyone inherits is a configuration act, not a personal one.
+            _require("skills:write", user)
+        # In open mode there is no signed-in user and no second person to distinguish from,
+        # so a "personal" value is simply the workspace's — which is what `resolve` reads
+        # when `user` is None. With auth on, `_require_user` above has already refused an
+        # anonymous caller, so this can only be the single-user case.
+        owner = WORKSPACE_OWNER if scope == "workspace" else (user or WORKSPACE_OWNER)
+        try:
+            ctx.secret_store().set(owner, req.key, req.value)
+        except (SecretsUnavailable, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"ok": True, "key": req.key.strip(), "scope": scope}
+
+    @api.delete("/api/skills/secrets/{key}", tags=["Skills"], summary="Remove one stored secret — your own by default, or a workspace-wide one (admin only).")
+    def delete_skill_secret(
+        key: str, scope: str = "user", authorization: str | None = Header(default=None)
+    ):
+        from quickjoiner.skills import WORKSPACE_OWNER
+
+        user = _user(authorization)
+        _require_user(user)
+        _require("skills:secrets", user)
+        scope = (scope or "user").strip().lower()
+        if scope not in ("user", "workspace"):
+            raise HTTPException(status_code=400, detail="scope must be 'user' or 'workspace'")
+        if scope == "workspace":
+            _require("skills:write", user)
+        owner = WORKSPACE_OWNER if scope == "workspace" else (user or WORKSPACE_OWNER)
+        try:
+            ctx.secret_store().delete(owner, key)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"ok": True, "key": key, "scope": scope}
+
+    @api.post("/api/skills", tags=["Skills"], summary="Install a skill from a .zip containing SKILL.md. Admin only — a skill may carry scripts that run with the server's privileges.")
+    async def install_skill(
+        file: UploadFile = File(...), authorization: str | None = Header(default=None)
+    ):
+        """Extract a skill archive into `<workspace>/skills/<name>/`, replacing any
+        same-named one outright (so a re-upload cannot leave a stale script behind).
+        QuickJoiner's stored configuration for that name survives — an admin's scope
+        decision outlives the files."""
+        from quickjoiner.skills import InstallError, install_zip
+
+        user = _user(authorization)
+        _require_user(user)
+        _require("skills:write", user)
+        data = await file.read()
+        if not data:
+            raise HTTPException(status_code=400, detail="No file uploaded")
+        fallback = Path(file.filename or "").stem
+        try:
+            installed = await run_in_threadpool(install_zip, ctx.workspace, data, fallback)
+        except InstallError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        # Register it immediately so the response carries the scope it was given — which,
+        # for a skill whose scripts read credentials, is "user" and NOT ready to run yet.
+        config = next(
+            (c for c in ctx.skill_configs(installed_by=user or "") if c.name == installed.name),
+            None,
+        )
+        return {
+            "installed": installed.name,
+            "files": installed.files,
+            "replaced": installed.replaced,
+            "skill": _skill_row(config, user) if config else None,
+        }
+
+    @api.patch("/api/skills/{name}", tags=["Skills"], summary="Configure a skill: who it is scoped to, which values it requires, and whether it is enabled. Admin only.")
+    def update_skill(
+        name: str, req: SkillUpdateRequest, authorization: str | None = Header(default=None)
+    ):
+        """Override what the skill's own frontmatter declares. The folder seeds this
+        configuration on first sight; thereafter the stored row is authoritative, so an
+        admin who narrowed or widened a skill keeps that decision across rediscovery."""
+        from quickjoiner.skills.registry import SCOPES
+
+        user = _user(authorization)
+        _require_user(user)
+        _skill_or_404(name)
+        _require("skills:write", user)
+        if req.scope is not None and req.scope not in SCOPES:
+            raise HTTPException(
+                status_code=400, detail=f"scope must be one of {', '.join(SCOPES)}")
+        required = None
+        if req.required_env is not None:
+            required = json.dumps([str(v).strip() for v in req.required_env if str(v).strip()])
+        try:
+            ctx.catalog.update_skill_config(
+                name, scope=req.scope, required_env=required, enabled=req.enabled)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Could not update {name!r}: {exc}")
+        return {"skill": _skill_row(_skill_or_404(name), user)}
+
+    @api.delete("/api/skills/{name}", tags=["Skills"], summary="Remove a workspace-installed skill and forget its configuration. Admin only.")
+    def delete_skill(name: str, authorization: str | None = Header(default=None)):
+        """Deletes the skill's folder from the workspace. A skill discovered under a
+        personal `~/.claude/skills` is refused with 409 — it belongs to that person's own
+        tooling, and removing their file because we happened to read it would be well
+        beyond what this owns. Disable it instead."""
+        from quickjoiner.skills import uninstall
+
+        user = _user(authorization)
+        _require_user(user)
+        config = _skill_or_404(name)
+        _require("skills:write", user)
+        if config.skill.origin != "workspace":
+            raise HTTPException(
+                status_code=409,
+                detail=f"{name!r} was discovered in {config.skill.origin} storage, not this "
+                       "workspace, so it is not QuickJoiner's to delete. Disable it instead.")
+        removed = uninstall(ctx.workspace, name)
+        if not removed:
+            raise HTTPException(status_code=400, detail=f"Could not remove {name!r}")
+        try:
+            ctx.catalog.delete_skill_config(name)
+        except Exception:
+            pass  # the folder is gone, which is what "removed" means; the row is bookkeeping
+        return {"removed": name}
 
     @api.get("/api/sources", tags=["Connectors"], summary="List every source with its document count — configured connectors plus ingestion buckets (taught notes, webhook pushes).")
     def sources(authorization: str | None = Header(default=None)):
@@ -1962,12 +2186,23 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
         return FileResponse(path, filename=row["filename"],
                             media_type=row.get("content_type") or "application/octet-stream")
 
-    @api.post("/api/chat", tags=["Ask & search"], summary="Ask a grounded, cited question. Streams Server-Sent Events: thinking / delta / tool_call / candidates / answer / done. Answers only from learned memory, or says it hasn't learned that yet.")
+    @api.post("/api/chat", tags=["Ask & search"], summary="Ask a grounded, cited question. Streams Server-Sent Events: thinking / delta / tool_call / tool_result / sources / candidates / answer / done. Answers only from learned memory, or says it hasn't learned that yet.")
     def chat(req: ChatRequest, authorization: str | None = Header(default=None)):
-        """SSE stream: {type: thinking|delta|tool_call|candidates|answer|error|done, data: ...}
-        events. `candidates` (plan 06 §C) carries a JSON list of validated multi-angle
-        candidate answers, emitted before `answer` when the model produced a valid
-        ```candidates block; confidence values in it are server-computed."""
+        """SSE stream: {type: thinking|delta|tool_call|tool_result|sources|candidates|answer|
+        error|done, data: ...} events. `tool_call` / `tool_result` carry JSON
+        (`{id, name, args}` and `{id, name, ok, summary, chars}`) — paired by `id`, and
+        interleaved with `thinking` in the real order they happened, which is what lets a
+        client render the run as a step-by-step trace rather than a wall of text. `summary`
+        is a bounded preview, with `chars` stating the true size. `sources` carries a JSON
+        list of citable refs (`{label, uri, link?, kind?, score?, snippet}`) a tool result
+        newly introduced — additive across the turn — so a citation of a readable title in
+        the answer can be resolved to the page it came from and rendered as a link. `uri`
+        is identity and is not always browsable (a cloned repo file is
+        `<clone-url>::<path>`); **`link` is where a citation should open** and is absent
+        when the document has no web address, so clients should link on `link`, not `uri`.
+        `candidates` (plan 06 §C) carries a JSON list of validated multi-angle candidate
+        answers, emitted before `answer` when the model produced a valid ```candidates
+        block; confidence values in it are server-computed."""
         events: queue.Queue = queue.Queue()
         user = _user(authorization)
 

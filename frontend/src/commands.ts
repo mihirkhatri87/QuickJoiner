@@ -13,6 +13,7 @@
 import { api, streamScrape } from "./api";
 import type { Artifact } from "./components/ArtifactModal";
 import type { Msg } from "./components/Chat";
+import { pushNote } from "./components/ThinkingTrace";
 import { startWizard, wizardInput, type WizardResult, type WizardState } from "./wizard";
 
 export interface CommandCtx {
@@ -197,7 +198,7 @@ async function runScrape(ctx: CommandCtx, url: string, raw: string): Promise<voi
   try {
     await streamScrape({ url, depth, max_pages: maxPages }, (e) => {
       if (e.type === "status")
-        ctx.patchMessage(id, (m) => ({ ...m, thinking: (m.thinking ? m.thinking + "\n" : "") + e.data }));
+        ctx.patchMessage(id, (m) => ({ ...m, trace: pushNote(m.trace || [], e.data) }));
       else if (e.type === "delta")
         ctx.patchMessage(id, (m) => ({ ...m, streamText: (m.streamText || "") + e.data }));
       else if (e.type === "answer") {

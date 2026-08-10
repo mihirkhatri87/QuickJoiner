@@ -23,6 +23,18 @@ body:json {
 
 docs {
   Ask a grounded, cited question (uses the `askQuestion` variable). Streams Server-Sent Events:
-  thinking / delta / tool_call / candidates / answer / done. Answers only from learned memory,
-  or says it hasn't learned that yet. `session_id` and `project` are optional.
+  thinking / delta / tool_call / tool_result / sources / candidates / answer / done. Answers only from
+  learned memory, or says it hasn't learned that yet. `session_id` and `project` are optional.
+
+  `tool_call` and `tool_result` carry JSON in `data` — `{id, name, args}` and
+  `{id, name, ok, summary, chars}` — paired by `id` and interleaved with `thinking` in the
+  real order the run happened, so a client can render it as a step-by-step trace. `summary`
+  is a bounded preview; `chars` is the true size of the output the model received.
+
+  `sources` carries `[{label, uri, link?, kind?, score?, snippet}]` — the citable refs a tool
+  result newly introduced, additive across the turn. It is what lets a citation of a readable
+  title ("Caffeine - Team Charter") resolve to the page it came from and render as a link.
+  `uri` is IDENTITY and is not always browsable (a cloned repo file is `<clone-url>::<path>`);
+  `link` is where the citation should open, and is absent when there is no web address —
+  link on `link`, never on `uri`.
 }

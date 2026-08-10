@@ -771,7 +771,15 @@ def test_chat_streams_tool_calls_and_answer(client, monkeypatch):
     events = sse_events(resp.text)
     types = [e["type"] for e in events]
     # ScriptedProvider simulates streaming, so the final text also arrives as a delta.
-    assert types == ["tool_call", "delta", "answer", "done"]
+    assert types == ["tool_call", "tool_result", "delta", "answer", "done"]
+    # The call carries its ARGUMENTS and the result its outcome — that pairing is what
+    # lets a client render the run as a readable trace ("searched for X, found Y")
+    # instead of a bare list of function names.
+    call = json.loads(next(e for e in events if e["type"] == "tool_call")["data"])
+    assert call["name"] == "echo" and call["args"] == {"value": "x"}
+    result = json.loads(next(e for e in events if e["type"] == "tool_result")["data"])
+    assert result["id"] == call["id"] and result["ok"] is True
+    assert result["chars"] == len(result["summary"])  # short output: preview is complete
     answer = next(e for e in events if e["type"] == "answer")
     assert answer["data"] == "grounded answer"
     assert answer["session_id"]  # returned so the client can continue the session
@@ -803,7 +811,12 @@ def test_chat_forwards_candidates_event(client, monkeypatch):
 
     events = sse_events(client.post("/api/chat", json={"message": "options?"}).text)
     types = [e["type"] for e in events]
-    assert types == ["tool_call", "delta", "candidates", "answer", "done"]
+    assert types == ["tool_call", "tool_result", "sources", "delta", "candidates", "answer", "done"]
+    # The uri behind the cited label reaches the client, which is what lets the UI
+    # render "[EchoDoc]" as a link to the page rather than an unresolvable number.
+    cited = json.loads(next(e for e in events if e["type"] == "sources")["data"])
+    assert cited == [{"label": "EchoDoc", "uri": "file://e.md", "kind": "doc",
+                      "score": 0.9, "snippet": "text"}]
     cands = json.loads(next(e for e in events if e["type"] == "candidates")["data"])
     assert cands == [{"rank": 1, "summary": "Weekly cadence", "confidence": 0.45,
                       "sources": ["EchoDoc"]}]
@@ -1317,3 +1330,148 @@ def test_browser_session_done_routes_through_and_guards_a_local_job(api_workspac
         source=name, url="https://gated.test/", state="waiting", mode="local"))
     r = client.post("/api/connectors/gated/browser/session/done")
     assert r.status_code == 409
+
+
+# -- skills --------------------------------------------------------------------
+
+SKILL_MD = """---
+name: query-logs
+description: Query application logs. Use when asked to search logs.
+---
+
+# Query Logs
+Always use index `filebeat-*`.
+"""
+
+
+def _skill_zip(entries: dict) -> bytes:
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, text in entries.items():
+            zf.writestr(name, text)
+    return buf.getvalue()
+
+
+def test_uploading_a_skill_makes_it_listed_and_usable(client):
+    r = client.post("/api/skills", files={"file": ("query-logs.zip", _skill_zip(
+        {"query-logs/SKILL.md": SKILL_MD}), "application/zip")})
+    assert r.status_code == 200, r.text
+    assert r.json()["installed"] == "query-logs"
+
+    skills = client.get("/api/skills").json()["skills"]
+    row = next(s for s in skills if s["name"] == "query-logs")
+    # No credentials in its scripts -> open, and ready for anyone with no setup.
+    assert row["scope"] == "open" and row["ready"] and row["missing"] == []
+    assert row["removable"] and row["origin"] == "workspace"
+
+
+def test_a_skill_whose_scripts_read_credentials_arrives_unavailable(client):
+    """The scoping decision is made from what the skill actually reads, so an uploaded
+    skill that reaches a real system does not silently run with the server's identity."""
+    client.post("/api/skills", files={"file": ("deploy.zip", _skill_zip({
+        "deploy/SKILL.md": "---\nname: deploy\ndescription: Deploy things.\n---\nbody",
+        "deploy/scripts/go.py": "import os\nprint(os.environ['DEPLOY_TOKEN'])\n",
+    }), "application/zip")})
+
+    row = next(s for s in client.get("/api/skills").json()["skills"] if s["name"] == "deploy")
+    assert row["scope"] == "user"
+    assert row["required_env"] == ["DEPLOY_TOKEN"]
+    assert not row["ready"] and row["missing"] == ["DEPLOY_TOKEN"]
+
+    # Supplying it flips exactly that skill to ready.
+    assert client.post("/api/skills/secrets",
+                       json={"key": "DEPLOY_TOKEN", "value": "s3cret"}).status_code == 200
+    row = next(s for s in client.get("/api/skills").json()["skills"] if s["name"] == "deploy")
+    assert row["ready"] and row["missing"] == []
+
+
+def test_secret_names_are_listed_but_values_are_never_returned(client):
+    client.post("/api/skills/secrets", json={"key": "DEPLOY_TOKEN", "value": "s3cret"})
+    body = client.get("/api/skills/secrets").text
+    assert "DEPLOY_TOKEN" in body
+    assert "s3cret" not in body  # presence, never content
+    client.delete("/api/skills/secrets/DEPLOY_TOKEN")
+    assert "DEPLOY_TOKEN" not in client.get("/api/skills/secrets").text
+
+
+def test_an_admin_can_override_what_a_skill_requires(client):
+    """The folder seeds the configuration; the stored row is authoritative thereafter."""
+    client.post("/api/skills", files={"file": ("q.zip", _skill_zip(
+        {"query-logs/SKILL.md": SKILL_MD}), "application/zip")})
+    r = client.patch("/api/skills/query-logs",
+                     json={"scope": "user", "required_env": ["LOG_TOKEN"]})
+    assert r.status_code == 200
+    row = r.json()["skill"]
+    assert row["scope"] == "user" and row["required_env"] == ["LOG_TOKEN"]
+    assert not row["ready"] and row["missing"] == ["LOG_TOKEN"]
+
+    # Rediscovery must not undo it.
+    row = next(s for s in client.get("/api/skills").json()["skills"] if s["name"] == "query-logs")
+    assert row["scope"] == "user" and row["required_env"] == ["LOG_TOKEN"]
+
+
+def test_deleting_a_skill_removes_it_from_the_library(client):
+    client.post("/api/skills", files={"file": ("q.zip", _skill_zip(
+        {"query-logs/SKILL.md": SKILL_MD}), "application/zip")})
+    assert client.delete("/api/skills/query-logs").status_code == 200
+    assert not any(s["name"] == "query-logs"
+                   for s in client.get("/api/skills").json()["skills"])
+    assert client.delete("/api/skills/query-logs").status_code == 404
+
+
+def test_an_unreadable_archive_is_refused_with_a_reason(client):
+    r = client.post("/api/skills", files={"file": ("x.zip", b"not a zip", "application/zip")})
+    assert r.status_code == 400
+    assert "zip" in r.json()["detail"].lower()
+
+
+def test_uploading_a_skill_requires_admin_when_auth_is_on(client):
+    """Installing runs to arbitrary code eventually; using a skill does not. So the two
+    sit at different tiers the moment auth exists."""
+    client.post("/api/auth/users", json={"username": "root", "password": "pw-root-123"})
+    admin = client.post("/api/auth/login",
+                        json={"username": "root", "password": "pw-root-123"}).json()["token"]
+    client.post("/api/auth/users", json={"username": "dev", "password": "pw-dev-1234"},
+                headers={"Authorization": f"Bearer {admin}"})
+    dev = client.post("/api/auth/login",
+                      json={"username": "dev", "password": "pw-dev-1234"}).json()["token"]
+
+    payload = {"file": ("q.zip", _skill_zip({"query-logs/SKILL.md": SKILL_MD}), "application/zip")}
+    assert client.post("/api/skills", files=payload,
+                       headers={"Authorization": f"Bearer {dev}"}).status_code == 403
+    assert client.post("/api/skills", files=payload,
+                       headers={"Authorization": f"Bearer {admin}"}).status_code == 200
+    # ...but a viewer still sees the library and can supply their own credentials.
+    assert client.get("/api/skills", headers={"Authorization": f"Bearer {dev}"}).status_code == 200
+    assert client.post("/api/skills/secrets", json={"key": "LOG_TOKEN", "value": "mine"},
+                       headers={"Authorization": f"Bearer {dev}"}).status_code == 200
+    # A workspace-wide value is an admin's to set, not a viewer's.
+    assert client.post("/api/skills/secrets",
+                       json={"key": "LOG_URL", "value": "https://x", "scope": "workspace"},
+                       headers={"Authorization": f"Bearer {dev}"}).status_code == 403
+
+
+def test_one_users_secret_does_not_make_a_skill_ready_for_another(client):
+    client.post("/api/skills", files={"file": ("d.zip", _skill_zip({
+        "deploy/SKILL.md": "---\nname: deploy\ndescription: d\nrequires_env: [DEPLOY_TOKEN]\n---\nb",
+    }), "application/zip")})
+    client.post("/api/auth/users", json={"username": "root", "password": "pw-root-123"})
+    admin = client.post("/api/auth/login",
+                        json={"username": "root", "password": "pw-root-123"}).json()["token"]
+    client.post("/api/auth/users", json={"username": "dev", "password": "pw-dev-1234"},
+                headers={"Authorization": f"Bearer {admin}"})
+    dev = client.post("/api/auth/login",
+                      json={"username": "dev", "password": "pw-dev-1234"}).json()["token"]
+
+    client.post("/api/skills/secrets", json={"key": "DEPLOY_TOKEN", "value": "roots-own"},
+                headers={"Authorization": f"Bearer {admin}"})
+
+    def ready_for(token):
+        rows = client.get("/api/skills", headers={"Authorization": f"Bearer {token}"}).json()
+        return next(s for s in rows["skills"] if s["name"] == "deploy")["ready"]
+
+    assert ready_for(admin)
+    assert not ready_for(dev)  # each person acts as themselves

@@ -53,6 +53,22 @@ _SCHEMA_STATEMENTS = [
         username TEXT PRIMARY KEY, password_hash TEXT NOT NULL, created_at TEXT NOT NULL)""",
     """CREATE TABLE IF NOT EXISTS auth_tokens (
         token_hash TEXT PRIMARY KEY, username TEXT NOT NULL, created_at TEXT NOT NULL)""",
+    # Environment values a skill needs, layered: `owner` is a username for a personal
+    # secret and '' for a workspace-wide one, so one table serves both and a personal
+    # value simply wins the lookup. Values are ENCRYPTED (see skills/secrets.py) — unlike
+    # connector options, these are individual people's own credentials.
+    """CREATE TABLE IF NOT EXISTS skill_secrets (
+        owner TEXT NOT NULL, key TEXT NOT NULL, value_enc TEXT NOT NULL,
+        updated_at TEXT NOT NULL, PRIMARY KEY (owner, key))""",
+    # QuickJoiner's OWN definition of a skill, seeded from the folder on first sight but
+    # authoritative thereafter — so what a skill requires is configurable here rather than
+    # only in a file the uploader wrote. `scope` is 'open' (no credentials, everyone) or
+    # 'user' (each person supplies `required_env` before it will run for them).
+    """CREATE TABLE IF NOT EXISTS skills (
+        name TEXT PRIMARY KEY, path TEXT NOT NULL, origin TEXT NOT NULL DEFAULT '',
+        scope TEXT NOT NULL DEFAULT 'open', required_env TEXT NOT NULL DEFAULT '[]',
+        enabled INTEGER NOT NULL DEFAULT 1, installed_by TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""",
     # knowledge graph (docs/KNOWLEDGE_GRAPH.md): entities + typed edges, every edge
     # carrying the doc that proves it so graph answers stay citable.
     """CREATE TABLE IF NOT EXISTS entities (
@@ -1567,6 +1583,86 @@ class _SqlCatalog:
                 "UPDATE gaps SET status='resolved', resolution=?, resolved_at=? WHERE id=?",
                 (resolution, _now(), gid),
             )
+
+    # -- skill secrets --------------------------------------------------------
+    # `owner` is a username for a personal value, '' for a workspace-wide one. Values are
+    # stored already-encrypted by skills/secrets.py; this layer never sees plaintext and
+    # deliberately has no "list every value" read — only a keyed lookup and a key listing,
+    # so nothing can accidentally dump the store.
+
+    def set_skill_secret(self, owner: str, key: str, value_enc: str) -> None:
+        self._write(
+            "INSERT INTO skill_secrets (owner, key, value_enc, updated_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(owner, key) DO UPDATE SET value_enc=excluded.value_enc, "
+            "updated_at=excluded.updated_at",
+            (owner or "", key, value_enc, _now()),
+        )
+
+    def delete_skill_secret(self, owner: str, key: str) -> None:
+        self._write("DELETE FROM skill_secrets WHERE owner=? AND key=?", (owner or "", key))
+
+    def skill_secret_keys(self, owner: str) -> list[str]:
+        """Which keys this owner has set — names only, never values."""
+        rows = self._read_all(
+            "SELECT key FROM skill_secrets WHERE owner=? ORDER BY key", (owner or "",))
+        return [r["key"] for r in rows]
+
+    def skill_secrets_for(self, owners: list[str]) -> dict[str, dict[str, str]]:
+        """owner -> {key: encrypted value}, for the owners given. Fetched in ONE query so
+        resolving a skill's whole environment is a single read rather than one per key."""
+        if not owners:
+            return {}
+        marks = ",".join("?" for _ in owners)
+        rows = self._read_all(
+            f"SELECT owner, key, value_enc FROM skill_secrets WHERE owner IN ({marks})",
+            tuple(owners),
+        )
+        out: dict[str, dict[str, str]] = {o: {} for o in owners}
+        for r in rows:
+            out.setdefault(r["owner"], {})[r["key"]] = r["value_enc"]
+        return out
+
+    # -- skill definitions ----------------------------------------------------
+
+    def list_skill_configs(self) -> list[dict]:
+        return self._read_all("SELECT * FROM skills ORDER BY name")
+
+    def get_skill_config(self, name: str) -> dict | None:
+        return self._read_one("SELECT * FROM skills WHERE name = ?", (name,))
+
+    def register_skill(self, name: str, path: str, origin: str, scope: str,
+                       required_env: str, installed_by: str = "") -> None:
+        """Record a newly-discovered skill. Deliberately does NOT overwrite `scope` or
+        `required_env` on conflict: those are the configuration an admin edits in the UI,
+        and re-running discovery must not silently revert their decision. Only the
+        location follows the folder."""
+        now = _now()
+        self._write(
+            "INSERT INTO skills (name, path, origin, scope, required_env, enabled, "
+            "installed_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET path=excluded.path, origin=excluded.origin, "
+            "updated_at=excluded.updated_at",
+            (name, path, origin, scope, required_env, installed_by, now, now),
+        )
+
+    def update_skill_config(self, name: str, scope: str | None = None,
+                            required_env: str | None = None,
+                            enabled: bool | None = None) -> None:
+        sets, params = [], []
+        if scope is not None:
+            sets.append("scope = ?"); params.append(scope)
+        if required_env is not None:
+            sets.append("required_env = ?"); params.append(required_env)
+        if enabled is not None:
+            sets.append("enabled = ?"); params.append(1 if enabled else 0)
+        if not sets:
+            return
+        sets.append("updated_at = ?"); params.append(_now())
+        params.append(name)
+        self._write(f"UPDATE skills SET {', '.join(sets)} WHERE name = ?", tuple(params))
+
+    def delete_skill_config(self, name: str) -> None:
+        self._write("DELETE FROM skills WHERE name = ?", (name,))
 
     # -- sync history (notifications) ----------------------------------------
     def record_sync_event(self, job_id: str, source: str, state: str, clean: bool,

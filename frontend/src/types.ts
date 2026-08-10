@@ -349,11 +349,44 @@ export interface CandidateItem {
   sources: string[];
 }
 
+/** A tool invocation, as carried in the `tool_call` event's JSON `data`. */
+export interface ToolCallEvent {
+  id: string;
+  name: string;
+  args: Record<string, string>;
+}
+
+/** How that invocation came back (`tool_result` JSON `data`), paired by `id`.
+ * `summary` is a bounded preview; `chars` is the true length of the full output. */
+export interface ToolResultEvent {
+  id: string;
+  name: string;
+  ok: boolean;
+  summary: string;
+  chars: number;
+}
+
+/** A citable reference the retrieval tools reported, so the client can turn a cited
+ * title into a link (`sources` event `data`, a JSON array of these). */
+export interface CitedSourceEvent {
+  label: string;
+  /** Identity as the tools reported it — not always browsable (a cloned repo file is
+   * `<clone-url>::<path>`). Shown, never linked. */
+  uri: string;
+  /** Where a citation should open; absent when the document has no web address. */
+  link?: string;
+  kind?: string;
+  score?: number;
+  snippet?: string;
+}
+
 /** Streaming events the /api/chat SSE emits. */
 export type ChatEvent =
   | { type: "thinking"; data: string }
   | { type: "delta"; data: string }
   | { type: "tool_call"; data: string }
+  | { type: "tool_result"; data: string }
+  | { type: "sources"; data: string }
   | { type: "candidates"; data: string }
   | { type: "answer"; data: string; session_id: string }
   | { type: "error"; data: string }
@@ -378,4 +411,44 @@ export interface UploadRowResult {
 export interface UploadResult {
   uploaded: UploadRowResult[];
   ingested: number;
+}
+
+/** One skill in the library, joined to this workspace's configuration for it.
+ *
+ * `ready`/`missing` are computed per CALLER: a scoped skill is still listed when its
+ * credentials are absent, so the UI can say what to set rather than hiding a capability
+ * the person can see elsewhere. */
+export interface SkillRow {
+  name: string;
+  description: string;
+  /** "workspace" (installed here, ours to remove) or a personal Claude/Copilot folder. */
+  origin: string;
+  /** "open" — anyone may run it; "user" — it runs with each person's own credentials. */
+  scope: string;
+  required_env: string[];
+  enabled: boolean;
+  ready: boolean;
+  missing: string[];
+  references: string[];
+  scripts: string[];
+  warnings: string[];
+  /** What its scripts look like they read — a suggestion for the admin form, not a
+   * declaration. `required_env` is what actually gates it. */
+  detected_env: string[];
+  installed_by: string;
+  removable: boolean;
+}
+
+export interface SkillSecrets {
+  /** Names this user has set. Values are never returned by any endpoint. */
+  mine: string[];
+  /** Names an admin set workspace-wide; a personal value of the same name wins. */
+  workspace: string[];
+}
+
+export interface SkillInstallResult {
+  installed: string;
+  files: number;
+  replaced: boolean;
+  skill: SkillRow | null;
 }

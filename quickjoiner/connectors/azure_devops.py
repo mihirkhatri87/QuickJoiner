@@ -8,6 +8,7 @@ from typing import Any, Iterator
 from urllib.parse import quote
 
 from quickjoiner.connectors.base import ConnectionStatus, Connector, Document, Mode
+from quickjoiner.connectors.live_tools import cite
 from quickjoiner.connectors.registry import register
 from quickjoiner.connectors.util import as_bool as _as_bool, get_json, post_json, prefetch_pages, resolve_secret
 from quickjoiner.llm.base import AgentTool, ToolSpec
@@ -662,6 +663,10 @@ class AzureDevOpsConnector(Connector):
             return "\n".join(
                 f"- #{i['id']}: {i.get('fields', {}).get('System.Title', '')} "
                 f"[{i.get('fields', {}).get('System.State', '?')}]"
+                # Same URL the ingested work-item documents carry, so an item found LIVE
+                # cites and links exactly like one already in memory.
+                + cite(f"#{i['id']}: {i.get('fields', {}).get('System.Title', '')}",
+                       f"{org_url}/_workitems/edit/{i['id']}")
                 for i in items
             )
 
@@ -710,6 +715,8 @@ class AzureDevOpsConnector(Connector):
                 f" [{(b.get('repository') or {}).get('name', '?')}]:"
                 f" {b.get('result') or b.get('status') or '?'}"
                 f" ({str(b.get('finishTime') or b.get('queueTime') or '')[:16]})"
+                + cite(f"build {(b.get('definition') or {}).get('name', '?')} #{b.get('id')}",
+                       f"{org_url}/{project}/_build/results?buildId={b.get('id')}")
                 for b in builds[:10]
             )
 
@@ -730,7 +737,9 @@ class AzureDevOpsConnector(Connector):
             assignee = f.get("System.AssignedTo") or {}
             aname = assignee.get("displayName", "unassigned") if isinstance(assignee, dict) else str(assignee)
             out = (
-                f"#{data.get('id')} [{f.get('System.WorkItemType', '?')}]: {f.get('System.Title', '')}\n"
+                f"#{data.get('id')} [{f.get('System.WorkItemType', '?')}]: {f.get('System.Title', '')}"
+                + cite(f"#{data.get('id')}: {f.get('System.Title', '')}",
+                       f"{org_url}/_workitems/edit/{data.get('id')}") + "\n"
                 f"State: {f.get('System.State', '?')} | Assigned: {aname} | "
                 f"Area: {f.get('System.AreaPath', '')} | Iteration: {f.get('System.IterationPath', '')}\n"
                 f"Tags: {f.get('System.Tags', 'none')}\n\n"

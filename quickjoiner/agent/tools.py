@@ -243,13 +243,25 @@ def build_builtin_tools(
                                        visible_source_ids=visible)
         return score_edge(_evidence_class(r), c["doc_count"], c["source_count"])
 
+    def _evidence_ref(r) -> str:
+        """The citable form of an edge's evidence: its readable title, followed by the
+        page it lives on when that is known. The uri was previously discarded here (the
+        title won an `or` chain), so a citation the model made from the GRAPH could never
+        be resolved to a link, unlike one made from search_memory — the same document,
+        cited two ways, behaved differently. Matches the `| uri:` shape search_memory
+        already emits so one parser reads both."""
+        title = r["evidence_title"] or r["evidence_uri"] or r["evidence_doc_id"]
+        if not title:
+            # Bridges have no evidence doc; their self-describing detail is the story.
+            return "none — name-equality inference"
+        uri = r["evidence_uri"] or ""
+        return f"{title} | uri: {uri}" if uri and uri != title else str(title)
+
     def _format_edge(r, flag_weak: bool = False) -> str:
         src = r["src_name"] or r["src"]
         dst = r["dst_name"] or r["dst"]
         detail = f" ({r['detail']})" if r["detail"] else ""
-        # Bridges have no evidence doc; their self-describing detail is the whole story.
-        evidence = (r["evidence_title"] or r["evidence_uri"] or r["evidence_doc_id"]
-                    or "none — name-equality inference")
+        evidence = _evidence_ref(r)
         suffix = ""
         if flag_weak and _evidence_class(r) == "meeting-notes":
             suffix = " (low-confidence: meeting-notes evidence)"
@@ -332,9 +344,18 @@ def build_builtin_tools(
         contested = 0
         for dst, group in grouped.items():
             names = sorted({(r["src_name"] or r["src"]) for r in group})
-            evidence = sorted({(r["evidence_title"] or r["evidence_uri"] or "")
-                               for r in group if r["evidence_title"] or r["evidence_uri"]})
-            cite = f" [evidence: {'; '.join(evidence[:2])}]" if evidence else ""
+            # Deduped on the TITLE so one page contributes one citation, but each carries
+            # its uri so the model's citation of it can be resolved to a link.
+            by_title: dict[str, str] = {}
+            for r in group:
+                if r["evidence_title"] or r["evidence_uri"]:
+                    by_title.setdefault(_evidence_ref(r).split(" | uri: ")[0], _evidence_ref(r))
+            evidence = [by_title[k] for k in sorted(by_title)]
+            # One bracket PER document rather than a semicolon list inside a single one:
+            # each is then the same "<label> | uri: <uri>" shape search_memory emits, so
+            # the citation parser reads it, and the model cites one page per bracket
+            # instead of a run-on string naming two.
+            cite = "".join(f" [evidence: {e}]" for e in evidence[:2])
             lines.append(f"\n{dst} ({len(names)}):{cite}")
             lines.append("  " + ", ".join(names))
             # The merged line above is the UNION of what every system asserted, so no
@@ -374,8 +395,7 @@ def build_builtin_tools(
         src = r["src_name"] or r["src"]
         dst = r["dst_name"] or r["dst"]
         detail = f" ({r['detail']})" if r["detail"] else ""
-        evidence = r["evidence_title"] or r["evidence_uri"] or r["evidence_doc_id"]
-        return f"{i}. {src} --{r['rel']}--> {dst}{detail} [evidence: {evidence}]"
+        return f"{i}. {src} --{r['rel']}--> {dst}{detail} [evidence: {_evidence_ref(r)}]"
 
     def graph_path(a: str, b: str, max_hops: int = _DEFAULT_MAX_HOPS) -> str:
         ent_a, ent_b = catalog.resolve_entity(a), catalog.resolve_entity(b)

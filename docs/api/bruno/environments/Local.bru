@@ -24,6 +24,9 @@ vars {
   ~progressToken: demo-progress-token
   ~onedriveTarget: https://contoso.sharepoint.com/:w:/r/sites/Eng/Shared%20Documents/design.docx
   ~scrapeConnector: Plumber
+  ~skillZip: /absolute/path/to/a/skill.zip
+  ~skillName: query-logs
+  ~skillSecretKey: DEPLOY_TOKEN
 }
 
 vars:secret [
@@ -48,6 +51,9 @@ docs {
     from the `List a source's documents` response) for the archive-contents request.
   - **progressToken** — folder `4-query`: any string you pick, passed as `progress_token`
     when learning an attachment, then polled to watch real chunk-embedding progress.
+  - **skillZip / skillName / skillSecretKey** — folder `9-skills`: a .zip containing
+    `SKILL.md` to install, the skill's name, and one environment-variable name it requires
+    (the credential you'd supply as yourself).
   - **scrapeConnector** — folder `2-connect`: a `web_scrape` connector with
     `use_browser=true`, i.e. a site behind a login. Used by the two gated-site requests
     (check the browser session / open a sign-in window on the QuickJoiner host).

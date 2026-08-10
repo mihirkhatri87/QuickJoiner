@@ -30,6 +30,9 @@ import type {
   SourceDocuments,
   OAuthStatus,
   OneDriveLearnResult,
+  SkillRow,
+  SkillSecrets,
+  SkillInstallResult,
 } from "./types";
 
 const TOKEN_KEY = "qj_token";
@@ -81,6 +84,46 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ llm }),
     }),
+
+  // Skills — packaged expertise in the open Agent Skills format. Listing and setting your
+  // OWN credentials is open to every signed-in user; install/remove/configure is admin-only
+  // and 403s otherwise, so callers render those affordances behind the role check.
+  skills: () => req<{ skills: SkillRow[] }>("/api/skills").then((r) => r.skills),
+  skillSecrets: () => req<SkillSecrets>("/api/skills/secrets"),
+  setSkillSecret: (key: string, value: string, scope: "user" | "workspace" = "user") =>
+    req<{ ok: boolean }>("/api/skills/secrets", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key, value, scope }),
+    }),
+  deleteSkillSecret: (key: string, scope: "user" | "workspace" = "user") =>
+    req<{ ok: boolean }>(
+      `/api/skills/secrets/${encodeURIComponent(key)}?scope=${scope}`,
+      { method: "DELETE" },
+    ),
+  updateSkill: (
+    name: string,
+    body: { scope?: string; required_env?: string[]; enabled?: boolean },
+  ) =>
+    req<{ skill: SkillRow }>(`/api/skills/${encodeURIComponent(name)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).then((r) => r.skill),
+  deleteSkill: (name: string) =>
+    req<{ removed: string }>(`/api/skills/${encodeURIComponent(name)}`, { method: "DELETE" }),
+  installSkill: async (file: File): Promise<SkillInstallResult> => {
+    const form = new FormData();
+    form.append("file", file);
+    const resp = await fetch("/api/skills", {
+      method: "POST",
+      headers: { ...authHeaders() },
+      body: form,
+    });
+    const data = resp.status === 204 ? null : await resp.json().catch(() => null);
+    if (!resp.ok) throw new Error((data && (data as { detail?: string }).detail) || `${resp.status}`);
+    return data as SkillInstallResult;
+  },
 
   authStatus: () => req<AuthStatus>("/api/auth/status"),
   login: (username: string, password: string) =>

@@ -40,6 +40,15 @@ CAPS = frozenset({
     "scrape:run",
     "chat:use",
     "users:admin",
+    # Skills. Three tiers rather than the usual read/write pair, because "configure the
+    # library" and "set my own password for a skill" are genuinely different acts:
+    #   skills:read    — see what exists and whether it is ready for me
+    #   skills:secrets — supply MY OWN credentials (every user needs this; it grants no
+    #                    reach over anyone else's, and workspace-wide values are checked
+    #                    separately at the route)
+    #   skills:write   — install/remove/reconfigure a skill. ADMIN ONLY: a skill may carry
+    #                    scripts, and a script runs with the server's privileges.
+    "skills:read", "skills:secrets", "skills:write",
 })
 
 # Routes anyone may call regardless of role (login/logout/status/health). Distinct from an
@@ -54,6 +63,10 @@ MUTATING_METHODS = frozenset({"POST", "PATCH", "PUT", "DELETE"})
 _VIEWER_CAPS = frozenset({
     "status:read", "connectors:read", "search:read", "graph:read",
     "gaps:read", "sessions:read", "settings:read", "chat:use",
+    # Using a skill is open to everybody — that is the point of the feature. Supplying
+    # your own credentials for one is likewise yours to do; it is what makes a scoped
+    # skill work for you and reaches nobody else's values.
+    "skills:read", "skills:secrets",
 })
 _EDITOR_CAPS = _VIEWER_CAPS | frozenset({
     "connectors:write", "connectors:delete", "sync:run", "memory:write",
@@ -171,6 +184,16 @@ _ROUTES: list[tuple[str, str, str, Optional[str]]] = [
     ("GET", "/api/settings/defaults", "settings:read", None),
     ("PATCH", "/api/settings", "settings:write", None),
     ("POST", "/api/llm/test", "settings:write", None),
+    # Skills. Reading the library and managing your own secrets are open to every signed-in
+    # user; installing, removing or reconfiguring one is admin-only (a skill can carry
+    # scripts that run with the server's privileges).
+    ("GET", "/api/skills", "skills:read", None),
+    ("GET", "/api/skills/secrets", "skills:read", None),
+    ("POST", "/api/skills/secrets", "skills:secrets", None),
+    ("DELETE", "/api/skills/secrets/{key}", "skills:secrets", None),
+    ("POST", "/api/skills", "skills:write", None),
+    ("PATCH", "/api/skills/{name}", "skills:write", None),
+    ("DELETE", "/api/skills/{name}", "skills:write", None),
     # Briefs & repo docs
     ("GET", "/api/briefs", "search:read", None),
     ("POST", "/api/briefs/{brief_type}", "briefs:write", None),
