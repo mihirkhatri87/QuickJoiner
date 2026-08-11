@@ -52,7 +52,16 @@ qj onedrive learn <name> <url-or-path>...     #   connector; `learn` ingests ONL
                                               #   Microsoft on the connector plate.
 qj skills list|show <name>                    # packaged expertise (open Agent Skills format).
 qj skills install <folder-or-zip>             #   `list` marks each one ready / needs-N FOR YOU;
-qj skills remove <name> [-y]                  #   install/remove are admin acts (a skill may
+qj skills disable|enable <name>               #   `disable` stops offering one WITHOUT deleting —
+qj skills remove <name> [-y]                  #   the answer for a personal ~/.claude or ~/.copilot
+                                              #   skill, which QJ refuses to delete (another tool's
+                                              #   files). install/remove are admin acts (a skill may
+qj promotions mine|offer <doc> [--note ..]    # personal -> org, BY REVIEW. `offer` queues one of
+qj promotions queue                           #   YOUR private documents; a reviewer (editor+) sees
+qj promotions decide <doc> --approve|--decline#   it in `queue`, can read it there, and decides.
+    [--note ..]                               #   Approving is a metadata FLIP, not a copy: same
+                                              #   doc_id, same citations, same graph edges, no
+                                              #   re-embed. Offering publishes nothing on its own.
 qj skills secrets                             #   carry scripts). `secrets` shows which values
 qj skills set-secret KEY [--value V]          #   you've set and which are missing — NAMES only,
     [--shared]                                #   never values; --shared = workspace-wide default
@@ -1657,6 +1666,80 @@ Previously BOTH source copies preceded the install layer, so every edit re-downl
   **secret values are never echoed** — a failure names only the KEYS that were missing. What it is
   NOT is a sandbox: a script runs with the server's privileges, which is why authoring is an admin
   act while *using* a skill is open to everybody.
+  **`encoding_hint` — naming a failure the interpreter blames on the wrong line
+  (2026-08-10, hit debugging a real skill).** `pwsh` is preferred, but where it is absent
+  `.ps1` falls back to **Windows PowerShell 5.1**, which has no `-Encoding` for `-File`
+  and reads a BOM-less script in the system ANSI codepage. A UTF-8 em dash is then three
+  cp1252 characters ending in **U+201D — a smart double quote, which PowerShell accepts as
+  a string delimiter** — so one em dash inside a double-quoted string silently terminates
+  it and the parser reports `Missing closing '}'` against an unrelated line dozens of
+  lines away. Reproduced minimally (`Write-Output "a — b"` inside an `if` block ⇒ exactly
+  that error). Nothing in the message mentions encoding, so it reads as a brace bug that
+  is not there. The hint is **appended to a failure, never a refusal** — a genuinely
+  ANSI-encoded script with the same bytes runs fine, and a false refusal would cost more
+  than a redundant note — and is added AFTER output truncation so a verbose failure cannot
+  push the diagnosis off the end. Fires only when the run failed, the fallback was used,
+  the file has no BOM, and the bytes decode as UTF-8 with non-ASCII present. Tests:
+  `tests/test_skills.py` (the note, three no-note cases, and survival of truncation —
+  verified to fail with the append removed).
+  ⚠ **Two authoring rules a skill's scripts must follow, both found the same day and both
+  independently fatal**: a script that calls `Read-Host` on a path the agent reaches is
+  unusable (5.1 is launched `-NonInteractive`, so it throws) — prompt only when there is a
+  real console AND stdin is not redirected, and default everything else; and **`SKILL.md`
+  must document its scripts' parameters**, because `open_skill` shows the model only the
+  filenames. Given a script and no signature, a model guesses, and the guess lands in
+  whichever parameter is positionally first.
+  **`split_args` — neither shlex mode is correct, and both are wrong silently
+  (2026-08-10).** Arguments arrive as ONE string (tool schemas vary in list support across
+  providers) and were split with `posix=False`, which preserves Windows backslashes but
+  **leaves the quote characters inside the token** — measured end to end, `-SearchTerm
+  "subscription installed"` reached the script as `['-SearchTerm', '"subscription
+  installed"']`, quotes included. The other mode is no better: `posix=True` treats a
+  backslash as an escape, so `-Path C:\Users\x` arrives as `C:Usersx`. So: split
+  non-posix, then strip ONE matching pair of surrounding quotes per token. `""` stays a
+  deliberate empty argument, an inner quote (`'{"a":1}'`) survives, and unbalanced quotes
+  degrade to a whitespace split rather than raising — the string is model-authored.
+  `_rejoin_equals_quoted` additionally re-quotes the `=`-joined GNU/.NET spelling
+  (`--key="a b"`) around the WHOLE argument before splitting, since a quote that does not
+  START a token is interior to shlex and the value would split on the space inside it;
+  quoting the whole thing preserves `--key=a b` as one argument rather than rewriting it
+  to two, which a parser accepting only the joined form would reject.
+  **`stdin` — the escape hatch for a script that prompts and cannot be changed
+  (2026-08-10).** `run_script(stdin=)` / the tool's `stdin` parameter feed answers one per
+  line. Deliberately framed as a LAST RESORT in the tool description — answering blind
+  guesses the prompt order — but it makes an unmodifiable interactive script usable
+  instead of dead, verified against the original broken `Query-AppLogs.ps1`. Two details
+  make it actually work: PowerShell is normally launched **`-NonInteractive`**, under
+  which `Read-Host` throws no matter what is on stdin, so that flag is **dropped for this
+  run only**; and with NO stdin supplied the child gets **`DEVNULL` rather than the
+  server's inherited stdin**, so a prompting script hits EOF and fails in a second instead
+  of blocking for the full 120s timeout and reporting only "timed out". Clipping at
+  `MAX_STDIN_CHARS` is stated in the output, because a silently truncated answer is a
+  *plausible wrong* answer to a prompt rather than an error.
+  ⚠ **A skill's NAME and its FOLDER need not agree, and deriving the delete target from
+  the name made such a skill undeletable everywhere (2026-08-10).** `load_skill` reads the
+  name from frontmatter and falls back to the folder only when that is missing — and the
+  CLI explicitly invites dropping a folder into `<workspace>/skills`. So a folder `logs/`
+  declaring `name: query-app-logs` listed fine under the declared name while its files
+  lived elsewhere, and `uninstall(workspace, name)` computing `skills/<name>` found
+  nothing: **CLI, API and UI all failed at once**, while the API row's `removable: true`
+  went on promising otherwise, and the 400 raised before `delete_skill_config` so the
+  catalog row survived too. `uninstall` now takes the **discovered `skill.path`** (still
+  confined to the workspace skills root, so it cannot become a delete-anything primitive).
+  Zip installs always agree — the archive is unpacked into a folder named after the
+  declared name — which is exactly why the suite never caught it.
+  ⚠ **What the author STATED outranks what detection guessed (2026-08-10).**
+  `requires_env: []` is an author saying "this needs nothing", and `_env_list` returned
+  `()` for it — indistinguishable from the key being absent — so `skill.requires_env or
+  detect_env(skill)` let the heuristic override an explicit declaration. It now returns
+  **`None` for absent and `()` for explicitly empty**, and the `scope:` frontmatter key —
+  documented in `loader.py`'s own header from the first commit and **never actually
+  parsed** — is now read, with `scope: open` overriding detection outright. This matters
+  because the failure is total and silent in the wrong direction: detection cannot tell a
+  credential from a base URL or a tuning flag (measured on the real `tfs-control` skill: 9
+  proposed, 4 with defaults), and one such read made the skill `SCOPE_USER`, which
+  resolves with `include_process_env=False` — so it was `UNAVAILABLE` to **every** user,
+  including where the server already held the value, fixable only through an admin PATCH.
   `install.py` — a skill arrives as a zip (the shape GitHub, Claude Code and Copilot all hand
   you). Every member is resolved and checked to stay inside the target (a naive `extractall`
   writes `../../etc/…`), symlink entries are dropped since they are a path escape that survives
@@ -1712,7 +1795,12 @@ Previously BOTH source copies preceded the install layer, so every edit re-downl
   (`connectors:write`, `sync:run`, `memory:reset`, `settings:write`, `users:admin`, …), and a
   `(method, path) → capability + connector-scope` map (`required_capability`, `can`) covering
   every `/api` route — a **route-coverage lockstep test** asserts none is unmapped. `connectors:
-  delete`/`memory:reset` are the danger tier. Enforced in **two** places: the control tool
+  delete`/`memory:reset`/**`skills:delete`** are the danger tier (`rbac.DANGER_CAPS`) — each
+  needs a typed `confirm=true` from the chat path on top of the conversational confirmation.
+  `skills:delete` is split out from `skills:write` for exactly the reason `connectors:delete`
+  is split from `connectors:write`: same admin role, but deleting files is not the same act as
+  installing them, and it is reachable from chat where "tidy up the old skills" must not become
+  an unconfirmed `rm`. Enforced in **two** places: the control tool
   (`agent/control.py`, the chat path) and the HTTP layer (`_require(cap, user)` on every mutating
   route, placed after existence/visibility checks so a private resource still 404s rather than
   leaking via 403 — open mode is a no-op since everyone is admin). Connector-specific ops also

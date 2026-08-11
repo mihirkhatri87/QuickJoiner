@@ -46,9 +46,14 @@ CAPS = frozenset({
     #   skills:secrets — supply MY OWN credentials (every user needs this; it grants no
     #                    reach over anyone else's, and workspace-wide values are checked
     #                    separately at the route)
-    #   skills:write   — install/remove/reconfigure a skill. ADMIN ONLY: a skill may carry
+    #   skills:write   — install/reconfigure a skill. ADMIN ONLY: a skill may carry
     #                    scripts, and a script runs with the server's privileges.
-    "skills:read", "skills:secrets", "skills:write",
+    #   skills:delete  — remove one, deleting its files. Split out and put in the danger
+    #                    tier for the same reason `connectors:delete` is: it is
+    #                    irreversible from inside QuickJoiner, and it is reachable from
+    #                    chat, where "tidy up the old skills" must not become an
+    #                    unconfirmed rm. Same admin role, one extra typed confirm.
+    "skills:read", "skills:secrets", "skills:write", "skills:delete",
 })
 
 # Routes anyone may call regardless of role (login/logout/status/health). Distinct from an
@@ -56,7 +61,7 @@ CAPS = frozenset({
 PUBLIC = "public"
 
 # Capabilities that additionally require a typed confirm at the tool layer (§ safety posture).
-DANGER_CAPS = frozenset({"connectors:delete", "memory:reset"})
+DANGER_CAPS = frozenset({"connectors:delete", "memory:reset", "skills:delete"})
 
 MUTATING_METHODS = frozenset({"POST", "PATCH", "PUT", "DELETE"})
 
@@ -193,7 +198,7 @@ _ROUTES: list[tuple[str, str, str, Optional[str]]] = [
     ("DELETE", "/api/skills/secrets/{key}", "skills:secrets", None),
     ("POST", "/api/skills", "skills:write", None),
     ("PATCH", "/api/skills/{name}", "skills:write", None),
-    ("DELETE", "/api/skills/{name}", "skills:write", None),
+    ("DELETE", "/api/skills/{name}", "skills:delete", None),
     # Briefs & repo docs
     ("GET", "/api/briefs", "search:read", None),
     ("POST", "/api/briefs/{brief_type}", "briefs:write", None),

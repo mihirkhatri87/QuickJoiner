@@ -77,11 +77,32 @@ def sync_registry(catalog, skills: list[Skill], installed_by: str = "") -> list[
     for skill in skills:
         row = stored.get(skill.name)
         if row is None:
-            # First sight: derive the scope from what the skill actually reads. The
-            # declared `requires_env` wins when present — it is an explicit statement —
-            # and detection fills in for the (common) skill that declares nothing.
-            required = skill.requires_env or detect_env(skill)
+            # First sight: derive the scope from what the skill actually reads. Anything
+            # the author STATED wins over the heuristic, in this order:
+            #
+            #   scope: open          -> open, and nothing is required. The explicit escape
+            #                           hatch for a skill whose scripts read a base URL or
+            #                           a tuning flag: detection cannot tell those from a
+            #                           credential (measured on a real skill: 9 proposed,
+            #                           4 with defaults), and without this the skill is
+            #                           UNAVAILABLE to everyone until each person sets a
+            #                           value that was never secret.
+            #   requires_env: []     -> open. An explicitly empty list is an author saying
+            #                           "needs nothing"; `None` (absent) is saying nothing.
+            #   requires_env: [A, B] -> user-scoped on exactly those.
+            #   (absent)             -> fall back to detect_env, the common case.
+            declared = skill.requires_env
+            if skill.declared_scope == SCOPE_OPEN:
+                required = ()
+            elif declared is not None:
+                required = declared
+            else:
+                required = detect_env(skill)
             scope = SCOPE_USER if required else SCOPE_OPEN
+            if skill.declared_scope == SCOPE_USER and not required:
+                # Declared user-scoped with nothing to require: honour the scope so an
+                # admin can attach the values, rather than silently reopening it.
+                scope = SCOPE_USER
             try:
                 catalog.register_skill(
                     skill.name, str(skill.path), skill.origin, scope,

@@ -185,17 +185,37 @@ def install_zip(workspace: Path, data: bytes, fallback_name: str = "") -> Instal
     return Installed(name=name, path=target, files=written, replaced=replaced)
 
 
-def uninstall(workspace: Path, name: str) -> bool:
+def uninstall(workspace: Path, name: str, path: Path | None = None) -> bool:
     """Remove a workspace-installed skill's folder. False when there was nothing to remove.
 
     Only the workspace root is writable here: a skill discovered under a personal
     `~/.claude/skills` belongs to that person's own tooling, and deleting their file
     because QuickJoiner happened to read it would be well beyond what this owns.
+
+    ⚠ **Pass `path` — the folder the skill was actually DISCOVERED in.** A skill's name
+    comes from its frontmatter and the folder name is only the fallback (`loader.load_skill`),
+    so the two need not agree: drop a folder `logs/` whose SKILL.md declares
+    `name: query-app-logs` — which the CLI explicitly invites you to do — and every layer
+    lists it under the declared name while its files live elsewhere. Deriving the target as
+    `skills/<name>` then finds nothing, and the skill becomes **undeletable from the CLI, the
+    API and the UI at once**, while `removable: true` on the API row goes on promising
+    otherwise. Zip installs always agree (the archive is unpacked into a folder named after
+    the declared name), which is exactly why the suite never caught it.
+
+    `path` is still confined to the workspace skills root, so a caller cannot widen this
+    into a delete-anything primitive; the name-derived fallback is kept only for callers
+    that genuinely have nothing else.
     """
-    if not name or not _NAME.match(name):
-        return False
     root = (workspace / "skills").resolve()
-    target = (root / name).resolve()
+    if path is not None:
+        try:
+            target = Path(path).resolve()
+        except (OSError, ValueError):
+            return False
+    else:
+        if not name or not _NAME.match(name):
+            return False
+        target = (root / name).resolve()
     if not target.is_relative_to(root) or target == root or not target.is_dir():
         return False
     shutil.rmtree(target, ignore_errors=True)

@@ -1281,7 +1281,7 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
             raise HTTPException(status_code=400, detail=f"Could not update {name!r}: {exc}")
         return {"skill": _skill_row(_skill_or_404(name), user)}
 
-    @api.delete("/api/skills/{name}", tags=["Skills"], summary="Remove a workspace-installed skill and forget its configuration. Admin only.")
+    @api.delete("/api/skills/{name}", tags=["Skills"], summary="Remove a workspace-installed skill and forget its configuration. Admin only; danger tier, so the chat path also needs a typed confirm.")
     def delete_skill(name: str, authorization: str | None = Header(default=None)):
         """Deletes the skill's folder from the workspace. A skill discovered under a
         personal `~/.claude/skills` is refused with 409 — it belongs to that person's own
@@ -1292,31 +1292,49 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
         user = _user(authorization)
         _require_user(user)
         config = _skill_or_404(name)
-        _require("skills:write", user)
+        # `skills:delete`, not `skills:write` — same admin role, but it sits in the danger
+        # tier so the chat path (agent/control.py) demands a typed confirm on top of the
+        # conversational one. Deleting files is not the same act as installing them.
+        _require("skills:delete", user)
         if config.skill.origin != "workspace":
             raise HTTPException(
                 status_code=409,
                 detail=f"{name!r} was discovered in {config.skill.origin} storage, not this "
                        "workspace, so it is not QuickJoiner's to delete. Disable it instead.")
-        removed = uninstall(ctx.workspace, name)
+        # The DISCOVERED path, not one derived from the name — see uninstall()'s docstring
+        # for why those differ and why deriving it made such a skill undeletable.
+        removed = uninstall(ctx.workspace, name, config.skill.path)
         if not removed:
             raise HTTPException(status_code=400, detail=f"Could not remove {name!r}")
+        forgotten = True
         try:
             ctx.catalog.delete_skill_config(name)
         except Exception:
-            pass  # the folder is gone, which is what "removed" means; the row is bookkeeping
-        return {"removed": name}
+            # The folder is gone, which is what "removed" means. But a surviving row is not
+            # inert forever: register_skill's ON CONFLICT preserves scope/required_env/
+            # enabled, so reinstalling this name would silently inherit the old
+            # configuration — including enabled=0, i.e. installed but invisible. Report it
+            # rather than leaving that to be discovered later.
+            forgotten = False
+        return {"removed": name, "configuration_forgotten": forgotten}
 
     @api.get("/api/sources", tags=["Connectors"], summary="List every source with its document count — configured connectors plus ingestion buckets (taught notes, webhook pushes).")
     def sources(authorization: str | None = Header(default=None)):
         user = _user(authorization)
         configured = {s.name: s for s in ctx.config.sources}
+        # A configured connector follows its SourceConfig's visibility; a catalog-only row
+        # (a taught-notes bucket, a webhook push target) follows the same ownership rule
+        # through the catalog. Those used to be treated as commons unconditionally, which
+        # was true before per-user notes existed and would now list "Notes from ada" — a
+        # name and a document count — to everybody.
+        readable = ctx.visible_source_ids(user)
         rows = []
         for s in ctx.catalog.list_sources():
             cfg = configured.get(s["name"])
-            # Catalog-only rows (taught notes, webhook pushes) are commons;
-            # configured rows follow the source's visibility.
-            if cfg is not None and not visible(cfg, user, auth.enabled):
+            if cfg is not None:
+                if not visible(cfg, user, auth.enabled):
+                    continue
+            elif readable is not None and s["id"] not in readable:
                 continue
             rows.append(
                 {

@@ -10,8 +10,9 @@ Three gates, all enforced here before anything runs (defense in depth — the HT
 gets `_require` in stage 3):
   1. capability — the acting role must grant what the route needs;
   2. connector scope — a route naming a connector needs it visible (read) / manageable (write);
-  3. danger confirm — `connectors:delete` / `memory:reset` need an explicit typed `confirm=true`
-     on top of the conversational confirmation the prompt already requires for any mutation.
+  3. danger confirm — `connectors:delete` / `memory:reset` / `skills:delete` need an explicit
+     typed `confirm=true` on top of the conversational confirmation the prompt already requires
+     for any mutation. (The canonical list is `rbac.DANGER_CAPS`, not this comment.)
 
 The acting user is injected into the in-process request via a per-process internal secret header
 (see api/app.py's `_internal_user` middleware), so the dispatched handler runs AS that user

@@ -10,6 +10,7 @@ environment into a log.
 
 import json
 import os
+import sys
 
 import pytest
 
@@ -260,6 +261,253 @@ def test_a_script_outside_the_folder_is_refused(env):
 
     result = run_script(env["root"] / "query-logs", "../../../evil.py")
     assert not result.ok and "outside the skill folder" in result.output
+
+
+# -- a skill's name and its folder need not agree ------------------------------
+#
+# `load_skill` takes the name from FRONTMATTER and only falls back to the folder. The CLI
+# explicitly invites dropping a folder into <workspace>/skills, so the two can differ —
+# and deriving the delete target from the name then made such a skill undeletable from the
+# CLI, the API and the UI at once, while the API row still reported removable: true. Zip
+# installs always agree, which is why nothing caught it.
+
+def test_a_skill_whose_folder_differs_from_its_name_is_still_removable(tmp_path):
+    from quickjoiner.skills import discover, uninstall
+
+    root = tmp_path / "ws" / "skills"
+    (root / "some-folder").mkdir(parents=True)
+    (root / "some-folder" / "SKILL.md").write_text(
+        "---\nname: query-app-logs\ndescription: d\n---\nbody", encoding="utf-8")
+
+    skill = discover([(root, "workspace")])[0]
+    assert skill.name == "query-app-logs" and skill.path.name == "some-folder"
+
+    assert uninstall(tmp_path / "ws", skill.name) is False       # the old, name-derived way
+    assert (root / "some-folder").exists()
+    assert uninstall(tmp_path / "ws", skill.name, skill.path) is True
+    assert not (root / "some-folder").exists()
+
+
+def test_a_supplied_path_outside_the_workspace_is_still_refused(tmp_path):
+    """The path argument must not become a delete-anything primitive."""
+    from quickjoiner.skills import uninstall
+
+    (tmp_path / "ws" / "skills").mkdir(parents=True)
+    elsewhere = tmp_path / "somebody-elses"
+    elsewhere.mkdir()
+    assert uninstall(tmp_path / "ws", "x", elsewhere) is False
+    assert elsewhere.exists()
+
+
+# -- who supplies a skill's values: what the author said beats what we detected --
+
+def test_an_explicitly_empty_requires_env_keeps_a_skill_open(tmp_path):
+    """`requires_env: []` is an author saying "needs nothing". Reading it the same as
+    saying nothing at all let detection override it — and a script reading one
+    non-credential base URL then made the skill UNAVAILABLE to everybody."""
+    from quickjoiner.memory.catalog import Catalog
+    from quickjoiner.skills import SCOPE_OPEN, discover, sync_registry
+
+    root = tmp_path / "skills"
+    _write_skill(root, "svc",
+                 "---\nname: svc\ndescription: d\nrequires_env: []\n---\nbody",
+                 scripts={"go.ps1": 'Invoke-RestMethod $env:SOME_BASE_URL'})
+    catalog = Catalog(tmp_path / "ws")
+    config = sync_registry(catalog, discover([(root, "workspace")]))[0]
+    assert config.scope == SCOPE_OPEN and config.required_env == ()
+    catalog.close()
+
+
+def test_scope_open_frontmatter_overrides_detection(tmp_path):
+    """The `scope:` key was documented in loader.py's own header from the start and never
+    parsed. It is the escape hatch for a skill whose scripts read a tuning flag."""
+    from quickjoiner.memory.catalog import Catalog
+    from quickjoiner.skills import SCOPE_OPEN, discover, sync_registry
+
+    root = tmp_path / "skills"
+    _write_skill(root, "flagged",
+                 "---\nname: flagged\ndescription: d\nscope: open\n---\nbody",
+                 scripts={"go.ps1": 'Write-Output $env:LOG_LEVEL_FILTER'})
+    catalog = Catalog(tmp_path / "ws")
+    config = sync_registry(catalog, discover([(root, "workspace")]))[0]
+    assert config.scope == SCOPE_OPEN and config.required_env == ()
+    catalog.close()
+
+
+def test_an_absent_requires_env_still_falls_back_to_detection(tmp_path):
+    """The common case must be unchanged: most skills declare nothing."""
+    from quickjoiner.memory.catalog import Catalog
+    from quickjoiner.skills import SCOPE_USER, discover, sync_registry
+
+    root = tmp_path / "skills"
+    _write_skill(root, "creds", "---\nname: creds\ndescription: d\n---\nbody",
+                 scripts={"go.ps1": 'Invoke-RestMethod -Headers @{k=$env:DEPLOY_TOKEN}'})
+    catalog = Catalog(tmp_path / "ws")
+    config = sync_registry(catalog, discover([(root, "workspace")]))[0]
+    assert config.scope == SCOPE_USER and "DEPLOY_TOKEN" in config.required_env
+    catalog.close()
+
+
+def test_an_unrecognised_scope_is_warned_about_rather_than_obeyed(tmp_path):
+    from quickjoiner.skills import discover
+
+    root = tmp_path / "skills"
+    _write_skill(root, "odd", "---\nname: odd\ndescription: d\nscope: nonsense\n---\nb")
+    skill = discover([(root, "workspace")])[0]
+    assert skill.declared_scope == ""
+    assert any("nonsense" in w for w in skill.warnings)
+
+
+# -- argument splitting --------------------------------------------------------
+#
+# Neither shlex mode is right alone, and each is wrong SILENTLY: posix=True eats the
+# backslashes out of a Windows path, posix=False leaves the quote characters inside the
+# token. The second shipped, and a value with a space arrived wrapped in literal quotes.
+
+@pytest.mark.parametrize("text, expected", [
+    ('-SearchTerm "subscription installed"', ["-SearchTerm", "subscription installed"]),
+    ("-SearchTerm 'a b'", ["-SearchTerm", "a b"]),
+    (r"-Path C:\Users\khatrim\docs", ["-Path", r"C:\Users\khatrim\docs"]),
+    (r'-Path "C:\Program Files\x" -Q 1', ["-Path", r"C:\Program Files\x", "-Q", "1"]),
+    ("""-Json '{"a":1}'""", ["-Json", '{"a":1}']),   # only the OUTER pair is stripped
+    ('-Empty ""', ["-Empty", ""]),                   # a deliberate empty argument
+    ("", []),
+    ("   ", []),
+    ('unbalanced "quote', ["unbalanced", '"quote']),  # degrades, never raises
+    # The `=`-joined GNU/.NET spelling: the quote is interior, so shlex split on the space
+    # inside it and the value silently arrived in two pieces.
+    ('--path="C:\\a b" --n=2', ["--path=C:\\a b", "--n=2"]),
+    ("--msg='hello there'", ["--msg=hello there"]),
+    ("-Out=\"a b\"", ["-Out=a b"]),
+    # The joined FORM is preserved, not rewritten to two arguments: a parser accepting
+    # only `--key=value` would break if we split it.
+    ('--key="v"', ["--key=v"]),
+])
+def test_split_args_handles_quotes_and_windows_paths(text, expected):
+    from quickjoiner.skills.runner import split_args
+
+    assert split_args(text) == expected
+
+
+def test_a_quoted_argument_reaches_the_script_without_its_quotes(env, tmp_path):
+    """End-to-end through the tool, which is where the bug was observable."""
+    _write_skill(env["root"], "argv", "---\nname: argv\ndescription: d\n---\nb",
+                 scripts={"show.py": "import sys, json; print(json.dumps(sys.argv[1:]))"})
+    configs = sync_registry(env["catalog"], discover([(env["root"], "workspace")]))
+    tools = {t.spec.name: t for t in build_skill_tools(configs, "amy", env["store"])}
+    out = tools["run_skill_script"].fn(
+        name="argv", script="scripts/show.py", args='-SearchTerm "subscription installed"')
+    assert json.loads(out.strip()) == ["-SearchTerm", "subscription installed"]
+
+
+# -- stdin: the escape hatch for a script that prompts -------------------------
+
+def test_stdin_answers_a_prompting_script(env):
+    """An agent has no console. A script that cannot be edited is answered blind — a last
+    resort, and the tool description says so, but it beats the capability being unusable."""
+    _write_skill(env["root"], "asker", "---\nname: asker\ndescription: d\n---\nb",
+                 scripts={"ask.py": "a = input('Range? '); b = input('Term? ');"
+                                    " print(f'GOT {a}/{b}')"})
+    configs = sync_registry(env["catalog"], discover([(env["root"], "workspace")]))
+    tools = {t.spec.name: t for t in build_skill_tools(configs, "amy", env["store"])}
+    out = tools["run_skill_script"].fn(name="asker", script="scripts/ask.py",
+                                       stdin="7d\nsubscription\n")
+    assert "GOT 7d/subscription" in out
+
+
+def test_a_final_answer_without_a_newline_is_still_consumed(env):
+    from quickjoiner.skills.runner import run_script
+
+    _write_skill(env["root"], "asker2", "---\nname: asker2\ndescription: d\n---\nb",
+                 scripts={"ask.py": "print('GOT ' + input())"})
+    result = run_script(env["root"] / "asker2", "scripts/ask.py", stdin="no-trailing-newline")
+    assert result.ok and "GOT no-trailing-newline" in result.output
+
+
+def test_without_stdin_a_prompting_script_fails_fast_instead_of_hanging(env):
+    """Standard input is /dev/null, not the server's own: inheriting it lets a prompt
+    block for the whole 120s timeout and report nothing about the prompt."""
+    import time as _time
+
+    from quickjoiner.skills.runner import run_script
+
+    _write_skill(env["root"], "hanger", "---\nname: hanger\ndescription: d\n---\nb",
+                 scripts={"ask.py": "print('PROMPT'); input(); print('never')"})
+    started = _time.monotonic()
+    result = run_script(env["root"] / "hanger", "scripts/ask.py", timeout=30)
+    assert not result.ok
+    assert _time.monotonic() - started < 15      # EOF at once, not a timeout
+    assert "PROMPT" in result.output             # and the prompt text is visible to retry
+
+
+def test_stdin_is_bounded_and_says_when_it_clipped(env):
+    """A silently clipped answer is a plausible WRONG answer to a prompt, not an error."""
+    from quickjoiner.skills.runner import MAX_STDIN_CHARS, run_script
+
+    _write_skill(env["root"], "counter", "---\nname: counter\ndescription: d\n---\nb",
+                 scripts={"n.py": "import sys; print(len(sys.stdin.read()))"})
+    result = run_script(env["root"] / "counter", "scripts/n.py", stdin="x" * 99_999)
+    assert result.ok
+    assert int(result.output.splitlines()[0].strip()) <= MAX_STDIN_CHARS + 1  # +1 newline
+    assert "cut off" in result.output
+
+    within = run_script(env["root"] / "counter", "scripts/n.py", stdin="short\n")
+    assert "cut off" not in within.output
+
+
+# -- the encoding trap under the Windows PowerShell fallback -------------------
+#
+# Windows PowerShell 5.1 has no `-Encoding` for `-File`: a BOM-less script is read in the
+# system ANSI codepage, where a UTF-8 em dash ends in U+201D — a smart quote PowerShell
+# accepts as a string delimiter. One em dash inside a double-quoted string therefore ends
+# it early, and the parser blames an unrelated line for a missing brace. Hit while
+# testing a real skill; nothing in the error mentions encoding.
+
+def test_bom_less_utf8_earns_an_encoding_note(tmp_path):
+    from quickjoiner.skills.runner import encoding_hint
+
+    script = tmp_path / "s.ps1"
+    script.write_bytes('Write-Output "a — b"\n'.encode("utf-8"))
+    assert "UTF-8 with no BOM" in encoding_hint(script)
+
+
+@pytest.mark.parametrize("data, why", [
+    ('Write-Output "a - b"\n'.encode("utf-8"), "pure ASCII cannot be misread"),
+    ('Write-Output "a — b"\n'.encode("utf-8-sig"), "a BOM is honoured by 5.1"),
+    (b"Write-Output 'caf\xe9'\n", "already ANSI, so ANSI is the right reading"),
+])
+def test_no_note_when_the_encoding_is_not_the_problem(tmp_path, data, why):
+    """A false note is cheap but a false REFUSAL would not be — which is why this is only
+    ever appended to a failure, never used to block a run."""
+    from quickjoiner.skills.runner import encoding_hint
+
+    script = tmp_path / "s.ps1"
+    script.write_bytes(data)
+    assert encoding_hint(script) == "", why
+
+
+def test_the_note_rides_a_failure_and_survives_output_truncation(tmp_path, monkeypatch):
+    """It is appended AFTER truncation: a script that fails verbosely must not push the
+    one line explaining why off the end."""
+    import quickjoiner.skills.runner as runner_module
+
+    skill = tmp_path / "sk"
+    (skill / "scripts").mkdir(parents=True)
+    script = skill / "scripts" / "s.ps1"
+    script.write_bytes(('Write-Output "x — y"\n' * 50).encode("utf-8"))
+
+    # Stand in for PowerShell so the test runs anywhere: the primary interpreter is
+    # missing, so the WINDOWS FALLBACK path is taken — which is the branch that earns the
+    # note. run_script appends the script path, which `python -c` ignores.
+    noisy_failure = [sys.executable, "-c", "import sys; sys.stderr.write('E'*500); sys.exit(1)"]
+    monkeypatch.setattr(runner_module, "_INTERPRETERS", {".ps1": ["definitely-not-a-real-shell"]})
+    monkeypatch.setattr(runner_module, "_WINDOWS_FALLBACK", {".ps1": noisy_failure})
+    monkeypatch.setattr(runner_module, "MAX_OUTPUT_CHARS", 50)
+
+    result = runner_module.run_script(skill, "scripts/s.ps1")
+    assert not result.ok
+    assert "UTF-8 with no BOM" in result.output
+    assert "output truncated" in result.output
 
 
 # -- installation --------------------------------------------------------------

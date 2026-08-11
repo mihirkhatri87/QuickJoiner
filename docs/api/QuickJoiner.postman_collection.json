@@ -1127,7 +1127,7 @@
         },
         {
           "name": "Remove a skill (admin)",
-          "description": "Deletes the skill's folder from the workspace and forgets its configuration. 409 for a skill discovered under a personal ~/.claude/skills or ~/.copilot/skills \u2014 that belongs to the operator's own tooling, not to QuickJoiner; disable it with PATCH instead.",
+          "description": "Deletes the skill's folder from the workspace and forgets its configuration. Requires the skills:delete capability, which is in the DANGER tier \u2014 reaching this from chat additionally needs a typed confirm=true. 409 for a skill discovered under a personal ~/.claude/skills or ~/.copilot/skills \u2014 that belongs to the operator's own tooling, not to QuickJoiner; disable it instead (PATCH {\"enabled\": false}, or qj skills disable). Returns {removed, configuration_forgotten}. Stored secrets are NOT removed \u2014 a value may serve other skills; clear one via DELETE /api/skills/secrets/{key}.",
           "request": {
             "method": "DELETE",
             "url": "{{baseUrl}}/api/skills/{{skillName}}"

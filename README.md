@@ -567,8 +567,22 @@ qj skills show <name>                # the instructions the agent gets
 qj skills install <folder-or-zip>    # add one to this workspace
 qj skills secrets                    # which values you've set, which are still missing
 qj skills set-secret DEPLOY_TOKEN    # prompts without echo (preferred over --value)
-qj skills remove <name>
+qj skills disable <name>             # stop offering it, without deleting anything
+qj skills enable <name>              # put it back
+qj skills remove <name>              # delete a workspace-installed skill's files
 ```
+
+**Removing vs disabling.** `remove` deletes the skill's folder, and only ever under
+`<workspace>/skills`: a skill discovered in your personal `~/.claude/skills` or
+`~/.copilot/skills` belongs to that tooling, so QuickJoiner refuses to delete it and points
+you at `disable` instead — which stops offering it to the agent and leaves the files alone.
+The same rule holds in every layer: the CLI, `DELETE /api/skills/{name}` (409 for a personal
+skill), the Skills panel (the trash button is absent, with the reason shown), and chat.
+Deleting from chat additionally needs a typed confirmation on top of the conversational one,
+because it removes files and cannot be undone from inside QuickJoiner.
+
+Your own stored credentials are **not** removed with a skill — a value like `OCTOPUS_API_KEY`
+may be shared with other skills. Clear one explicitly with `qj skills unset-secret KEY`.
 
 **Installing is admin-only, using is not.** A skill can bundle scripts, and a script runs with the
 server's own privileges — this is not a sandbox. Install what you would be willing to run
@@ -577,6 +591,31 @@ makes a scoped skill work *as you*.
 
 API: `GET /api/skills`, `POST /api/skills` (multipart `.zip`), `PATCH /api/skills/{name}`,
 `DELETE /api/skills/{name}`, and `GET`/`POST`/`DELETE /api/skills/secrets…`.
+
+### Writing a script a skill can actually run
+
+The agent has no terminal, so **a script that prompts cannot be used at all** — and a script
+that prompts *only when a parameter is missing* is still unusable if it prompts unconditionally.
+Two rules cover it:
+
+- **Give every parameter a working default**, and prompt only when the host is genuinely
+  interactive (a real console *and* stdin not redirected). Then say in the output which values
+  were defaulted, so an empty result is never mistaken for a specified search that found nothing.
+- **Document the script's parameters in `SKILL.md`.** The agent only sees a script's filename;
+  if the instructions do not say how to call it, it will guess — and a guess lands in whatever
+  the first positional parameter happens to be.
+
+Also worth knowing on Windows: if `pwsh` (PowerShell 7) is not on PATH, `.ps1` files fall back to
+Windows PowerShell 5.1, which reads a **BOM-less UTF-8** file in the system ANSI codepage. One
+em dash or curly quote then becomes a smart quote that silently ends a string, and the parse
+error blames an unrelated line. Save PowerShell scripts as **UTF-8 with BOM** (or keep them
+ASCII), or install PowerShell 7. QuickJoiner adds a note naming this cause when a script fails
+under the 5.1 fallback.
+
+A script that prompts is the other trap: the agent has no console, so `Read-Host` (or Python
+`input()`) fails. Give every parameter a default and prompt only when a real console is
+attached. If a script genuinely can't be changed, the agent can answer its prompts by feeding
+stdin — a last resort, since answering blind depends on the prompt order not changing.
 
 ## Knowledge-debt backlog (gaps)
 

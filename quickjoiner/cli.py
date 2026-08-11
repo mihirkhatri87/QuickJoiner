@@ -1418,6 +1418,50 @@ def skills_install(
             f"[bold]qj skills set-secret {config.required_env[0]}[/bold].")
 
 
+@skills_app.command("disable")
+def skills_disable(
+    name: str = typer.Argument(..., help="Skill name"),
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """Stop offering a skill to the agent, without deleting anything.
+
+    This is the answer the API and the UI already give when you try to delete a skill
+    that lives in your personal ~/.claude or ~/.copilot folder — QuickJoiner will not
+    touch another tool's files. Until now the CLI said no without saying what to do
+    instead, because there was no command to point at.
+    """
+    _set_skill_enabled(workspace, name, False)
+
+
+@skills_app.command("enable")
+def skills_enable(
+    name: str = typer.Argument(..., help="Skill name"),
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """Offer a previously disabled skill to the agent again."""
+    _set_skill_enabled(workspace, name, True)
+
+
+def _set_skill_enabled(workspace: Optional[Path], name: str, enabled: bool) -> None:
+    ctx = _context(workspace)
+    config = next((c for c in ctx.skill_configs() if c.name == name), None)
+    if config is None:
+        console.print(f"[red]No skill named '{name}'.[/red]")
+        raise typer.Exit(1)
+    if config.enabled == enabled:
+        console.print(f"'{name}' is already {'enabled' if enabled else 'disabled'}.")
+        return
+    try:
+        ctx.catalog.update_skill_config(name, enabled=enabled)
+    except Exception as exc:
+        console.print(f"[red]Could not update '{name}': {exc}[/red]")
+        raise typer.Exit(1)
+    word = "enabled" if enabled else "disabled"
+    console.print(f"[green]'{name}' {word}.[/green]")
+    if not enabled:
+        console.print("[dim]Its files are untouched; `qj skills enable` puts it back.[/dim]")
+
+
 @skills_app.command("remove")
 def skills_remove(
     name: str = typer.Argument(..., help="Skill name"),
@@ -1437,16 +1481,21 @@ def skills_remove(
         console.print(
             f"[yellow]'{name}' was found in {config.skill.origin} storage, not this "
             "workspace — it is not QuickJoiner's to delete.[/yellow]")
+        console.print(f"[dim]To stop offering it here: qj skills disable {name}[/dim]")
         raise typer.Exit(1)
     if not yes and not typer.confirm(f"Remove skill '{name}' and its files?"):
         raise typer.Exit(1)
-    if not uninstall(ctx.workspace, name):
+    # The discovered path, not one derived from the name: a skill whose frontmatter name
+    # differs from its folder is otherwise undeletable (see uninstall()'s docstring).
+    if not uninstall(ctx.workspace, name, config.skill.path):
         console.print(f"[red]Could not remove '{name}'.[/red]")
         raise typer.Exit(1)
     try:
         ctx.catalog.delete_skill_config(name)
     except Exception:
-        pass
+        console.print(
+            f"[yellow]Removed the files, but '{name}' kept its stored configuration — "
+            "reinstalling this name would inherit the old scope/enabled state.[/yellow]")
     console.print(f"[green]Removed '{name}'.[/green]")
 
 

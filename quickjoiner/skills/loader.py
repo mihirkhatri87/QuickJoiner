@@ -46,8 +46,13 @@ class Skill:
     name: str
     description: str
     path: Path
-    #: Environment variables this skill needs. Empty ⇒ open to everyone.
-    requires_env: tuple[str, ...] = ()
+    #: Environment variables this skill needs. `()` is an author's explicit "none", and
+    #: **None means the key was absent** — the distinction decides whether `detect_env`'s
+    #: heuristic gets to speak (see `registry.sync_registry`).
+    requires_env: tuple[str, ...] | None = ()
+    #: Optional `scope:` frontmatter — "open" or "user". An explicit statement of who
+    #: supplies the values, which overrides both the declaration and detection.
+    declared_scope: str = ""
     #: Where it was found, for the UI to explain why a skill is present.
     origin: str = "workspace"
     references: tuple[str, ...] = ()
@@ -77,9 +82,15 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
 def _env_list(value) -> tuple[tuple[str, ...], list[str]]:
     """Normalize `requires_env` from a list or a comma-separated string. Names that
     aren't valid environment-variable identifiers are dropped WITH a warning — silently
-    ignoring one would make a skill look open when it isn't."""
+    ignoring one would make a skill look open when it isn't.
+
+    Returns `None` for an ABSENT key and `()` for an explicitly empty one. Collapsing the
+    two is not cosmetic: `requires_env: []` is an author stating "this needs nothing", and
+    if it reads the same as saying nothing at all then `detect_env`'s heuristic overrides
+    it — see `registry.sync_registry`.
+    """
     if value is None:
-        return (), []
+        return None, []
     items = value.split(",") if isinstance(value, str) else value
     if not isinstance(items, (list, tuple)):
         return (), [f"requires_env should be a list, got {type(value).__name__}"]
@@ -145,11 +156,22 @@ def load_skill(folder: Path, origin: str = "workspace") -> Skill | None:
     requires_env, env_warnings = _env_list(front.get("requires_env"))
     warnings.extend(env_warnings)
 
+    # `scope:` was documented in this module's own header from the start and never read.
+    # It is the author's explicit statement of who supplies the values, so it outranks
+    # both the declaration and detection.
+    declared_scope = str(front.get("scope") or "").strip().lower()
+    if declared_scope and declared_scope not in ("open", "user", "shared"):
+        warnings.append(f"ignored unrecognised scope {declared_scope!r}")
+        declared_scope = ""
+    if declared_scope == "shared":  # the header's older spelling of workspace-wide values
+        declared_scope = "user"
+
     return Skill(
         name=name,
         description=description,
         path=folder,
         requires_env=requires_env,
+        declared_scope=declared_scope,
         origin=origin,
         references=_listing(folder / "references", (".md", ".txt", ".json", ".yaml", ".yml")),
         scripts=_listing(folder / "scripts"),

@@ -15,8 +15,18 @@ auth:bearer {
 }
 
 docs {
-  Deletes the skill's folder from the workspace and forgets its configuration. Admin only.
+  Deletes the skill's folder from the workspace and forgets its configuration. Admin only —
+  and specifically the `skills:delete` capability, which is in the DANGER tier, so reaching
+  this from chat (`qj_api`) additionally needs a typed `confirm=true`.
 
   409 for a skill discovered under a personal `~/.claude/skills` or `~/.copilot/skills` — that
-  belongs to the operator's own tooling, not to QuickJoiner. Disable it with PATCH instead.
+  belongs to the operator's own tooling, not to QuickJoiner. Disable it instead: PATCH
+  /api/skills/{name} with `{"enabled": false}`, or `qj skills disable <name>`.
+
+  Returns `{removed, configuration_forgotten}`. `configuration_forgotten: false` means the
+  files are gone but the stored row survived, so reinstalling this name would inherit its old
+  scope/enabled state.
+
+  Stored secrets are NOT removed — a value such as OCTOPUS_API_KEY may serve other skills.
+  Clear one explicitly via DELETE /api/skills/secrets/{key}.
 }

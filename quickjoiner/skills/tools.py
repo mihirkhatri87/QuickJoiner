@@ -20,7 +20,7 @@ from __future__ import annotations
 from quickjoiner.llm.base import AgentTool, ToolSpec
 from quickjoiner.skills.loader import read_reference, skill_body
 from quickjoiner.skills.registry import SkillConfig, runnable, skill_environment
-from quickjoiner.skills.runner import run_script
+from quickjoiner.skills.runner import run_script, split_args
 
 MAX_CATALOG_SKILLS = 60
 # A description rides in EVERY system prompt, so it is bounded: it only has to be enough
@@ -107,7 +107,7 @@ def build_skill_tools(configs: list[SkillConfig], user: str | None, store) -> li
         c, err = _get(name)
         return err if c is None else read_reference(c.skill, path)
 
-    def run_skill_script(name: str, script: str, args: str = "") -> str:
+    def run_skill_script(name: str, script: str, args: str = "", stdin: str = "") -> str:
         c, err = _get(name)
         if c is None:
             return err
@@ -125,14 +125,10 @@ def build_skill_tools(configs: list[SkillConfig], user: str | None, store) -> li
         except Exception as exc:
             return f"Cannot run {c.name}: its secrets could not be read ({exc})."
         # Arguments arrive as one string because tool schemas vary in list support across
-        # providers; split on whitespace respecting simple quoting.
-        import shlex
-
-        try:
-            argv = shlex.split(args or "", posix=False)
-        except ValueError:
-            argv = (args or "").split()
-        result = run_script(c.skill.path, script, argv, env_values=env)
+        # providers. `split_args` is quoting- AND Windows-path-correct; see its docstring
+        # for why neither shlex mode alone is.
+        result = run_script(c.skill.path, script, split_args(args), env_values=env,
+                            stdin=stdin or None)
         header = "" if result.ok else f"[exit {result.exit_code}] "
         return header + result.output
 
@@ -178,11 +174,23 @@ def build_skill_tools(configs: list[SkillConfig], user: str | None, store) -> li
               ["name", "path"]),
         _tool("run_skill_script",
               "Run one of a skill's bundled scripts as the current user, with their own "
-              "credentials. Only use a script the skill's instructions tell you to run.",
+              "credentials. Only use a script the skill's instructions tell you to run. "
+              "There is no console: a script that prompts will fail unless you answer it "
+              "via `stdin`.",
               run_skill_script,
               {"name": {"type": "string"},
                "script": {"type": "string", "description": "e.g. 'scripts/Query-AppLogs.ps1'"},
-               "args": {"type": "string", "description": "Command-line arguments, one string."}},
+               "args": {"type": "string",
+                        "description": "Command-line arguments as one string. Quote values "
+                                       "containing spaces: -SearchTerm \"disk full\"."},
+               "stdin": {"type": "string",
+                         "description": "LAST RESORT, for a script that prompts and cannot "
+                                        "be changed: the answers, one per line, in the order "
+                                        "asked. Prefer passing parameters — answering blind "
+                                        "guesses the prompt order and takes the wrong answer "
+                                        "if the script's questions differ. If a run fails on "
+                                        "a prompt, read the prompt text in the output and "
+                                        "retry with the answers here."}},
               ["name", "script"]),
         _tool("my_skill_secrets",
               "Which skills are ready for this user and which are still missing required "
