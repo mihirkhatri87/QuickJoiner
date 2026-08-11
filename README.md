@@ -617,6 +617,31 @@ A script that prompts is the other trap: the agent has no console, so `Read-Host
 attached. If a script genuinely can't be changed, the agent can answer its prompts by feeding
 stdin — a last resort, since answering blind depends on the prompt order not changing.
 
+## Dates it can actually reason about
+
+Ask "what broke last Friday?" and the assistant does not guess. It knows today's date, and it
+resolves any phrase you use — *last Friday, this weekend, last week, last 30 days, 3 days ago,
+yesterday* — to an exact UTC window before it searches, then tells you which window it used.
+
+This matters more than it sounds. A time window that is wrong by a day or a week still returns
+real, well-formed, citable results — from the wrong period. Nothing in the answer looks amiss,
+so the mistake survives review. The resolution is therefore deterministic rather than left to
+the model, and where a phrase is genuinely ambiguous the assumption is stated back to you:
+
+- **"last week" is the previous calendar week** (Monday–Sunday); **"last 7 days" is rolling**
+  from now. Same for "last month" vs "last 30 days". Both readings are common, so it says which
+  it used and names the other.
+- **"last Friday" is strictly before today** — asked on a Friday it means seven days ago, not
+  today. A bare "Friday" includes today.
+- **"this weekend" looks backward** when the coming weekend hasn't happened yet, because a
+  question about what happened can't mean a future window.
+- A phrase it can't pin down (*"a while back"*) gets a request for specifics, never a guess.
+
+**Set your time zone** in Settings → Conversations (`chat.timezone`, an IANA name such as
+`America/Chicago`; default `UTC`). Calendar days are days *in that zone*, converted to UTC for
+the query — left at UTC, a US-Central "Friday" is shifted five hours and quietly loses part of
+a working evening at each end.
+
 ## Knowledge-debt backlog (gaps)
 
 Every refusal is a signal about what the org still needs to teach the tool. QuickJoiner logs each

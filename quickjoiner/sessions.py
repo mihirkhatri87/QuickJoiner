@@ -63,6 +63,12 @@ conversation established (e.g. "team: payments guild | owns | repo: proj-a").
 {SIGNATURE_LINES}
 Use names exactly as the conversation gave them. Never invent relationships.
 
+Resolve every relative date to an absolute one before recording a FACT: today's date is
+given below, so write "deployed 2026-08-07", never "deployed yesterday". A FACT becomes a
+permanent, retrievable, citable memory document read long after this conversation, and a
+relative date in one is unrecoverable — nothing downstream knows when it was said. If a
+date cannot be pinned down, say so in the fact rather than dropping or guessing it.
+
 If a section has nothing, leave it empty. Output nothing else.\
 """
 
@@ -271,9 +277,15 @@ class SessionManager:
             except Exception:
                 return fallback_digest(messages), [], []  # keyless: no triples, deterministic graph only
         try:
+            # The anchor the "resolve every relative date" rule above needs to be
+            # followable at all. Appended rather than baked into COMPRESS_SYSTEM so that
+            # constant stays a pure, lockstep-testable string.
+            from datetime import datetime as _dt, timezone as _tz
+
+            today = _dt.now(_tz.utc).strftime("%A, %Y-%m-%d")
             result = provider.chat(
                 [{"role": "user", "content": f"Compress these conversation turns:\n\n{transcript}"}],
-                system=COMPRESS_SYSTEM,
+                system=f"{COMPRESS_SYSTEM}\n\nToday is {today} (UTC).",
             )
             return parse_compression(result.text)
         except Exception:

@@ -27,6 +27,10 @@ dependencies = [
     # Encrypts each user's skill credentials at rest (quickjoiner/skills/secrets.py). A core
     # dependency, not an extra: without it a user-scoped skill cannot store a value at all.
     "cryptography>=42.0",
+    # The IANA time-zone database `zoneinfo` reads. Windows ships no tz database at all, so
+    # without this `chat.timezone` silently degrades to UTC and every "last Friday" is off by
+    # the local offset (quickjoiner/agent/dates.py resolves calendar days in the local zone).
+    "tzdata>=2024.1",
 ]
 
 [project.optional-dependencies]

@@ -136,7 +136,7 @@ class DynatraceConnector(Connector):
                         "type": "object",
                         "properties": {
                             "query": {"type": "string"},
-                            "minutes": {"type": "integer"},
+                            "minutes": {"type": "integer", "description": "How far back from NOW, in minutes. For a phrase like 'last Friday' or 'this weekend', call resolve_dates first and use the minutes it reports — do not estimate."},
                             "limit": {"type": "integer"},
                         },
                         "required": ["query"],

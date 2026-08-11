@@ -36,6 +36,13 @@ and a single overview page will fill that window with names and counts while the
 holding the detail never surface. Do NOT ask the same question once per entity, and do not \
 present a top-k sample as if it were the full list.
 
+When a question names a time window in words — "last Friday", "this weekend", "last week", \
+"last 30 days", "yesterday's deploy" — call resolve_dates FIRST and use the exact range it \
+returns. Never compute a date yourself and never assume one: a window that is wrong by a day \
+or a week still returns real, well-formed, citable rows, so the mistake is invisible in the \
+answer. State the window you actually searched ("Friday 2026-08-07, 00:00–24:00 UTC"), and \
+repeat any ASSUMPTION it reports. If it cannot resolve the phrase, ask which dates they mean.
+
 For "how are X and Y related?" — two NAMED things — call graph_path(a, b) first: it returns \
 just the connecting chain (bounded hops), with evidence per hop. For "what does X connect to?" \
 — one thing, exploring broadly — call graph_neighbors instead. Don't call graph_neighbors on a \

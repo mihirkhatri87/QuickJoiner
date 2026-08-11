@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from quickjoiner.agent.agent import OnboardingAgent
@@ -24,6 +25,34 @@ from quickjoiner.memory.reranker import create_reranker
 # uncapped_tools comment in agent/agent.py for why applying that cap here anyway
 # silently re-truncates an already-complete, already-honest result.
 _UNCAPPED_TOOLS = frozenset({"graph_relations", "graph_neighbors", "graph_path"})
+
+
+def _current_date_line(tz_name: str = "UTC") -> str:
+    """Grounds relative dates ("Friday", "last week", "yesterday's deploy") in the real
+    clock instead of the model's training cutoff or an invented guess. Without this the
+    agent has NO idea what day it is: observed live, a single 22-round tool-calling turn
+    resolving "Friday" invented four different, mutually inconsistent "today"s
+    (2024-05-21, 2025-05-19, 2025-05-20, "Oct 21 2024") and never actually computed a
+    date — the eventual failure (an interactive skill script) was real, but this was an
+    independent, silent defect underneath it.
+
+    Date-only, deliberately no time-of-day: Anthropic prompt caching hashes the whole
+    system+tools prefix as one unit (see llm/anthropic_provider.py), so anything that
+    changes here misses cache on the NEXT request. A per-minute clock would invalidate
+    it on every follow-up turn of every conversation; a per-day one costs at most one
+    miss every 24h, which is the same order of cost the codebase already accepts for
+    session-compression cache invalidation.
+    """
+    from quickjoiner.agent.dates import load_timezone
+
+    tz = load_timezone(tz_name)
+    label = "UTC" if tz is timezone.utc else tz_name
+    now = datetime.now(timezone.utc).astimezone(tz)
+    return (
+        f"Current date: {now.strftime('%A, %Y-%m-%d')} ({label}). "
+        "For any other date the user names in words, call resolve_dates — do not do the "
+        "arithmetic yourself."
+    )
 
 
 @dataclass
@@ -104,6 +133,7 @@ class AppContext:
         tools = build_builtin_tools(
             self.store, self.catalog, self.pipeline, self.config.retrieval, self.config.gaps,
             score_ledger=ledger, scope=scope, user=user,
+            timezone_name=self.config.chat.timezone,
         )
         tools.extend(build_ops_tools(self))
         tools.extend(self.connector_tools(self._scoped_sources(sources, scope)))
@@ -115,7 +145,8 @@ class AppContext:
         # demand, and a user-scoped skill runs only with THIS user's own credentials.
         skills_prompt, skill_tools = self.skill_tools(user)
         tools.extend(skill_tools)
-        system = SYSTEM_PROMPT + (f"\n\n{skills_prompt}" if skills_prompt else "")
+        system = SYSTEM_PROMPT + f"\n\n{_current_date_line(self.config.chat.timezone)}"
+        system += f"\n\n{skills_prompt}" if skills_prompt else ""
         system += f"\n\n{extra_system}" if extra_system else ""
         return OnboardingAgent(
             provider, tools, system,

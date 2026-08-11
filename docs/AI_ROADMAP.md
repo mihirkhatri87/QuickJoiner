@@ -213,6 +213,12 @@ How each works is documented in `CLAUDE.md` — the source of truth for current 
 11. **Temporal knowledge (PRD W6)** — *adapt*. Bi-temporal doc records; staleness-aware
     ranking; `as-of` filters; contradiction detection (conflicting same-entity claims
     surfaced with both citations, never silently merged — I2).
+    ⚠ **Not closed by the 2026-08-10 date work.** `agent/dates.py` resolves the dates in a
+    *question* ("last Friday" → an exact UTC window) and grounds the prompts that judge
+    recency. This item is about the dates on the *evidence* — when a document was valid vs
+    when it was observed, ranking a stale claim below a fresh one, and answering "as of
+    March". Query-side date handling is a prerequisite for `as-of` filters, not a partial
+    delivery of them.
 12. **Deterministic community summaries** (our answer to GraphRAG) — *adapt*. Cluster the
     evidence-weighted graph, generate cited per-community summaries, re-ingest as
     `graph-summary://` docs. LLM for prose, never for edges (I3).

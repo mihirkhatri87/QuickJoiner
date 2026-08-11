@@ -71,7 +71,11 @@ def test_brief_generation_grounds_saves_and_reingests(ctx):
 
     # The prompt was grounded: system prompt + retrieved chunks with their URIs.
     call = provider.calls[0]
-    assert call["system"] == BRIEF_SYSTEM
+    assert BRIEF_SYSTEM in call["system"]
+    # ...and dated. The `week1` and `roadmap` specs ask what is in flight, upcoming or
+    # overdue; the date used to be computed AFTER this call, so the model never saw it and
+    # judged recency against nothing.
+    assert "Today is" in call["system"]
     prompt = call["messages"][0]["content"]
     assert "Octopus on Fridays" in prompt and "[https://wiki.acme.test/deploys]" in prompt
 

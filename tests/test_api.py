@@ -191,6 +191,20 @@ def test_settings_change_reaches_the_live_pipeline_not_just_the_saved_config(api
     assert ctx.pipeline.extracts_triples is False
 
 
+def test_chat_timezone_round_trips_and_reaches_the_agent(api_workspace):
+    """The zone decides what calendar day "last Friday" means. It must survive the whole
+    round trip AND move the live agent, or a non-UTC team silently searches shifted days."""
+    ctx = build_context(api_workspace)
+    client = TestClient(create_app(api_workspace, ctx=ctx))
+    assert client.get("/api/settings").json()["chat"]["timezone"] == "UTC"
+    assert client.get("/api/settings/defaults").json()["chat"]["timezone"] == "UTC"
+
+    assert client.patch(
+        "/api/settings", json={"chat": {"timezone": "America/Chicago"}}).status_code == 200
+    assert client.get("/api/settings").json()["chat"]["timezone"] == "America/Chicago"
+    assert "America/Chicago" in ctx.build_agent()._system   # same process, no restart
+
+
 def test_settings_defaults_are_shipped_values_not_current_ones(client):
     """The Settings drawer marks which fields still sit at their default. The defaults must
     come from fresh config models — reading back the *saved* config would make every field

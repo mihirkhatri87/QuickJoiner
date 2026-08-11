@@ -1329,6 +1329,54 @@ Previously BOTH source copies preceded the install layer, so every edit re-downl
   Tests: `tests/test_triples.py` (empty ⇒ identical prompt, hint present + subordinating
   sentence, length cap, off-signature/off-vocab lines still dropped under a "ignore the
   rules" hint, pipeline resolves it from the source config, missing source ⇒ "").
+- **The agent is told what day it is** (`app._current_date_line`, prepended to
+  `SYSTEM_PROMPT` in `build_agent`, 2026-08-10). It never was, and nothing in a grounded
+  answer can supply it: a relative date ("on Friday", "yesterday's deploy", "last week")
+  has no referent, so the model falls back on its training cutoff or simply invents one.
+  Observed live in one 22-round turn resolving a single "Friday", it guessed
+  **2024-05-21, then 2025-05-19, then 2025-05-20, then "Oct 21 2024"** — four mutually
+  inconsistent "today"s — and never computed a date at all. That is a *silent* failure of
+  exactly the kind this repo's grounding contract exists to prevent: a confidently wrong
+  time window looks identical to a correct one that found nothing.
+  **Date-only, deliberately no time of day**: Anthropic prompt caching hashes the whole
+  tools→system→messages prefix as one unit, so anything that changes here misses cache on
+  the NEXT request; a per-minute clock would invalidate every follow-up turn of every
+  conversation, while a per-day grain costs at most one miss per 24h — the same order the
+  codebase already accepts for session-compression invalidation. Rendered as
+  `Current date: <Weekday>, <YYYY-MM-DD> (<zone>)` so a weekday question needs no
+  arithmetic from an ISO date. Tests: `tests/test_agent_context.py`.
+- **`agent/dates.py` + the `resolve_dates` tool — the arithmetic, not just the anchor
+  (2026-08-10).** Knowing today fixes *where* to count from; it does not stop a model
+  getting the count wrong, and that error is the dangerous one: a window off by a day or a
+  week still returns real, well-formed, citable rows, so nothing downstream can detect it.
+  `resolve(phrase, now, tz)` is pure and returns a half-open UTC `[start, end)` plus a
+  **label** (what it resolved to, in words) and an **assumption** — non-empty exactly when
+  the phrase was genuinely ambiguous and a convention had to be applied, which the prompt
+  requires the agent to repeat. Conventions, all deliberate and all stated: days are
+  **calendar days in `chat.timezone`** converted to UTC (a US-Central Friday is 05:00Z
+  Fri–05:00Z Sat; resolving in UTC silently trims a working evening off each end); weeks
+  are Monday-start; **"last week"/"last month" are the previous CALENDAR period while
+  "last 7 days"/"last 30 days" are ROLLING** — different windows, both readings common, so
+  the calendar ones name the alternative; **"last Friday" is strictly before today**, so
+  on a Friday it is seven days ago, not today, while a bare "Friday" includes today; and
+  **"this weekend" resolves BACKWARD when the current week's has not finished**, because a
+  question about what happened cannot mean a future window (on a Monday "this weekend" and
+  "last weekend" therefore agree — which is how people speak, not a bug). An unparseable
+  phrase returns **None** and the tool tells the agent to ask rather than guess: inventing
+  a window is the very thing this removes. `_span` rebuilds the end from the DATE rather
+  than adding 24h, so a DST day stays a whole local day (25 hours on 2026-11-01). It also
+  emits a **minutes-back-from-now** equivalent, because the grafana/datadog/dynatrace live
+  tools take `minutes` rather than a range — closing that seam in one place instead of
+  handing the arithmetic back to the model — and says plainly that minutes-back runs to
+  now and so sweeps up everything since the window ended. Date grounding was extended to
+  the two other prompts that needed it: `briefs.py` (the `week1`/`roadmap` specs ask what
+  is in flight and upcoming, and the date was computed AFTER the model call and used only
+  for the header, so the model never saw it) and `sessions.py`'s distillation prompt, the
+  most durable case — a `FACTS:` line becomes a permanent citable memory document, so
+  "deployed yesterday" is unrecoverable and relative dates must be resolved before
+  recording. `chat.timezone` (IANA, default UTC) is the zone; `tzdata` is declared for it
+  since Windows ships no tz database, and an unavailable zone degrades to UTC **and says
+  so** rather than silently shifting every window. Tests: `tests/test_dates.py` (39).
 - `quickjoiner/agent/` — grounded system prompt (`prompts.py`), built-in tools
   (search_memory/remember/list_sources + graph_neighbors/**graph_relations**/graph_path in
   `tools.py`; **`graph_relations(rel, src_type, dst_type)` is the ENUMERATION read** —

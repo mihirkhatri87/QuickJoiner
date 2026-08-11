@@ -77,6 +77,7 @@ def build_builtin_tools(
     score_ledger: dict[str, float] | None = None,
     scope=None,
     user: str | None = None,
+    timezone_name: str = "UTC",
 ) -> list[AgentTool]:
     """`scope` (memory.store.SearchScope) narrows every memory read for this turn — to the
     connectors/documents the user picked, AND to what the acting user is allowed to read
@@ -88,6 +89,15 @@ def build_builtin_tools(
     user chose the first and must not be told the second is their doing.
     """
     visible = None if scope is None else scope.visible_source_ids
+
+    def resolve_dates(phrase: str) -> str:
+        """Deterministic date arithmetic — see agent/dates.py for the conventions and why
+        each one is stated rather than silently applied."""
+        from datetime import datetime, timezone as _tz
+
+        from quickjoiner.agent.dates import describe
+
+        return describe(phrase, datetime.now(_tz.utc), timezone_name)
 
     def _capture_gap(query: str) -> None:
         """Log a refusal as a knowledge gap. Fire-and-forget: any failure here must
@@ -616,5 +626,32 @@ def build_builtin_tools(
                 },
             ),
             fn=graph_path,
+        ),
+        AgentTool(
+            spec=ToolSpec(
+                name="resolve_dates",
+                description=(
+                    "Turn a relative date phrase — 'last Friday', 'this weekend', 'last "
+                    "week', 'last 30 days', '3 days ago', 'yesterday' — into an exact "
+                    "UTC start/end you can paste into a query. ALWAYS call this before "
+                    "searching a time window the user described in words: the arithmetic "
+                    "has traps ('last Friday' on a Friday is seven days ago; 'last week' "
+                    "is the previous calendar week, not a rolling seven days) and a wrong "
+                    "window returns real rows from the wrong period, which looks exactly "
+                    "like a correct answer. It reports any convention it had to apply — "
+                    "repeat that to the user. If it cannot resolve the phrase, ask which "
+                    "dates they mean rather than guessing."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "phrase": {"type": "string",
+                                   "description": "The date phrase as the user said it, "
+                                                  "e.g. 'last friday' or 'last 30 days'."},
+                    },
+                    "required": ["phrase"],
+                },
+            ),
+            fn=resolve_dates,
         ),
     ]

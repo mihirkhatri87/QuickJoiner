@@ -183,6 +183,12 @@ class ChatConfig(BaseModel):
     # is capped to this many chars, and the files themselves are auto-deleted after N days.
     attachment_context_max_chars: int = 24000
     context_retention_days: int = 7
+    # IANA name (e.g. "America/Chicago"). The calendar days a relative date resolves to —
+    # "last Friday", "this weekend" — are days in THIS zone, converted to UTC for the
+    # query. A US-Central Friday is 05:00Z Fri to 05:00Z Sat, so leaving this at UTC for a
+    # non-UTC team silently trims hours off each end of every day-shaped window. An
+    # unknown or unavailable zone degrades to UTC and says so rather than failing.
+    timezone: str = "UTC"
 
 
 class GapsConfig(BaseModel):

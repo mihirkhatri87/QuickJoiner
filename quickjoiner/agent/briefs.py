@@ -164,10 +164,22 @@ def generate_brief(
     if provider is None:
         provider = ctx.build_provider(provider_override, model_override)
 
-    result = provider.chat(
-        [{"role": "user", "content": build_prompt(spec, hits)}], system=BRIEF_SYSTEM
+    # The date was computed AFTER this call and used only for the header and filename, so
+    # the model never saw it — while two of the brief specs are explicitly temporal
+    # ("a day-by-day focus for the first week", "what is in flight, what is coming next,
+    # and any deadlines"). Deciding what is upcoming or recently finished with no idea
+    # what today is, from undated chunks, is the same silent-wrong-window failure
+    # agent/dates.py exists to remove.
+    now = datetime.now(timezone.utc)
+    dated_system = (
+        f"{BRIEF_SYSTEM}\n\nToday is {now.strftime('%A, %Y-%m-%d')} (UTC). Judge what is "
+        "recent, in flight, overdue or upcoming against that date, and say when a source "
+        "carries no date rather than assuming it is current."
     )
-    today = datetime.now(timezone.utc).date().isoformat()
+    result = provider.chat(
+        [{"role": "user", "content": build_prompt(spec, hits)}], system=dated_system
+    )
+    today = now.date().isoformat()
     markdown = (
         f"# {spec.title}\n\n_Generated {today} from {len(hits)} learned chunks; "
         f"claims are cited, gaps are listed at the end._\n\n{result.text.strip()}\n"
