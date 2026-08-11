@@ -76,6 +76,39 @@ def test_danger_requires_confirm_then_dispatches(env):
     assert "HTTP 409" in out
 
 
+def test_deleting_a_skill_from_chat_needs_a_typed_confirm(env, tmp_path):
+    """Skill removal is reachable from chat, so "tidy up the old skills" must not become an
+    unconfirmed rm. Same admin role as installing, one extra gate — `connectors:delete`'s
+    precedent, and the reason DELETE has its own capability rather than sharing skills:write."""
+    ctx, _ = env
+    skill = ctx.workspace / "skills" / "throwaway"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: throwaway\ndescription: d\n---\nbody", encoding="utf-8")
+
+    qj = _tools(ctx, "admin")["qj_api"]
+    assert "CONFIRM REQUIRED" in qj("DELETE", "/api/skills/throwaway")
+    assert skill.exists(), "an unconfirmed call must not have deleted anything"
+
+    assert "HTTP 200" in qj("DELETE", "/api/skills/throwaway", confirm=True)
+    assert not skill.exists()
+
+
+def test_a_viewer_cannot_delete_a_skill_even_with_confirm(env):
+    ctx, _ = env
+    qj = _tools(ctx, "viewer")["qj_api"]
+    assert "PERMISSION DENIED" in qj("DELETE", "/api/skills/anything", confirm=True)
+
+
+def test_the_reference_surfaces_skills_so_the_agent_can_find_them(env):
+    """Discoverability is the other half of "reachable from chat": an endpoint the model
+    cannot find in qj_api_reference may as well not exist to it."""
+    ctx, _ = env
+    reference = _tools(ctx, "admin")["qj_api_reference"]("skills")
+    assert "/api/skills" in reference
+    assert "DELETE" in reference
+
+
 # -- connector scope ----------------------------------------------------------
 
 def test_connector_scope_denies_unknown_connector(env):
