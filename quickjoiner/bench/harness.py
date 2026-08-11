@@ -25,7 +25,7 @@ against the real workspace, so it includes whatever else the machine is doing; r
 twice before believing a small delta. Percentiles over a handful of samples are indicative,
 not statistical — `samples` is reported next to every one so a p95 over 6 points is
 visibly that. Warm-up iterations are run and DISCARDED because the first search of a
-process pays one-off costs that no user pays twice (the ~80MB cross-encoder loads lazily on
+process pays one-off costs that no user pays twice (the cross-encoder loads lazily on
 first `rank()`, LanceDB opens the table, the FTS sidecar backfills); folding those into a
 p50 would make every "optimization" look like a win the moment it moved them around.
 """

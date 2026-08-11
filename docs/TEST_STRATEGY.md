@@ -30,6 +30,14 @@ non-coverage dimensions that actually catch bugs (property, parity, mutation, E2
   promoted, which is what makes it a recall knob rather than a cost dial — plus a guard that
   the default stays above the measured floor of 12. A future cut then has to bring its own
   measurement rather than merely update an expectation.
+- **An upgrade path is a test case** (added 2026-08-11 with the S4a INT8 reranker default).
+  Changing the default cross-encoder to a file that is not yet in anyone's cache is fine on a
+  networked box and a silent quality regression on an offline one: the new model fails to load,
+  the existing lazy-load path degrades permanently to RRF order, and reranking simply stops —
+  no error, no log, just worse answers after an upgrade. So the fallback to the previously
+  cached fp32 model is tested, not merely implemented, and both tests were **verified to fail
+  with the fallback removed**. The transferable form: when a default changes to something that
+  must be *fetched*, write the test for the machine that cannot fetch it.
 - **Standing lesson, re-earned 2026-08-10**: a green suite proves a feature does what it says,
   never that what it says is worth saying. Two HIGH defects in the skills feature — a skill whose
   frontmatter name differed from its folder was undeletable from *every* layer, and

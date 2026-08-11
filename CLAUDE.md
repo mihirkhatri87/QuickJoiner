@@ -308,9 +308,42 @@ Previously BOTH source copies preceded the install layer, so every edit re-downl
   and `min_score` gates on it** — fusion changes what surfaces and in what order, never the
   grounded-vs-refuse decision (sparse-only hits get their cosine via a targeted lookup).
   Cross-encoder second stage (`reranker.py`, `retrieval.reranker="fastembed"`, **on by default**;
-  lazy — the ~80MB ONNX model loads on first `rank()`, not at construction, so startup/build_context
+  lazy — the ONNX model loads on first `rank()`, not at construction, so startup/build_context
   is free; failures degrade to RRF order; `QJ_DISABLE_RERANKER=1` env kill-switch, set by the test
   suite to stay offline). `factory.create_store` wires `retrieval` + reranker into both stores.
+  **The default cross-encoder is the INT8 build (S4a, 2026-08-11, closing the last of S4's
+  levers):** fastembed's catalogue carries only the fp32 `onnx/model.onnx`, so
+  `_register_quantized` uses `add_custom_model` to register the SAME HF repo pointed at its
+  `onnx/model_quantized.onnx` (23MB vs 91MB) — it still downloads and caches through the ordinary
+  fastembed path, honouring `FASTEMBED_CACHE_PATH`. Measured over the live corpus's fused pools on
+  the 32-case eval set: **−28.6% on the rerank stage, faster on 32/32 queries** (paired ratio
+  0.63–0.80), with recall@k, grounded recall, MRR, hop coverage and refusal accuracy **all
+  byte-identical** — `qj eval --compare` reports delta 0.000 on every watched metric. Three
+  variants of the same repo were measured, not assumed: `model_quantized` 918ms, `model_int8`
+  1012ms, `model_uint8` 1517ms against fp32 1474ms in that run — identical 23MB file sizes, very
+  different speeds, so the file is named explicitly.
+  ⚠ **How that −28.6% was arrived at is the transferable part.** Two earlier framings of the same
+  experiment (in-process, then a same-session A/B through `apply_config`) both ran fp32 first and
+  both reported **−38%/−41%** — and the *untouched embedder*, carried as a control, came out **25%
+  faster** in the second arm of the second one. This machine drifts under sustained ONNX load, so
+  an arm-at-a-time comparison quietly hands ~10 points of drift to whichever arm ran later, and
+  nothing in the numbers says so. The shipped figure is **paired and order-alternated** (both
+  encoders resident, arms swapped per repeat, per-query ratios) which cancels monotonic drift to
+  first order. Same reason `qj bench --compare` against the 01:44 baseline is NOT the evidence
+  here: it flagged +12.5% p50 while reporting the embedder **64.5% slower** in the same run —
+  a machine difference, not a code one. **Carry a control variable through any latency A/B on this
+  box, and distrust any cross-run bench comparison whose untouched stages moved.**
+  Whole-query effect follows the stage's share (65–76% depending on the run), i.e. roughly −19–22%.
+  **The fp32 fallback is load-bearing, not belt-and-braces:** an existing install already has the
+  91MB fp32 model cached, so an upgrade able to reach only the new file would turn an offline
+  machine's *working* reranker into a silent degrade-to-RRF — a quality regression caused purely by
+  upgrading. `_candidates()` therefore returns `[int8, fp32]` for the default and `[pinned]` for an
+  explicit `retrieval.reranker_model`, which is never second-guessed. Both behaviours are pinned by
+  tests **verified to fail with the fallback removed**. Honest limit: quantization perturbs scores,
+  so the returned top-8 **order differs on 26 of 32 queries** — MRR being unchanged means the
+  expected document holds its rank in every answerable case and the reshuffling is among candidates
+  the eval set has no opinion about, which is a bound on what 20 answerable cases can see rather
+  than a clean bill of health.
   **`retrieval.rerank_candidates` is a RECALL knob before it is a cost dial (24 → 16, S4,
   2026-08-10):** the reranker only ever sees `ordered[:rerank_candidates]`, so a candidate the
   fused order buried below that depth is invisible to it and no amount of relevance brings it
@@ -342,11 +375,32 @@ Previously BOTH source copies preceded the install layer, so every edit re-downl
   185 chars, 9.2 at 464, 19.1 at 929, 30.3 at 1394, 69.3 at 2789; live corpus median chunk 1013
   chars, and **18% of chunks already exceed the model's 512-token cap** and are silently
   truncated by the tokenizer). A length cap is therefore a real second lever, deliberately NOT
-  shipped: its measured effect flipped sign with depth (at depth 24 truncating to 400 chars cost
-  nothing, at depth 12 it cost MRR), and 20 answerable cases cannot tell that from noise —
-  exactly the blind trade S4 exists to prevent. Also measured and rejected as levers: ONNX thread
-  count (the default beats every explicit setting — 1684 ms vs 2100 at 4 threads, 5350 at 1) and
-  batching (fastembed already puts the whole depth in one forward pass at `batch_size=64`).
+  shipped, and **re-measured in S4a (2026-08-11) with a sharper test that settles it**: judged by
+  ORDER IDENTITY against the untruncated ranking rather than by whether metrics happen to hold,
+  because 20 answerable cases cannot distinguish a safe cap from a lucky one. The tokenizer cuts
+  at **512 tokens** (`direction=Right`), so a cap above that boundary is *provably* lossless and
+  one below it is a genuine trade — and the boundary is empirically **2000 chars: identical top-8
+  on 32/32 queries**, versus 8/32 at 1400 and 1/32 at 1000. But it buys nothing measurable, because
+  only **4%** of live candidates exceed 2048 chars: cap 2000 came out 1380ms against 1535 uncapped
+  while cap **1400 came out SLOWER than uncapped** (1636ms), which puts run-to-run noise at ~±10%
+  and makes the apparent win unquotable. The large savings are all below the token cap and all
+  lossy — cap 600 is −55% for MRR 0.925 → 0.892, past the 0.02 `--compare` tolerance — and they
+  wobble rather than degrade (hop coverage *improves* 0.750 → 0.875 at every cap ≤1400 while MRR
+  dips; with 20 answerable and 8 multi-hop cases every one of those is a single case moving rank).
+  So it stays parked behind a bigger eval set (#19), now with numbers rather than a hunch.
+  **The more useful finding is why the stage costs what it does:** the median candidate in the live
+  fused pools is **1658 chars ≈ 415 of the model's 512 tokens**, and cost is quadratic in sequence
+  length (19 ms/candidate at 300 chars vs 86 at 2000) — so per-candidate cost here is set by *chunk
+  length*, not by model choice, which makes the remaining headroom a chunking question (AI #2,
+  AST-aware chunking) rather than a reranker one. Also measured and rejected as levers: ONNX thread
+  count (the default beats every explicit setting — 1684 ms vs 2100 at 4 threads, 5350 at 1),
+  batching (fastembed already puts the whole depth in one forward pass at `batch_size=64`), the
+  three *other* fastembed cross-encoders (`jina-reranker-v1-tiny-en` is 21% faster but costs MRR
+  0.925 → 0.863 — 3× the tolerance — and is *larger* on disk at 0.13GB than the incumbent's 0.08,
+  so "smaller CE" was wrong twice; `jina-turbo` and `MiniLM-L-12` are worse on quality AND slower),
+  and **early exit on an already-stable fused head, which is empirically dead**: reranking changed
+  the returned top-8 on **32/32** queries, so there is no stable-head population to exit on — and
+  the same run shows why the stage earns its keep at all (MRR 0.775 without it vs 0.925 with).
   `KnowledgeStore.ensure_ann_index()` builds a LanceDB IVF index past `retrieval.ann_min_rows`
   (pipeline calls it after each ingest batch). **Graph-expansion retrieval** (`retrieval.graph_expansion`,
   on): `catalog.graph_expand(seed_doc_ids)` finds documents one knowledge-graph hop from the grounded

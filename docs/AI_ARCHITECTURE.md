@@ -70,13 +70,18 @@ Key defended choices:
 - **Hybrid with RRF, not score mixing.** Ranks, not scores, fuse (k=60): immune to scale
   mismatch between cosine and BM25, deterministic, tunable with two knobs. Sparse-only
   candidates get their cosine computed *afterwards* purely to face the gate (I1).
-- **Reranker on by default, and it is the dominant query cost.** A cross-encoder reorders
-  the fused head only, but reads query+candidate together, so it costs a forward pass per
-  candidate — measured at **~77ms/candidate**, i.e. 83% of a 2.2s query at the shipped
-  depth of 24 (`qj bench`, 2026-07-31). Kept on because retrieval quality is the product;
-  right-sizing the depth against measured marginal gain is S4. `QJ_DISABLE_RERANKER=1` or
-  `retrieval.reranker="none"` turns it off, and the ~80MB model loads lazily on first use,
-  so nothing is paid by a workspace that never searches.
+- **Reranker on by default, and it is still the dominant query cost.** A cross-encoder
+  reorders the fused head only, but reads query+candidate together, so it costs a forward
+  pass per candidate. Two measured rounds of right-sizing have cut it without costing any
+  watched quality metric: depth 24 → 16 (S4, 2026-08-10, quality flat from 12 to 32) and
+  fp32 → the **INT8 build** of the same model (S4a, 2026-08-11, −28.6% on the stage, faster
+  on 32/32 queries, `qj eval --compare` delta 0.000). It remains ~65–76% of a query, and
+  what is left is candidate **length** — the median live candidate fills 415 of the model's
+  512 tokens and cost is quadratic in sequence length — which makes the next lever chunking
+  (S4b/#2), not the reranker. Kept on because retrieval quality is the product, and because
+  the same measurements show what it buys: MRR 0.775 without it against 0.925 with.
+  `QJ_DISABLE_RERANKER=1` or `retrieval.reranker="none"` turns it off, and the 23MB model
+  loads lazily on first use, so nothing is paid by a workspace that never searches.
 - **The graph is relational, not a graph DB.** At org scale (10³–10⁵ entities) SQL with
   three indexed tables beats operating Neptune/Neo4j; BFS in Python over ≤10⁴ edges is
   microseconds. Revisit only past ~10⁷ edges (see CLOUD_ROADMAP Y3).
@@ -145,13 +150,16 @@ Each maps to a pending item in `docs/AI_ROADMAP.md` (noted in parentheses).
    are unexploited (#15, #16, S5).
 7. Graph is entity-level; no community/global summaries for "what is this org about?"
    corpus-level questions (#12).
-8. **Query latency and per-answer cost are measured; a real sync's throughput is not.**
-   `qj bench` (2026-07-31) times every retrieval stage and, with `--agent`, answer latency
-   and tokens per answer. What it revealed on the live corpus is itself a limitation worth
-   stating: a query costs **~2.2s p50, 83% of it in the cross-encoder** (~77ms per
-   candidate at the default depth of 24), and an answer costs **22.4k tokens over 3 model
-   rounds with zero prompt-cache reads** on the current backend. Sync throughput
-   (docs/min) still has no harness (S1 remainder).
+8. **Query latency, per-answer cost and ingest throughput are all measured now.**
+   `qj bench` times every retrieval stage, reads ingest docs/min from real run history
+   (2026-08-04), and with `--agent` reports answer latency and tokens per answer. What it
+   revealed on the live corpus is itself a limitation worth stating: the cross-encoder is
+   **~65–76% of a query** even after two rounds of measured right-sizing (S4 depth 24 → 16,
+   S4a fp32 → INT8), and an answer costs **22.4k tokens over 3 model rounds with zero
+   prompt-cache reads** on the current backend (S5). A second limitation surfaced while
+   measuring: this machine drifts materially under sustained ONNX load — an untouched
+   embedder moved 25–64% between runs — so **cross-run bench comparisons are unreliable
+   here and latency A/Bs need a control variable and interleaved arms** to mean anything.
 9. Document ingestion is **text-first**: Word/PPT/Excel/PDF/HTML extract their text layer, but
    **images inside documents and scanned/image-only PDFs are not read** — the `ingest/extract.py`
    `ImageHandler` seam is wired for it, awaiting the vision layer (#23, plan 07).

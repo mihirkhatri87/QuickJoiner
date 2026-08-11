@@ -148,7 +148,10 @@ class RetrievalConfig(BaseModel):
     # disables it. "fastembed" downloads a small ONNX cross-encoder on first use
     # (needs network once, then cached; failures degrade gracefully to RRF order).
     reranker: str = "fastembed"  # fastembed | none
-    reranker_model: str | None = None  # None -> Xenova/ms-marco-MiniLM-L-6-v2
+    # None -> the INT8 build of Xenova/ms-marco-MiniLM-L-6-v2 (23MB, -28.6% rerank time
+    # at identical eval metrics — S4a, 2026-08-11; see memory/reranker.py). Pin the
+    # plain "Xenova/ms-marco-MiniLM-L-6-v2" here to run fp32 instead.
+    reranker_model: str | None = None
     # How many fused candidates the cross-encoder scores. This is a RECALL knob before
     # it is a cost dial: a candidate the fused order buried below this depth is never
     # shown to the model at all, so no amount of relevance can bring it back.

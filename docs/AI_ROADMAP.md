@@ -34,7 +34,7 @@ An item listed under a tier below is genuinely unbuilt.
 | Axis | Measured today? | Instruments | Biggest known gap |
 |---|---|---|---|
 | **Quality** (grounded, cited, multi-hop, honest refusal) | ✅ | `qj eval [--agent]`, `--calibrate`, `--compare`, hop_coverage | No per-claim verification at answer time (#13); no temporal model (#11) |
-| **Speed** (latency to first token / full answer / sync) | ✅ | `qj bench [--agent] --compare` — per-stage p50/p95, embedder chunks/sec, ingest docs/min | Rerank is 83% of a query (S4). Ingest throughput is read from real run history, so it needs runs in the window to report anything |
+| **Speed** (latency to first token / full answer / sync) | ✅ | `qj bench [--agent] --compare` — per-stage p50/p95, embedder chunks/sec, ingest docs/min | Rerank is still the largest stage (~65-76% of a query) after S4/S4a took depth 24 -> 16 and fp32 -> INT8; what is left is candidate length, i.e. chunking (S4b/#2) |
 | **Cost** (tokens per answer, LLM calls per sync, index size) | ✅ **per answer** | `qj bench --agent` — tokens/answer + cache-hit rate via `ChatResult.usage` | 22.4k tokens/answer with 0 cache reads on the live backend (S5); index size still unmeasured (S2) |
 
 The first bench run replaced two years of guessing with numbers, and immediately found a
@@ -105,7 +105,25 @@ How each works is documented in `CLAUDE.md` — the source of truth for current 
   20 **and** 32 — non-monotone, therefore not a property of depth, and recorded rather than
   tuned to. Also measured and rejected as levers: ONNX thread count (the default already beats
   every explicit setting) and batching (already one forward pass per depth). Details in
-  CLAUDE.md's `memory/` retrieval bullet; the remaining levers are S4a above.
+  CLAUDE.md's `memory/` retrieval bullet.
+- **S4a (remaining levers) — quantized cross-encoder; length cap and early exit closed**
+  (2026-08-11). The default cross-encoder is now the **INT8 build** of the same model:
+  fastembed's catalogue carries only fp32, so `add_custom_model` registers the same HF repo
+  pointed at its `onnx/model_quantized.onnx` (23MB vs 91MB), still cached through the ordinary
+  path. **−28.6% on the rerank stage, faster on 32/32 queries**, with every watched eval metric
+  byte-identical (`qj eval --compare` delta 0.000). Three variants of that repo were measured
+  rather than assumed — `model_quantized` beats `model_int8` and `model_uint8` despite identical
+  file sizes. An fp32 fallback ships with it, because an upgrade that could only reach the new
+  file would turn an offline install's *working* reranker into a silent degrade-to-RRF.
+  **The methodology is the durable lesson**: two earlier framings both ran fp32 first and both
+  reported −38%/−41%, while the untouched embedder carried as a control moved 25% between arms —
+  the box drifts under sustained ONNX load, so arm-at-a-time A/Bs hand ~10 points to whoever ran
+  later. Only the paired, order-alternated run is quoted. The other two levers are closed as
+  measured dead ends: **early exit is impossible** (reranking changes the top-8 on 32/32 queries,
+  so there is no stable head to exit on — and the same run shows the stage earns its cost, MRR
+  0.775 → 0.925), and the **length cap** is decided by order identity rather than metric wobble
+  and re-scoped to S4b above. `jina-reranker-v1-tiny-en` was measured too: 21% faster, MRR
+  0.925 → 0.863, and *larger* on disk than the incumbent — rejected.
 - **#29 (classifier) Architectural-layer classification** — `ingest/layers.py`,
   `entities.layer` (2026-08-10). Deterministic, never LLM: `classify_layer(path)` reads the
   role a file's own path states and returns None when it states nothing. **Measured before
@@ -341,7 +359,9 @@ without a before/after `qj bench --compare` table, exactly as no quality work me
 `qj eval --compare`. **Baseline on the live 57,659-chunk workspace** (32 queries × 3, after
 S4's depth retune — the previous baseline was p50 1977ms / p95 2564ms at
 `rerank_candidates=24`): retrieval **p50 1401ms / p95 2029ms**, of which rerank 76%, sparse 7%,
-graph expansion 4%, dense 4%; embedder 117 chunks/sec; ingest 9.3 docs/min read from real run
+graph expansion 4%, dense 4% (S4a's INT8 default then took the rerank stage down a further
+**28.6%**, paired measurement — but this machine drifts enough under sustained ONNX load that
+the absolute p50 is not comparable across runs hours apart; see the S4a ledger entry); embedder 117 chunks/sec; ingest 9.3 docs/min read from real run
 history; agent layer (gpt-oss-120b via litellm) first token 22.3s, full answer 32.7s, 22.4k
 tokens/answer over 3 rounds, **0 cache reads** (agent numbers unchanged since 2026-07-31 — no
 agent-layer run has been made since). Beat those numbers or explain why not.
@@ -354,18 +374,18 @@ agent-layer run has been made since). Beat those numbers or explain why not.
   independent tool calls within one agent round concurrently; embed batches during sync
   pipelined with upserts. The agent loop is round-sequential today; multi-tool rounds are
   the cheap win.
-- **S4a — Smaller/quantized cross-encoder, and early exit** — *adopt; the remainder of S4
-  after the depth half shipped 2026-08-10 (see the Shipped ledger)*. Depth is settled: quality
-  is flat from 12 to 32, the default is now 16, and rerank is **76% of a 1.4s query** rather
-  than 83% of a 2.0s one. What is left is the per-candidate cost itself, which measurement
-  showed is linear in candidate **length** as well as count (4.3ms at 185 chars → 69.3ms at
-  2789), and that **18% of live chunks already exceed the model's 512-token cap** and are
-  silently truncated by the tokenizer. Three untried levers: a deliberate length cap (measured
-  promising but its sign flipped with depth on a 20-answerable-case set — needs a bigger eval
-  set to separate from noise, so it is gated behind #18/X1 synthetic eval generation), a
-  smaller or quantized CE (`jina-reranker-v1-tiny-en`, INT8 ONNX), and early exit when the
-  fused head order is already stable. Same gate as before: no change ships without
-  `qj eval --compare` showing zero recall loss.
+- **S4b — Candidate length, i.e. chunk size** — *gated on #18/X1, a bigger eval set*. All three
+  of S4a's named levers are now measured and closed (see the Shipped ledger); what they
+  exposed is that per-candidate rerank cost is set by **chunk length**, not model choice —
+  the median live candidate is 1658 chars ≈ 415 of the model's 512 tokens, and cost is
+  quadratic in sequence length (19 ms/candidate at 300 chars vs 86 at 2000). A deliberate
+  length cap is the direct lever and is **provably lossless only above 2000 chars** (the
+  512-token boundary: identical top-8 on 32/32 queries), where just 4% of candidates sit, so
+  it buys nothing measurable. Every worthwhile saving is below the token cap and genuinely
+  lossy (cap 600 = −55% for MRR 0.925 → 0.892), and on 20 answerable / 8 multi-hop cases the
+  movements are single cases changing rank — undecidable, not unmeasured. Reopen when #18/X1
+  lands, or address it upstream in **#2 (AST-aware chunking)**, which changes candidate length
+  by construction. Same gate: no change ships without `qj eval --compare` showing zero loss.
 - **S5 — Prompt-cache-aware context assembly** — *adapt; partially shipped 2026-07-18*.
   SHIPPED (documented in CLAUDE.md `llm/` bullet): explicit Anthropic `cache_control`
   breakpoints (system block caches tools+system; moving message breakpoint + intermediate

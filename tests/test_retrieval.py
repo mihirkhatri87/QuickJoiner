@@ -19,7 +19,13 @@ from quickjoiner.ingest.normalize import normalize_query, normalize_text
 from quickjoiner.ingest.pipeline import IngestPipeline, breadcrumb
 from quickjoiner.memory.factory import create_store
 from quickjoiner.memory.hybrid import rrf_fuse
-from quickjoiner.memory.reranker import create_reranker
+from quickjoiner.memory.reranker import (
+    BASE_RERANK_MODEL,
+    DEFAULT_RERANK_MODEL,
+    CrossEncoderReranker,
+    _register_quantized,
+    create_reranker,
+)
 from quickjoiner.memory.store import KnowledgeStore
 
 from tests.conftest import FakeEmbedder
@@ -156,6 +162,65 @@ def test_reranker_default_on_but_disableable():
     assert RetrievalConfig().reranker == "fastembed"
     assert create_reranker(None) is None
     assert create_reranker(RetrievalConfig(reranker="none")) is None
+
+
+def test_default_reranker_is_the_quantized_build_with_an_fp32_fallback():
+    """The default cross-encoder is the INT8 build (S4a, 2026-08-11): measured on the live
+    corpus it is 28.6% faster on the rerank stage (paired, order-alternated — the naive
+    fp32-first framings said 38-41% and were measuring the machine warming up) with recall,
+    grounded recall, MRR, hop coverage and refusal accuracy all identical to fp32.
+    fastembed's catalogue does not carry it, so we register the same HF repo pointed at its
+    quantized ONNX.
+
+    The fp32 fallback is the part that matters: an existing install already has the 91MB
+    fp32 model cached, so an upgrade that could ONLY reach the new file would turn an
+    offline machine's working reranker into a silent degrade-to-RRF — a quality regression
+    caused by upgrading. An explicitly pinned model is never substituted this way."""
+    assert DEFAULT_RERANK_MODEL.startswith(BASE_RERANK_MODEL)
+    assert DEFAULT_RERANK_MODEL != BASE_RERANK_MODEL
+
+    assert CrossEncoderReranker()._candidates() == [DEFAULT_RERANK_MODEL, BASE_RERANK_MODEL]
+    pinned = CrossEncoderReranker(BASE_RERANK_MODEL)
+    assert pinned._candidates() == [BASE_RERANK_MODEL]  # a choice is a choice
+
+
+def test_reranker_falls_back_to_fp32_when_the_quantized_build_is_unreachable(monkeypatch):
+    """Offline/rate-limited first load of the INT8 file must cost the quantization, not
+    the whole reranking stage."""
+    tried: list[str] = []
+
+    def only_fp32_builds(self, name):
+        tried.append(name)
+        if name != BASE_RERANK_MODEL:
+            raise RuntimeError("404 from the hub")
+        return ReverseReranker()  # stand-in for a loaded encoder
+
+    monkeypatch.setattr(CrossEncoderReranker, "_build", only_fp32_builds)
+    rr = CrossEncoderReranker()
+    rr._ensure()
+    assert tried == [DEFAULT_RERANK_MODEL, BASE_RERANK_MODEL]
+    assert rr._encoder is not CrossEncoderReranker._FAILED  # still reranking
+    assert rr._model_name == BASE_RERANK_MODEL              # reports what actually loaded
+
+    # ...and when nothing loads at all, it still degrades quietly to RRF order.
+    monkeypatch.setattr(CrossEncoderReranker, "_build",
+                        lambda self, name: (_ for _ in ()).throw(RuntimeError("no network")))
+    dead = CrossEncoderReranker()
+    dead._ensure()
+    assert dead._encoder is CrossEncoderReranker._FAILED
+    assert dead.rank("q", ["a", "b"]) == [0, 1]  # input order, no exception
+
+
+def test_quantized_model_registration_is_idempotent():
+    """fastembed raises on re-registering a name, and a reranker is rebuilt on every
+    settings change (AppContext.apply_config) — so the second call must be a no-op."""
+    pytest.importorskip("fastembed")
+    from fastembed.rerank.cross_encoder import TextCrossEncoder
+
+    _register_quantized()
+    _register_quantized()  # would raise ValueError if unguarded
+    names = [m["model"] for m in TextCrossEncoder.list_supported_models()]
+    assert names.count(DEFAULT_RERANK_MODEL) == 1
 
 
 class GoldReranker:

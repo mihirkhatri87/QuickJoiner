@@ -465,7 +465,7 @@ RULES
   (adapt to this machine). Reports save to <workspace>/evals/*.json.
 - Work in a DEDICATED eval workspace: set QJ_WORKSPACE=~/.quickjoiner/eval (NOT production).
   A/B toggles re-embed the whole corpus.
-- Ensure network is available (reranker downloads ~80MB on first search) and QJ_DISABLE_RERANKER
+- Ensure network is available (reranker downloads ~23MB on first search) and QJ_DISABLE_RERANKER
   is NOT set.
 - Never write real secrets into config; connectors use env: indirection (token=env:VAR).
 
