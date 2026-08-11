@@ -15,7 +15,7 @@
  * removing one affects every sibling.
  */
 
-import { ChevronDown, ChevronRight, FileArchive, FileText, Folder, Plus, Tag, X } from "lucide-react";
+import { ChevronDown, ChevronRight, FileArchive, FileText, Folder, Globe, Plus, Tag, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "../api";
 import type { DocLabel, IngestedDoc, SourceDocuments } from "../types";
@@ -354,6 +354,45 @@ function AddLabel({
   );
 }
 
+/** "Offer this to the organisation" — shown only on documents in a source only YOU can read.
+ *
+ * Deliberately worded as offering rather than publishing: this queues the document for
+ * review and changes nothing about who can read it until a reviewer approves. Saying
+ * "share" here would promise something the click does not do. */
+function OfferToOrg({ docId, onFlash }: { docId: string; onFlash: (m: string) => void }) {
+  const [state, setState] = useState<"idle" | "busy" | "offered">("idle");
+
+  if (state === "offered") {
+    return (
+      <span
+        title="Waiting for a reviewer. It stays private to you until one approves it."
+        className="inline-flex items-center gap-1 rounded-full bg-gold-soft px-2 py-0.5 font-mono text-[9.5px] uppercase tracking-[0.08em] text-gold"
+      >
+        <Globe size={9} /> offered
+      </span>
+    );
+  }
+  return (
+    <button
+      disabled={state === "busy"}
+      title="Offer this note to the whole organisation — a reviewer decides, and it stays private to you until then"
+      onClick={async () => {
+        setState("busy");
+        try {
+          onFlash((await api.promoteDocument(docId, "")).message);
+          setState("offered");
+        } catch (e) {
+          onFlash((e as Error).message);
+          setState("idle");
+        }
+      }}
+      className="inline-flex items-center gap-1 rounded-full bg-fill px-2 py-0.5 font-mono text-[9.5px] uppercase tracking-[0.08em] text-faint hover:text-ink disabled:opacity-40"
+    >
+      <Globe size={9} /> offer to org
+    </button>
+  );
+}
+
 /** Lazily fetched, cached-per-mount list of what's inside an ingested .zip — see
  * api.documentArchive. Fetched on first expand, not on every row render: most archives in
  * a source will never be opened, and the endpoint re-derives the list from chunk text. */
@@ -626,6 +665,11 @@ export function DocumentsModal({
   const add = (uriPrefix: string) => (kind: "tag" | "aka", value: string) =>
     mutate(() => api.addLabel({ source_id: sourceId, uri_prefix: uriPrefix, kind, value }));
   const remove = (l: DocLabel) => () => mutate(() => api.removeLabel(l));
+
+  // Offering a document to the org is only meaningful in a source only you can read —
+  // and reaching this response at all means a private one is yours.
+  const isPrivate = Boolean(data?.private);
+  const setFlash = (m: string) => setError(m);
 
   const groups = useMemo(() => {
     const docs = (data?.documents ?? []).filter((d) => {
@@ -931,6 +975,11 @@ export function DocumentsModal({
                             <span onClick={(e) => e.stopPropagation()}>
                               <AddLabel covers="just this document" onAdd={add(doc.uri)} />
                             </span>
+                            {isPrivate && (
+                              <span onClick={(e) => e.stopPropagation()}>
+                                <OfferToOrg docId={doc.doc_id} onFlash={setFlash} />
+                              </span>
+                            )}
                           </div>
                           {expanded && <ArchiveContents sourceId={sourceId} docId={doc.doc_id} />}
                         </div>

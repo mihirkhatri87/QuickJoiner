@@ -1,0 +1,30 @@
+meta {
+  name: 10-promotions
+  seq: 11
+}
+
+docs {
+  # Promotion — a personal note becomes the organisation's, by review
+
+  A taught note is private to its author by default (knowledge scopes). That is right, and on
+  its own a dead end: the useful half of what a joiner works out is exactly what the next
+  joiner needs. This is the path across, and it is a **review** rather than a button, because
+  one person's unreviewed assertion must not become citable org truth by accident.
+
+  Three steps, three capabilities:
+
+  1. **Offer** (`promotions:request`, every user) — you offer one of your OWN documents, in a
+     source only you can read. It publishes nothing: the document stays private and
+     unanswerable to everyone else until someone approves it.
+  2. **Review** (`promotions:review`, editor and admin) — the queue, and the one narrow read
+     exception in the whole knowledge-scopes model: a reviewer may open a document that is
+     still private, but only while its author has it offered. Anything else 404s.
+  3. **Decide** — approving re-homes the document to the shared `promoted:org` bucket.
+
+  Approval is a **metadata flip, not a copy**: the same `doc_id`, the same chunks, the same
+  vectors, the same citations and graph edges — nothing is re-uploaded, re-chunked or
+  re-embedded. Declining leaves the document exactly where it was, with your note back to the
+  author.
+
+  Set `promoteDocId` in the environment first (`qj promotions mine` lists yours).
+}

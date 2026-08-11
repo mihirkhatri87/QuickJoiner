@@ -134,7 +134,7 @@ def ledger_entries_for_hits(hits) -> dict[str, float]:
         if not key:
             continue
         score = score_edge(
-            classify_evidence(h.title, h.uri, h.kind),
+            classify_evidence(h.title, h.uri, h.kind, h.source_id),
             doc_corroboration=len(by_source.get(h.source_id, ())),
             source_corroboration=source_count,
         )

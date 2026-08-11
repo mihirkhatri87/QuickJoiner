@@ -170,6 +170,15 @@ class UploadLocalRequest(BaseModel):
     path: str  # a file path on the server, ingested into the rolling uploads connector
 
 
+class PromoteRequest(BaseModel):
+    note: str = ""  # why this is worth the whole org having — shown to the reviewer
+
+
+class PromotionDecision(BaseModel):
+    approve: bool
+    note: str = ""  # a decline reason the author can act on
+
+
 class BrowserInputEvent(BaseModel):
     """One input event for a remote (headless, polled-screenshot) sign-in session. A fixed
     shape, not an arbitrary passthrough — `connectors/browser/session._apply_input` further
@@ -1343,6 +1352,9 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
                     "type": s["type"],
                     "documents": s["doc_count"],
                     "configured": cfg is not None,
+                    # Yours alone — so the UI can show it as your own notes rather than as
+                    # a connected system, and offer its documents to the organisation.
+                    "private": ctx.catalog.is_private_source(s["id"]),
                 }
             )
         return rows
@@ -1446,7 +1458,11 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
         if not _source_visible(source_id, user):
             raise HTTPException(status_code=404, detail=f"No source {source_id!r}")
         rows = ctx.catalog.documents_for_source(source_id)
+        # `private` drives the "offer this to the organisation" affordance. Reaching this
+        # line already means the caller may see the source, so a private one here is by
+        # definition their own — the client needs no separate ownership check.
         return {"source_id": source_id, "documents": _labelled(source_id, rows),
+                "private": ctx.catalog.is_private_source(source_id),
                 "labels": ctx.catalog.labels_for_source(source_id)}
 
     @api.get("/api/sources/{source_id:path}/documents/archive", tags=["Ask & search"], summary="List the member files inside an ingested archive (.zip) document, recovered from its extracted text.")
@@ -1717,6 +1733,84 @@ def create_app(workspace: Path, ctx: AppContext | None = None, revive: bool = Tr
             raise HTTPException(status_code=400, detail=f"Could not read {src}: {exc}")
         path = save_upload(ctx.workspace, src.name, data)
         return _ingest_upload_path(path)
+
+    # -- promotion: a personal document becomes the organisation's, by review -------------
+    @api.post("/api/documents/{doc_id}/promote", tags=["Sync & ingestion"], summary="Offer one of your own private documents to the whole organisation (queues it for review).")
+    def promote_document(doc_id: str, req: PromoteRequest | None = None,
+                         authorization: str | None = Header(default=None)):
+        """Offer a private document to the org. It stays private and unanswerable to
+        everyone else until a reviewer approves — this only queues it."""
+        from quickjoiner import promotion
+
+        user = _user(authorization)
+        _require_user(user)
+        _require("promotions:request", user)
+        try:
+            result = promotion.request(ctx.catalog, doc_id, user,
+                                       note=(req.note if req else ""))
+        except promotion.PromotionError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return result.__dict__
+
+    @api.get("/api/promotions", tags=["Sync & ingestion"], summary="The review queue: documents their authors have offered to the organisation.")
+    def list_promotions(authorization: str | None = Header(default=None)):
+        """Documents offered for promotion, oldest first. These are still private to their
+        authors — a reviewer sees them here, and only here, because they were offered."""
+        from quickjoiner import promotion
+
+        user = _user(authorization)
+        _require_user(user)
+        _require("promotions:review", user)
+        rows = [
+            {
+                "doc_id": r["doc_id"], "title": r["title"] or r["uri"], "uri": r["uri"],
+                "kind": r["kind"], "source_id": r["source_id"],
+                "source_name": r.get("source_name") or r["source_id"],
+                "author": r.get("promotion_by") or r.get("source_owner") or "",
+                "note": r.get("promotion_note") or "", "requested_at": r.get("promotion_at") or "",
+            }
+            for r in promotion.pending(ctx.catalog)
+        ]
+        return {"promotions": rows}
+
+    @api.get("/api/promotions/{doc_id}", tags=["Sync & ingestion"], summary="Read an offered document's text so it can actually be reviewed.")
+    def read_promotion(doc_id: str, authorization: str | None = Header(default=None)):
+        """The narrow, deliberate read exception: a reviewer can open a document that is
+        still private, but ONLY while its author has it offered for review. A document in
+        any other state 404s here exactly as if it did not exist."""
+        from quickjoiner import promotion
+
+        user = _user(authorization)
+        _require_user(user)
+        _require("promotions:review", user)
+        doc = ctx.catalog.get_document(doc_id)
+        if doc is None or doc.get("promotion_status") != promotion.REQUESTED:
+            raise HTTPException(status_code=404, detail="No such document is awaiting review.")
+        chunks = ctx.store.get_document_chunks(doc_id)
+        return {
+            "doc_id": doc_id, "title": doc["title"] or doc["uri"], "uri": doc["uri"],
+            "kind": doc["kind"], "source_id": doc["source_id"],
+            "author": doc.get("promotion_by") or "", "note": doc.get("promotion_note") or "",
+            "text": "\n\n".join(chunks),
+        }
+
+    @api.post("/api/promotions/{doc_id}/decide", tags=["Sync & ingestion"], summary="Approve an offered document into the organisation's memory, or decline it with a reason.")
+    def decide_promotion(doc_id: str, req: PromotionDecision,
+                         authorization: str | None = Header(default=None)):
+        """Approving re-homes the document to the shared `promoted:org` bucket — a metadata
+        flip, not a copy: the same chunks, vectors, citations and graph edges, now readable
+        by everyone. Declining leaves it exactly where it was."""
+        from quickjoiner import promotion
+
+        user = _user(authorization)
+        _require_user(user)
+        _require("promotions:review", user)
+        try:
+            result = promotion.decide(ctx.catalog, ctx.store, doc_id, req.approve,
+                                      reviewer=user, note=req.note)
+        except promotion.PromotionError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return result.__dict__
 
     @api.post("/api/chat/attachments/{att_id}/learn", tags=["Sync & ingestion"], summary="Promote a chat attachment into permanent memory — ingests the already-uploaded file into the rolling Uploads connector.")
     def learn_attachment(

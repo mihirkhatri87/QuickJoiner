@@ -1,0 +1,36 @@
+meta {
+  name: Offer one of your documents to the organisation
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/api/documents/{{promoteDocId}}/promote
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "note": "the next joiner will hit this in week one"
+  }
+}
+
+docs {
+  Queue one of YOUR OWN private documents for review. `note` is why the org should have it —
+  the reviewer reads it beside the document.
+
+  This changes nothing about who can read the document. It is still private to you until a
+  reviewer approves.
+
+  400 if the document is already readable by everyone (a promotion that would be a no-op is
+  refused rather than reported as success), if it is not yours, or if it is already queued.
+}

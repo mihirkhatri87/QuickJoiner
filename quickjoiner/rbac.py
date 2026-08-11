@@ -54,6 +54,13 @@ CAPS = frozenset({
     #                    chat, where "tidy up the old skills" must not become an
     #                    unconfirmed rm. Same admin role, one extra typed confirm.
     "skills:read", "skills:secrets", "skills:write", "skills:delete",
+    # Promotion of a personal document to the organisation. Split for the same reason the
+    # skills caps are: offering YOUR OWN note is something every user must be able to do
+    # (it is the flywheel), while deciding what becomes org truth for everybody is a
+    # reviewer's act. `promotions:review` also carries a narrow read exception — a
+    # reviewer can open a document that is still private — so it is deliberately not
+    # folded into `memory:write`.
+    "promotions:request", "promotions:review",
 })
 
 # Routes anyone may call regardless of role (login/logout/status/health). Distinct from an
@@ -72,10 +79,14 @@ _VIEWER_CAPS = frozenset({
     # your own credentials for one is likewise yours to do; it is what makes a scoped
     # skill work for you and reaches nobody else's values.
     "skills:read", "skills:secrets",
+    # Offering your own private note to the org is yours to do; whether it is accepted is
+    # not (see `promotions:review` below).
+    "promotions:request",
 })
 _EDITOR_CAPS = _VIEWER_CAPS | frozenset({
     "connectors:write", "connectors:delete", "sync:run", "memory:write",
     "gaps:write", "sessions:write", "briefs:write", "scrape:run",
+    "promotions:review",
 })
 _ADMIN_CAPS = CAPS  # everything
 
@@ -154,6 +165,13 @@ _ROUTES: list[tuple[str, str, str, Optional[str]]] = [
     # chat:use — attaching a file is a chat action, but *learning* it is a memory mutation.
     ("POST", "/api/chat/attachments/{att_id}/learn", "memory:write", None),
     ("GET", "/api/ingest-progress/{token}", "chat:use", None),
+    # Promotion (personal -> organisation). The queue is a REVIEW capability, not a read
+    # one: its rows are documents still private to their authors, readable here only
+    # because those authors offered them.
+    ("POST", "/api/documents/{doc_id}/promote", "promotions:request", None),
+    ("GET", "/api/promotions", "promotions:review", None),
+    ("GET", "/api/promotions/{doc_id}", "promotions:review", None),
+    ("POST", "/api/promotions/{doc_id}/decide", "promotions:review", None),
     # Ask & search
     ("GET", "/api/search", "search:read", None),
     # Document browser + the tag/aka labels that drive question scoping.

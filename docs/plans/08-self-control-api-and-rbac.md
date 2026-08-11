@@ -193,9 +193,11 @@ viewer with no connector access simply gets no live tools.
 - API-docs house rule: Swagger tags/summaries for the 2 new/extended user-role endpoints;
   Postman + Bruno runbook entries; `docs/api/README.md` if the flow changes.
 - `AI_ROADMAP.md`/`PRIORITIES.md`/`STATUS.md`: this plan tracked; on ship, graduate.
-- `docs/CLOUD_ROADMAP.md` Y1.8 (knowledge scopes / multi-user GA) cross-reference — RBAC is a
-  prerequisite layer for it; note the relationship (RBAC governs API/connector access; knowledge
-  scopes govern per-user *memory* visibility — complementary, not the same).
+- Knowledge scopes (formerly Cloud Y1.8, **shipped 2026-08-10**) is the complementary layer,
+  not the same one: RBAC governs API/connector access, knowledge scopes govern per-user
+  *memory* visibility. It has since added its own capabilities to `rbac.py`
+  (`promotions:request` at viewer, `promotions:review` at editor), so this plan's
+  route-coverage lockstep test is what keeps the two in step.
 
 ## 5. Tests
 - `tests/test_rbac.py` — `ROLE_CAPS` shape, `can()` truth table, `required_capability` patterns,

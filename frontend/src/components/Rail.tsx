@@ -20,6 +20,8 @@ const TYPE_LABELS: Record<string, string> = {
   uploads: "Uploaded documents",
   quickjoiner: "QuickJoiner control",
   conversations: "Conversations",
+  notes: "Taught notes",
+  promoted: "Promoted to the organisation",
 };
 const typeLabel = (t: string) => TYPE_LABELS[t] ?? t;
 
@@ -76,6 +78,9 @@ export function Rail({
   const [newProj, setNewProj] = useState("");
   const [addingProj, setAddingProj] = useState(false);
   const configured = sources.filter((s) => s.configured);
+  // Ingestion buckets only YOU can read — your taught notes. Not connectors, so they don't
+  // belong in the list above; reaching them is what makes offering one to the org possible.
+  const myNotes = sources.filter((s) => !s.configured && s.private && s.documents > 0);
   // Newest job per source — a system that is syncing right now says so here, and clicking
   // it re-opens the live log (the same panel the Sync button opens).
   const jobBySource = new Map<string, SyncJob>();
@@ -371,6 +376,16 @@ export function Rail({
                   renderSystemRow(rows[0])
                 ),
               )}
+            </div>
+          )}
+
+          {/* Your own notes are a source, but not a connected SYSTEM — and until this row
+              existed there was no way to reach them at all, since the list above shows only
+              configured connectors. Rendered only when you actually have some. */}
+          {myNotes.length > 0 && (
+            <div className="mt-3">
+              <Eyebrow>Your private notes</Eyebrow>
+              {myNotes.map((s) => renderSystemRow(s))}
             </div>
           )}
         </div>

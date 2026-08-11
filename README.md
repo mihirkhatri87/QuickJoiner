@@ -498,7 +498,7 @@ Once auth is on, **each connector and each taught note is either commons or owne
 | A connector with no owner | everyone (the commons) |
 | A connector you created with `--share` | everyone |
 | A connector you created **privately** (the signed-in default) | only you |
-| A fact you taught with `qj learn "…"` | only you |
+| A fact you taught with `qj learn "…"` | only you (until promoted — see below) |
 | A fact you taught with `qj learn --share "…"` | everyone |
 
 "Only you" means it genuinely: another user's questions never retrieve those documents, the
@@ -513,11 +513,36 @@ wrong one taught to the commons becomes citable org truth for everyone. In chat,
 thumbs-down "help QuickJoiner learn" box has a **Share with everyone** checkbox (off by
 default), and the agent's `remember` tool only shares when you say so.
 
-⚠ Being unreadable is not yet the same as being invisible to the *ingest* side: a private
-document can still influence which entities exist in the graph and how they resolve, even
-though nobody else can read, cite, or enumerate it. The ingest-time merge guard and the
-promotion flow (personal → org by review) are the remaining pieces — see
-[docs/CLOUD_ROADMAP.md](docs/CLOUD_ROADMAP.md) Y1.8.
+A private document also can't reshape the org's knowledge graph. It may **attach** to things
+that already exist — a private note about a real service still records that relationship —
+but it cannot merge two entities, rename one, give one a new alias, or bridge one to
+another. Those writes are global and permanent, so they're reserved for content the whole
+organisation can read. The visible cost is small and only yours: if your note spells a
+service differently, you'll see your own extra node for it until the note is promoted.
+
+### Promoting a note to the whole organisation
+
+The useful half of what you work out in week one is exactly what the next joiner needs, so
+a private note can be offered to everyone — and it's a *review*, not a button, for the same
+reason sharing is opt-in.
+
+```
+qj promotions mine                     # your private documents, with their ids
+qj promotions offer <doc-id> --note "the next joiner will hit this"
+qj promotions queue                    # what people have offered (reviewers)
+qj promotions decide <doc-id> --approve
+```
+
+In the UI: browse **Your private notes** in the left rail, click **offer to org** on a
+document; a reviewer (editor or admin) sees it under Settings → **Offered to the
+organisation**, can read it there, and publishes or declines it with a note back to you.
+Offering changes nothing about who can read it — it stays private until someone approves.
+
+Approving is a **metadata flip, not a copy**: the same document, the same id, the same
+citations and graph edges, now readable by everyone. Nothing is re-uploaded, re-chunked or
+re-embedded. Until it's promoted, a personal note is also scored slightly below evidence the
+organisation can see, so a personal-vs-org contradiction shows you *both* citations rather
+than quietly averaging them.
 
 ## Skills — teaching it *how*, not just *what*
 

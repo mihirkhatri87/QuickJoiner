@@ -1904,20 +1904,88 @@ Previously BOTH source copies preceded the install layer, so every edit re-downl
   `share` on `POST /api/learn`, `--share` on `qj learn`, a `share` argument on the agent's
   `remember` tool (prompt-instructed to pass it only on an explicit request), and a
   "Share with everyone" checkbox on the thumbs-down feedback modal.
-  Tests: `tests/test_knowledge_scopes.py` (28 — written as leak tests: the AND-ing, the
+  Tests: `tests/test_knowledge_scopes.py` (written as leak tests: the AND-ing, the
   fail-closed empty list, escalation via picking an unreadable source *or* document, every
   graph channel, the bridge-vs-dangling-edge split, note ownership, and an end-to-end
   two-user API test verified to FAIL with the filter disabled) + a Postgres parity test in
   `tests/test_pg_backend.py` **actually run against pgvector**, not statically reviewed.
-  ⚠ **NOT yet built** (tracked as Cloud Y1.8 remainders): the **ingest-time entity-merge
-  guard** — personal evidence may attach to org entities but must never *trigger* a merge of
-  them, the one pollution filtering can't undo — and the **promotion flow** (personal → org
-  by review, a metadata flip rather than a copy) with its discounted `personal-note` evidence
-  class. Until the merge guard lands, a private document can still influence which entities
-  exist and how they resolve, even though it can no longer be read, cited or enumerated.
+  **`GET /api/sources` filters ingestion buckets too (2026-08-10).** It skipped the
+  ownership check for any row with no `SourceConfig`, on a comment asserting that
+  catalog-only rows "are commons" — true when it was written and false the moment a
+  taught note could be private, so `Notes from ada` and its document count were listed
+  to everyone. Retrieval and the graph were already filtered; this was the last
+  enumeration surface, and it is the one the Rail renders.
+  **The ingest-time merge guard (2026-08-10, Y1.8c).** Filtering decides what a person
+  may READ; this decides what a private document may WRITE, which is the half filtering
+  cannot undo — a merge, a rename or a bridge rewrites canonical graph state for the
+  whole organisation and no read-side predicate puts it back. `catalog.is_private_source`
+  is the ingest-side twin of `visible_source_ids` (owned AND not shared; an unknown or
+  ownerless source is NOT private — the read side fails closed on a missing row, the
+  write side deliberately does not, because withholding a document is cheap and
+  reversible while refusing to merge is a permanent quality loss nobody would notice).
+  `pipeline._persist_graph` then closes **three** paths, not one, because they are the
+  same act through different doors: the entity resolver is skipped (no alias onto a
+  canonical org entity), `upsert_entity(allow_rename=False)` makes the write insert-only
+  (the rename rule is the quieter merge — a materially different name replaces an org
+  entity's display name everywhere), and an extractor-supplied alias row is written only
+  onto entities the same source minted (`entities.source_id`, which records the minting
+  source and is never rewritten). `refresh_same_as_bridges` additionally excludes
+  entities minted privately — a bridge is the one edge with **no evidence document**, so
+  `_evidence_visible` keeps it visible to everyone and bridging a private-only entity
+  would publish its name however well its documents are filtered. What is deliberately
+  still allowed is ATTACHING: an exact-id assertion still becomes an edge, because a
+  private note about a real service is the point of teaching one. The cost is a
+  duplicate node in the owner's own view when their wording differs from the org's —
+  visible only to them, and cleared by promoting the note.
+  Not cached (ownership can change between two documents of one run, and it is a single
+  indexed read against the N entity upserts that follow it).
+- `quickjoiner/promotion.py` — **personal → organisation, by review (2026-08-10, Y1.8f).**
+  Private-by-default was right and on its own a dead end: the useful half of what a joiner
+  works out is exactly what the next joiner needs, and nothing carried it across.
+  **A metadata flip, not a copy.** A `doc_id` is derived from `(source_id, uri)` at ingest
+  and opaque forever after, so promotion rewrites which source owns the document and
+  nothing else — same chunks, same vectors, same `evidence_doc_id` on every edge, same
+  labels, same citations, no re-chunk and no re-embed. Three writes make it real
+  (`catalog.move_document`, plus `store.move_document` on **both** backends, which rewrites
+  the chunk rows' own `source_id` column and the FTS sidecar's), because retrieval filters
+  on the chunk's copy — a document moved in one place and not the others would be
+  retrievable through one leg and invisible through the other. The target is
+  `promoted:org`, an ownerless commons bucket, which is what makes **every existing
+  visibility predicate start including it with no read-path change at all**.
+  Three steps, each with a reason: **request** (only the owner, only for a source only
+  they can read — a document already public is refused rather than silently no-op'd,
+  since a no-op that reads as success leaves the requester believing they published
+  something); **queue** (`GET /api/promotions[/{doc_id}]` — a reviewer may open a document
+  that is *still private*, a real but narrow exception scoped to `requested` state and to
+  these endpoints only, sound because its author offered it; retrieval is untouched, so an
+  offered note is still unanswerable to anyone but its author); **decide**. Approval also
+  calls `catalog.rehome_document_entities`, releasing exactly the entities the promoted
+  document cites from the merge guard's hold — scoped to that document, so a promotion
+  cannot release the rest of a private bucket's graph.
+  RBAC splits `promotions:request` (**viewer** — offering your own note is yours to do)
+  from `promotions:review` (**editor**), for the same reason the skills caps are split:
+  the review capability also carries that read exception, so folding it into `memory:write`
+  would have widened something. Surfaces: the four routes above, `qj promotions
+  offer|mine|queue|decide`, an **offer to org** chip on each document of a private source
+  in the document browser (and a new **Your private notes** rail group, without which that
+  browser was unreachable — the rail lists only *configured* connectors, so a notes bucket
+  had no row at all), and a **Offered to the organisation** review panel in Settings.
+  `confidence.classify_evidence` gained a 4th `source_id` argument and a **`personal-note`**
+  class at 0.28 — below every org-visible document class because nobody else has ever seen
+  it, above `meeting-notes` because a taught fact is a deliberate statement where a dated
+  journal page is an incidental record. Provenance is checked before shape, and promotion
+  *lifts* the discount by moving the note out of the personal bucket rather than re-scoring
+  it, which is the incentive the flywheel wants. Deliberately NOT applied to a private
+  *connector's* documents — an org system one person can reach is a different thing from a
+  personal jotting, and a pure function cannot tell without an ownership lookup.
+  ⚠ Stated loose end: promotion releases those entities but does not re-run entity
+  resolution, so a promoted note that spells a service differently keeps its own node until
+  the next `qj regraph` or re-sync — a missing merge, never a wrong one. And a viewer cannot
+  currently teach a note at all (`POST /api/learn` is `memory:write`), so today the flywheel
+  starts at editor.
 - `quickjoiner/api/` — FastAPI. **OpenAPI/Swagger is grouped + documented** (2026-07-20): the app
   carries a top-level `description` + `openapi_tags`, and every route decorator has `tags=[...]` +
-  a plain-English `summary=` (the HTML `/` route is `include_in_schema=False`). **83 operations
+  a plain-English `summary=` (the HTML `/` route is `include_in_schema=False`). **87 operations
   across 12 tag groups** (Status / Authentication / Connectors / Sync & ingestion / Ask & search /
   Knowledge graph / Knowledge gaps / Sessions & projects / Briefs & repo docs / Settings / Skills /
   Webhooks) — counted from `app.openapi()`, not from memory; the previously-stated "43 across 11"
@@ -3752,6 +3820,44 @@ Post-phase additions (2026-07-07, all tested — suite: **89 passed**):
   covered by tests (env layering, containment, refusal) and the real skills on this machine
   are PowerShell/Node against TFS/Octopus/Mongo endpoints this environment cannot reach, so
   no script has yet been run end-to-end with live credentials through the agent.
+- Knowledge scopes completed — the merge guard and the promotion flow (2026-08-10,
+  **PRIORITIES #2**, Cloud Y1.8 (c)+(f); the item that gated multi-user GA). Design in the
+  `auth.py` and `promotion.py` bullets above. The enforcement core shipped 2026-08-04 and
+  these were the two remainders it deliberately left, both real: a private document could
+  still shape the org's canonical graph, and there was no way for anything private to ever
+  become the org's.
+  **What building it changed about the plan.** The merge guard was scoped as "don't let the
+  resolver merge", and reading the write path found **three** doors to the same act, not
+  one — the resolver's alias, `upsert_entity`'s rename rule (a materially different name
+  silently replaces an org entity's display name everywhere), and the extractor-supplied
+  alias rows a table or an `aka` produces. Guarding only the first would have shipped a
+  feature that looks finished and leaks. The fourth was `same_as` bridges, which are the
+  only edges carrying **no evidence document** and are therefore, by the enforcement core's
+  own deliberate rule, visible to everybody — so a private-only entity bridged to an org
+  one publishes its name no matter how well its documents are filtered.
+  Scoping promotion turned up the reason the roadmap said "a metadata flip, not a copy" and
+  what makes it possible: a `doc_id` is *derived* from `(source_id, uri)` at ingest and
+  opaque everywhere after, so a document can change source and keep every citation, edge and
+  label. Moving it to an **ownerless** bucket then means every visibility predicate already
+  written starts including it — zero read-path change, which is why this is ~200 lines rather
+  than a second visibility dimension threaded through a dozen graph reads.
+  Two gaps found by USING it rather than by reading it, both fixed here: `GET /api/sources`
+  was still listing catalog-only rows unconditionally (so `Notes from ada` and its document
+  count were enumerable by everyone — the last enumeration surface the 2026-08-04 pass
+  missed, on a comment that had been true when written); and the Rail lists only *configured*
+  connectors, so a private notes bucket had no row at all and the author-side affordance was
+  unreachable in the product even though the endpoint worked.
+  Suite: **1047 passed** (+17), 16 skipped (+1: the new Postgres test, correctly env-gated).
+  The merge-guard leak tests were **run with the
+  guard disabled and confirmed to fail** (4 of them; the three controls — a shared source
+  still merges, attaching still works, open mode unchanged — correctly pass either way, which
+  is what proves the guard bites on privacy alone). **16/16 Postgres tests run against a real
+  pgvector container**, including a new one covering the insert-only upsert, the LEFT-JOINed
+  bridge query, `rehome_document_entities` and the in-place source move across both the
+  catalog and the `chunks` table. Browser-verified end to end against a live two-user server:
+  Bob's **Your private notes** row → **offer to org** → the chip flips to "offered", Ada's
+  Settings shows the queue, expanding it shows the note's real text, **Publish to everyone**
+  empties the queue, and Ada's search goes from `[]` to a 0.791 hit on the same document.
 
 ## Next steps (agreed with user)
 

@@ -27,6 +27,7 @@ vars {
   ~skillZip: /absolute/path/to/a/skill.zip
   ~skillName: query-logs
   ~skillSecretKey: DEPLOY_TOKEN
+  ~promoteDocId: 0123456789abcdef
 }
 
 vars:secret [
@@ -54,6 +55,9 @@ docs {
   - **skillZip / skillName / skillSecretKey** — folder `9-skills`: a .zip containing
     `SKILL.md` to install, the skill's name, and one environment-variable name it requires
     (the credential you'd supply as yourself).
+  - **promoteDocId** — folder `10-promotions`: a `doc_id` from one of YOUR OWN private
+    documents (`GET /api/sources/notes:<you>/documents`, or `qj promotions mine`). Everything
+    in that folder acts on this one document.
   - **scrapeConnector** — folder `2-connect`: a `web_scrape` connector with
     `use_browser=true`, i.e. a site behind a login. Used by the two gated-site requests
     (check the browser session / open a sign-in window on the QuickJoiner host).

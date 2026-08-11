@@ -14,6 +14,9 @@ import type {
   GraphPathResult,
   NotificationsResponse,
   ProjectRow,
+  PromotionDetail,
+  PromotionResult,
+  PromotionRow,
   ScrapeEvent,
   SessionDetail,
   SessionRow,
@@ -289,6 +292,26 @@ export const api = {
     req<{ members: string[]; notes: string[] }>(
       `/api/sources/${encodeURIComponent(sourceId)}/documents/archive?doc_id=${encodeURIComponent(docId)}`,
     ),
+  // Promotion: a private document is offered to the org and a reviewer decides. Offering
+  // publishes nothing on its own — the whole point is that one person's unreviewed note
+  // does not become citable org truth by accident.
+  promoteDocument: (docId: string, note: string) =>
+    req<PromotionResult>(`/api/documents/${encodeURIComponent(docId)}/promote`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ note }),
+    }),
+  promotions: () => req<{ promotions: PromotionRow[] }>("/api/promotions"),
+  // The narrow read exception: a reviewer can open a document that is still private, but
+  // only while its author has it offered for review.
+  promotionText: (docId: string) =>
+    req<PromotionDetail>(`/api/promotions/${encodeURIComponent(docId)}`),
+  decidePromotion: (docId: string, approve: boolean, note = "") =>
+    req<PromotionResult>(`/api/promotions/${encodeURIComponent(docId)}/decide`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ approve, note }),
+    }),
   labels: () => req<{ labels: DocLabel[] }>("/api/labels"),
   addLabel: (body: DocLabel) =>
     req<{ ok: boolean; labels: DocLabel[] }>("/api/labels", {

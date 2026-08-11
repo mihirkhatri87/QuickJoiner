@@ -1,0 +1,39 @@
+meta {
+  name: Approve or decline (reviewer)
+  type: http
+  seq: 4
+}
+
+post {
+  url: {{baseUrl}}/api/promotions/{{promoteDocId}}/decide
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "approve": true,
+    "note": ""
+  }
+}
+
+docs {
+  `approve: true` re-homes the document to the shared `promoted:org` bucket — an ownerless
+  commons source, which is what makes every visibility predicate already in the codebase
+  start including it with no read-path change at all. Same `doc_id`, same chunks, same
+  vectors, same citations, same graph edges: a metadata flip, not a copy.
+
+  `approve: false` leaves the document exactly where it was and records `note` as a reason
+  the author can act on.
+
+  Verify with the search request in folder `4-query` as a DIFFERENT user: empty before,
+  a hit after.
+}

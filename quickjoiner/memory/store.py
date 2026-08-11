@@ -438,6 +438,26 @@ class KnowledgeStore:
             table.delete(f'doc_id = "{doc_id}"')
         self._fts_write("DELETE FROM chunks_fts WHERE doc_id = ?", (doc_id,))
 
+    def move_document(self, doc_id: str, source_id: str) -> None:
+        """Re-home an already-indexed document to another source, in place.
+
+        This is what makes promoting a personal note to the org a metadata flip rather
+        than a copy: both retrieval legs filter on the chunk's own `source_id` column, so
+        moving a document means rewriting that column — and nothing else. Chunk ids are
+        `doc_id#i` and carry no source, the vectors are the same vectors, so no text is
+        re-chunked and no embedding is recomputed; every citation, edge (keyed on
+        `evidence_doc_id`) and label keeps pointing at the same document.
+
+        Both stores are updated even though only one may hold rows for this document —
+        an update against nothing is a no-op, and a half-moved document would be
+        retrievable through one leg and invisible through the other.
+        """
+        table = self._table()
+        if table is not None:
+            table.update(where=f'doc_id = "{doc_id}"', values={"source_id": source_id})
+        self._fts_write("UPDATE chunks_fts SET source_id = ? WHERE doc_id = ?",
+                        (source_id, doc_id))
+
     def get_document_chunks(self, doc_id: str) -> list[str]:
         """Full ordered chunk texts for one document — chunks are the only place
         the original text lives (the catalog only stores metadata + a hash), so

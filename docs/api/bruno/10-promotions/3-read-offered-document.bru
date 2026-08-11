@@ -1,0 +1,27 @@
+meta {
+  name: Read an offered document (reviewer)
+  type: http
+  seq: 3
+}
+
+get {
+  url: {{baseUrl}}/api/promotions/{{promoteDocId}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}
+
+docs {
+  The document's actual text, so a reviewer can decide on what it says rather than on its
+  title.
+
+  This is the one deliberate exception to knowledge scopes: it returns a document that is
+  still private to its author. It is sound because they explicitly offered it, and it is kept
+  narrow — scoped to documents in `requested` state and to this endpoint alone. Retrieval is
+  untouched, so an offered note is still unanswerable to anyone but its author.
+
+  404 for any document that is not currently awaiting review — exactly as if it did not exist.
+}

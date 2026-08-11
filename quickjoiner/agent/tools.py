@@ -5,7 +5,12 @@ from __future__ import annotations
 import hashlib
 import re
 
-from quickjoiner.agent.confidence import classify_evidence, score_chain, score_edge
+from quickjoiner.agent.confidence import (
+    USER_TAUGHT_SOURCE,
+    classify_evidence,
+    score_chain,
+    score_edge,
+)
 from quickjoiner.agent.divergence import (
     ledger_entries_for_hits,
     membership_by_source as _membership_by_source,
@@ -19,7 +24,9 @@ from quickjoiner.memory.catalog import Catalog
 from quickjoiner.memory.expansion import expand_query
 from quickjoiner.memory.store import KnowledgeStore, SearchScope
 
-USER_TAUGHT_SOURCE = "notes:user-taught"
+# `USER_TAUGHT_SOURCE` is imported above from `confidence.py` — the import-graph leaf, so
+# `memory/` can classify a personal note without pulling the agent in — and re-exported
+# from here, where every caller already looks for it.
 
 
 def note_source(user: str | None, share: bool) -> tuple[str, str]:
@@ -245,7 +252,8 @@ def build_builtin_tools(
             # name-equality inferences and score as their own lowest-tier class.
             return "name-bridge"
         return classify_evidence(r["evidence_title"] or "", r["evidence_uri"] or "",
-                                 r["evidence_kind"] or "")
+                                 r["evidence_kind"] or "",
+                                 r.get("evidence_source_id") or "")
 
     def _hop_score(r) -> float:
         """Server-side confidence for one edge row: evidence shape + corroboration."""

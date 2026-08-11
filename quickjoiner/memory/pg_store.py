@@ -116,6 +116,13 @@ class PgVectorStore:
         with self._pool.connection() as conn:
             conn.execute("DELETE FROM chunks WHERE doc_id = %s", (doc_id,))
 
+    def move_document(self, doc_id: str, source_id: str) -> None:
+        """Re-home an indexed document to another source in place — see the LanceDB
+        twin in `store.py` for why promotion is a column rewrite and not a re-ingest."""
+        with self._pool.connection() as conn:
+            conn.execute("UPDATE chunks SET source_id = %s WHERE doc_id = %s",
+                         (source_id, doc_id))
+
     def get_document_chunks(self, doc_id: str) -> list[str]:
         with self._pool.connection() as conn:
             rows = conn.execute(

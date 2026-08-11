@@ -137,6 +137,11 @@
       "key": "skillSecretKey",
       "value": "DEPLOY_TOKEN",
       "description": "One environment-variable name a skill requires (your credential)"
+    },
+    {
+      "key": "promoteDocId",
+      "value": "0123456789abcdef",
+      "description": "A doc_id from one of YOUR OWN private documents (GET /api/sources/notes:<you>/documents, or `qj promotions mine`)."
     }
   ],
   "auth": {
@@ -1131,6 +1136,64 @@
           "request": {
             "method": "DELETE",
             "url": "{{baseUrl}}/api/skills/{{skillName}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "10 \u00b7 Promotion (personal \u2192 organisation)",
+      "description": "A taught note is private to its author by default (knowledge scopes). That is right, and on its own a dead end: the useful half of what a joiner works out is exactly what the next joiner needs. This is the path across, and it is a REVIEW rather than a button, because one person's unreviewed assertion must not become citable org truth by accident.\n\nThree steps, three capabilities: OFFER (promotions:request, every user \u2014 your own documents only, and it publishes nothing); REVIEW (promotions:review, editor and admin \u2014 the queue, plus the one narrow read exception in the whole knowledge-scopes model: a reviewer may open a document that is still private, but only while its author has it offered); DECIDE.\n\nApproval is a METADATA FLIP, NOT A COPY: the document moves to the ownerless `promoted:org` bucket keeping the same doc_id, chunks, vectors, citations and graph edges. Nothing is re-uploaded, re-chunked or re-embedded.\n\nSet {{promoteDocId}} first.",
+      "item": [
+        {
+          "name": "Offer one of your documents to the organisation",
+          "description": "Queue one of YOUR OWN private documents for review. `note` is why the org should have it. This changes nothing about who can read it \u2014 it stays private to you until a reviewer approves.\n\n400 if the document is already readable by everyone (a promotion that would be a no-op is refused rather than reported as success), if it is not yours, or if it is already queued.",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"note\": \"the next joiner will hit this in week one\"\n}"
+            },
+            "url": "{{baseUrl}}/api/documents/{{promoteDocId}}/promote"
+          }
+        },
+        {
+          "name": "The review queue (editor/admin)",
+          "description": "Everything people have offered, oldest first \u2014 a backlog, not a feed. This is `promotions:review`, NOT an ordinary read capability: every row is a document still private to its author, listed only because they offered it. A viewer gets 403.",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/promotions"
+          }
+        },
+        {
+          "name": "Read an offered document (reviewer)",
+          "description": "The document's actual text, so a reviewer decides on what it says rather than on its title. The one deliberate exception to knowledge scopes, kept narrow: scoped to documents in `requested` state and to this endpoint alone, with retrieval untouched. 404 for anything not currently awaiting review \u2014 exactly as if it did not exist.",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/promotions/{{promoteDocId}}"
+          }
+        },
+        {
+          "name": "Approve or decline (reviewer)",
+          "description": "`approve: true` re-homes the document to the shared `promoted:org` bucket \u2014 an ownerless commons source, which is what makes every visibility predicate already in the codebase start including it with no read-path change at all. `approve: false` leaves it exactly where it was and records `note` as a reason the author can act on.\n\nVerify with the search request in folder 4 as a DIFFERENT user: empty before, a hit after.",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"approve\": true,\n  \"note\": \"\"\n}"
+            },
+            "url": "{{baseUrl}}/api/promotions/{{promoteDocId}}/decide"
           }
         }
       ]

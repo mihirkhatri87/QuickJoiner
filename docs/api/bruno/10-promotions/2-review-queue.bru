@@ -1,0 +1,23 @@
+meta {
+  name: The review queue (editor/admin)
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{baseUrl}}/api/promotions
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}
+
+docs {
+  Everything people have offered, oldest first — a backlog, not a feed. Each row carries the
+  document's title and uri, who offered it, when, and their note.
+
+  This is `promotions:review`, NOT an ordinary read capability: every row is a document that
+  is still private to its author, listed here only because they offered it. A viewer gets 403.
+}

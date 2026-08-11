@@ -74,3 +74,8 @@ login request stores the bearer token so every later request sends `Authorizatio
     exists and whether each one is ready **for you**, supply your own credentials for the scoped
     ones, and (admin) install a `.zip`, re-scope what a skill requires, or remove it. Secrets are
     write-only — the list request returns names, never values.
+11. **10 · Promotion (personal → organisation)** — offer one of your own private documents to
+    everyone, review what others have offered (including reading a document that is still
+    private, the one narrow exception to knowledge scopes), and approve or decline. Approving
+    is a metadata flip, not a copy: the same `doc_id`, chunks, vectors and citations, now
+    readable by all. Set `promoteDocId` first (`qj promotions mine`).

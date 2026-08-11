@@ -15,6 +15,11 @@ from __future__ import annotations
 
 import re
 
+# The shared, pre-knowledge-scopes bucket every taught fact used to land in. Defined here
+# rather than in `agent/tools.py` (which re-exports it) purely so this module can stay the
+# leaf of the import graph — `memory/` imports it lazily and must not pull the agent in.
+USER_TAUGHT_SOURCE = "notes:user-taught"
+
 # Titles that ARE a date ("2026-01-06", "01/06/26", "Jan 6, 2026") — the classic
 # meeting-notes/journal page naming pattern seen across the Confluence corpus.
 _DATE_TITLE = re.compile(
@@ -34,9 +39,30 @@ _AUTHORED_BASENAME = re.compile(
 )
 
 
-def classify_evidence(title: str, uri: str, kind: str) -> str:
-    """Bucket one evidence document: 'dependency-map' | 'meeting-notes' |
-    'authored-doc' | 'generic'. First match wins, checked in that order.
+def is_personal_note_source(source_id: str) -> bool:
+    """Is this the private notes bucket of one person? `agent.tools.note_source` names
+    them `notes:<username>`, with the pre-knowledge-scopes commons keeping the historic
+    `notes:user-taught` id — so the convention is readable without a catalog lookup, and
+    this module stays pure."""
+    sid = (source_id or "").strip().lower()
+    return sid.startswith("notes:") and sid != USER_TAUGHT_SOURCE
+
+
+def classify_evidence(title: str, uri: str, kind: str, source_id: str = "") -> str:
+    """Bucket one evidence document: 'personal-note' | 'dependency-map' |
+    'meeting-notes' | 'authored-doc' | 'generic'. First match wins, checked in that order.
+
+    Provenance outranks shape, so the personal-note check comes first: a fact one person
+    taught themselves is one person's unreviewed word however the page is titled, and the
+    point of the class is that a personal-vs-org contradiction surfaces with BOTH
+    citations and the org's evidence scoring higher — never that they are silently
+    averaged (invariant I2). Promotion (`quickjoiner/promotion.py`) re-homes a reviewed
+    note to the commons, at which point it stops being discounted, which is exactly the
+    incentive the flywheel wants.
+
+    Deliberately NOT applied to a private *connector's* documents: those are an org
+    system that happens to be reachable by one person — a different thing from a personal
+    jotting, and one this pure function could not detect without an ownership lookup.
 
     Honesty note: a dedicated architecture *wiki page* is indistinguishable from any
     other prose page at this layer (Confluence ingests everything as kind="doc"), so
@@ -44,6 +70,8 @@ def classify_evidence(title: str, uri: str, kind: str) -> str:
     of a shape heuristic we can't actually compute.
     """
     title, uri = title or "", uri or ""  # LEFT-JOIN rows may carry None
+    if is_personal_note_source(source_id):
+        return "personal-note"
     if uri.lower().endswith("::dependency-map"):
         return "dependency-map"
     if _DATE_TITLE.match(title) or _MEETING_TITLE.search(title):
@@ -69,6 +97,12 @@ _BASE = {
     # wrong about *what was said*, only about identity) yet below all document-backed
     # classes; with zero corroboration possible, chains crossing a bridge cap here.
     "name-bridge": 0.30,
+    # One person's own unreviewed note. Below every org-visible document class, because
+    # nobody else has ever seen it — but above meeting-notes, because a taught fact is a
+    # deliberate statement of something its author believes true, where a dated journal
+    # page is an incidental record. Promotion moves a reviewed note out of this class
+    # rather than re-scoring it, so the discount is provenance, not a permanent judgement.
+    "personal-note": 0.28,
     "meeting-notes": 0.25,
 }
 

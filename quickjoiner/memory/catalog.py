@@ -188,6 +188,15 @@ _MIGRATION_STATEMENTS = [
     # both SQLite and Postgres support indexes on an expression, and it must spell
     # LOWER(name) exactly as the query does for the planner to match it.
     "CREATE INDEX IF NOT EXISTS idx_entities_lower_name ON entities(LOWER(name))",
+    # Promotion of a personal document to the organisation (2026-08-10, knowledge scopes
+    # Y1.8f). Status is '' for the overwhelming majority — a document nobody has offered —
+    # so this is a sparse flag on an existing table rather than its own; a promoted
+    # document carries no lasting status at all, because its moved source_id IS the record.
+    "ALTER TABLE documents ADD COLUMN promotion_status TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE documents ADD COLUMN promotion_by TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE documents ADD COLUMN promotion_note TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE documents ADD COLUMN promotion_at TEXT NOT NULL DEFAULT ''",
+    "CREATE INDEX IF NOT EXISTS idx_documents_promotion ON documents(promotion_status)",
 ]
 
 
@@ -406,6 +415,27 @@ class _SqlCatalog:
             (owner, 1 if shared else 0, source_id),
         )
 
+    def get_source(self, source_id: str) -> dict | None:
+        return self._read_one("SELECT * FROM sources WHERE id = ?", (source_id,))
+
+    def is_private_source(self, source_id: str) -> bool:
+        """Is this source readable only by its owner? The ingest-side twin of
+        `visible_source_ids` — what the merge guard keys on.
+
+        Private means owned AND not shared, i.e. exactly the rows `visible_source_ids`
+        withholds from everyone but their owner. An **unknown or ownerless** source is
+        NOT private: ownerless rows are the commons (that method's own rule), and a
+        missing row would otherwise silently disable entity resolution org-wide for a
+        source that simply hasn't been registered yet. The asymmetry with the read side
+        (which fails closed on a missing row) is deliberate: withholding a document is
+        cheap and reversible, whereas refusing to merge is a permanent quality loss the
+        operator would have no way to notice.
+        """
+        row = self._read_one(
+            "SELECT owner, shared FROM sources WHERE id = ?", (source_id,)
+        )
+        return bool(row and row["owner"] and not row["shared"])
+
     def list_sources(self) -> list[dict]:
         return self._read_all(
             """SELECT s.*, COUNT(d.doc_id) AS doc_count
@@ -615,6 +645,68 @@ class _SqlCatalog:
         self-heal on the next ordinary sync without a re-embed."""
         self._write("UPDATE documents SET metadata_json = ? WHERE doc_id = ?", (metadata_json, doc_id))
 
+    # -- promotion (personal -> organisation) ---------------------------------
+    def set_promotion(self, doc_id: str, status: str, by: str = "", note: str = "") -> None:
+        """Record (or clear, with `status=''`) a document's standing offer to the org."""
+        self._write(
+            "UPDATE documents SET promotion_status = ?, promotion_by = ?, "
+            "promotion_note = ?, promotion_at = ? WHERE doc_id = ?",
+            (status, by, note, _now() if status else "", doc_id),
+        )
+
+    def list_promotions(self, status: str = "requested") -> list[dict]:
+        """Documents currently offered to the organisation, oldest first — the review
+        queue. Joined to their source so a reviewer sees whose note this is without a
+        second round trip; ordered oldest-first because a review queue is a backlog, not
+        a feed."""
+        return self._read_all(
+            """SELECT d.*, s.name AS source_name, s.type AS source_type, s.owner AS source_owner
+               FROM documents d LEFT JOIN sources s ON s.id = d.source_id
+               WHERE d.promotion_status = ? ORDER BY d.promotion_at, d.doc_id""",
+            (status,),
+        )
+
+    def move_document(self, doc_id: str, source_id: str) -> None:
+        """Re-home a document to another source, keeping its `doc_id`.
+
+        The id is a content hash of `(original source_id, uri)`, but it is only DERIVED at
+        ingest — everything afterwards treats it as opaque, so a move can keep it and with
+        it every citation, edge (`evidence_doc_id`), label and chunk. The caller must move
+        the vector rows too (`store.move_document`), since retrieval filters on the chunk's
+        own copy of `source_id`.
+
+        One consequence is worth stating rather than discovering: if the ORIGINAL connector
+        later re-provides the same uri, it recomputes the old doc_id, finds nothing, and
+        ingests a fresh private copy alongside the promoted one. That is the right outcome
+        for a re-taught note (the author kept their own), and it is why promotion is a
+        reviewed act rather than an automatic one.
+        """
+        self._write(
+            "UPDATE documents SET source_id = ?, promotion_status = '' WHERE doc_id = ?",
+            (source_id, doc_id),
+        )
+
+    def rehome_document_entities(self, doc_id: str, from_source_id: str,
+                                 to_source_id: str) -> int:
+        """Move the entities THIS document minted from one source to another.
+
+        `entities.source_id` records who created a node and is what the merge guard and
+        the `same_as` bridge pass key on, so promoting a document has to hand over the
+        nodes it brought with it. Scoped to entities the document actually cites — a
+        promotion must not release the rest of its former bucket's graph — and to nodes
+        still marked as the origin's, so an entity that was really the org's all along is
+        left alone. Returns how many moved."""
+        rows = self._read_all(
+            """SELECT DISTINCT e.id FROM entities e
+               JOIN edges g ON (g.src = e.id OR g.dst = e.id)
+               WHERE g.evidence_doc_id = ? AND e.source_id = ?""",
+            (doc_id, from_source_id),
+        )
+        for row in rows:
+            self._write("UPDATE entities SET source_id = ? WHERE id = ?",
+                        (to_source_id, row["id"]))
+        return len(rows)
+
     def delete_document(self, doc_id: str) -> None:
         self._write("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
         self._write("DELETE FROM edges WHERE evidence_doc_id = ?", (doc_id,))
@@ -660,10 +752,24 @@ class _SqlCatalog:
         "also known as" names). Full replace — the bridge layer is derived, so
         recomputing after each ingest batch keeps it consistent with whatever entities
         exist now (bridges to deleted entities simply don't come back). Returns the
-        number of bridges now in place."""
+        number of bridges now in place.
+
+        Entities minted by a **private** source are excluded, because a bridge is the one
+        edge with no evidence document — `_evidence_visible` therefore keeps it visible to
+        everyone, so bridging a private-only entity to an org one would publish that
+        entity's name through `graph_neighbors`/`graph_path` however well its documents
+        are filtered. A private source's own entities still bridge among themselves; an
+        entity first minted by an org source keeps bridging even when private evidence
+        later cites it too (the ownership marker is the minting source, so this errs
+        toward a missing bridge rather than a leaked name).
+        """
         from quickjoiner.ingest.bridges import compute_same_as_bridges
 
-        entities = self._read_all("SELECT id, name, type FROM entities")
+        entities = self._read_all(
+            """SELECT e.id, e.name, e.type FROM entities e
+               LEFT JOIN sources s ON s.id = e.source_id
+               WHERE s.id IS NULL OR s.owner IS NULL OR s.shared = 1"""
+        )
         alias_rows = self._read_all("SELECT entity_id, alias FROM entity_aliases")
         bridges = compute_same_as_bridges(
             entities, [(r["entity_id"], r["alias"]) for r in alias_rows])
@@ -925,8 +1031,16 @@ class _SqlCatalog:
         self._write("DELETE FROM auth_tokens WHERE token_hash = ?", (token_hash,))
 
     # -- knowledge graph --------------------------------------------------------
-    def upsert_entity(self, entity_id: str, name: str, type_: str, source_id: str = "") -> None:
+    def upsert_entity(self, entity_id: str, name: str, type_: str, source_id: str = "",
+                      allow_rename: bool = True) -> None:
         """Insert or update an entity, protecting a well-cased display name.
+
+        `allow_rename=False` makes this insert-only: an existing node is left exactly as
+        it is and only its absence creates one. That is how evidence from a **private**
+        source attaches to an org entity without being able to reshape it — the rename
+        rule below is otherwise a second, quieter merge: a document asserting the same id
+        under a materially different name renames that node for the whole organisation.
+        See `ingest/pipeline._persist_graph`.
 
         Deterministic extractors (deps.py, code_graph.py, connector metadata) name a
         node once at creation; LLM triple extraction can later propose the SAME id with
@@ -947,6 +1061,13 @@ class _SqlCatalog:
         counts as a rename on SQLite and as a case variant on Postgres. Entity names here
         are repo/package/service identifiers (effectively ASCII), so this is noted rather
         than worked around — doing so would mean a custom collation on both engines."""
+        if not allow_rename:
+            self._write(
+                "INSERT INTO entities (id, name, type, source_id) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(id) DO NOTHING",
+                (entity_id, name, type_, source_id),
+            )
+            return
         self._write(
             """INSERT INTO entities (id, name, type, source_id) VALUES (?, ?, ?, ?)
                ON CONFLICT(id) DO UPDATE SET
@@ -958,6 +1079,12 @@ class _SqlCatalog:
                  type = excluded.type""",
             (entity_id, name, type_, source_id),
         )
+
+    def get_entity(self, entity_id: str) -> dict | None:
+        """One entity by its exact id — no name/alias fallback, unlike `resolve_entity`.
+        The merge guard asks 'which source minted this node', and a question about a
+        specific id must not be answered by a same-named different node."""
+        return self._read_one("SELECT * FROM entities WHERE id = ?", (entity_id,))
 
     def entities_by_type(self, type_: str) -> list[dict]:
         """All entities of one type — candidate pool for entity-resolution dedup
@@ -1315,7 +1442,8 @@ class _SqlCatalog:
             classes = frozenset(
                 classify_evidence(hop.get("evidence_title") or "",
                                   hop.get("evidence_uri") or "",
-                                  hop.get("evidence_kind") or "")
+                                  hop.get("evidence_kind") or "",
+                                  hop.get("evidence_source_id") or "")
                 for hop in chain
             )
             return (intermediates, rels, classes)

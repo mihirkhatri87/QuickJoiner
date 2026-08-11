@@ -11,6 +11,21 @@ Container: single Docker image (UI baked in, `/data` volume). Team-ish: `docker-
 = app + Postgres/pgvector, all state in PG (catalog, vectors, tsvector sparse, graph).
 This section exists so every later year is diffed against something real.
 
+**Shipped out of Y1** (graduated per the house rule — described now in CLAUDE.md and README,
+not here):
+
+- **Y1.8 Knowledge scopes — per-user visibility over ONE communal store.** Complete as of
+  2026-08-10; it was the product-layer prerequisite for multi-user GA, and its urgency came
+  from the OneDrive/SharePoint connector, which is per-user by construction. The read half
+  (visibility predicate on both hybrid legs of both backends, every graph read, entity
+  autocomplete, corroboration counts, gaps, `/learn` ownership) shipped 2026-08-04; the write
+  half — the ingest-time **merge guard**, so personal evidence may attach to org entities but
+  never merge, rename, alias or bridge them — and the **promotion flow** (personal → org by
+  review, a source move that keeps the document's id, chunks, vectors and citations; plus the
+  discounted `personal-note` evidence class) shipped 2026-08-10. Open mode stays
+  byte-identical. See CLAUDE.md's `auth.py` + `promotion.py` bullets and README's "Who can
+  read what".
+
 ## Year 1 — "Team Server": one org, one VPC, boring and bulletproof
 
 Target: 5–200 users/org, self-hosted by the customer's platform team or by us (single-tenant).
@@ -46,49 +61,6 @@ Workstreams (each is a PR-able epic):
    blue/green on ECS; image scanning (ECR + Inspector).
 7. **DR/backup**: PITR on RDS, S3 versioning, weekly restore drill in CI (restore → run
    grounding smoke suite against the restored copy — *backups that answer questions*).
-8. **Knowledge scopes — the personal-layer union** (intake 2026-07-18; also PRD W9.3).
-   **The enforcement core shipped 2026-08-04** — (a) the visibility predicate, (b) graph
-   reads, (d) aliases/suggester/gaps, and (e) `/learn` ownership are all built, tested as
-   leak tests, and verified on both backends; how it works is documented in CLAUDE.md's
-   `auth.py` bullet and README's "Who can read what". **REMAINING here, and both are real:**
-   **(c) the ingest-time merge guard** — personal evidence may attach to org entities but
-   must never *trigger* a merge of them, since a wrong merge rewrites canonical ids globally
-   and is the one pollution filtering cannot undo; a private document today still influences
-   which entities exist and how they resolve, even though nobody else can read, cite or
-   enumerate it. **(f) the promotion flow** — personal → org via review, a metadata flip
-   rather than a copy (the onboarding flywheel), plus a discounted `personal-note` evidence
-   class so personal-vs-org contradictions surface with both citations (invariant I2) instead
-   of being silently averaged. The description below is the original intake, kept for the
-   design rationale.
-   **Urgency raised 2026-07-24 by the OneDrive/SharePoint connector** (`PRIORITIES.md` #2):
-   it is per-user by construction — a delegated Microsoft 365 token reads exactly what that
-   person can read, *including files shared privately with them* — but everything it learns
-   lands in the one communal memory, so a private document becomes retrievable and citable
-   for every user of the workspace. The connector warns about this at connect time, in its
-   `test()` message and before every on-demand learn, but a warning is not a control. This
-   workstream is what turns it into one.
-   Today ingested knowledge is one communal memory (documented in CLAUDE.md's auth bullet) —
-   right for single-user/open mode, wrong at 5–200 users: a user's `/learn` notes and private
-   scrapes pollute the org graph (entities, edges, corroboration counts, autocomplete),
-   wrong personal "facts" become citable org truth, and personal notes are readable by all.
-   Model: **query-time row-level visibility over ONE store** (never per-user forks) — user U
-   retrieves the union of {ownerless commons, owned-by-U, shared} sources; the scope key is
-   the existing `documents.source_id → sources.owner/shared` chain, so no doc-schema change.
-   Work: (a) native source-visibility predicate in `store.search` (LanceDB where / pgvector
-   WHERE / FTS sidecar, both hybrid legs, over-fetch so the grounding gate can't be starved
-   into false refusals); (b) graph reads filtered by evidence-doc visibility
-   (`graph_neighbors`/`graph_path[_candidates]`/`graph_expand`, plan-06 `edge_corroboration`
-   counts visible evidence only); (c) **ingest-time merge guard** — personal evidence may
-   attach to org entities but must never *trigger* a merge of them (a wrong merge rewrites
-   canonical ids globally — the one pollution filtering can't undo); (d) aliases, suggester,
-   and gaps scoped the same way; (e) `/learn` gains ownership (owner=user, private by
-   default, `--share` to teach the commons — the connector flags exactly); (f) **promotion
-   flow**: personal → org via review, a metadata flip, not a copy — the onboarding flywheel;
-   plus a discounted `personal-note` evidence class so personal-vs-org contradictions
-   surface with both citations (invariant I2), never silently averaged. Open-mode/single-user
-   behavior stays byte-identical (everything is commons). **Must land before multi-user GA**
-   — retrofitting visibility onto a polluted graph is a cleanup migration.
-
 SLOs: API P95 < 400 ms (non-LLM), chat first token < 3 s, sync lag < interval + 5 min,
 99.9% availability. Cost envelope (100 users): ~2×Fargate 1vCPU + db.r6g.large Multi-AZ +
 S3/ALB ≈ **$600–900/mo** ≈ $6–9/user/mo infra.

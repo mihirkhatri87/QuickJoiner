@@ -1316,6 +1316,88 @@ def onedrive_learn_cmd(
     console.print(f"[green]{name}:[/green] {stats.summary()}")
 
 
+promotions_app = typer.Typer(
+    help="Offer one of your own private documents to the whole organisation, and review "
+         "what others have offered. Approving is a metadata flip — the same document, "
+         "the same citations, now readable by everyone.")
+app.add_typer(promotions_app, name="promotions")
+
+
+@promotions_app.command("offer")
+def promotions_offer(
+    doc_id: str = typer.Argument(..., help="Document id (from `qj promotions mine` or the UI)"),
+    note: str = typer.Option("", "--note", help="Why the org should have this"),
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """Offer one of your own private documents to the organisation, for review."""
+    from quickjoiner import promotion
+
+    ctx = _context(workspace)
+    try:
+        result = promotion.request(ctx.catalog, doc_id, _session_user(ctx), note=note)
+    except promotion.PromotionError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    console.print(f"[green]{result.message}[/green]")
+
+
+@promotions_app.command("mine")
+def promotions_mine(workspace: Optional[Path] = WORKSPACE_OPT):
+    """Your own private documents, with their ids — what you could offer."""
+    from quickjoiner import promotion
+
+    ctx = _context(workspace)
+    user = _session_user(ctx)
+    private = [s["id"] for s in ctx.catalog.list_sources()
+               if ctx.catalog.is_private_source(s["id"]) and s.get("owner") == user]
+    if not private:
+        console.print("You have no private documents.")
+        return
+    for source_id in private:
+        for doc in ctx.catalog.documents_for_source(source_id):
+            state = doc.get("promotion_status") or ""
+            mark = f" [yellow]({state})[/yellow]" if state else ""
+            console.print(f"- [dim]{doc['doc_id'][:12]}[/dim] {doc['title'] or doc['uri']}{mark}")
+
+
+@promotions_app.command("queue")
+def promotions_queue(workspace: Optional[Path] = WORKSPACE_OPT):
+    """Documents other people have offered to the organisation, awaiting a decision."""
+    from quickjoiner import promotion
+
+    ctx = _context(workspace)
+    rows = promotion.pending(ctx.catalog)
+    if not rows:
+        console.print("Nothing is waiting for review.")
+        return
+    for r in rows:
+        who = r.get("promotion_by") or r.get("source_owner") or "someone"
+        console.print(f"- [dim]{r['doc_id'][:12]}[/dim] {r['title'] or r['uri']} "
+                      f"[dim]— offered by {who}[/dim]")
+        if r.get("promotion_note"):
+            console.print(f"    [dim]{r['promotion_note']}[/dim]")
+
+
+@promotions_app.command("decide")
+def promotions_decide(
+    doc_id: str = typer.Argument(..., help="Document id from `qj promotions queue`"),
+    approve: bool = typer.Option(..., "--approve/--decline", help="Accept it into org memory, or send it back"),
+    note: str = typer.Option("", "--note", help="A reason the author can act on"),
+    workspace: Optional[Path] = WORKSPACE_OPT,
+):
+    """Approve an offered document into the organisation's memory, or decline it."""
+    from quickjoiner import promotion
+
+    ctx = _context(workspace)
+    try:
+        result = promotion.decide(ctx.catalog, ctx.store, doc_id, approve,
+                                  reviewer=_session_user(ctx), note=note)
+    except promotion.PromotionError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    console.print(f"[green]{result.message}[/green]")
+
+
 skills_app = typer.Typer(
     help="Packaged expertise in the open Agent Skills format (the layout Claude Code and "
          "GitHub Copilot read). Install one, see whether it is ready, and supply your own "

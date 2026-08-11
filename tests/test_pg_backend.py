@@ -136,6 +136,59 @@ def test_pg_knowledge_scopes_filter_identically_to_sqlite(pg):
                                           visible_source_ids=["files:handbook"])) == []
 
 
+def test_pg_merge_guard_and_promotion_round_trip(pg):
+    """The write half of knowledge scopes on the real engine. Both pieces here touch SQL
+    that only exists in the neutral base — an insert-only `ON CONFLICT DO NOTHING`, a
+    LEFT-JOINed bridge query, a correlated entity/edge join and an in-place source move
+    across BOTH the catalog and the pgvector `chunks` table — so "statically reviewed"
+    would mean untested, exactly as it did the last time that phrase appeared here."""
+    from quickjoiner import promotion
+    from quickjoiner.memory.store import SearchScope
+
+    catalog, store = pg
+    catalog.upsert_source("files:handbook", "Handbook", "files")
+    catalog.upsert_source("notes:ada", "Ada's notes", "notes")
+    catalog.set_source_ownership("notes:ada", owner="ada", shared=False)
+    assert catalog.is_private_source("notes:ada") is True
+    assert catalog.is_private_source("files:handbook") is False
+
+    # A private document may not rename an org entity, and its own nodes are kept out of
+    # the evidence-free bridge layer that everybody can see.
+    catalog.upsert_entity("service:appriver.connector.web", "AppRiver.Connector.Web",
+                          "service", "files:handbook")
+    catalog.upsert_entity("service:appriver.connector.web", "Ada's own name for it",
+                          "service", "notes:ada", allow_rename=False)
+    assert catalog.get_entity("service:appriver.connector.web")["name"] == \
+        "AppRiver.Connector.Web"
+    catalog.upsert_entity("repo:appriver.connector.web", "AppRiver.Connector.Web",
+                          "repo", "notes:ada")
+    assert catalog.refresh_same_as_bridges() == 0
+
+    catalog.upsert_document("d-note", "notes:ada", "note://ada/aardvark", "Aardvark",
+                            "note", "h9", None, 1)
+    store.upsert_document(doc_id="d-note", source_id="notes:ada", uri="note://ada/aardvark",
+                          title="Aardvark", kind="note",
+                          chunks=["the aardvark migration slips to Q4"])
+    catalog.replace_doc_edges("d-note", [("repo:appriver.connector.web", "part_of",
+                                          "service:appriver.connector.web", "")])
+
+    bob_only = SearchScope(visible_source_ids=["files:handbook"])
+    assert store.search("aardvark migration", top_k=10, min_score=0.0, scope=bob_only) == []
+
+    promotion.request(catalog, "d-note", "ada", note="the next joiner will hit this")
+    assert [r["doc_id"] for r in promotion.pending(catalog)] == ["d-note"]
+    promotion.decide(catalog, store, "d-note", approve=True, reviewer="boss")
+
+    assert catalog.get_document("d-note")["source_id"] == promotion.PROMOTED_SOURCE
+    visible = catalog.visible_source_ids("bob")
+    hits = store.search("aardvark migration", top_k=10, min_score=0.0,
+                        scope=SearchScope(visible_source_ids=visible))
+    assert [h.doc_id for h in hits] == ["d-note"]
+    # The promoted document's own entities are released, so bridges form again.
+    assert catalog.get_entity("repo:appriver.connector.web")["source_id"] == \
+        promotion.PROMOTED_SOURCE
+
+
 def test_pg_users_tokens(pg):
     catalog, _ = pg
     assert catalog.count_users() == 0

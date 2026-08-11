@@ -741,22 +741,76 @@ class IngestPipeline:
         to the canonical one. Unconditional replace_doc_edges: a changed doc
         that dropped its assertions must also drop its stale edges (hash
         dedupe means we only get here on change). The evidence doc's title/kind
-        ride along as adjudication context (plan 06 §1.D)."""
+        ride along as adjudication context (plan 06 §1.D).
+
+        **Merge guard (knowledge scopes).** Evidence from a source only its owner may read
+        may ATTACH to org entities — an exact-id assertion still becomes an edge, which is
+        the whole point of a private note about a real service — but it must never
+        *reshape* them, because every one of the three write paths below is global and
+        none of them is undone by filtering what people can read:
+
+        * a resolver merge writes an alias onto a canonical org entity, so a private
+          document's spelling becomes an org-wide way to name that thing;
+        * `upsert_entity`'s rename rule replaces an org entity's display name, which then
+          shows in everyone's graph view, autocomplete and citations;
+        * an extractor-supplied alias row (a person's email from a table, a declared
+          `aka`) is the same alias write through a quieter door.
+
+        So a private document resolves nothing, renames nothing, and may only alias
+        entities its own source minted. The cost is a duplicate node in the owner's own
+        view when their private wording differs from the org's — visible only to them,
+        and cleared by promoting the note (`quickjoiner/promotion.py`), whereas a wrong
+        merge rewrites canonical ids for everyone and is not recoverable at all.
+
+        Deliberately not cached: ownership can change (a note is shared, a connector is
+        promoted) between two documents of one run, and this is a single indexed read
+        against the N entity upserts that follow it."""
         context = f'mentioned in "{doc_title}" ({doc_kind})' if doc_title else ""
+        private = self._is_private_evidence(source_id)
         id_map: dict[str, str] = {}
         for eid, name, type_ in entities:
             canonical, merged = (
                 self._entity_resolver.resolve(eid, name, type_, context)
-                if self._entity_resolver else (eid, False)
+                if self._entity_resolver and not private else (eid, False)
             )
             id_map[eid] = canonical
             if not merged:
-                self._catalog.upsert_entity(canonical, name, type_, source_id)
+                self._catalog.upsert_entity(canonical, name, type_, source_id,
+                                            allow_rename=not private)
         for alias, eid in alias_rows:
-            self._catalog.add_entity_alias(alias, id_map.get(eid, eid))
+            target = id_map.get(eid, eid)
+            if private and not self._minted_by(target, source_id):
+                continue
+            self._catalog.add_entity_alias(alias, target)
         remapped = [(id_map.get(s, s), rel, id_map.get(d, d), detail) for s, rel, d, detail in edges]
         self._catalog.replace_doc_edges(doc_id, remapped)
         self._catalog.clear_graph_pending(doc_id)
+
+    def _is_private_evidence(self, source_id: str) -> bool:
+        """Does this source's content belong to one person? Best-effort — a catalog
+        without the method (an older test double) means the guard simply doesn't engage,
+        which is the pre-knowledge-scopes behaviour, never a crash mid-ingest."""
+        check = getattr(self._catalog, "is_private_source", None)
+        if check is None:
+            return False
+        try:
+            return bool(check(source_id))
+        except Exception:
+            return False
+
+    def _minted_by(self, entity_id: str, source_id: str) -> bool:
+        """Was this entity created by `source_id` (or is it about to be, this call)?
+        `entities.source_id` records the source that first inserted the node and is never
+        rewritten, so it answers 'is this mine to name?' — an entity that does not exist
+        yet is one this document is minting now, hence also mine."""
+        get = getattr(self._catalog, "get_entity", None)
+        if get is None:
+            return False
+        try:
+            row = get(entity_id)
+        except Exception:
+            return False
+        return row is None or row["source_id"] == source_id
 
     def _triples_apply(self, doc: Document, text: str) -> bool:
         """Whether a document qualifies for LLM relationship extraction: a prose-ish

@@ -70,6 +70,8 @@ export interface Settings {
     tool_result_max_chars: number;
     live_tool_result_max_chars: number;
     learn_from_conversations: boolean;
+    /** IANA zone the assistant resolves "last Friday"/"this weekend" in. */
+    timezone: string;
   };
   graph: { extract_triples: boolean; entity_resolution: boolean };
   repos: { auto_agents_md: boolean };
@@ -99,6 +101,8 @@ export interface SourceRow {
   type: string;
   documents: number;
   configured: boolean;
+  /** Readable only by you — your own notes bucket, not a connected system. */
+  private?: boolean;
 }
 
 export interface ConnectorRow {
@@ -239,6 +243,35 @@ export interface SourceDocuments {
   source_id: string;
   documents: IngestedDoc[];
   labels: DocLabel[];
+  /** Only its owner can read this source — so seeing it means it is yours, and its
+   * documents can be offered to the organisation. */
+  private?: boolean;
+}
+
+/** One document its author has offered to the whole organisation, awaiting review. */
+export interface PromotionRow {
+  doc_id: string;
+  title: string;
+  uri: string;
+  kind: string;
+  source_id: string;
+  source_name: string;
+  author: string;
+  note: string;
+  requested_at: string;
+}
+
+/** An offered document with its text, so a reviewer can actually read what they decide on. */
+export interface PromotionDetail extends Omit<PromotionRow, "source_name" | "requested_at"> {
+  text: string;
+}
+
+export interface PromotionResult {
+  doc_id: string;
+  /** "requested" | "declined" | "promoted" */
+  status: string;
+  source_id: string;
+  message: string;
 }
 
 /** What a question is restricted to. Empty in every field = all of memory. */

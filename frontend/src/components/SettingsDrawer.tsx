@@ -19,6 +19,7 @@ import { api, token } from "../api";
 import type { AuthStatus, BrowserSessionStatus, ConnectorRow, ConnectorType, OAuthStatus, SettingDefaults, Settings, SyncJob, UserRow } from "../types";
 import { EditConnectorModal } from "./EditConnectorModal";
 import { RemoteBrowserModal } from "./RemoteBrowserModal";
+import { PromotionsPanel } from "./PromotionsPanel";
 import { SkillsPanel } from "./SkillsPanel";
 import { Button, cn, Field, IconButton, schedLabel, Select, SYNC_OPTIONS, TextArea, TextInput } from "./ui";
 
@@ -34,6 +35,7 @@ const REPOS_KEYS = ["auto_agents_md"];
 const CHAT_KEYS = [
   "compress_after_est_tokens", "keep_recent_messages",
   "tool_result_max_chars", "live_tool_result_max_chars", "learn_from_conversations",
+  "timezone",
 ];
 const EMBEDDING_KEYS = ["provider", "model", "instruct"];
 
@@ -139,6 +141,12 @@ export function SettingsDrawer({
             <SkillsPanel isAdmin={auth.role === "admin"} signedOut={auth.enabled && !auth.user}
                          onFlash={flash} />
           </Section>
+
+          {(auth.role === "admin" || auth.role === "editor") && (
+            <Section title="Offered to the organisation">
+              <PromotionsPanel canReview onFlash={flash} onChanged={onChanged} />
+            </Section>
+          )}
 
           {auth.role === "admin" && (
             <Section title="Danger zone">
@@ -958,6 +966,22 @@ function WorkspaceSettings({
           label="Distill durable facts from chats into memory"
           note={note("chat.learn_from_conversations")}
         />
+        {/* The calendar days "last Friday" / "this weekend" resolve to are days in THIS
+            zone. Left at UTC for a non-UTC team, every day-shaped window is shifted by
+            the local offset — hours trimmed off each end, silently. */}
+        <Field label="Time zone" note={note("chat.timezone")}>
+          <TextInput
+            value={s.chat.timezone ?? "UTC"}
+            placeholder="UTC"
+            onChange={(e) => set("chat.timezone", e.target.value.trim() || "UTC")}
+          />
+        </Field>
+        <p className="text-[11px] leading-relaxed text-muted">
+          IANA name (e.g. <span className="font-mono">America/Chicago</span>). Dates the
+          assistant works out from words — “last Friday”, “this weekend” — are calendar
+          days in this zone, converted to UTC for the query. An unknown zone falls back to
+          UTC and says so.
+        </p>
       </Group>
 
       <Group title="Embedding (advanced)" locked={locked} changed={changed("embedding", EMBEDDING_KEYS)}>
