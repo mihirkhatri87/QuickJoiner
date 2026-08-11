@@ -28,6 +28,9 @@ export interface SimNode {
   id: string;
   name: string;
   type: string;
+  /** Deterministic architectural layer of the defining file, or '' / undefined when the
+   * path stated nothing (the majority — see quickjoiner/ingest/layers.py). */
+  layer?: string;
   /** Live layout position — mutated in place by d3 every tick. */
   x: number;
   y: number;
@@ -85,6 +88,7 @@ export class GraphLayout {
       if (prev) {
         prev.name = n.name;
         prev.type = n.type;
+        prev.layer = n.layer;
         prev.degree = 0;
         nodes.push(prev);
         nextById.set(n.id, prev);

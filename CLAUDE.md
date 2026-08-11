@@ -578,7 +578,52 @@ Previously BOTH source copies preceded the install layer, so every edit re-downl
   carries the provenance/structure it was chunked away from. **Structural graph extraction at ingest**
   (in `_sync_graph`): `code_graph.py` emits `repo --defines--> symbol` / `repo --imports--> module`
   edges per code file (regex per language: py/js-ts/java-kotlin/c#/go; call graphs are out of scope —
-  need tree-sitter); **`pubsub.py` (2026-07-17) emits runtime-coupling edges deterministically** —
+  need tree-sitter);
+  **`layers.py` — the deterministic architectural layer of a code entity (2026-08-10,
+  AI_ROADMAP #29).** `classify_layer(path)` reads the role a file's own path states —
+  `api | service | data | ui | utility | infra | test | vendor` — and returns **None** when
+  it states nothing, which is the honest majority case. Never LLM-derived (I3), so it works
+  keyless and offline and is identical on every machine. Rides the entity tuple as an
+  optional **4th element** from `code_graph` (other extractors' 3-tuples are untouched;
+  `_persist_graph` unpacks by slice), stored on `entities.layer` and resolved by
+  **precedence, not last-writer-wins** — a production layer beats `test` beats `vendor`, so
+  a symbol defined in both `CustomerService.cs` and `CustomerServiceTests.cs` stays a
+  service symbol regardless of which document a sync reaches first. Classified from the
+  FULL uri, not the `defines` edge's `detail`, which `_short_path` truncates to 80 chars.
+  **The taxonomy is a superset of the roadmap's because the corpus demanded it, and this is
+  the part worth remembering.** Measured on the live 15,469 `defines` paths *before* writing
+  any rules: the roadmap's first-named signal (directories like `/controllers`,
+  `/repositories`) tags **3.3%** — this codebase is organised by DOMAIN (customeraccounts,
+  sales, pricing, quotes), which is normal for enterprise .NET and fatal to a directory-only
+  rule. Filenames are 4× better (13.1%), and even combined the six layers the roadmap names
+  reach only **10.4%** of production files — an attribute that sparse cannot make a graph
+  "read as an architecture". The two dominant categories are ones it never mentions: **test
+  scaffolding is 33.7%** of defining files and **vendored code 16.0%** (one
+  `jquery-1.4.4.js` contributing symbols like `doscrollcheck` as first-class org entities).
+  With `test` and `vendor` added, coverage is **59.9% of defining paths / 54.8% of symbol
+  entities** — a different feature from the one specified, serving the same three payoffs.
+  **Ambiguous words are left untagged on purpose**: `handler` is an HTTP handler in one
+  codebase and a CQRS command handler in the next, `model` is domain/persistence/view
+  depending on the shop, and `event`/`command`/`request`/`response`/`dto` are message
+  shapes rather than layers. A wrong layer is invisible once stored; untagged is honest.
+  `view`/`page`/`screen` survive only as DIRECTORY signals after `Model/Page.cs` — an
+  OpenAPI pagination model — was mislabelled `ui` in validation. `is_vendored` matches whole
+  path SEGMENTS and library filenames, never a substring, because the corpus contains
+  `GetOrderByVendorCodeResponseServiceModel.cs`, an org file about a *vendor code* business
+  concept. ⚠ **Two defects were caught only by scoring against the real corpus, not by unit
+  tests**: `_segments` lowercased every segment, so the CamelCase regex that reads the
+  trailing role word matched nothing on multi-word names and collapsed test detection from
+  31.9% to **0.5%** (short fixture names survived it); and .NET names test PROJECTS rather
+  than folders (`AppRiver.Nautical.Domain.Tests`), which exact segment matching missed
+  entirely — `_is_test_dir` now checks dot-separated parts. Surfaces: `entities.layer`
+  (migration, both backends), `src_layer`/`dst_layer` on `_EDGE_SELECT` and the graph
+  snapshot's nodes, and a **Tests & vendor** toggle in GraphView that states how many nodes
+  it hides rather than quietly shrinking the graph (opt-in; nothing hidden by default).
+  `GRAPH_EXTRACTOR_VERSION` 5→**6** carries it onto already-ingested code with no re-embed.
+  Tests: `tests/test_layers.py` (13). NB an imported `module` entity gets NO layer — that
+  would be a property of the module's own source, and taking the importer's path would tag
+  every library with its consumer's layer;
+  **`pubsub.py` (2026-07-17) emits runtime-coupling edges deterministically** —
   `repo --publishes_to/subscribes_to--> topic` and `repo --stores_in--> datastore` — from per-language
   Service Bus SDK patterns (C# incl. Functions bindings/`[return: ServiceBus]`/legacy clients; Python
   `get_*_sender/receiver`; JS/TS `createSender/createReceiver`; Java builder chains matched within one
@@ -3933,6 +3978,36 @@ Post-phase additions (2026-07-07, all tested — suite: **89 passed**):
   **1049 passed** (+2), 16 skipped.
   Not verified: any agent-layer effect — that needs `--agent` runs with real LLM spend, and
   the agent numbers in the S-track baseline are unchanged since 2026-07-31.
+- Architectural-layer classification — AI_ROADMAP **#29**, the classifier half (2026-08-10,
+  `docs/PRIORITIES.md` #4). Design in the `ingest/layers.py` note above.
+  **The measurement changed the feature, which is the part worth carrying forward.** Scoring
+  the roadmap's own proposed signals against 15,469 real defining paths BEFORE writing any
+  rules showed its first-named signal (layer-named directories) tags **3.3%**, and its full
+  six-layer taxonomy **10.4%** of production files — because this corpus, like most
+  enterprise .NET, is organised by domain (customeraccounts, sales, pricing, quotes) rather
+  than by layer. Shipping it as specified would have produced an attribute too sparse to do
+  any of the three jobs it was ranked for. The corpus instead named its own dominant
+  categories — test scaffolding **33.7%**, vendored code **16.0%** — and adding those takes
+  coverage to **59.9%** of defining paths / 54.8% of symbol entities. Had the vocabulary been
+  written from taste, it would have been wrong in a way no test would have shown.
+  ⚠ **Two defects survived a green unit suite and died on the real corpus**, which is the
+  lesson: `_segments` lowercased before `_tail_word` read CamelCase, so multi-word names
+  (`SubscriptionInfoDenormalizerTests`) yielded nothing and test detection silently fell to
+  **0.5%** — every fixture name in the tests was short enough to survive it; and .NET names
+  test PROJECTS not folders, which exact segment matching missed. A third was caught by a
+  test I had written badly rather than by the code: the "ambiguous words stay untagged" case
+  wrapped its fixtures in `src/Domain/`, which legitimately IS a layer directory, so the
+  classifier was right and the test was wrong.
+  Also corrected in flight: my own vendor probe matched "vendor" as a substring and claimed
+  `GetOrderByVendorCodeResponseServiceModel.cs` — an org file about a *vendor code* business
+  concept — as third-party, which is why `is_vendored` matches whole path segments only.
+  Suite: **1062 passed** (+13), 16 skipped; frontend typechecked and rebuilt.
+  Not verified: the layer on the live graph — `entities.layer` is written at ingest, so the
+  real corpus shows it only after a sync re-provides its code documents (the
+  `GRAPH_EXTRACTOR_VERSION` 5→6 bump makes that an ordinary sync, not a clean re-sync). The
+  coverage figures above are from running the shipped classifier over the paths already
+  stored on those edges, not from a populated column. Payoffs (b) the guided-tour spine and
+  (c) layer as a retrieval signal are untouched and tracked as AI_ROADMAP #29a.
 
 ## Next steps (agreed with user)
 

@@ -6,13 +6,23 @@ non-coverage dimensions that actually catch bugs (property, parity, mutation, E2
 
 ## 1. Current state (measured honestly)
 
-- **Backend**: **1049 tests green** (2026-08-10; local + a pg parity suite, env-gated, that runs
+- **Backend**: **1062 tests green** (2026-08-10; local + a pg parity suite, env-gated, that runs
   against Docker), but coverage is *unmeasured* — no `pytest-cov` gate. Strong areas: connectors'
   pure converters, retrieval, graph, API contracts, sessions, evals (incl. threshold calibration +
   report comparison), alias query expansion, skills (written as leak tests), and relative-date
   resolution (`test_dates.py` — these pin the *conventions*, not just the parsing, because the
   failure they exist to stop is a plausible-looking window off by a day or a week that returns
   real rows from the wrong period). Known thin areas listed in §3.
+- **A rule table is only as good as the corpus it was scored against** (added 2026-08-10 with
+  the architectural-layer classifier). Two defects in `ingest/layers.py` passed a green unit
+  suite and were caught only by scoring the classifier over 15,469 real paths: `_segments`
+  lowercased every segment, so the CamelCase regex reading a filename's trailing role word
+  matched nothing on any multi-word name — collapsing test detection from a measured 31.9% to
+  **0.5%** while short fixture names like `Repository.cs` sailed through; and .NET names test
+  PROJECTS rather than folders (`AppRiver.Nautical.Domain.Tests`), which exact segment matching
+  missed entirely. Both are now regression-tested, but the transferable lesson is that a
+  classifier's tests should include names as ugly as the ones it will meet, and that coverage
+  against real data is a different measurement from correctness against fixtures.
 - **Tuned defaults are pinned by their mechanism, not their value** (added 2026-08-10 with the
   S4 rerank-depth retune). Asserting `rerank_candidates == 16` would restate the constant and
   catch nothing; the tests instead pin *why* the number has a floor — that a candidate the

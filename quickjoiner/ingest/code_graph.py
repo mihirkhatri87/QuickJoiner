@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import re
 
+from quickjoiner.ingest.layers import classify_layer
+
 # Cap symbols/imports per file so a generated or vendored megafile can't explode
 # the graph. Real source files sit well under this.
 _MAX = 80
@@ -158,11 +160,19 @@ def extract_code_graph(text: str, uri: str, repo_id: str) -> tuple[list[tuple], 
         return [], []
 
     path = _short_path(uri)
+    # Classified from the FULL uri, not `path`: `_short_path` keeps only the last 80
+    # characters for the edge detail, which is fine as evidence a human reads but can
+    # chop a leading directory the layer rules would have matched.
+    layer = classify_layer(uri) or ""
     entities: list[tuple] = []
     edges: list[tuple] = []
     for name in defines:
         sid = f"symbol:{name.lower()}"
-        entities.append((sid, name, "symbol"))
+        # 4-tuple: the layer is a property of where this symbol is DEFINED, so only
+        # `defines` carries it. An imported module's layer would be a property of the
+        # module's own source, which this file cannot see — guessing it from the
+        # importer's path would tag every library with its consumer's layer.
+        entities.append((sid, name, "symbol", layer))
         edges.append((repo_id, "defines", sid, f"in {path}"))
     for mod in imports:
         mid = f"module:{mod.lower()}"

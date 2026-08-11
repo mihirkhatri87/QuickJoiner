@@ -106,6 +106,19 @@ How each works is documented in `CLAUDE.md` — the source of truth for current 
   tuned to. Also measured and rejected as levers: ONNX thread count (the default already beats
   every explicit setting) and batching (already one forward pass per depth). Details in
   CLAUDE.md's `memory/` retrieval bullet; the remaining levers are S4a above.
+- **#29 (classifier) Architectural-layer classification** — `ingest/layers.py`,
+  `entities.layer` (2026-08-10). Deterministic, never LLM: `classify_layer(path)` reads the
+  role a file's own path states and returns None when it states nothing. **Measured before
+  it was written, which changed the taxonomy**: the directory signal this item named first
+  tags 3.3% of real files (the corpus is organised by domain, not layer), and the six layers
+  it specified reach only 10.4% of production files — too sparse to make a graph read as an
+  architecture. The two dominant categories were unnamed by the item: test scaffolding
+  (33.7% of defining files) and vendored code (16.0%). Shipping those as first-class layers
+  takes coverage to **59.9% of defining paths / 54.8% of symbol entities**, and separating
+  noise from production code is what actually makes the view legible. Ambiguous role words
+  (`handler`, `model`, `event`, `dto`) are deliberately left untagged. Full design, the two
+  defects that only corpus validation caught, and the honesty rules are in CLAUDE.md's
+  `ingest/` bullet. Payoffs (b) and (c) remain open as #29a above.
 - **#31 Skip server error pages during a crawl** — `scraper.looks_like_error_page`
   (2026-08-04). Framework boilerplate markers AND brevity, so a genuine page *about* errors
   is not dropped; the crawl still follows a failed page's links (the page failed, the site
@@ -184,20 +197,16 @@ How each works is documented in `CLAUDE.md` — the source of truth for current 
     live graph literally contains `#{azureusername}` placeholders today). Same conservative
     direction rules; per-environment variable scoping can carry the environment entity as
     detail. Extension of the same mechanism: Terraform state/vars, k8s ConfigMaps.
-29. **Architectural-layer classification** — *adopt* (validated by **Understand-Anything**,
-    which auto-groups nodes into API/Service/Data/UI/Utility). A deterministic pass tags each
-    repo/module/symbol entity with an architectural **layer** (API / Service / Data / UI /
-    Utility / Infra) from cheap, evidence-bearing signals — path segments (`/api`,
-    `/controllers`, `/services`, `/repositories`, `/components`), filename conventions, and
-    import direction from the existing `imports`/dependency-map edges — stored as an entity
-    attribute, **never inferred by the LLM** (I3, keyless/offline). Pays off three ways:
-    (a) GraphView groups/colors by layer so a dense multi-repo graph reads as an architecture,
-    not a node soup (FE surface: FRONTEND_ROADMAP F1); (b) it gives the guided tour (#28) its
-    **cross-repo spine** — order and cluster the walkthrough by layer, not just per-repo
-    dependency depth (the user's note that layer classification helps resolve cross-repo
-    relationships); (c) layer becomes a retrieval/answer signal ("where does auth live" →
-    Service-layer entities first). Gate: extractor unit tests + no `qj eval --compare`
-    regression (attribute-only, doesn't touch the gate).
+29a. **Layer as a retrieval and tour signal** — *adopt; the classifier itself shipped
+    2026-08-10 (see the Shipped ledger), payoff (a) with it*. `entities.layer` now exists and
+    covers 54.8% of symbol entities on the live corpus, but only the GraphView noise filter
+    consumes it. Remaining: (b) order and cluster the guided tour (#28) by layer to give it a
+    **cross-repo spine**, and (c) make layer a retrieval/answer signal ("where does auth
+    live" → service-layer entities first), which must ship with `qj eval --compare` showing
+    no regression. Also open: extending coverage past the ~60% of files whose path states a
+    role — import-direction inference from the existing `imports` edges is the roadmap's
+    original third signal and remains unbuilt, deliberately, because it infers rather than
+    reads (a module imported by an API file is not thereby an API module).
 
 ### Tier 2 — strong, moderate effort
 6. **Query decomposition / multi-query** — *adopt*. LLM splits compound questions;

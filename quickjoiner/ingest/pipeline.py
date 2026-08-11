@@ -129,7 +129,11 @@ class IngestStats:
 # (`documents.graph_json`). Nothing about the EDGES changes here; the bump exists so an
 # ordinary sync backfills that payload onto already-ingested documents without re-embedding,
 # which is what lets `regraph` later rebuild them faithfully instead of text-only.
-GRAPH_EXTRACTOR_VERSION = 5
+# v6 (2026-08-10) = deterministic architectural layer on symbol entities
+# (`ingest/layers.py`, AI_ROADMAP #29). Again no EDGE changes — the bump exists so an
+# ordinary sync backfills the layer onto already-ingested code documents with no re-embed,
+# the same carry mechanism v5 used for the graph payload.
+GRAPH_EXTRACTOR_VERSION = 6
 
 
 @dataclass
@@ -768,7 +772,12 @@ class IngestPipeline:
         context = f'mentioned in "{doc_title}" ({doc_kind})' if doc_title else ""
         private = self._is_private_evidence(source_id)
         id_map: dict[str, str] = {}
-        for eid, name, type_ in entities:
+        for ent in entities:
+            # Extractors emit (id, name, type); code_graph adds an optional 4th element,
+            # the architectural layer of the defining file. Unpacked by slice rather than
+            # by arity so the other extractors' 3-tuples keep working untouched.
+            eid, name, type_ = ent[0], ent[1], ent[2]
+            layer = ent[3] if len(ent) > 3 else None
             canonical, merged = (
                 self._entity_resolver.resolve(eid, name, type_, context)
                 if self._entity_resolver and not private else (eid, False)
@@ -776,7 +785,7 @@ class IngestPipeline:
             id_map[eid] = canonical
             if not merged:
                 self._catalog.upsert_entity(canonical, name, type_, source_id,
-                                            allow_rename=not private)
+                                            allow_rename=not private, layer=layer)
         for alias, eid in alias_rows:
             target = id_map.get(eid, eid)
             if private and not self._minted_by(target, source_id):

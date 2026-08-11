@@ -317,6 +317,11 @@ export interface GraphNode {
   id: string;
   name: string;
   type: string; // repo | package | project | ticket | service | environment | source
+  /** Deterministic architectural layer of the file this code entity is defined in —
+   * api | service | data | ui | utility | infra | test | vendor. Empty for most nodes,
+   * which is the honest answer: it is set only where a defining path stated a role, and
+   * never guessed (see quickjoiner/ingest/layers.py). */
+  layer?: string;
 }
 export interface GraphEdge {
   src: string;

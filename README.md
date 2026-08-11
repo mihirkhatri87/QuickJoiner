@@ -702,6 +702,13 @@ is a lookup rather than a bet on vector ranking:
   (`/TeamDetails?team=Payments`) become edges, and a person row's **email becomes an alias**, so
   the same human known as `a.lee@corp.com` in one system and "Ann Lee" in another is one node.
   Works on any source whose text carries a table — scraped pages, Confluence, markdown, Office.
+- **Architectural layer**, read from each defining file's own path — `api`, `service`, `data`,
+  `ui`, `utility`, `infra`, plus `test` and `vendor`. Deterministic, never LLM-derived, and
+  **blank whenever the path says nothing**, which is most files: a wrong layer is invisible once
+  stored, so ambiguous role words (`handler`, `model`, `dto`) are left untagged rather than
+  guessed. The immediate payoff is legibility — on a real .NET corpus a third of the code graph
+  is test scaffolding and a sixth is vendored jQuery, so the graph view offers a **Tests &
+  vendor** toggle that says how many nodes it is hiding instead of quietly shrinking the picture.
 - **Graph-expansion retrieval** (on by default): once an answer is grounded, QuickJoiner walks one
   hop out in the graph to surface linked evidence the vector search missed (a ticket → the repo that
   references it → the deploy that shipped it). It never changes the grounded-vs-refuse decision.

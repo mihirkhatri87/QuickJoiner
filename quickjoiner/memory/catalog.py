@@ -172,6 +172,12 @@ _MIGRATION_STATEMENTS = [
     # predate this column drain with only what their stored text still yields — stated
     # plainly in the drain's log rather than passed off as a complete rebuild.
     "ALTER TABLE graph_pending ADD COLUMN graph_json TEXT NOT NULL DEFAULT ''",
+    # Deterministic architectural layer for a code entity (2026-08-10, AI_ROADMAP #29) —
+    # api/service/data/ui/utility/infra plus test and vendor, derived from the defining
+    # file's own path by ingest/layers.py, never by an LLM. '' means the path said
+    # nothing, which is the honest majority case; see that module for why the ambiguous
+    # role words are deliberately left untagged.
+    "ALTER TABLE entities ADD COLUMN layer TEXT NOT NULL DEFAULT ''",
     # The connector's OWN structural graph claims for a document (2026-08-06), kept so the
     # graph can be rebuilt from stored state without a connector round-trip. These edges —
     # ADO dev-links and work-item hierarchy, GitLab MR/branch joins, Jira issue links,
@@ -1032,8 +1038,16 @@ class _SqlCatalog:
 
     # -- knowledge graph --------------------------------------------------------
     def upsert_entity(self, entity_id: str, name: str, type_: str, source_id: str = "",
-                      allow_rename: bool = True) -> None:
+                      allow_rename: bool = True, layer: str | None = None) -> None:
         """Insert or update an entity, protecting a well-cased display name.
+
+        `layer` is the deterministic architectural tag from `ingest/layers.py` ('' when
+        the evidence says nothing, which is the common case). It is resolved in the same
+        statement as the name, by PRECEDENCE rather than last-writer-wins: a production
+        layer beats `test` beats `vendor`, and nothing beats a value with ''. A symbol
+        defined in both `CustomerService.cs` and `CustomerServiceTests.cs` is a service
+        symbol that also happens to be tested — the mirror in the test project should not
+        relabel it, and which document a sync happens to reach first must not decide it.
 
         `allow_rename=False` makes this insert-only: an existing node is left exactly as
         it is and only its absence creates one. That is how evidence from a **private**
@@ -1063,21 +1077,32 @@ class _SqlCatalog:
         than worked around — doing so would mean a custom collation on both engines."""
         if not allow_rename:
             self._write(
-                "INSERT INTO entities (id, name, type, source_id) VALUES (?, ?, ?, ?) "
-                "ON CONFLICT(id) DO NOTHING",
-                (entity_id, name, type_, source_id),
+                "INSERT INTO entities (id, name, type, source_id, layer) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
+                (entity_id, name, type_, source_id, layer or ""),
             )
             return
         self._write(
-            """INSERT INTO entities (id, name, type, source_id) VALUES (?, ?, ?, ?)
+            """INSERT INTO entities (id, name, type, source_id, layer)
+               VALUES (?, ?, ?, ?, ?)
                ON CONFLICT(id) DO UPDATE SET
                  name = CASE
                           WHEN lower(entities.name) <> lower(excluded.name) THEN excluded.name
                           WHEN entities.name <> lower(entities.name) THEN entities.name
                           ELSE excluded.name
                         END,
-                 type = excluded.type""",
-            (entity_id, name, type_, source_id),
+                 type = excluded.type,
+                 layer = CASE
+                           WHEN excluded.layer = '' THEN entities.layer
+                           WHEN entities.layer = '' THEN excluded.layer
+                           WHEN entities.layer IN ('test', 'vendor')
+                                AND excluded.layer NOT IN ('test', 'vendor')
+                             THEN excluded.layer
+                           WHEN entities.layer = 'vendor' AND excluded.layer = 'test'
+                             THEN excluded.layer
+                           ELSE entities.layer
+                         END""",
+            (entity_id, name, type_, source_id, layer or ""),
         )
 
     def get_entity(self, entity_id: str) -> dict | None:
@@ -1204,8 +1229,8 @@ class _SqlCatalog:
         )
 
     _EDGE_SELECT = """SELECT g.src, g.rel, g.dst, g.detail, g.evidence_doc_id,
-                             s.name AS src_name, s.type AS src_type,
-                             t.name AS dst_name, t.type AS dst_type,
+                             s.name AS src_name, s.type AS src_type, s.layer AS src_layer,
+                             t.name AS dst_name, t.type AS dst_type, t.layer AS dst_layer,
                              d.title AS evidence_title, d.uri AS evidence_uri,
                              d.kind AS evidence_kind, d.source_id AS evidence_source_id
                       FROM edges g
@@ -1533,12 +1558,12 @@ class _SqlCatalog:
             ph = ",".join("?" for _ in core)
             rows = self._read_all(
                 f"""SELECT src, rel, dst, detail, evidence_doc_id,
-                           src_name, src_type, dst_name, dst_type,
+                           src_name, src_type, src_layer, dst_name, dst_type, dst_layer,
                            evidence_title, evidence_uri, evidence_kind
                     FROM (
                         SELECT g.src, g.rel, g.dst, g.detail, g.evidence_doc_id,
-                               s.name AS src_name, s.type AS src_type,
-                               t.name AS dst_name, t.type AS dst_type,
+                               s.name AS src_name, s.type AS src_type, s.layer AS src_layer,
+                               t.name AS dst_name, t.type AS dst_type, t.layer AS dst_layer,
                                d.title AS evidence_title, d.uri AS evidence_uri,
                                d.kind AS evidence_kind,
                                ROW_NUMBER() OVER (
@@ -1568,10 +1593,14 @@ class _SqlCatalog:
         nodes: dict[str, dict] = {}
         edges = []
         for r in rows:
+            # `layer` is '' for most nodes and that is reported as-is, never guessed: it
+            # is only ever set where a defining file's own path stated a role.
             nodes.setdefault(r["src"], {"id": r["src"], "name": r["src_name"] or r["src"],
-                                        "type": r["src_type"] or "unknown"})
+                                        "type": r["src_type"] or "unknown",
+                                        "layer": r.get("src_layer") or ""})
             nodes.setdefault(r["dst"], {"id": r["dst"], "name": r["dst_name"] or r["dst"],
-                                        "type": r["dst_type"] or "unknown"})
+                                        "type": r["dst_type"] or "unknown",
+                                        "layer": r.get("dst_layer") or ""})
             edges.append({
                 "src": r["src"], "rel": r["rel"], "dst": r["dst"], "detail": r["detail"],
                 "evidence": {"doc_id": r["evidence_doc_id"], "title": r["evidence_title"],

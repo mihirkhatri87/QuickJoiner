@@ -14,7 +14,9 @@ def _extract(text, uri):
 
 
 def _names(entities, type_):
-    return {name for _id, name, t in entities if t == type_}
+    # Sliced, not unpacked: a symbol entity carries a 4th element (its architectural
+    # layer, ingest/layers.py) while module entities stay 3-tuples.
+    return {e[1] for e in entities if e[2] == type_}
 
 
 # ---------------------------------------------------------------- detection
