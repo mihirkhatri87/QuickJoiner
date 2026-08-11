@@ -149,7 +149,27 @@ class RetrievalConfig(BaseModel):
     # (needs network once, then cached; failures degrade gracefully to RRF order).
     reranker: str = "fastembed"  # fastembed | none
     reranker_model: str | None = None  # None -> Xenova/ms-marco-MiniLM-L-6-v2
-    rerank_candidates: int = 24  # how many fused candidates the reranker scores
+    # How many fused candidates the cross-encoder scores. This is a RECALL knob before
+    # it is a cost dial: a candidate the fused order buried below this depth is never
+    # shown to the model at all, so no amount of relevance can bring it back.
+    # Cut 24 -> 16 on measured evidence (S4, 2026-08-10, live 57,659-chunk corpus, the
+    # 32-case eval set, every depth simulated from one scoring pass and verified to
+    # reproduce store.search exactly on 32/32 queries):
+    #   depth 0  recall 0.900  mrr 0.775   <- reranking off
+    #   depth 4-10 recall 0.900 mrr 0.900
+    #   depth 12 recall 0.950  mrr 0.950   <- everything above here is flat
+    #   depth 16/20/24/32 recall 0.950 mrr 0.925
+    # Quality is flat from 12 to 32, so the shipped 24 was doing twice the necessary
+    # work. 16 rather than the measured-best 12 is deliberate margin: 12 is exactly
+    # where a real expected source sat (connector-nautical-pubsub, fused rank 12 — the
+    # deepest in the set), and a default parked on a measured cliff turns into lost
+    # recall on the next corpus, whereas being too deep only costs latency. Same
+    # max-margin reasoning as the min_score retune above.
+    # Per-candidate cost is linear in the candidate's LENGTH as well as in depth
+    # (measured: 4.3ms at 185 chars, 30.3ms at 1394, 69.3ms at 2789), so a length cap
+    # is a second lever — left unshipped because its measured effect flipped sign with
+    # depth on a 20-answerable-case set, which is too thin to tell that from noise.
+    rerank_candidates: int = 16
     # Graph-expansion retrieval: after grounded hits are found, surface documents
     # linked to them through the knowledge graph (1 hop) that the vector search
     # missed — the multi-hop / cross-source correlation channel. It NEVER changes the
@@ -284,11 +304,12 @@ SUPERSEDED_DEFAULTS: dict[str, tuple] = {
     "retrieval.min_score": (0.55,),      # -> 0.64 (plan 05 retune, 2026-07-29)
     "retrieval.reranker": ("none",),     # -> "fastembed" (cross-encoder on by default)
     "graph.triple_workers": (4,),        # -> 16 (measured p50 ~18s/call)
+    "retrieval.rerank_candidates": (24,),  # -> 16 (S4 depth retune, 2026-08-10)
 }
 
 # Bumped whenever SUPERSEDED_DEFAULTS gains an entry, so the reconciliation runs again
 # for a workspace that has not re-saved (and thus not sparsified) since the last one.
-DEFAULTS_EPOCH = 1
+DEFAULTS_EPOCH = 2
 
 
 def _is_same_value(value: object, candidate: object) -> bool:

@@ -91,6 +91,21 @@ How each works is documented in `CLAUDE.md` — the source of truth for current 
   and excluding them would systematically drop the long crawls whose throughput matters
   most — so `SyncManager` now records `ingested` on those paths too. A window with no
   finished run reports that, never a zero.
+- **S4 (depth half) — reranker right-sizing** — `retrieval.rerank_candidates` 24 → 16
+  (2026-08-10). Measured, not tuned: cross-encoder scores are independent per candidate, so
+  the entire depth curve was simulated from ONE scoring pass over the live 57,659-chunk
+  corpus's fused pools, after proving the reconstruction reproduces `store.search` exactly on
+  32/32 eval queries. Quality is **flat from depth 12 to 32** (recall 0.950 / MRR 0.925 at 16,
+  20, 24 and 32); the only structural feature is a cliff below 12, and it is one named case
+  whose expected source sits at fused rank 12. 16 rather than the measured-best 12 is
+  deliberate margin — too shallow costs recall, too deep costs only latency. Result on the
+  live workspace: query p50 **1977 → 1401 ms (−29%)**, p95 −21%, with recall, grounded recall,
+  MRR and hop coverage all unchanged. `qj eval --compare` does flag `refusal_accuracy`
+  0.25 → 0.167: a single case that is correct at exactly depth 24 and wrong at 8, 10, 12, 16,
+  20 **and** 32 — non-monotone, therefore not a property of depth, and recorded rather than
+  tuned to. Also measured and rejected as levers: ONNX thread count (the default already beats
+  every explicit setting) and batching (already one forward pass per depth). Details in
+  CLAUDE.md's `memory/` retrieval bullet; the remaining levers are S4a above.
 - **#31 Skip server error pages during a crawl** — `scraper.looks_like_error_page`
   (2026-08-04). Framework boilerplate markers AND brevity, so a genuine page *about* errors
   is not dropped; the crawl still follows a failed page's links (the page failed, the site
@@ -314,11 +329,13 @@ How each works is documented in `CLAUDE.md` — the source of truth for current 
 **S1 shipped 2026-07-31** (`qj bench` — see the Shipped ledger and CLAUDE.md's
 `bench/harness.py` bullet). Its rule now applies to everything below: no speed work merges
 without a before/after `qj bench --compare` table, exactly as no quality work merges without
-`qj eval --compare`. **Baseline on the live 56,519-chunk workspace** (32 queries × 3, after
-the alias-expansion index fix S1 itself surfaced): retrieval **p50 2186ms / p95 2834ms**, of
-which rerank 83%, sparse 4%, graph expansion 4%, dense 2%; embedder 112 chunks/sec;
-agent layer (gpt-oss-120b via litellm) first token 22.3s, full answer 32.7s, 22.4k
-tokens/answer over 3 rounds, **0 cache reads**. Beat those numbers or explain why not.
+`qj eval --compare`. **Baseline on the live 57,659-chunk workspace** (32 queries × 3, after
+S4's depth retune — the previous baseline was p50 1977ms / p95 2564ms at
+`rerank_candidates=24`): retrieval **p50 1401ms / p95 2029ms**, of which rerank 76%, sparse 7%,
+graph expansion 4%, dense 4%; embedder 117 chunks/sec; ingest 9.3 docs/min read from real run
+history; agent layer (gpt-oss-120b via litellm) first token 22.3s, full answer 32.7s, 22.4k
+tokens/answer over 3 rounds, **0 cache reads** (agent numbers unchanged since 2026-07-31 — no
+agent-layer run has been made since). Beat those numbers or explain why not.
 
 - **S2 — ANN & vector economy at scale** — *adopt*. IVF tuning past `ann_min_rows`,
   scalar/binary quantization for large corpora, measured on S1 **and** the eval pack
@@ -328,15 +345,18 @@ tokens/answer over 3 rounds, **0 cache reads**. Beat those numbers or explain wh
   independent tool calls within one agent round concurrently; embed batches during sync
   pipelined with upserts. The agent loop is round-sequential today; multi-tool rounds are
   the cheap win.
-- **S4 — Reranker right-sizing** — *adopt; now the single biggest speed lever, with numbers*.
-  S1 measured the cross-encoder at **~77ms per candidate** on the live corpus (~420-token
-  chunks), scaling linearly — 4→293ms, 12→879ms, 24→1843ms — so the shipped
-  `rerank_candidates=24` is **83% of a 2.2s query**. The open question is what that depth
-  buys: auto-tune it from measured marginal gain (S1 × eval, so a depth cut must show zero
-  recall loss on the eval set before it ships), evaluate smaller/quantized CE models, and
-  consider early-exit when the fused head order is already stable. Deliberately NOT changed
-  blind — the reranker is a *quality* knob, and trading recall for latency without the eval
-  half of the measurement is exactly the mistake this track exists to prevent.
+- **S4a — Smaller/quantized cross-encoder, and early exit** — *adopt; the remainder of S4
+  after the depth half shipped 2026-08-10 (see the Shipped ledger)*. Depth is settled: quality
+  is flat from 12 to 32, the default is now 16, and rerank is **76% of a 1.4s query** rather
+  than 83% of a 2.0s one. What is left is the per-candidate cost itself, which measurement
+  showed is linear in candidate **length** as well as count (4.3ms at 185 chars → 69.3ms at
+  2789), and that **18% of live chunks already exceed the model's 512-token cap** and are
+  silently truncated by the tokenizer. Three untried levers: a deliberate length cap (measured
+  promising but its sign flipped with depth on a 20-answerable-case set — needs a bigger eval
+  set to separate from noise, so it is gated behind #18/X1 synthetic eval generation), a
+  smaller or quantized CE (`jina-reranker-v1-tiny-en`, INT8 ONNX), and early exit when the
+  fused head order is already stable. Same gate as before: no change ships without
+  `qj eval --compare` showing zero recall loss.
 - **S5 — Prompt-cache-aware context assembly** — *adapt; partially shipped 2026-07-18*.
   SHIPPED (documented in CLAUDE.md `llm/` bullet): explicit Anthropic `cache_control`
   breakpoints (system block caches tools+system; moving message breakpoint + intermediate

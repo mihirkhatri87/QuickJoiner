@@ -6,13 +6,20 @@ non-coverage dimensions that actually catch bugs (property, parity, mutation, E2
 
 ## 1. Current state (measured honestly)
 
-- **Backend**: **1029 tests green** (2026-08-10; local + a pg parity suite, env-gated, that runs
+- **Backend**: **1049 tests green** (2026-08-10; local + a pg parity suite, env-gated, that runs
   against Docker), but coverage is *unmeasured* — no `pytest-cov` gate. Strong areas: connectors'
   pure converters, retrieval, graph, API contracts, sessions, evals (incl. threshold calibration +
   report comparison), alias query expansion, skills (written as leak tests), and relative-date
   resolution (`test_dates.py` — these pin the *conventions*, not just the parsing, because the
   failure they exist to stop is a plausible-looking window off by a day or a week that returns
   real rows from the wrong period). Known thin areas listed in §3.
+- **Tuned defaults are pinned by their mechanism, not their value** (added 2026-08-10 with the
+  S4 rerank-depth retune). Asserting `rerank_candidates == 16` would restate the constant and
+  catch nothing; the tests instead pin *why* the number has a floor — that a candidate the
+  fused order buried below the depth is never scored by the cross-encoder and so can never be
+  promoted, which is what makes it a recall knob rather than a cost dial — plus a guard that
+  the default stays above the measured floor of 12. A future cut then has to bring its own
+  measurement rather than merely update an expectation.
 - **Standing lesson, re-earned 2026-08-10**: a green suite proves a feature does what it says,
   never that what it says is worth saying. Two HIGH defects in the skills feature — a skill whose
   frontmatter name differed from its folder was undeletable from *every* layer, and

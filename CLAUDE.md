@@ -274,8 +274,9 @@ Previously BOTH source copies preceded the install layer, so every edit re-downl
   A blob written by the old code has everything materialized, so "never set" and "deliberately
   set" cannot be told apart in it — **except** for a value that equals a default this repo has
   since superseded. `config.SUPERSEDED_DEFAULTS` (pure `reconcile_superseded_defaults`) lists
-  those three (`retrieval.min_score` 0.55, `retrieval.reranker` "none", `graph.triple_workers` 4
-  — the only defaults ever changed, confirmed against git history, not memory) and
+  those four (`retrieval.min_score` 0.55, `retrieval.reranker` "none", `graph.triple_workers` 4,
+  `retrieval.rerank_candidates` 24 — the only defaults ever changed, confirmed against git
+  history, not memory) and
   `_adopt_shipped_defaults` prunes them ONCE per workspace, guarded by a `config_defaults_epoch`
   settings row against `config.DEFAULTS_EPOCH`. It **logs every field it moves** at INFO —
   retrieval behaviour must never change silently — and keeps anything else, so the live
@@ -310,6 +311,42 @@ Previously BOTH source copies preceded the install layer, so every edit re-downl
   lazy — the ~80MB ONNX model loads on first `rank()`, not at construction, so startup/build_context
   is free; failures degrade to RRF order; `QJ_DISABLE_RERANKER=1` env kill-switch, set by the test
   suite to stay offline). `factory.create_store` wires `retrieval` + reranker into both stores.
+  **`retrieval.rerank_candidates` is a RECALL knob before it is a cost dial (24 → 16, S4,
+  2026-08-10):** the reranker only ever sees `ordered[:rerank_candidates]`, so a candidate the
+  fused order buried below that depth is invisible to it and no amount of relevance brings it
+  back. Measured on the live 57,659-chunk corpus over the 32-case eval set, simulating every
+  depth from ONE cross-encoder pass per candidate (scores are independent per candidate, so the
+  whole curve comes out of a single scoring run) and **verified to reproduce `store.search`
+  exactly on 32/32 queries** before any of it was believed: reranking off → recall 0.900 /
+  MRR 0.775; depth 4–10 → 0.900 / 0.900; **depth 12 → 0.950 / 0.950**; depth 16, 20, 24 and 32
+  → 0.950 / 0.925. Quality is **flat from 12 to 32**, so the shipped 24 was doing twice the
+  necessary work. The one structural feature is the cliff below 12, and it has a name —
+  `connector-nautical-pubsub`'s expected source sits at fused rank 12, the deepest in the set,
+  so shallower depths never show it to the model at all. 16 rather than the measured-best 12 is
+  deliberate margin: too shallow costs *recall*, too deep costs only latency, so the default
+  does not park on a measured cliff (same reasoning as the `min_score` retune above).
+  Live before/after on the real workspace, both gates run: `qj eval --compare` gives recall
+  0.950, grounded recall 0.950, MRR 0.925 and hop coverage 0.750 **unchanged to three
+  decimals**, and `qj bench --compare` gives rerank p50 **1628 → 1066 ms (−35%)**, whole query
+  p50 **1977 → 1401 ms (−29%)** and p95 **2564 → 2029 ms (−21%)**, with `reranked: 16.0`
+  confirming the depth actually moved. (The same bench run shows the embedder 11% faster; that
+  is machine variance, not this change — nothing here touches ingest.)
+  ⚠ **The one watched metric that moves is `refusal_accuracy` (0.25 → 0.167), and it is
+  noise, recorded rather than tuned to**: it is a single case (`unlearned-competitor-pricing`)
+  which leaks at depths 8, 10, 12, 16, 20 **and 32** and is correct at exactly 24 — non-monotone
+  in depth, so it is not a property of depth 24. The mechanism is that the gate reads the dense
+  cosine while reranking decides which chunks occupy the returned top-k, so a high-cosine chunk
+  can be pushed out of the window by luck; "improving" refusal that way is an artifact, not
+  judgment, which is why the deeper default was not kept to preserve it.
+  Per-candidate cost is linear in candidate **length** as well as depth (measured 4.3 ms at
+  185 chars, 9.2 at 464, 19.1 at 929, 30.3 at 1394, 69.3 at 2789; live corpus median chunk 1013
+  chars, and **18% of chunks already exceed the model's 512-token cap** and are silently
+  truncated by the tokenizer). A length cap is therefore a real second lever, deliberately NOT
+  shipped: its measured effect flipped sign with depth (at depth 24 truncating to 400 chars cost
+  nothing, at depth 12 it cost MRR), and 20 answerable cases cannot tell that from noise —
+  exactly the blind trade S4 exists to prevent. Also measured and rejected as levers: ONNX thread
+  count (the default beats every explicit setting — 1684 ms vs 2100 at 4 threads, 5350 at 1) and
+  batching (fastembed already puts the whole depth in one forward pass at `batch_size=64`).
   `KnowledgeStore.ensure_ann_index()` builds a LanceDB IVF index past `retrieval.ann_min_rows`
   (pipeline calls it after each ingest batch). **Graph-expansion retrieval** (`retrieval.graph_expansion`,
   on): `catalog.graph_expand(seed_doc_ids)` finds documents one knowledge-graph hop from the grounded
@@ -2345,7 +2382,9 @@ Previously BOTH source copies preceded the install layer, so every edit re-downl
   correctness test passed throughout and none of them could ever have caught it. The
   remaining 83% is the cross-encoder at **~77ms/candidate** on ~420-token chunks, scaling
   linearly (4→293ms, 12→879ms, 24→1843ms) — that is a `rerank_candidates` depth decision,
-  i.e. **S4**, now with data instead of speculation. Agent layer live (gpt-oss-120b via the
+  i.e. **S4, since settled 2026-08-10**: the depth was measured rather than guessed and cut
+  24 → 16 (see the retrieval bullet above), taking the query to **p50 1401ms** with rerank
+  76% of it and no measured recall cost. Agent layer live (gpt-oss-120b via the
   litellm broker): first token 22.3s, full answer 32.7s, **22.4k tokens/answer** over 3
   rounds — and **zero cache reads**, the S5 verification that had been pending.
   Tests: `tests/test_bench.py`.
@@ -3858,6 +3897,42 @@ Post-phase additions (2026-07-07, all tested — suite: **89 passed**):
   Bob's **Your private notes** row → **offer to org** → the chip flips to "offered", Ada's
   Settings shows the queue, expanding it shows the note's real text, **Publish to everyone**
   empties the queue, and Ada's search goes from `[]` to a 0.791 hit on the same document.
+- Reranker right-sizing — the depth half of AI_ROADMAP **S4** (2026-08-10, top of
+  `docs/PRIORITIES.md`). `retrieval.rerank_candidates` 24 → 16; design and the full curve are
+  in the `memory/` retrieval bullet above. Live result: query p50 **1977 → 1401 ms (−29%)**,
+  p95 −21%, recall/grounded-recall/MRR/hop-coverage **unchanged**.
+  **What made this cheap enough to do properly** is worth keeping: cross-encoder scores are
+  independent per candidate, so the entire depth curve comes out of ONE scoring pass over each
+  query's fused pool — an eleven-depth × six-truncation grid that would have been ~40 minutes
+  of real searches was 5 minutes of simulation. The safeguard that makes a simulation
+  admissible is the first thing the script does: rebuild the pool, apply the real reranker at
+  the configured depth, and check the result against `store.search` — **32/32 queries
+  reproduced exactly**, and the subsequent live `qj eval` matched the simulated numbers to
+  three decimals.
+  **Two things measurement overturned.** The roadmap framed S4 as "cut the depth to save
+  time", implying a recall-for-latency trade; there was no trade to make — quality is flat
+  from 12 to 32, so the shipped 24 was simply doing twice the necessary work, and the honest
+  cost of the change is zero. And the roadmap's other two candidate levers were checked before
+  being believed: ONNX thread count is already optimal at its default (explicitly setting it
+  made things *worse* — 1684 ms vs 2100 ms at 4 threads, 5350 ms at 1), and batching is
+  already one forward pass for the whole depth. The genuinely new finding was that
+  per-candidate cost is linear in candidate **length**, not just count — and that 18% of live
+  chunks already blow past the model's 512-token cap and are silently truncated — which is a
+  real second lever, deliberately left unshipped because its measured sign flipped with depth
+  on a 20-answerable-case set. It is now AI_ROADMAP **S4a**, gated on a bigger eval set.
+  ⚠ **`qj eval --compare` exits 1 on this change** and that is reported, not suppressed:
+  `refusal_accuracy` moves 0.25 → 0.167 on one case that is correct at exactly depth 24 and
+  wrong at 8, 10, 12, 16, 20 and 32. Non-monotone in depth ⇒ not caused by depth; the
+  mechanism is that the gate reads dense cosine while reranking decides which chunks occupy
+  the returned window, so a high-cosine chunk can fall outside it by luck. Holding depth 24 to
+  preserve that number would be tuning to an artifact — the same trap the divergence work hit
+  in 2026-08-05, and the reason a base-rate check comes before believing a metric.
+  Tests: `tests/test_retrieval.py` — one pinning the **mechanism** (a candidate buried below
+  the depth is never scored and so can never be promoted, making this a recall knob before a
+  cost dial) and one guarding the measured floor of 12 against a future blind cut. Suite:
+  **1049 passed** (+2), 16 skipped.
+  Not verified: any agent-layer effect — that needs `--agent` runs with real LLM spend, and
+  the agent numbers in the S-track baseline are unchanged since 2026-07-31.
 
 ## Next steps (agreed with user)
 

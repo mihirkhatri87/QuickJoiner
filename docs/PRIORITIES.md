@@ -7,9 +7,12 @@ any change to a roadmap or plan — item added, removed, shipped, re-scoped — 
 list in the same change.** A row here must always correspond to a live item in its source
 doc; shipped work is deleted from here (the source docs' Shipped ledgers are the record).
 
-Last reconciled against the roadmaps: **2026-08-10** — **knowledge scopes is done and its row
-is gone**: the ingest-time merge guard and the promotion flow shipped, closing Cloud Y1.8 and
-PRD W9.3, which were what gated multi-user GA. Everything below it moved up one.
+Last reconciled against the roadmaps: **2026-08-10** — two changes. **Knowledge scopes is done
+and its row is gone**: the ingest-time merge guard and the promotion flow shipped, closing Cloud
+Y1.8 and PRD W9.3, which were what gated multi-user GA; everything below it moved up one. And
+**S4's depth half shipped**, so row #2 is rewritten in place (not removed) as S4a: the reranker
+is still the largest single cost in a query, just a smaller one, and the remaining levers are
+different work from the depth decision that is now settled.
 Prior: 2026-08-09 (Agent Skills shipped — a new feature, so nothing graduated out; it added
 one row, now #37, for the sandboxing it deliberately does not do).
 
@@ -25,7 +28,7 @@ Sources: [plans](plans/STATUS.md) · [AI_ROADMAP](AI_ROADMAP.md) · [FRONTEND_RO
 | # | Item | V | E | ROI | Source |
 |---|------|---|---|-----|--------|
 | 1 | Close plan 06 remainder — **user-gated, not dev work** (re-checked 2026-07-30): every open item (AC #1 worked example, AC #7 entity merge, §4 repo-graph refresh + connect Nautical↔Stevedore) needs the live org's credentials and a real sync; code + fixtures are done and green. Runs itself the next time those connectors sync — the merge now only needs an **ordinary** sync, not a clean one, for any doc below the current `GRAPH_EXTRACTOR_VERSION` | 3 | 1 | 3.0 | [Plan 06](plans/06-multi-angle-confidence-scored-answers.md) |
-| 2 | **Reranker right-sizing (S4)** — no longer speculative: `qj bench` measured the cross-encoder at **~77ms/candidate**, making the default `rerank_candidates=24` **83% of a 2.2s query** on the live corpus. Auto-tune depth from measured marginal gain, and/or a smaller/quantised CE model. Must ship with the eval half (`qj eval --compare`) proving zero recall loss — it is a quality knob, not just a cost one | 4 | 2 | 2.0 | [AI S4](AI_ROADMAP.md) |
+| 2 | **Reranker right-sizing, remaining levers (S4a)** — the depth half **shipped 2026-08-10** (`rerank_candidates` 24 → 16 on measured evidence; query p50 −29%, zero recall loss). Rerank is still **76% of a 1.4s query**, so the per-candidate cost is now the target: a smaller/quantised CE (`jina-reranker-v1-tiny-en`, INT8 ONNX) is validatable on today's eval set exactly as depth was; a deliberate length cap is measurably promising but its sign flipped with depth on 20 answerable cases, so it is gated behind a bigger eval set (#19); early exit on a stable head is untried. Same gate: `qj eval --compare` must show zero recall loss | 4 | 2 | 2.0 | [AI S4a](AI_ROADMAP.md) |
 | 3 | Slack + Teams connectors — the #1 catalog gap; first half of the W3 team surface | 5 | 3 | 1.7 | [Plan 03](plans/03-slack-teams-connectors.md) · [PRD W3](PRD.md) |
 | 4 | Architectural-layer classification (#29) — deterministic layer tag (API/Service/Data/UI/Utility/Infra) from paths + import direction, never LLM; unblocks the guided tour's cross-repo spine (#16) and a readable layer-colored graph. *(Understand-Anything intake)* | 3 | 2 | 1.5 | [AI #29](AI_ROADMAP.md) · [FE F1](FRONTEND_ROADMAP.md) |
 | 5 | Persona-adaptive answer detail (#30) — persona on the user profile shapes answer verbosity/framing (grounding gate untouched); chat header chip shows the active persona. *(Understand-Anything intake)* | 3 | 2 | 1.5 | [AI #30](AI_ROADMAP.md) · [FE F1](FRONTEND_ROADMAP.md) |

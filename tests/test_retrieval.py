@@ -158,6 +158,63 @@ def test_reranker_default_on_but_disableable():
     assert create_reranker(RetrievalConfig(reranker="none")) is None
 
 
+class GoldReranker:
+    """Promotes whichever candidate contains 'gold', and records how many it was shown."""
+
+    def __init__(self) -> None:
+        self.depths: list[int] = []
+
+    def rank(self, query: str, texts: list[str]) -> list[int]:
+        self.depths.append(len(texts))
+        return sorted(range(len(texts)), key=lambda i: 0 if "gold" in texts[i] else 1)
+
+
+def _buried_gold(store: KnowledgeStore, n: int = 20) -> None:
+    for i in range(n):
+        store.upsert_document(f"D{i}", "src", f"u{i}", f"D{i}", "doc", [f"alpha beta filler{i}"])
+    store.upsert_document("GOLD", "src", "ugold", "GOLD", "doc", ["alpha gold nugget"])
+
+
+def test_rerank_depth_bounds_which_candidates_can_be_promoted(workspace):
+    """`rerank_candidates` is a recall knob, not only a cost dial: a candidate the fused
+    order buried BELOW it is never shown to the cross-encoder, so no amount of relevance
+    can bring it back. That is the floor under the default — measured on the live corpus
+    (2026-08-10), the deepest expected source in the eval set sits at fused rank 12, and
+    every depth below that lost the case outright while every depth at or above it scored
+    identically. Pinned here as the mechanism rather than as a number."""
+    plain = KnowledgeStore(workspace / "plain", FakeEmbedder())
+    _buried_gold(plain)
+    order = [h.doc_id for h in plain.search("alpha beta", top_k=64, min_score=0.0)]
+    depth_needed = order.index("GOLD") + 1
+    assert depth_needed > 1, "the fixture must actually bury GOLD for this to test anything"
+
+    def _search(depth: int) -> tuple[str, GoldReranker]:
+        rr = GoldReranker()
+        store = KnowledgeStore(
+            workspace / f"rr{depth}", FakeEmbedder(),
+            retrieval=RetrievalConfig(rerank_candidates=depth), reranker=rr,
+        )
+        _buried_gold(store)
+        return store.search("alpha beta", top_k=64, min_score=0.0)[0].doc_id, rr
+
+    top_shallow, shallow = _search(depth_needed - 1)
+    assert top_shallow != "GOLD"                      # out of reach: never scored
+    assert shallow.depths and max(shallow.depths) == depth_needed - 1
+
+    top_deep, deep = _search(depth_needed)
+    assert top_deep == "GOLD"                         # in reach: promoted to the top
+    assert max(deep.depths) == depth_needed
+
+
+def test_default_rerank_depth_stays_above_the_measured_floor():
+    """The default was cut 24 -> 16 on measured evidence (S4): quality was flat from depth
+    12 to 32 on the live corpus, so two thirds of the cross-encoder's work bought nothing.
+    16 rather than 12 is deliberate margin — 12 is where a real expected source sat, and
+    sitting exactly on a measured cliff is how a cheaper default turns into lost recall on
+    the next corpus. A future cut below that floor needs its own measurement, not a guess."""
+    assert RetrievalConfig().rerank_candidates >= 12
+
+
 # ------------------------------------------------------------ pipeline wiring
 
 def test_pipeline_normalizes_and_dedupes_cosmetic_variants(workspace, catalog, store):

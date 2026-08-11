@@ -754,8 +754,12 @@ Speed is measured the same way, by **`qj bench`**: it breaks a query's latency d
 embed, dense leg, sparse leg, fusion, reranking, the grounding gate, plus alias and graph
 expansion — so you can see *where* the time goes rather than only how long it took, and
 `--compare` fails a run that got more than 20% slower. Quality knobs cost real time, and this is
-how you decide whether they're worth it on your corpus: on a 56k-chunk workspace the cross-encoder
-reranker alone is ~77ms per candidate, which at the default depth of 24 is most of a query.
+how you decide whether they're worth it on your corpus. That is not hypothetical: on a 58k-chunk
+workspace the cross-encoder reranker costs ~70ms per candidate, and measuring what depth actually
+bought showed retrieval quality was flat from depth 12 upwards — so `retrieval.rerank_candidates`
+was cut 24 → 16, taking 29% off a typical query with recall, MRR and hop coverage all unchanged.
+Note it is a **recall** knob before it is a cost dial: a candidate ranked below that depth is never
+shown to the reranker at all, so lower it only with an eval run to back you up.
 `--agent` adds end-to-end answer latency and tokens per answer, including how much of the prompt
 your provider served from cache. It also reports **ingest throughput** (documents per minute,
 overall and per connector) — read from the syncs you have actually run rather than by running
