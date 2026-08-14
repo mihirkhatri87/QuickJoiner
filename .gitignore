@@ -41,3 +41,8 @@ evals/
 # settings, credentials, plugins) — see scripts/relocate-claude-config.ps1.
 # This holds real credentials; it must never be committed.
 .claude-home/
+
+# Toolchains scripts/activate.ps1 provisions for a machine that lacks them
+# (currently a repo-local Node when there's no usable one and no nvm).
+# Large, platform-specific binaries — re-fetched on demand, never committed.
+.tools/

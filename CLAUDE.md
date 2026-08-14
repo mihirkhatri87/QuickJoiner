@@ -19,9 +19,32 @@ with citations — or says "I haven't learned that yet."
   answers AND "I haven't learned that yet" refusal. Still no `ANTHROPIC_API_KEY`; scripted-provider
   tests remain the coverage for the Anthropic path. Playwright IS installed (playwright 1.61.0 +
   Chromium 149, verified headless launch 2026-07-07) — `qj browser login` works.
-- **Node for the frontend**: nvm-windows has v22.22.3 but it's NOT on PATH (PATH resolves to
-  an old v16.10.0). Prepend per command: `$env:Path = "$env:APPDATA\nvm\v22.22.3;$env:Path"`,
-  then `npm run build` in `frontend/` (slow machine: build ≈ 2–5 min; don't kill it early).
+- **One-command dev shell: `.\scripts\activate.ps1`** (use this instead of the venv's own
+  `Activate.ps1`). It activates the Python venv — *creating* it, and installing deps via uv or
+  pip, if absent — and puts a usable Node first on PATH, **provisioning one when the machine has
+  none**. `deactivate` reverts both. Flags: `-Yes` (unattended/CI), `-NoProvision` (offline or
+  locked-down: report, never install), `-SkipPython` / `-SkipNode`.
+  **Why it exists, and why it's a repo file rather than an edit to `.venv\Scripts\Activate.ps1`:**
+  `python -m venv` regenerates that file on every venv rebuild, so a hand-edit there doesn't
+  survive a clone. And "node is installed" ≠ "node works here" — nvm-windows can hold several
+  versions with an OLD one globally selected (`C:\Program Files\nodejs` is nvm's symlink target;
+  on this machine it points at **v16.10.0** while v22.22.3 sits installed but unselected), and
+  Vite 5 needs **Node ≥ 18** — under 16 the build dies with the un-obvious
+  `crypto$2.getRandomValues is not a function`. The script never changes the machine's *global*
+  Node, only this session's PATH.
+  **Node resolution order** (first hit wins, least invasive first): repo-local `.tools\node` →
+  the pinned version via nvm → any other nvm version ≥ 18 (highest) → whatever's already on PATH
+  if ≥ 18 → provision (`nvm install` when nvm exists, else download the official zip from
+  nodejs.org into `.tools\node`, **checksum-verified against nodejs.org's SHASUMS256.txt** before
+  extraction; no admin, no installer, nothing touched outside the repo). Steps 3–4 deliberately
+  accept a non-pinned version — a machine with a working Node 20 shouldn't be made to download
+  another — and say so, so a version-specific problem stays diagnosable. `.tools/` is gitignored.
+  ⚠ **Keep `scripts/activate.ps1` pure ASCII.** Windows PowerShell 5.1 reads a BOM-less script in
+  the system ANSI codepage, so a UTF-8 em dash arrives as three cp1252 chars ending in U+201D — a
+  smart double quote PowerShell accepts as a **string delimiter** — producing a cascade of parse
+  errors pointing at unrelated lines (hit while writing this script; same failure class as the
+  skills-runner `encoding_hint` note below). (slow machine: frontend build ≈ 2–5 min via
+  `npm run build` in `frontend/`; don't kill it early.)
 
 ## Commands
 

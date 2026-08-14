@@ -135,7 +135,7 @@ is best if you want the `qj` CLI and to hack on the code.
 |------|----------|
 | Docker path | Docker Desktop (or Docker Engine + Compose) |
 | Local path | Python **3.11+** and `git` |
-| Building the web UI from source (optional) | Node.js **22+** |
+| Building the web UI from source (optional) | Node.js **18+** (22 recommended; on Windows `scripts\activate.ps1` will fetch it for you) |
 | An answer to any question | one LLM backend: an **Anthropic API key**, a local **Ollama**, or a **LiteLLM / OpenAI-compatible** endpoint |
 
 Notes:
@@ -144,6 +144,10 @@ Notes:
   You only need an LLM backend to have the agent *answer* questions.
 - A prebuilt web UI ships with the app, so the Node toolchain is only needed if you want to
   change the frontend.
+- Vite needs Node **18+**; on Node 16 the build fails with the misleading
+  `crypto$2.getRandomValues is not a function`. If you use nvm, note that having v22 *installed*
+  isn't enough — it also has to be *selected*. On Windows `scripts\activate.ps1` handles this
+  for you without changing your global Node.
 
 ### Option A — Docker (recommended for a quick look)
 
@@ -187,14 +191,35 @@ dependency layers. If you ever *do* need a genuinely clean build, use
 
 ### Option B — Local install (the `qj` CLI)
 
+**Windows — one command does the whole setup:**
+
 ```powershell
 git clone <this-repo> quickjoiner
 cd quickjoiner
+.\scripts\activate.ps1              # creates + activates the venv, installs deps, sorts out Node
+qj init                             # --provider anthropic | ollama | litellm  (default: anthropic)
+```
+
+`scripts\activate.ps1` is written to work whatever state the machine is in. It creates the
+virtual environment if there isn't one (picking a Python 3.11+ via the `py` launcher, installing
+with `uv` when present and `pip` otherwise), activates it, and makes sure a Node the frontend can
+actually build with is first on `PATH` — using one you already have where possible, and otherwise
+downloading the official Node zip from nodejs.org into a gitignored `.tools\node` (verified
+against nodejs.org's own published SHA-256 checksums; no admin rights, no installer, nothing
+changed outside the repo folder). It never alters your machine-wide Node version, so other
+projects are unaffected. `deactivate` undoes all of it. Useful flags: `-Yes` (never prompt, for
+CI), `-NoProvision` (offline or locked-down machines: report what's missing, install nothing),
+`-SkipPython`, `-SkipNode`.
+
+**macOS / Linux, or if you'd rather do it by hand:**
+
+```bash
+git clone <this-repo> quickjoiner && cd quickjoiner
 
 # 1. Create and activate a virtual environment (Python 3.11+)
 python -m venv .venv
-.venv\Scripts\Activate.ps1          # Windows PowerShell
-# source .venv/bin/activate         # macOS / Linux
+source .venv/bin/activate           # macOS / Linux
+# .venv\Scripts\Activate.ps1        # Windows PowerShell
 
 # 2. Install QuickJoiner (editable). Extras: [dev] tests, [browser] scraping, [cloud] Postgres
 pip install -e .                    # or, faster: uv pip install -e .
