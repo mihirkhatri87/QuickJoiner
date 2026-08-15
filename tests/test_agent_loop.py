@@ -103,8 +103,42 @@ def test_agent_caps_large_tool_output_before_feeding_back():
     agent = OnboardingAgent(provider, [_big_tool(500_000)], system="sys", tool_result_max_chars=1000)
     agent.ask("q")
     tool_msg = [m for m in provider.calls[1]["messages"] if m["role"] == "tool"][0]
-    assert len(tool_msg["content"]) < 1100  # capped near the limit, not 500k
-    assert tool_msg["content"].endswith("[tool output truncated]")
+    assert len(tool_msg["content"]) < 1250  # capped near the limit, not 500k
+    assert "[tool output truncated" in tool_msg["content"]
+
+
+def test_truncation_marker_states_how_much_was_dropped():
+    """A bare "truncated" marker tells the model a boundary exists but not which side of
+    it the answer is on: losing 200 characters and losing 499,000 read identically, so a
+    list that stops 0.2% in gets summarised as though it were the whole thing. State the
+    scale — the same no-silent-caps rule the crawler and the graph tools follow."""
+    provider = ScriptedProvider(
+        [
+            ChatResult(text="", tool_calls=[ToolCall(id="c1", name="dump", input={})]),
+            ChatResult(text="answer"),
+        ]
+    )
+    agent = OnboardingAgent(provider, [_big_tool(500_000)], system="sys", tool_result_max_chars=1000)
+    agent.ask("q")
+    content = [m for m in provider.calls[1]["messages"] if m["role"] == "tool"][0]["content"]
+    assert "1,000" in content and "500,000" in content and "499,000" in content
+    assert "PARTIAL" in content, "the model must be told the view is incomplete, not just cut"
+
+
+def test_output_exactly_at_the_limit_is_not_marked_truncated():
+    """Nothing was dropped, so claiming a partial view would be its own dishonesty —
+    and would push the model to hedge an answer that is in fact complete."""
+    provider = ScriptedProvider(
+        [
+            ChatResult(text="", tool_calls=[ToolCall(id="c1", name="dump", input={})]),
+            ChatResult(text="answer"),
+        ]
+    )
+    agent = OnboardingAgent(provider, [_big_tool(1000)], system="sys", tool_result_max_chars=1000)
+    agent.ask("q")
+    content = [m for m in provider.calls[1]["messages"] if m["role"] == "tool"][0]["content"]
+    assert content == "x" * 1000
+    assert "truncated" not in content
 
 
 def _named_big_tool(name, size):
@@ -132,7 +166,7 @@ def test_uncapped_tool_bypasses_the_char_cap():
     agent.ask("q")
     tool_msg = [m for m in provider.calls[1]["messages"] if m["role"] == "tool"][0]
     assert len(tool_msg["content"]) == 500_000  # untouched — not capped, not truncated
-    assert not tool_msg["content"].endswith("[tool output truncated]")
+    assert "[tool output truncated" not in tool_msg["content"]
 
 
 def test_agent_makes_final_tool_free_turn_when_round_limit_hit():

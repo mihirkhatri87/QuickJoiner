@@ -1578,7 +1578,18 @@ Previously BOTH source copies preceded the install layer, so every edit re-downl
   (`agent.py`, max 10 rounds —
   **each live tool result is capped to `chat.live_tool_result_max_chars` (default 24000) before
   re-entering the model context**, so an unbounded connector tool like the full Octopus dashboard
-  can't overflow the window and make the provider reject the follow-up turn — **except
+  can't overflow the window and make the provider reject the follow-up turn. **The marker states
+  the SCALE of the cut, not merely that one happened (2026-08-15)** — it names the shown size,
+  the true size and the number of characters omitted, and says the view is PARTIAL. The bare
+  `[tool output truncated]` it replaces told the model a boundary existed but nothing about
+  which side of it the answer was on: dropping 200 characters of a dashboard and dropping
+  476,000 read identically, so a list cut 4% in was summarised exactly like one cut 96% in.
+  With the numbers present the model can qualify the answer or re-query more narrowly instead
+  of confidently reporting a prefix — the same no-silent-caps rule the crawler (`_crawl`'s
+  truncation warning) and the graph tools already follow. Output landing exactly ON the limit
+  is deliberately NOT marked: nothing was dropped, and claiming a partial view would push the
+  model to hedge a complete answer. The `tool_result` trace event's `chars` (the true post-cap
+  size, for the UI) is unchanged and separate — this line is what the MODEL sees. **Except
   `graph_relations`/`graph_neighbors`/`graph_path` (`AppContext._UNCAPPED_TOOLS`, 2026-08-07,
   user-reported "you missed some teams")**: those three already bound themselves to a small,
   fixed shape (400 relationships / a hub sample / ≤3 path chains) with no model-controllable size

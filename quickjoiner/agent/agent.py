@@ -257,9 +257,28 @@ class OnboardingAgent:
             return text
 
     def _cap(self, output: str, tool_name: str) -> str:
+        """Bound one tool result before it re-enters the model's context.
+
+        The marker states the SCALE of what was cut, not merely that cutting happened.
+        A bare "[tool output truncated]" tells the model a boundary exists but nothing
+        about which side of it the answer is on — losing 200 characters of a dashboard
+        and losing 400,000 read identically, so a list that stops 3% in looks exactly
+        like one that stops 97% in and gets summarised as though it were complete. With
+        the numbers present the model can say the view was partial, or re-query more
+        narrowly, instead of confidently reporting a prefix. Same rule the crawler and
+        the graph tools already follow: never a silent cap, always state what was left
+        out. (The `tool_result` trace event carries the true post-cap size separately,
+        for the UI; this line is what the MODEL sees.)
+        """
         if tool_name in self._uncapped_tools:
             return output
         limit = self._tool_result_max_chars
         if limit and len(output) > limit:
-            return output[:limit] + "\n…[tool output truncated]"
+            dropped = len(output) - limit
+            return (
+                output[:limit]
+                + f"\n…[tool output truncated: showing the first {limit:,} of "
+                  f"{len(output):,} characters, {dropped:,} omitted. This view is "
+                  "PARTIAL — say so, or re-run the tool with a narrower query.]"
+            )
         return output
