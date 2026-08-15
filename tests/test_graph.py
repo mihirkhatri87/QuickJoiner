@@ -710,3 +710,96 @@ def test_graph_snapshot_states_what_it_left_out(catalog):
     catalog.replace_doc_edges("d", [("service:a", "depends_on", "repo:b", ""),
                                     ("service:a", "depends_on", "repo:c", "")])
     assert catalog.graph_snapshot(limit=1)["truncated"] is True
+
+
+# ------------------------------------------- path search: traversal vs display reads
+
+def _diamond(catalog):
+    """Two equally short routes from A to D, so tie-breaking is observable, plus a
+    private route that a filtered caller must not be sent down."""
+    for eid, name, typ in [("service:a", "A", "service"), ("service:b", "B", "service"),
+                           ("service:c", "C", "service"), ("service:d", "D", "service"),
+                           ("service:x", "X", "service")]:
+        catalog.upsert_entity(eid, name, typ, "s")
+    catalog.upsert_document("pub", "s", "https://pub", "Public doc", "page", "h", "2026-08-15", 1)
+    catalog.upsert_document("priv", "secret", "https://priv", "Private doc", "page", "h2",
+                            "2026-08-15", 1)
+    catalog.replace_doc_edges("pub", [("service:a", "depends_on", "service:b", ""),
+                                      ("service:b", "depends_on", "service:d", ""),
+                                      ("service:a", "depends_on", "service:c", ""),
+                                      ("service:c", "depends_on", "service:d", "")])
+    catalog.replace_doc_edges("priv", [("service:a", "owns", "service:x", ""),
+                                       ("service:x", "owns", "service:d", "")])
+
+
+def test_path_traversal_reads_only_traversal_columns(catalog):
+    """The BFS needs src/rel/dst; the names, layers and evidence titles a hop is RENDERED
+    with are 12 more columns behind three LEFT JOINs, fetched for EVERY edge in the graph
+    to decorate the at-most-three that come back. Measured at real corpus size (100k edges)
+    that scan was 92% of a 1.45s graph_path call. Pin the shape, not the timing."""
+    sql, _ = catalog._edge_scan(None)
+    assert "JOIN entities" not in sql, "entity names are display data, not traversal data"
+    assert "evidence_title" not in sql and "src_name" not in sql
+    assert "ORDER BY" in sql, "unordered rows make equally-short path selection a coin flip"
+
+    # A visibility filter predicates on d.source_id, so THAT join must survive.
+    filtered, _ = catalog._edge_scan(["s"])
+    assert "JOIN documents" in filtered
+
+
+def test_path_hops_still_carry_their_display_columns(catalog):
+    """Narrowing the scan must not narrow the ANSWER: every hop still renders with its
+    entity names and its citable evidence, hydrated after the search."""
+    _diamond(catalog)
+    path = catalog.graph_path("service:a", "service:d")
+    assert path and len(path) == 2
+    for hop in path:
+        assert hop["src_name"] and hop["dst_name"]
+        assert hop["evidence_title"] == "Public doc"
+        assert hop["evidence_uri"] == "https://pub"
+
+
+def test_equally_short_paths_are_broken_deterministically(catalog):
+    """A→B→D and A→C→D are both two hops, so whichever edge the scan yielded first won —
+    and the old statement had no ORDER BY, leaving that to the query planner. Measured
+    while narrowing the columns: 15 of 166 connected pairs changed route purely because
+    the row order moved. A product that cites its hops cannot have them wobble."""
+    _diamond(catalog)
+    runs = {tuple((h["src"], h["rel"], h["dst"]) for h in catalog.graph_path("service:a", "service:d"))
+            for _ in range(5)}
+    assert len(runs) == 1, f"path selection is not stable across calls: {runs}"
+
+
+def test_candidate_zero_is_exactly_the_single_path(catalog):
+    """graph_path_candidates documents that candidate 0 always agrees with graph_path.
+    Both now share one ordered statement, so that holds by construction rather than luck."""
+    _diamond(catalog)
+    single = catalog.graph_path("service:a", "service:d")
+    first = catalog.graph_path_candidates("service:a", "service:d")[0]
+    assert [(h["src"], h["rel"], h["dst"], h["evidence_doc_id"]) for h in first] == \
+           [(h["src"], h["rel"], h["dst"], h["evidence_doc_id"]) for h in single]
+
+
+def test_path_search_still_refuses_to_route_through_invisible_evidence(catalog):
+    """The visibility filter lives on the traversal scan, so narrowing that scan is
+    exactly where a leak would appear: a caller who cannot read 'secret' must never be
+    handed the A→X→D chain, and must still get the public one."""
+    _diamond(catalog)
+    visible = catalog.graph_path("service:a", "service:d", visible_source_ids=["s"])
+    assert visible and all(h["evidence_doc_id"] == "pub" for h in visible)
+    assert all("service:x" not in (h["src"], h["dst"]) for h in visible)
+
+    # With the public document gone, the only remaining route is private — refuse, don't route.
+    catalog.replace_doc_edges("pub", [])
+    assert catalog.graph_path("service:a", "service:d", visible_source_ids=["s"]) is None
+    assert catalog.graph_path("service:a", "service:d") is not None  # still there in open mode
+
+
+def test_hydration_never_drops_a_hop(catalog):
+    """A chain is a claim about connectivity. If a display lookup somehow misses, the hop
+    keeps its traversal row — silently shortening the chain would turn a correct answer
+    into a wrong one."""
+    _diamond(catalog)
+    ghost = {"src": "service:a", "rel": "nope", "dst": "service:d", "evidence_doc_id": "gone"}
+    out = catalog._hydrate_edges([ghost])
+    assert len(out) == 1 and out[0]["rel"] == "nope"

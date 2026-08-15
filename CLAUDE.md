@@ -400,6 +400,31 @@ Previously BOTH source copies preceded the install layer, so every edit re-downl
   rel, dst)` — distinct evidence docs + distinct sources per exact edge (the
   `(src,rel,dst,evidence_doc_id)` PK already stores one row per corroborating doc);
   `entity_evidence(entity_id, limit)` — evidence titles/kinds for adjudication context.
+  **Traversal and display are two different reads (`_edge_scan` / `_hydrate_edges`,
+  2026-08-15).** Both path searches load the whole edge table — deliberately, so a "no known
+  path" refusal is never wrong (see `graph_path`'s reachability note) — but they used to load
+  it through `_EDGE_SELECT`: 15 columns behind three LEFT JOINs, for a BFS that reads three of
+  them and decorates the at-most-three hops that come back. Measured on a synthetic graph the
+  size of the live corpus (100k edges / 36k entities / 20k documents), where the scan was
+  **92% of a 1.45s call**: the full scan is 1333ms, the four traversal columns 238ms. So
+  `_edge_scan` selects `src, rel, dst, evidence_doc_id` only, and `_hydrate_edges` re-reads the
+  display columns by primary key for the handful of edges on returned chains (≤3 hops for
+  `graph_path`; one batch of ≤`4*max_candidates` chains for the candidates search, hydrated
+  BEFORE signature dedupe, which classifies evidence). **`graph_path` p50 1453 → 349ms,
+  `graph_path_candidates` 1476 → 348ms (−76%, 4.2x)**, with reachability bit-for-bit unchanged
+  — every edge is still visited, only the row is narrower. The `documents` join survives just
+  when a visibility filter is active (the predicate is over `d.source_id`); open mode is a bare
+  `edges` scan. A hop that fails to hydrate keeps its traversal row rather than being dropped —
+  silently shortening a chain would turn a correct connectivity claim into a wrong one.
+  ⚠ **The `ORDER BY` is load-bearing.** BFS explores in adjacency-insertion order, so among
+  EQUALLY short chains whichever edge was read first wins — and the old statement had no
+  ordering, leaving that to the query planner. Measured while narrowing the columns: **15 of
+  166** connected pairs changed route purely because the row order moved. Ordering on the PK
+  `(src, rel, dst, evidence_doc_id)` makes the cited chain reproducible, and is **free** —
+  those four columns ARE the PK, so it is a covering index scan (238ms ordered vs 241ms not).
+  Both searches share the one statement, so the documented "candidate 0 agrees with
+  `graph_path`" invariant now holds by construction (verified 181/181 exact, against 0
+  reachability or hop-count regressions over 900 differential pairs).
   **`graph_relations(rel, src_type, dst_type, limit)` (2026-07-31, same neutral `?`-SQL, no
   schema change)** — every edge of ONE relation shape, optionally constrained by the entity
   type on each end, ordered by destination then source. The enumeration read the graph could
