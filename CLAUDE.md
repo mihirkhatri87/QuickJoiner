@@ -2416,9 +2416,28 @@ Previously BOTH source copies preceded the install layer, so every edit re-downl
   sparse, fuse, sparse-rescore, rerank, gate, plus alias expansion and graph expansion,
   which sit *around* `store.search` on the real `search_memory` path; **embed** (no LLM) —
   embedder chunks/sec at a realistic batch, the ingest bottleneck S6 must beat; **sync**
-  (no LLM, always) — see below; **agent**
+  (no LLM, always) — see below; **graph** (no LLM, always, 2026-08-15) — see below; **agent**
   (`--agent`, needs an LLM) — time to first token, full-answer time, model rounds, tool
   calls, and tokens per answer incl. cache reads.
+  **Graph reads are measured too** (`run_graph_bench` + `bench/synth.py`): `graph_path`,
+  `graph_path_candidates`, `graph_neighbors` and `graph_relations` sit on the answer path
+  exactly as retrieval does, and nothing timed them — which is how `graph_path` came to
+  spend **92% of a 1.45s call** re-reading 15 columns the BFS never used, invisible to
+  1062 passing tests because the answers were right and only slow. The first three p50s
+  now join `COMPARE_METRICS`, so that regression class is gated. Pairs come from
+  `synth.sample_pairs` and are deliberately **not** filtered to connected ones: an
+  unconnected pair is the expensive case (BFS exhausts its frontier instead of returning
+  early on a hit) and is what a user hits whenever two things turn out to be unrelated.
+  A workspace with no graph reports `skipped` rather than a 0ms that would read as
+  "instant" and sail through `--compare` as a huge win.
+  **`bench/synth.py` — a reproducible corpus, because a benchmark nobody else can run is
+  an anecdote.** `build_synthetic_graph(catalog, entities, edges, documents, seed)` writes
+  a seeded random graph through the ordinary public write path, so the rows are
+  indistinguishable from ingested ones; `LIVE_SCALE` (36k entities / 100k edges / 20k docs)
+  reproduces the corpus the path-search work was measured against, in ~150s. It is
+  explicitly NOT a stand-in for real data — the text is nonsense, so retrieval *quality*
+  figures from it would be meaningless. What it reproduces faithfully is **row counts**,
+  which is the only thing the whole-edge-table reads are sensitive to.
   **Ingest throughput is READ, not run** (`run_sync_bench`, 2026-08-04, closing S1's
   remainder): docs/min overall and per connector, computed from the runs already recorded in
   `sync_events` over a `--sync-days` window (default 7). Performing a sync would measure the

@@ -46,6 +46,16 @@ query latency). That is the argument for the measurement-gate rule above, in one
 ### Shipped (graduated)
 How each works is documented in `CLAUDE.md` — the source of truth for current behavior.
 
+- **Graph reads joined the bench, on a reproducible corpus** — `run_graph_bench`,
+  `bench/synth.py`, three new `COMPARE_METRICS` (2026-08-15). The S-track measured
+  retrieval, embed, sync and agent; the knowledge-graph reads sat on the same answer path
+  entirely unmeasured, which is how `graph_path` spent 92% of a 1.45s call on columns its
+  BFS never read without any test noticing. Now gated. `synth.build_synthetic_graph` gives
+  the layer a seeded corpus at `LIVE_SCALE`, so the numbers are reproducible off the one
+  machine that has a real workspace — previously every bench figure in this repo was
+  checkable only by its author. *Lesson worth keeping: the bottleneck was invisible to
+  1062 passing correctness tests, because a suite proves behaviour, never cost.*
+
 - **Path search reads traversal and display separately** — `catalog._edge_scan` /
   `_hydrate_edges` (2026-08-15). Both path searches deliberately load the whole edge
   table (a capped scan would make a "no known path" refusal wrong), but did so through
