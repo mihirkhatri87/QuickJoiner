@@ -299,3 +299,79 @@ def test_sync_bench_ignores_cleanups_unfinished_and_instant_runs(bench_ctx):
     _sync_event(bench_ctx.catalog, "u1", "Y", base, None, 500)          # still running
     _sync_event(bench_ctx.catalog, "z1", "Z", base, base, 500)          # 0s — undividable
     assert run_sync_bench(bench_ctx, days=7)["runs"] == 0
+
+
+# ------------------------------------------------ graph reads (S1, added 2026-08-15)
+
+def test_synthetic_graph_is_reproducible_and_writes_what_it_claims(catalog):
+    """A benchmark nobody else can reproduce is an anecdote. Same seed, same graph — and
+    the reported edge count must be the number of rows actually written, since edges are
+    keyed (src, rel, dst, evidence_doc_id) and a duplicate would silently collapse."""
+    from quickjoiner.bench.synth import build_synthetic_graph
+
+    built = build_synthetic_graph(catalog, entities=200, edges=600, documents=50, seed=3)
+    assert built["edges"] == catalog.graph_totals()["edges"]
+
+    shape = sorted((r["src"], r["rel"], r["dst"]) for r in catalog._read_all(
+        "SELECT src, rel, dst FROM edges"))
+    catalog.reset_knowledge()
+    build_synthetic_graph(catalog, entities=200, edges=600, documents=50, seed=3)
+    assert sorted((r["src"], r["rel"], r["dst"]) for r in catalog._read_all(
+        "SELECT src, rel, dst FROM edges")) == shape
+
+    # A different seed must actually differ, or "reproducible" is just "constant".
+    catalog.reset_knowledge()
+    build_synthetic_graph(catalog, entities=200, edges=600, documents=50, seed=4)
+    assert sorted((r["src"], r["rel"], r["dst"]) for r in catalog._read_all(
+        "SELECT src, rel, dst FROM edges")) != shape
+
+
+def test_sampled_pairs_include_unconnected_ones(catalog):
+    """The unconnected pair is the EXPENSIVE case — BFS exhausts its frontier instead of
+    returning early — and it is what a user hits whenever two things turn out to be
+    unrelated. Timing only reachable pairs would flatter the numbers and hide the work."""
+    from quickjoiner.bench.synth import build_synthetic_graph, sample_pairs
+
+    build_synthetic_graph(catalog, entities=300, edges=200, documents=20, seed=5)
+    pairs = sample_pairs(catalog, count=20, seed=5)
+    assert len(pairs) == 20
+    assert any(catalog.graph_path(a, b) is None for a, b in pairs), (
+        "every sampled pair was connected — the expensive branch is going unmeasured")
+
+
+def test_graph_bench_measures_the_reads_the_agent_actually_calls(bench_ctx):
+    """graph_path answers "how are these related" and graph_relations answers "list every
+    team with its members" — both on the answer path, neither previously measured. That gap
+    hid a 4.2x saving in graph_path that no correctness test could see, because the answers
+    were right and only slow."""
+    from quickjoiner.bench.harness import run_graph_bench
+    from quickjoiner.bench.synth import build_synthetic_graph
+
+    build_synthetic_graph(bench_ctx.catalog, entities=200, edges=600, documents=50, seed=3)
+    summary = run_graph_bench(bench_ctx, repeats=1, warmup=0, pairs=4)
+
+    assert summary["graph"] == {"edges": 600, "entities": 200}
+    for metric in ("graph_path_ms", "graph_path_candidates_ms",
+                   "graph_neighbors_ms", "graph_relations_ms"):
+        assert summary[metric]["samples"] > 0, f"{metric} reported no samples"
+        assert summary[metric]["p50"] >= 0
+
+
+def test_graph_bench_skips_rather_than_reporting_a_fake_zero(bench_ctx):
+    """An empty workspace has no graph to time. Reporting 0ms would read as "instant" and
+    would sail through --compare as a massive improvement."""
+    from quickjoiner.bench.harness import run_graph_bench
+
+    summary = run_graph_bench(bench_ctx)
+    assert "skipped" in summary and "graph_path_ms" not in summary
+
+
+def test_compare_gates_on_a_graph_slowdown():
+    """The graph layer joins the merge gate: this is the regression class that went
+    unnoticed until it was found by accident."""
+    old = {"graph": {"summary": {"graph_path_ms": {"p50": 350.0, "samples": 12}}}}
+    new = {"graph": {"summary": {"graph_path_ms": {"p50": 1450.0, "samples": 12}}}}
+    result = compare_reports(old, new)
+    row = [r for r in result["rows"] if r["metric"] == "graph_path_ms.p50"][0]
+    assert row["regressed"] and result["regressed"]
+    assert compare_reports(new, old)["regressed"] is False  # the reverse is the win

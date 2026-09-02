@@ -6,7 +6,7 @@ in shape — a YAML pack of inputs, a JSON report saved beside the eval reports,
 (AI_ROADMAP S1): no speed work merges without a before/after table, exactly as no quality
 work merges without `qj eval --compare`. "Felt faster" is not a measurement.
 
-Three layers, run independently:
+Four layers, run independently:
 
 - **retrieval** (no LLM, always runs): per-stage latency for each query — embed-query,
   dense leg, sparse leg, RRF fuse, sparse rescore, rerank, gate — plus alias expansion and
@@ -15,6 +15,12 @@ Three layers, run independently:
 
 - **embed** (no LLM): raw embedder throughput in chunks/sec at a realistic batch. This is
   the ingest bottleneck and the number S6 (GPU/parallel ingestion) has to beat.
+
+- **graph** (no LLM, always runs): latency of the knowledge-graph reads the agent calls
+  directly — `graph_path`, `graph_path_candidates`, `graph_neighbors`, `graph_relations`.
+  These sit on the answer path exactly as retrieval does, and went unmeasured until
+  `graph_path` turned out to be spending 92% of a 1.45s call re-reading columns the BFS
+  never used. Nothing in the correctness suite could see it: the answers were right.
 
 - **agent** (needs an LLM): time to first token, time to full answer, model rounds per
   answer, and tokens per answer including prompt-cache reads — the S5 cost-delta
@@ -74,6 +80,11 @@ COMPARE_METRICS = (
     ("retrieval", "search_total_ms.p50"),
     ("retrieval", "search_total_ms.p95"),
     ("embed", "ms_per_chunk"),
+    # The graph reads are on the answer path just as retrieval is, and were unmeasured
+    # until a 4.2x regression-shaped saving turned up in graph_path by accident.
+    ("graph", "graph_path_ms.p50"),
+    ("graph", "graph_path_candidates_ms.p50"),
+    ("graph", "graph_relations_ms.p50"),
     ("agent", "first_token_ms.p50"),
     ("agent", "answer_ms.p50"),
     ("agent", "tokens_per_answer.mean"),
@@ -225,6 +236,70 @@ def run_embed_bench(ctx, batch: int = 32, repeats: int = 3, warmup: int = 1) -> 
         "ms_per_chunk": round(per_batch["p50"] / len(texts), 4),
         "chunks_per_sec": round(len(texts) / (per_batch["p50"] / 1000), 1) if per_batch["p50"] else None,
     }
+
+
+# -- graph layer -------------------------------------------------------------------
+
+def run_graph_bench(ctx, repeats: int = 3, warmup: int = 1, pairs: int = 12) -> dict:
+    """Latency of the knowledge-graph reads the agent calls directly.
+
+    These sit on the answer path exactly as retrieval does — `graph_path` is what answers
+    "how are these two related", `graph_relations` what answers "list every team with its
+    members" — but nothing measured them, so their cost was invisible to the S-track. That
+    gap had teeth: `graph_path` was spending 92% of a 1.45s call re-reading 15 columns
+    through three LEFT JOINs for every edge in the graph, and no correctness test could
+    see it because the answers were right, only slow.
+
+    No LLM, so this always runs. It measures the catalog directly rather than through the
+    agent tools, which wrap these calls in prose formatting that would blur the signal.
+    A workspace with no graph reports `skipped` rather than a fabricated zero.
+    """
+    from quickjoiner.bench.synth import sample_pairs
+
+    totals = ctx.catalog.graph_totals() if hasattr(ctx.catalog, "graph_totals") else {}
+    if not totals.get("edges"):
+        return {"skipped": "no knowledge graph in this workspace"}
+
+    pair_list = sample_pairs(ctx.catalog, count=pairs)
+    if not pair_list:
+        return {"skipped": "not enough entities to time a path search"}
+
+    # One busy entity for the neighbour read, and the graph's most common relation for the
+    # enumeration read — benchmarking a rare relation would time an empty result set.
+    hub = ctx.catalog._read_all(
+        "SELECT src AS id, COUNT(*) AS n FROM edges GROUP BY src ORDER BY n DESC LIMIT 1")
+    rel = ctx.catalog._read_all(
+        "SELECT rel, COUNT(*) AS n FROM edges GROUP BY rel ORDER BY n DESC LIMIT 1")
+    hub_id = hub[0]["id"] if hub else None
+    top_rel = rel[0]["rel"] if rel else None
+
+    def _time(fn, samples: int) -> list[float]:
+        for _ in range(max(0, warmup)):
+            fn(0)
+        out = []
+        for r in range(max(1, repeats)):
+            for i in range(samples):
+                t0 = time.perf_counter()
+                fn(r * samples + i)
+                out.append((time.perf_counter() - t0) * 1000)
+        return out
+
+    n = len(pair_list)
+    summary: dict = {
+        "graph": {"edges": totals.get("edges"), "entities": totals.get("entities")},
+        "pairs": n,
+        "graph_path_ms": percentiles(
+            _time(lambda i: ctx.catalog.graph_path(*pair_list[i % n]), n)),
+        "graph_path_candidates_ms": percentiles(
+            _time(lambda i: ctx.catalog.graph_path_candidates(*pair_list[i % n]), n)),
+    }
+    if hub_id:
+        summary["graph_neighbors_ms"] = percentiles(
+            _time(lambda _i: ctx.catalog.graph_neighbors(hub_id), 1))
+    if top_rel:
+        summary["graph_relations_ms"] = percentiles(
+            _time(lambda _i: ctx.catalog.graph_relations(top_rel), 1))
+    return summary
 
 
 # -- agent layer -------------------------------------------------------------------
@@ -456,6 +531,9 @@ def run_bench(ctx, pack_path: Path | str, agent_layer: bool = False, repeats: in
     # Ingest throughput, read from the sync history rather than measured by running one —
     # always included because it costs one indexed query and closes S1's other half.
     report["sync"] = {"summary": run_sync_bench(ctx, days=sync_days)}
+    # Graph reads: no LLM and no corpus assumptions, so always included. Reports `skipped`
+    # on a workspace with no graph rather than a zero that would read as "instant".
+    report["graph"] = {"summary": run_graph_bench(ctx, repeats=repeats, warmup=warmup)}
     if agent_layer:
         agent_timings = run_agent_bench(ctx, queries, agent, provider_override, model_override)
         report["agent"] = {

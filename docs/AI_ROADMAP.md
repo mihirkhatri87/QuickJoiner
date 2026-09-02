@@ -46,6 +46,32 @@ query latency). That is the argument for the measurement-gate rule above, in one
 ### Shipped (graduated)
 How each works is documented in `CLAUDE.md` — the source of truth for current behavior.
 
+- **Graph reads joined the bench, on a reproducible corpus** — `run_graph_bench`,
+  `bench/synth.py`, three new `COMPARE_METRICS` (2026-08-15). The S-track measured
+  retrieval, embed, sync and agent; the knowledge-graph reads sat on the same answer path
+  entirely unmeasured, which is how `graph_path` spent 92% of a 1.45s call on columns its
+  BFS never read without any test noticing. Now gated. `synth.build_synthetic_graph` gives
+  the layer a seeded corpus at `LIVE_SCALE`, so the numbers are reproducible off the one
+  machine that has a real workspace — previously every bench figure in this repo was
+  checkable only by its author. *Lesson worth keeping: the bottleneck was invisible to
+  1062 passing correctness tests, because a suite proves behaviour, never cost.*
+
+- **Path search reads traversal and display separately** — `catalog._edge_scan` /
+  `_hydrate_edges` (2026-08-15). Both path searches deliberately load the whole edge
+  table (a capped scan would make a "no known path" refusal wrong), but did so through
+  `_EDGE_SELECT`: 15 columns behind three LEFT JOINs, to run a BFS that reads three of
+  them. At live-corpus scale (100k edges) that scan was **92% of a 1.45s call**.
+  Traversal now selects four columns and display is re-read by PK for the ≤3 hops that
+  come back: **`graph_path` 1453 → 349ms, `graph_path_candidates` 1476 → 348ms (−76%)**,
+  reachability bit-for-bit unchanged. The `ORDER BY` added with it is not tidiness —
+  BFS tie-breaks among equally short chains in row order, and with no ordering the
+  planner chose which route got cited (**15 of 166** pairs moved when the columns
+  narrowed). It is free (covering index scan on the PK) and makes the documented
+  "candidate 0 == `graph_path`" invariant hold by construction, 181/181 exact.
+  *Found by measurement, not from a bug report — and not by the analysis that prompted
+  the session, which called this an N+1 (it is a single query) while the real cost was
+  row width.*
+
 - **Graph rebuild from ingested state** — `IngestPipeline.rebuild_graph`,
   `documents.graph_json`, `SyncManager.start_regraph`, `qj regraph`,
   `POST /api/graph/rebuild` (+ preview), connector-plate and Settings UI (2026-08-06).

@@ -767,6 +767,11 @@ bought showed retrieval quality was flat from depth 12 upwards — so `retrieval
 was cut 24 → 16, taking 29% off a typical query with recall, MRR and hop coverage all unchanged.
 Note it is a **recall** knob before it is a cost dial: a candidate ranked below that depth is never
 shown to the reranker at all, so lower it only with an eval run to back you up.
+It also times the knowledge-graph reads — "how are these two related", "list every team with its
+members" — which sit on the same answer path and had never been measured. That gap was not
+harmless: `graph_path` was spending 92% of a 1.45s call re-reading columns its search never
+looked at, and every correctness test passed throughout, because the answers were right and
+only slow. Those timings are now part of the `--compare` gate.
 `--agent` adds end-to-end answer latency and tokens per answer, including how much of the prompt
 your provider served from cache. It also reports **ingest throughput** (documents per minute,
 overall and per connector) — read from the syncs you have actually run rather than by running
@@ -967,6 +972,20 @@ change what surfaces and in what order, but never turn a refusal into an invente
 pip install -e ".[dev]"
 pytest                                 # or: .venv\Scripts\python.exe -m pytest -q
 ```
+
+The Postgres/pgvector backend has its own suite, skipped unless you point it at a real
+database. Docker is not required — on Linux, `./scripts/pg-testdb.sh` installs the pgvector
+package, starts the cluster and prints a DSN:
+
+```bash
+QJ_TEST_DATABASE_URL="$(./scripts/pg-testdb.sh)" pytest -q    # runs the cloud backend tests too
+```
+
+Run it. Two real defects have been found in this repo that had been sitting behind that skip,
+one of which passed static review — an env-gated suite that nobody runs is not coverage.
+
+In [Claude Code on the web](https://claude.com/claude-code), `.claude/hooks/session-start.sh`
+does all of the above automatically, so the full suite runs with nothing skipped.
 
 Machine-specific dev notes (venv layout, building the frontend, the live Ollama/Playwright
 setup) and the full design/roadmap live in `CLAUDE.md` and `docs/`.

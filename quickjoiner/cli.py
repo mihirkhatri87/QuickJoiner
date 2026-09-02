@@ -981,8 +981,8 @@ def bench_cmd(
     model: Optional[str] = MODEL_OPT,
     workspace: Optional[Path] = WORKSPACE_OPT,
 ):
-    """Measure speed and cost: per-stage retrieval latency, embedder throughput, and
-    (with --agent) answer latency + tokens per answer.
+    """Measure speed and cost: per-stage retrieval latency, embedder throughput,
+    knowledge-graph read latency, and (with --agent) answer latency + tokens per answer.
 
     The speed twin of `qj eval`. Run it before and after any performance change and
     compare the two reports — a claim of "faster" without a bench table is a guess.

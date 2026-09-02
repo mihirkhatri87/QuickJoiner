@@ -400,6 +400,31 @@ Previously BOTH source copies preceded the install layer, so every edit re-downl
   rel, dst)` — distinct evidence docs + distinct sources per exact edge (the
   `(src,rel,dst,evidence_doc_id)` PK already stores one row per corroborating doc);
   `entity_evidence(entity_id, limit)` — evidence titles/kinds for adjudication context.
+  **Traversal and display are two different reads (`_edge_scan` / `_hydrate_edges`,
+  2026-08-15).** Both path searches load the whole edge table — deliberately, so a "no known
+  path" refusal is never wrong (see `graph_path`'s reachability note) — but they used to load
+  it through `_EDGE_SELECT`: 15 columns behind three LEFT JOINs, for a BFS that reads three of
+  them and decorates the at-most-three hops that come back. Measured on a synthetic graph the
+  size of the live corpus (100k edges / 36k entities / 20k documents), where the scan was
+  **92% of a 1.45s call**: the full scan is 1333ms, the four traversal columns 238ms. So
+  `_edge_scan` selects `src, rel, dst, evidence_doc_id` only, and `_hydrate_edges` re-reads the
+  display columns by primary key for the handful of edges on returned chains (≤3 hops for
+  `graph_path`; one batch of ≤`4*max_candidates` chains for the candidates search, hydrated
+  BEFORE signature dedupe, which classifies evidence). **`graph_path` p50 1453 → 349ms,
+  `graph_path_candidates` 1476 → 348ms (−76%, 4.2x)**, with reachability bit-for-bit unchanged
+  — every edge is still visited, only the row is narrower. The `documents` join survives just
+  when a visibility filter is active (the predicate is over `d.source_id`); open mode is a bare
+  `edges` scan. A hop that fails to hydrate keeps its traversal row rather than being dropped —
+  silently shortening a chain would turn a correct connectivity claim into a wrong one.
+  ⚠ **The `ORDER BY` is load-bearing.** BFS explores in adjacency-insertion order, so among
+  EQUALLY short chains whichever edge was read first wins — and the old statement had no
+  ordering, leaving that to the query planner. Measured while narrowing the columns: **15 of
+  166** connected pairs changed route purely because the row order moved. Ordering on the PK
+  `(src, rel, dst, evidence_doc_id)` makes the cited chain reproducible, and is **free** —
+  those four columns ARE the PK, so it is a covering index scan (238ms ordered vs 241ms not).
+  Both searches share the one statement, so the documented "candidate 0 agrees with
+  `graph_path`" invariant now holds by construction (verified 181/181 exact, against 0
+  reachability or hop-count regressions over 900 differential pairs).
   **`graph_relations(rel, src_type, dst_type, limit)` (2026-07-31, same neutral `?`-SQL, no
   schema change)** — every edge of ONE relation shape, optionally constrained by the entity
   type on each end, ordered by destination then source. The enumeration read the graph could
@@ -1553,7 +1578,18 @@ Previously BOTH source copies preceded the install layer, so every edit re-downl
   (`agent.py`, max 10 rounds —
   **each live tool result is capped to `chat.live_tool_result_max_chars` (default 24000) before
   re-entering the model context**, so an unbounded connector tool like the full Octopus dashboard
-  can't overflow the window and make the provider reject the follow-up turn — **except
+  can't overflow the window and make the provider reject the follow-up turn. **The marker states
+  the SCALE of the cut, not merely that one happened (2026-08-15)** — it names the shown size,
+  the true size and the number of characters omitted, and says the view is PARTIAL. The bare
+  `[tool output truncated]` it replaces told the model a boundary existed but nothing about
+  which side of it the answer was on: dropping 200 characters of a dashboard and dropping
+  476,000 read identically, so a list cut 4% in was summarised exactly like one cut 96% in.
+  With the numbers present the model can qualify the answer or re-query more narrowly instead
+  of confidently reporting a prefix — the same no-silent-caps rule the crawler (`_crawl`'s
+  truncation warning) and the graph tools already follow. Output landing exactly ON the limit
+  is deliberately NOT marked: nothing was dropped, and claiming a partial view would push the
+  model to hedge a complete answer. The `tool_result` trace event's `chars` (the true post-cap
+  size, for the UI) is unchanged and separate — this line is what the MODEL sees. **Except
   `graph_relations`/`graph_neighbors`/`graph_path` (`AppContext._UNCAPPED_TOOLS`, 2026-08-07,
   user-reported "you missed some teams")**: those three already bound themselves to a small,
   fixed shape (400 relationships / a hub sample / ≤3 path chains) with no model-controllable size
@@ -2380,9 +2416,28 @@ Previously BOTH source copies preceded the install layer, so every edit re-downl
   sparse, fuse, sparse-rescore, rerank, gate, plus alias expansion and graph expansion,
   which sit *around* `store.search` on the real `search_memory` path; **embed** (no LLM) —
   embedder chunks/sec at a realistic batch, the ingest bottleneck S6 must beat; **sync**
-  (no LLM, always) — see below; **agent**
+  (no LLM, always) — see below; **graph** (no LLM, always, 2026-08-15) — see below; **agent**
   (`--agent`, needs an LLM) — time to first token, full-answer time, model rounds, tool
   calls, and tokens per answer incl. cache reads.
+  **Graph reads are measured too** (`run_graph_bench` + `bench/synth.py`): `graph_path`,
+  `graph_path_candidates`, `graph_neighbors` and `graph_relations` sit on the answer path
+  exactly as retrieval does, and nothing timed them — which is how `graph_path` came to
+  spend **92% of a 1.45s call** re-reading 15 columns the BFS never used, invisible to
+  1062 passing tests because the answers were right and only slow. The first three p50s
+  now join `COMPARE_METRICS`, so that regression class is gated. Pairs come from
+  `synth.sample_pairs` and are deliberately **not** filtered to connected ones: an
+  unconnected pair is the expensive case (BFS exhausts its frontier instead of returning
+  early on a hit) and is what a user hits whenever two things turn out to be unrelated.
+  A workspace with no graph reports `skipped` rather than a 0ms that would read as
+  "instant" and sail through `--compare` as a huge win.
+  **`bench/synth.py` — a reproducible corpus, because a benchmark nobody else can run is
+  an anecdote.** `build_synthetic_graph(catalog, entities, edges, documents, seed)` writes
+  a seeded random graph through the ordinary public write path, so the rows are
+  indistinguishable from ingested ones; `LIVE_SCALE` (36k entities / 100k edges / 20k docs)
+  reproduces the corpus the path-search work was measured against, in ~150s. It is
+  explicitly NOT a stand-in for real data — the text is nonsense, so retrieval *quality*
+  figures from it would be meaningless. What it reproduces faithfully is **row counts**,
+  which is the only thing the whole-edge-table reads are sensitive to.
   **Ingest throughput is READ, not run** (`run_sync_bench`, 2026-08-04, closing S1's
   remainder): docs/min overall and per connector, computed from the runs already recorded in
   `sync_events` over a `--sync-days` window (default 7). Performing a sync would measure the
